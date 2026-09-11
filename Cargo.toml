@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+repository = "https://github.com/superboo07/DaysEngine"
+
+# ---------------------------------------------------------------------------
+# Dependency policy
+#
+# Every direct dependency is pinned to an EXACT version with `=`. Cargo's
+# default caret requirement ("1.2.3" means ">=1.2.3, <2.0.0") would let a fresh
+# checkout silently pull code nobody here has read. `=` plus the committed
+# Cargo.lock means a clone builds the same bytes today and in two years.
+#
+# Transitive dependencies are pinned by Cargo.lock, which is committed. Always
+# build with `--locked` (see `just` recipes and CI) so a stale or tampered lock
+# is an error rather than something Cargo quietly rewrites.
+#
+# Adding or bumping a dependency is a reviewed change: see docs/DEPENDENCIES.md
+# for the audit checklist and the rationale for each crate below.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Pure-Rust DEFLATE. Used for GPK index/entry decompression. No C, no unsafe-heavy
+# codepaths, and it is the same inflate implementation flate2 defaults to.
+miniz_oxide = { version = "=0.9.1", features = ["std"] }
+
+# derive(Error) boilerplate only. Compile-time only, no runtime surface.
+thiserror = "=2.0.20"
+
+# Error propagation in the binaries only. Libraries use typed `thiserror` enums
+# so callers can match on failure modes; `anyhow` never appears in a lib crate.
+anyhow = "=1.0.104"
+
+# Logging facade + the only backend we link. env_logger is binary-only.
+log = "=0.4.34"
+env_logger = "=0.11.11"
+
+# Route-graph and config serialization.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+# CLI for the offline asset/route tools. Binary-only.
+clap = { version = "=4.6.6", features = ["derive", "env"] }
+
+# Window, input, GPU present and audio output. Links the system libSDL3.
+sdl3 = "=0.20.0"
+
+# Raw bindgen bindings against the SYSTEM ffmpeg. Chosen over ffmpeg-next because
+# it generates bindings at build time and therefore tracks whatever libav* the
+# host actually ships, instead of lagging behind releases.
+rusty_ffmpeg = "=0.17.0"
+
+# Pure-Rust PNG decode for backgrounds and UI art.
+png = "=0.18.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+# Asset decode is unusably slow in a debug build; dependencies always get -O2.
+[profile.dev.package."*"]
+opt-level = 2

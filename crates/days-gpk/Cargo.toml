@@ -1,0 +1,11 @@
+[package]
+name = "days-gpk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reader for the STKFile0 (.GPK) archives used by Overflow's FILMEngine."
+
+[dependencies]
+miniz_oxide.workspace = true
+thiserror.workspace = true
+log.workspace = true

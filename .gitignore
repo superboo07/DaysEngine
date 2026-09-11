@@ -1,0 +1,16 @@
+/target
+*.orig
+
+# Extracted game assets and anything derived from the user's own install.
+# Never commit game data.
+/extracted
+/assets-cache
+*.GPK
+*.gpk
+*.ors
+*.ORS
+*.wmv
+*.WMV
+
+# Cargo.lock is intentionally NOT ignored. It is the pin that makes the
+# dependency policy in docs/DEPENDENCIES.md real. Do not add it here.

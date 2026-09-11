@@ -1,0 +1,5 @@
+# Pinned so every contributor and CI run uses one compiler. Bumping this is a
+# reviewed change, same as bumping a dependency.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

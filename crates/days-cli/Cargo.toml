@@ -1,0 +1,17 @@
+[package]
+name = "days-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline tools for inspecting a School Days HQ install."
+
+[[bin]]
+name = "days"
+path = "src/main.rs"
+
+[dependencies]
+days-gpk = { path = "../days-gpk", version = "=0.1.0" }
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true

@@ -1,0 +1,11 @@
+[build]
+# Surface warnings as errors locally the same way CI does.
+# (Opt out for a scratch build with `RUSTFLAGS= cargo build`.)
+
+[net]
+# Never let a build reach for a git dependency; deny.toml enforces this too, but
+# failing at fetch time gives a clearer error.
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "sparse"
