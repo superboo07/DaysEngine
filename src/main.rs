@@ -319,6 +319,10 @@ fn main() -> Result<()> {
     // position is already the graph's and must not be looked up again: a
     // script that several routes list would resolve back to the first of them.
     let mut chained = false;
+    // The replay scene being played and how far through its list, or `None`
+    // for ordinary playback. The original keeps the same pair on the replay
+    // module: the scene at `+0x2a8` and the step at `+0x2ac`.
+    let mut replaying: Option<(Vec<String>, usize)> = None;
     loop {
         if menus && !chained {
             // The menus reached from here are the whole screen. The control
@@ -337,9 +341,17 @@ fn main() -> Result<()> {
                 Outcome::Play | Outcome::Finished => next = wanted.clone(),
                 // A replay names its own script, which the DLL's table spells
                 // as a path; `find_script` wants the trailing name.
-                Outcome::Replay(script) => {
-                    next = script.rsplit('/').next().unwrap_or(&script).to_string();
-                    log::info!("replaying {next}");
+                // A scene is a sequence, not one script. `FUN_1001f270` starts
+                // it at step 0 and `FUN_1001f0d0` is asked for the next one
+                // each time a script ends, so the whole list is carried and
+                // walked here rather than the first of it being played alone.
+                Outcome::Replay(scripts) => {
+                    let Some(first) = scripts.first() else {
+                        continue;
+                    };
+                    next = first.rsplit('/').next().unwrap_or(first).to_string();
+                    log::info!("replaying {next}, {} script(s) in the scene", scripts.len());
+                    replaying = Some((scripts, 0));
                 }
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
@@ -396,11 +408,34 @@ fn main() -> Result<()> {
         // — the route ended, or the script was not in it — the session goes
         // back to the title, as the game does. Quitting ends it either way.
         if outcome == Outcome::Finished {
+            // A replay walks the scene's own list. `FUN_1001ee20`'s `default`
+            // arm is `step + 1`, which is every scene without a branch table —
+            // see `daysengine::ui::replay` for which twelve have one and what
+            // is still missing to follow them.
+            if let Some((scripts, step)) = &mut replaying {
+                *step += 1;
+                if let Some(script) = scripts.get(*step) {
+                    next = script.rsplit('/').next().unwrap_or(script).to_string();
+                    log::info!("replay step {step}: {next}");
+                    chained = true;
+                    continue;
+                }
+                // The list ran out, which is the chain ending. Back to the
+                // menus rather than into the route graph: a replay is not a
+                // position in the story.
+                log::info!("the replay scene ended");
+                replaying = None;
+                continue;
+            }
             if let Some(script) = progress.as_mut().and_then(Progress::advance) {
                 next = script.rsplit('/').next().unwrap_or(&script).to_string();
                 chained = true;
                 continue;
             }
+        }
+        // Anything else leaving playback ends the replay too.
+        if outcome != Outcome::Finished {
+            replaying = None;
         }
         if outcome == Outcome::Quit || !menus {
             break;
@@ -432,8 +467,8 @@ enum Outcome {
     Play,
     /// The script reached its end, so the branch graph decides what follows.
     Finished,
-    /// Play one replay scene's script, chosen on the replay screen.
-    Replay(String),
+    /// Play a replay scene: the sequence of scripts it runs through.
+    Replay(Vec<String>),
     /// Load a save slot and play what it names.
     LoadSlot(u32),
     /// Close the game.

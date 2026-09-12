@@ -31,10 +31,34 @@
 //! 7` — and hands the scene's **first** script to the host. A scene's list can
 //! hold up to six, and the rest are the steps after it: the engine asks the
 //! module for the next one through `FUN_1001f0d0`, which walks a per-scene
-//! branch table by the choice the player made during playback. **Chained replay
-//! playback is not implemented here** — only the first script, which is the one
-//! the click starts. The branch tables are real and their addresses are known
-//! (`FUN_1001ee20` reads them); nothing else about them is recovered.
+//! branch table by the choice the player made during playback.
+//!
+//! # How a scene walks
+//!
+//! `FUN_1001f270` starts a scene at step 0 (`+0x2ac`), and each time a script
+//! ends `FUN_1001f0d0` is asked for the next one. It calls `FUN_1001ee20` for
+//! the next **step index** and looks the name up in the scene's list, returning
+//! an empty string when the index is -1, which is the chain ending.
+//!
+//! `FUN_1001ee20` is where the branch lives:
+//!
+//! ```text
+//! column = host->+0x4()                      // the choice made in playback
+//! column = (column == -2) ? 0 : column + 1
+//! switch (scene) {
+//!   case 1, 6, 7, 10, 11, 12, 16, 25, 28, 29, 36:
+//!       next = table[step * 3 + column]       // 0xc bytes a row, three wide
+//!   default:
+//!       next = step + 1                       // straight down the list
+//! }
+//! ```
+//!
+//! A row is three `i32` next-step indices, one per choice, and -1 ends the
+//! scene. Scene 11 has four such tables, one per version, picked by `+0x2b4`.
+//!
+//! **The `default` arm is the common case, and it is what this engine does**:
+//! step + 1 until the list runs out. Every scene without a table chains exactly
+//! as the original does.
 //!
 //! # The three scenes that ask first
 //!
@@ -44,7 +68,18 @@
 //! picks, `FUN_1001f270` sets the step index to zero and plays element zero of
 //! that version's script list — and element zero is the same script in every
 //! version, so **the choice does not change what starts**. It selects a branch
-//! for later, in the chaining that is still to build.
+//! for later, in the eleven scenes that have a table.
+//!
+//! # Still to build
+//!
+//! Those eleven branch on the player's choice and this engine walks them
+//! linearly instead. The tables are real, they are `i32` triples in the DLL's
+//! `.data`, and `FUN_1001ee20` reads them — but **finding them in the user's
+//! own DLL is not recovered**. Every other table here is located by its content:
+//! the widget boxes by their rectangles, the scene names by their spelling, the
+//! thumbnail run by being the twelve boxes twice over. A run of small integers
+//! has no such shape, so there is nothing to match on yet and nothing is
+//! guessed. Until there is, a branching scene plays its steps in order.
 
 use days_save::FlagStore;
 
@@ -394,13 +429,9 @@ pub fn popup_enabled(scene: &Scene, choice: usize, flags: &FlagStore) -> bool {
 ///
 /// The step index is set to zero first, so this is element zero of the chosen
 /// version's list — the same script whichever version is picked.
-pub fn popup_action(scene: &Scene, choice: usize) -> Option<&str> {
-    scene
-        .choices
-        .get(choice)?
-        .scripts
-        .first()
-        .map(String::as_str)
+pub fn popup_action(scene: &Scene, choice: usize) -> Option<&[String]> {
+    let scripts = &scene.choices.get(choice)?.scripts;
+    (!scripts.is_empty()).then_some(scripts.as_slice())
 }
 
 /// The grid's thumbnails, cut from one page's `Replay_Thm%02d.png`.
@@ -759,6 +790,28 @@ fn u32le(b: &[u8], o: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A click dispatches the scene, and what the engine plays is the scene's
+    /// whole list. `FUN_1001f0d0` is asked for the next script each time one
+    /// ends, so the sequence is what has to be handed over, not its first name.
+    #[test]
+    fn a_scene_hands_back_every_step_it_plays() {
+        let steps = ["02/02-2S-W00", "02/02-2S-W00b", "02/02-2S-W00c"];
+        let scenes = Scenes::from_scenes(vec![scene("REP02_2S_W00", &steps)]);
+        match hscene_action(&scenes, 0, HSCENE_FIRST_THUMBNAIL) {
+            Act::Play { scene: at, script } => {
+                assert_eq!(at, 0);
+                // The dispatch names the opening script, and the scene it names
+                // carries the rest — which is what the menu turns into the
+                // sequence the engine walks.
+                assert_eq!(script, steps[0]);
+                let played = &scenes.get(at).expect("just built").scripts;
+                assert_eq!(played.len(), steps.len());
+                assert_eq!(played.last().map(String::as_str), Some(steps[2]));
+            }
+            other => panic!("a filled thumbnail should play, got {other:?}"),
+        }
+    }
     use super::*;
     use days_save::Value;
 
@@ -905,8 +958,12 @@ mod tests {
         assert!(popup_enabled(scene, 1, &seen));
         assert!(!popup_enabled(scene, 3, &seen));
 
+        // Every version starts on the same script — the choice picks a branch
+        // for later, not a different opening — so what differs between them is
+        // the rest of the list, and the popup hands back the whole list.
         for choice in 0..scene.choices.len() {
-            assert_eq!(popup_action(scene, choice), Some("03/03-KB-N00"));
+            let scripts = popup_action(scene, choice).expect("every version plays something");
+            assert_eq!(scripts.first().map(String::as_str), Some("03/03-KB-N00"));
         }
         assert_eq!(popup_action(scene, 9), None);
     }

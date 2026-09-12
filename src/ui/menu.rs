@@ -339,8 +339,13 @@ pub enum Action {
     Unavailable(Mode),
     /// Leave the menus and play the script.
     Play,
-    /// Play a replay scene's script, named as the DLL's table spells it.
-    PlayReplay(String),
+    /// Play a replay scene, as the sequence of scripts it runs through.
+    ///
+    /// The whole list, not just the first: `FUN_1001f0d0` is asked for the next
+    /// one each time a script ends, and walks the scene's own list by a step
+    /// index at `+0x2ac`. See [`crate::ui::replay`] for how far that is
+    /// recovered.
+    PlayReplay(Vec<String>),
     /// A setting changed. The engine should re-read the volumes it mixes with.
     ///
     /// The DLL writes each setting through to the config object as it happens,
@@ -1293,7 +1298,12 @@ impl Menu {
                 self.refresh();
                 Ok(Action::Sound(SystemSe::Click))
             }
-            replay::Act::Play { script, .. } => Ok(Action::PlayReplay(script)),
+            replay::Act::Play { scene, .. } => Ok(match self.session.scenes.get(scene) {
+                Some(scene) if !scene.scripts.is_empty() => {
+                    Action::PlayReplay(scene.scripts.clone())
+                }
+                _ => Action::Stay,
+            }),
             replay::Act::Ask { scene } => {
                 self.asked = Some(scene);
                 self.advance(vfs, dll, Mode::REPLAY_POPUP)
@@ -1308,7 +1318,7 @@ impl Menu {
             return Action::Stay;
         };
         match replay::popup_action(scene, widget) {
-            Some(script) => Action::PlayReplay(script.to_string()),
+            Some(scripts) => Action::PlayReplay(scripts.to_vec()),
             None => Action::Stay,
         }
     }

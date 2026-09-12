@@ -1665,6 +1665,18 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
             scene.flag,
             scene.first_script().unwrap_or("(no script recovered)"),
         );
+        // The steps after the first, which is what a scene chains through when
+        // it is played. See `daysengine::ui::replay` for the walk.
+        if scene.scripts.len() > 1 {
+            println!(
+                "        then {}",
+                scene.scripts[1..]
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            );
+        }
         for choice in &scene.choices {
             println!(
                 "        version {:<14} {}  {}",
@@ -1676,6 +1688,16 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
                 },
                 choice.scripts.first().map_or("(not recovered)", |s| s),
             );
+            if choice.scripts.len() > 1 {
+                println!(
+                    "                                       then {}",
+                    choice.scripts[1..]
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                );
+            }
         }
     }
     println!();
@@ -1881,7 +1903,11 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 break;
             }
             Action::PlayReplay(script) => {
-                println!("  (would replay {script})");
+                println!(
+                    "  (would replay {} script(s): {})",
+                    script.len(),
+                    script.join(", ")
+                );
                 break;
             }
             // The Option screen's Close flushes and then leaves like any
