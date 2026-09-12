@@ -11,6 +11,7 @@
 
 use anyhow::{bail, Context, Result};
 use days_engine::menu::{Action, Menu, Mode, SaveState, SystemSe};
+use days_engine::save::FlagStore;
 use days_engine::{ini::Ini, text, Mixer, Stage};
 use days_font::Font;
 use days_media::AudioBuffer;
@@ -135,6 +136,8 @@ struct Player<'a> {
     system_se: SystemSounds,
     /// The user's own `SysMenuSDHQ.dll`, which holds every widget table.
     dll: Vec<u8>,
+    /// What the player has unlocked, out of their `Save/GlobalFlag.DAT`.
+    flags: FlagStore,
 }
 
 fn main() -> Result<()> {
@@ -218,6 +221,7 @@ fn main() -> Result<()> {
         mixer: &mixer,
         sounds: Sounds::default(),
         system_se: SystemSounds::from_ini(&film),
+        flags: days_engine::save::load_flags(&game, &film),
         // The widget tables are only needed for menus. A missing DLL is not
         // fatal to playing a script, so this is reported and left empty.
         dll: match std::fs::read(game.join("SysMenuSDHQ.dll")) {
@@ -305,10 +309,7 @@ fn run_menu(
     events: &mut EventPump,
     start: &Ini,
 ) -> Result<Outcome> {
-    // The save file decides which title art and which entries are live. Reading
-    // it is not implemented yet, so this is a fresh install: plain title, replay
-    // locked. See days_engine::menu::SaveState.
-    let save = SaveState::default();
+    let save = SaveState::from_flags(&player.flags);
     let mut menu = Menu::open(player.vfs, &player.dll, Mode::TITLE, save, MENU_RESOLUTION)
         .context("opening the title screen")?;
 

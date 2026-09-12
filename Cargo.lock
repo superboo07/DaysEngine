@@ -225,6 +225,7 @@ dependencies = [
  "log",
  "png",
  "sdl3",
+ "thiserror",
 ]
 
 [[package]]

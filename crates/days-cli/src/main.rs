@@ -111,6 +111,15 @@ enum Cmd {
         #[arg(long)]
         verify: bool,
     },
+    /// Decode the save data and print what the player has unlocked.
+    Save {
+        /// Print every flag, not just the ones the menus read.
+        #[arg(long)]
+        all: bool,
+        /// Only print flags whose name contains this, implies --all.
+        #[arg(long)]
+        grep: Option<String>,
+    },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
     Timing {
@@ -157,13 +166,16 @@ struct MenuArgs {
     /// Resolution: standard, wide, note or full.
     #[arg(long, short = 'r', default_value = "wide")]
     resolution: String,
-    /// Treat the save as all-clear: the title becomes Title_AC.
+    /// Ignore the player's save data and start from a fresh install.
+    #[arg(long)]
+    fresh: bool,
+    /// Force the save to all-clear: the title becomes Title_AC.
     #[arg(long)]
     all_clear: bool,
-    /// Treat the first route as cleared: the title becomes Title_Clear.
+    /// Force the first route cleared: the title becomes Title_Clear.
     #[arg(long)]
     cleared: bool,
-    /// Unlock REPLAY, which is greyed out on a fresh save.
+    /// Force REPLAY unlocked, which is greyed out on a fresh save.
     #[arg(long)]
     replay: bool,
     /// Image to draw behind the title, normally STARTSCRIPT.INI [BaseFile].
@@ -250,6 +262,7 @@ fn main() -> Result<()> {
         Cmd::Render { name, at, out } => cmd_render(&game, &name, &at, &out)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
+        Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -846,6 +859,61 @@ fn select_packs(dir: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// Reads the player's global flag store, through the path their INI names.
+///
+/// Shared by `menu` and `save` so both see the install the same way. A missing
+/// or unreadable file reads as a fresh install, which is what it means.
+fn load_flags(game: &Path, vfs: &days_vfs::Vfs) -> days_engine::save::FlagStore {
+    let film = match vfs.read_path("Ini/FILMENGINE.INI") {
+        Ok(bytes) => days_engine::Ini::parse_bytes(&bytes),
+        Err(err) => {
+            log::warn!("reading Ini/FILMENGINE.INI: {err}");
+            days_engine::Ini::parse("")
+        }
+    };
+    days_engine::save::load_flags(game, &film)
+}
+
+/// Prints what the save data says the player has unlocked.
+fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
+    use days_engine::save::Value;
+    use days_engine::SaveState;
+
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let flags = load_flags(game, &vfs);
+    let save = SaveState::from_flags(&flags);
+
+    println!("{} flags", flags.len());
+    println!();
+    println!("what the title screen reads:");
+    println!("  AllClear          {}", flags.flag("AllClear"));
+    println!("  EndClear          {}", flags.flag("EndClear"));
+    match flags.get("EndNo").and_then(Value::as_int) {
+        Some(n) => println!("  EndNo             {n} endings seen"),
+        None => println!("  EndNo             (not set)"),
+    }
+    println!();
+    println!("so the title screen shows {}, REPLAY {}",
+        save.title_variant(),
+        if save.replay_unlocked() { "unlocked" } else { "locked" });
+
+    if all || grep.is_some() {
+        println!();
+        for (name, value) in flags.iter() {
+            if grep.is_some_and(|g| !name.to_lowercase().contains(&g.to_lowercase())) {
+                continue;
+            }
+            match value {
+                Value::Bool(b) => println!("  {name:<40} {b}"),
+                Value::Int(n) => println!("  {name:<40} {n}"),
+                Value::Float(f) => println!("  {name:<40} {f}"),
+                Value::Str(s) => println!("  {name:<40} {s:?}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     use days_engine::menu::{Action, Menu, Mode, SaveState};
@@ -855,12 +923,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
-    let save = SaveState {
-        all_clear: args.all_clear,
-        trial: false,
-        cleared_first: args.cleared,
-        cleared_replay: args.replay,
+    // The player's real save decides this; the flags below only force things
+    // on, so a fresh install can still be driven through every screen.
+    let mut save = if args.fresh {
+        SaveState::default()
+    } else {
+        SaveState::from_flags(&load_flags(game, &vfs))
     };
+    save.all_clear |= args.all_clear;
+    save.cleared_first |= args.cleared;
+    save.cleared_replay |= args.replay;
 
     if args.check_all {
         // Every mode SystemInit can dispatch to, opened at its own default

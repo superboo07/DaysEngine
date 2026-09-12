@@ -27,6 +27,7 @@
 //! the DLL's own dispatch — see [`Menu::confirm`].
 
 use crate::ini::Ini;
+use crate::save::FlagStore;
 use days_ui::{Resolution, Screen, WidgetState};
 use days_vfs::Vfs;
 
@@ -156,10 +157,10 @@ impl SystemSe {
 ///
 /// The title screen asks the host three questions — all-clear, trial build, and
 /// whether a given route is cleared — and picks its art and its enabled widgets
-/// from the answers. The answers live in `Save/GlobalFlag.DAT`, which is a
-/// `DFLT` + zlib container we do not decode yet, so these default to a fresh
-/// install: plain `Title`, replay locked. Decoding that file is what makes this
-/// struct true; nothing else has to change.
+/// from the answers. The host answers out of `Save/GlobalFlag.DAT`; see
+/// [`SaveState::from_flags`] for which flag answers which question, and
+/// [`crate::save`] for reading the file. The default is a fresh install: plain
+/// `Title`, replay locked.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SaveState {
     /// Every ending seen. Switches the title to `Title_AC` and adds its sixth
@@ -174,6 +175,41 @@ pub struct SaveState {
 }
 
 impl SaveState {
+    /// Answers the title screen's three questions out of the flag store.
+    ///
+    /// The DLL only asks; the executable answers, and these are the answers it
+    /// gives:
+    ///
+    /// | Question | Host slot | Answer |
+    /// |---|---|---|
+    /// | all-clear | `+0xe8` | flag `AllClear` |
+    /// | route *n* cleared | `+0xec` | flag `EndClear`, for **either** route |
+    /// | trial build | `+0x34` | not recovered; see below |
+    ///
+    /// One route, one flag: `FUN_0042baf0` answers route 0 and route 1 from the
+    /// same `EndClear` flag, so clearing the game once both changes the title
+    /// art and unlocks `REPLAY`. Route 0 carries one extra condition — a member
+    /// the exe must have set — that is **not recovered**, so `cleared_first`
+    /// here is `EndClear` alone and may be true slightly earlier than the
+    /// original would say.
+    ///
+    /// `trial` stays false: the retail executable contains no trial string and
+    /// no reachable trial branch, so there is nothing to read. A trial build
+    /// would be a different executable, not a different save.
+    ///
+    /// The exe sets `AllClear` itself, in `FUN_0041fee0`, once the `EndNo`
+    /// count of endings seen reaches the total — so it is a stored flag and not
+    /// something to recompute here.
+    pub fn from_flags(flags: &FlagStore) -> Self {
+        let cleared = flags.flag("EndClear");
+        SaveState {
+            all_clear: flags.flag("AllClear"),
+            trial: false,
+            cleared_first: cleared,
+            cleared_replay: cleared,
+        }
+    }
+
     /// The title art variant, following the DLL's own three-way test.
     pub fn title_variant(self) -> &'static str {
         if self.all_clear {

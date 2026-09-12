@@ -323,8 +323,8 @@ INI keys, and the engine picks the bindings itself.
 
 The three questions the title asks the host — all-clear (`+0xe8`), trial build
 (`+0x34`), and route *n* cleared (`+0xec`) — are answered out of
-`Save/GlobalFlag.DAT`, a `DFLT` + zlib container that is not decoded yet.
-`days_engine::menu::SaveState` defaults them to a fresh install.
+`Save/GlobalFlag.DAT`; see that section below for which flag answers which, and
+`days_engine::menu::SaveState::from_flags`.
 
 ---
 
@@ -401,8 +401,107 @@ match the original pixel for pixel.
 - `FEELINGSCRIPT.INI` / `STANDERDSCRIPT.INI` — per-script affection deltas,
   keyed by script name, feeding the route logic.
 
-`Config.DAT` and the save files use a `DFLT` + zlib container (magic `DFLT`
-followed by a raw zlib stream).
+`Config.DAT` uses a `DFLT` + zlib container (magic `DFLT` followed by a raw
+zlib stream). The save files do **not** — see below.
+
+---
+
+## `Save/GlobalFlag.DAT` — the global flag store
+
+Everything persistent the player has earned: one flag per script seen, one per
+replay scene unlocked, the clear flags the title screen reads, and the display
+strings the save/load screen shows. It is a `std::map<wstring, VARIANT>`
+written out whole — no index, no compression:
+
+```text
+"FlgH"                4 bytes. Written, but the reader only checks that four
+                      bytes came back; it never compares them.
+varint  count         number of entries
+count x
+    wstring name      enciphered, see below
+    varint  flags     -1 in every entry of every file seen
+    varint  vt        VARIANT type tag
+    value             by vt
+```
+
+**varint** — seven bits per byte, most significant group first. The top bit of
+every byte but the last is set, and `0x40` *of the first byte only* marks a
+negative number, encoded as `-1 - magnitude`:
+
+| Bytes | Value |
+|---|---|
+| `05` | 5 |
+| `40` | -1 |
+| `90 7e` | 2174 |
+
+`VARIANT_TRUE` is `-1`, so a set flag is the single byte `0x40` — which is why
+a hex dump of the file is long runs of `40 0b 40`.
+
+**Strings** — a varint length in *characters*, then that many UTF-16LE code
+units, each XORed with its own index:
+
+```text
+unit[i] ^= i
+```
+
+The index is the character position and never wraps. This is obfuscation, not
+encryption: there is no key. It is why the names look like readable text with
+holes punched in it — `"01-34(67%H:;"` is `"00/00-00-A00"`.
+
+**Value types** are Windows `VARIANT` tags. Anything not in this table is
+written as `VT_I4` zero, so nothing else can appear:
+
+| vt | Type | Encoding |
+|---|---|---|
+| 3 | `VT_I4` | varint |
+| 4 | `VT_R4` | 4 raw little-endian bytes |
+| 8 | `VT_BSTR` | string, as above |
+| 11 | `VT_BOOL` | varint; `-1` true, `0` false |
+
+Recovered from `SCHOOLDAYS HQ.exe`: `FUN_0045fe90` / `FUN_004600d0` write and
+read the container, `FUN_0042b490` / `FUN_0042b5f0` locate it through the
+`[FlagFileName]=` INI key, `FUN_004350b0` is the varint codec, `FUN_00435010`
+is the string reader that applies the cipher, and `FUN_0045c890` switches on
+the value tag.
+
+### What the title screen reads
+
+The DLL asks the host three questions; the executable answers out of this file:
+
+| Question | Host vtable slot | Answer |
+|---|---|---|
+| all-clear | `+0xe8` | flag `AllClear` |
+| route *n* cleared | `+0xec` | flag `EndClear`, for **either** route |
+| trial build | `+0x34` | not recovered |
+
+One route, one flag: `FUN_0042baf0` answers route 0 and route 1 from the same
+`EndClear`, so clearing the game once both switches the title to `Title_Clear`
+and unlocks `REPLAY`. Route 0 carries one further condition — a member at
+`+0x1f0` that the exe sets — which is **not recovered**.
+
+`AllClear` is a stored flag, not something to recompute: `FUN_0041fee0` sets it
+once the `EndNo` count of endings seen reaches the total.
+
+**Trial is not recovered.** The retail executable holds no trial string and no
+reachable trial branch, so there is nothing to read; a trial build would be a
+different executable, not a different save. The engine answers `false`.
+
+## `Save/SaveFile00N.DAT` — a save slot
+
+**Not yet decoded**, but it is built from the same primitives and its head
+parses with them:
+
+```text
+"SLog"                4 bytes
+varint  1             meaning unrecovered
+wstring               the script the slot is in, e.g. "05/05-A2-Z00"
+4 bytes               1.0f in the file checked; meaning unrecovered
+"FlgH" ...            a whole flag store, as above, embedded
+```
+
+The two unrecovered fields are named here as what they are — unrecovered —
+rather than guessed at. `FUN_0042aea0` and `FUN_0042a980` locate these files
+through `[SaveFileName]=` and are where to start.
 
 ---
 

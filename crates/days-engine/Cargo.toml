@@ -15,6 +15,7 @@ days-ui = { path = "../days-ui", version = "=0.1.0" }
 sdl3.workspace = true
 png.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
