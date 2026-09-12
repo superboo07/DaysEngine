@@ -660,9 +660,12 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
     let mut stage = daysengine::Stage::new(script);
     std::fs::create_dir_all(out)?;
 
-    // The choice box's axis is the install's, not ours.
-    let stacked = daysengine::ui::select::Layout::from_ini(&film_ini(&vfs))
-        == daysengine::ui::select::Layout::Stacked;
+    // Two answers only the install can give: the choice box's axis, and
+    // whether dialogue wraps and at what pitch.
+    let film = film_ini(&vfs);
+    let stacked =
+        daysengine::ui::select::Layout::from_ini(&film) == daysengine::ui::select::Layout::Stacked;
+    let english = film.get_bool("UseEnglish").unwrap_or(false);
 
     // The control bar, with the pointer parked inside the strip and the ramp
     // settled, so `--bar` shows the dropped-down state.
@@ -702,7 +705,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
                 .map(|w| format!("{:?}/{:?} {}..{}", w.a, w.b, w.start, w.end)),
         );
         let mut rgba =
-            daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked);
+            daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked, english);
 
         if let Some(strip) = &control {
             // Blended over the frame, which is the check that matters: the

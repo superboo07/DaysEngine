@@ -12,19 +12,23 @@ use days_font::Font;
 
 /// Composites one frame to RGBA at `width` x `height`.
 pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize) -> Vec<u8> {
-    frame_rgba_with(visual, font, width, height, false)
+    frame_rgba_with(visual, font, width, height, false, false)
 }
 
-/// As [`frame_rgba`], with the choice box's axis given.
+/// As [`frame_rgba`], with the two answers only the install can give.
 ///
-/// `stacked` is the install's own layout answer, which `frame_rgba` cannot read
-/// for itself because it is handed no INI — see [`crate::ui::select::Layout`].
+/// `stacked` is the choice box's axis and `english` is `FILMENGINE.INI`'s
+/// `[UseEnglish]`, which decides both the character pitch and whether dialogue
+/// wraps at all — see [`crate::playback::text`] and
+/// [`crate::ui::select::Layout`]. `frame_rgba` cannot read either for itself
+/// because it is handed no INI.
 pub fn frame_rgba_with(
     visual: &Visual<'_>,
     font: &Font,
     width: usize,
     height: usize,
     stacked: bool,
+    english: bool,
 ) -> Vec<u8> {
     let mut out = vec![0u8; width * height * 4];
     for px in out.as_chunks_mut::<4>().0 {
@@ -88,29 +92,39 @@ pub fn frame_rgba_with(
         }
     }
 
+    // Dialogue, broken into lines the way `FUN_0043f600` breaks them and
+    // stacked at the recovered pitch. A 62-column line comes to 992 units at
+    // the English pitch of 16, so at the half scale everything here is drawn
+    // at it lands inside 500 of the stage's 800 pixels — which is what stops
+    // long lines running off the edge.
     if let Some((speaker, line)) = visual.text {
         let display = if speaker.is_empty() {
             line.to_string()
         } else {
             format!("{speaker}: {line}")
         };
-        let image = text::render_line(font, &display, [255, 255, 255]);
-        // Half scale, bottom-left, matching the SDL path's placement.
-        let scaled = downscale_half(&image.rgba, image.width, image.height);
-        let (sw, sh) = (image.width / 2, image.height / 2);
-        let y = height.saturating_sub(sh + 8);
-        blit(
-            &mut out,
-            width,
-            height,
-            &Surface {
-                pixels: &scaled,
-                width: sw,
-                height: sh,
-            },
-            8,
-            y,
-        );
+        let lines = text::wrap(&display, english);
+        let pitch = text::LINE_PITCH / 2;
+        let block = pitch * lines.len();
+        for (n, one) in lines.iter().enumerate() {
+            let image = text::render_line(font, one, [255, 255, 255], english);
+            let scaled = downscale_half(&image.rgba, image.width, image.height);
+            let (sw, sh) = (image.width / 2, image.height / 2);
+            let _ = sh;
+            let y = height.saturating_sub(block + 8) + n * pitch;
+            blit(
+                &mut out,
+                width,
+                height,
+                &Surface {
+                    pixels: &scaled,
+                    width: sw,
+                    height: image.height / 2,
+                },
+                8,
+                y,
+            );
+        }
     }
 
     // The choice box, when one is up. Its labels are placed by fractions of
@@ -130,7 +144,7 @@ pub fn frame_rgba_with(
                 (_, true) => (0.5, 0.25 + 0.5 * index as f32),
                 (_, false) => (0.25 + 0.5 * index as f32, 0.5),
             };
-            let image = text::render_line(font, label, [255, 255, 255]);
+            let image = text::render_line(font, label, [255, 255, 255], english);
             let scaled = downscale_half(&image.rgba, image.width, image.height);
             let (sw, sh) = (image.width / 2, image.height / 2);
             let x = ((width as f32 * cx) as usize).saturating_sub(sw / 2);

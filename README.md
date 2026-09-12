@@ -45,7 +45,8 @@ Early. What works today:
 | Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
 | In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that chain to the next script are blocked on the route graph, and which menu each one opens is not recovered. `days bar` prints the table |
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
-| Text box, word wrap, backlog | Not started |
+| Dialogue line breaking and spacing | **Works** — the engine's own rule out of `FUN_0043f600`: 62 columns, word-wrapped at spaces, English only, with the `\n` escape as a hard break and the ruby marks recognised; characters spaced by the recovered pitch and kerning table rather than by measuring the glyph. Where the block sits on screen is ours — the transform to screen pixels is not recovered |
+| Text box art, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
 

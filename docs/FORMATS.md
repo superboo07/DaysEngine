@@ -80,6 +80,11 @@ Notes:
   (`Event01/01-00/01-00-T00/01-00-T00-009`). A missing asset must not be fatal.
 - `MoveSom` drives a toy; the retail engine no-ops it without hardware.
 - **`Next` and `SetSELECT` carry no targets.** The branch graph is not here.
+- `PrintText`'s text field is not plain: it may carry a `\n` **escape** — two
+  characters, a backslash and an `n` — as a hard line break, and the ruby marks
+  `｜` and `《…》`. Only 68 of the 30,485 statements use the escape and **none of
+  the English ones use ruby**. Everything else is wrapped by the engine; see
+  *Dialogue layout* below.
 
 ### Retail data quirks the parser must absorb
 
@@ -814,6 +819,65 @@ and nothing depends on it, because the boxes' real extents are the shipped maps.
 
 See `daysengine::ui::select`, and `days select` to print the map and metrics a
 resolution really gets.
+
+---
+
+### Dialogue layout — where a line breaks and how it is spaced
+
+The scripts do not pre-wrap. `FUN_0043dbe0`'s `[PrintText]` arm hands the text
+field straight to **`FUN_0043f600`**, which walks it a character at a time,
+appending to the line it is on, and after every space looks ahead to the next
+space or end of string:
+
+    if (column + word > 0x3e) { column = 0; line += 1; }
+
+So the limit is **62 columns, counted in characters**, and the break happens
+*after* the space, which stays on the line it ends. Two details are shipped
+behaviour rather than tidiness:
+
+- the test is gated on `[UseEnglish]`, so a Japanese install never breaks a line
+  this way at all;
+- the look-ahead is `while ((look = look + 1, text[look] != ' ' && ...))`, which
+  starts one past the word's first character, so it measures `word - 1` and a
+  line can finish one column past the limit.
+
+`｜` sets a ruby anchor, `《…》` is a ruby group handed to `FUN_0043f880`, and
+`\` followed by `n` is a hard break. None of the three counts as a column.
+
+Each line lands at `this+0x234 + line*0x1c` and the count at `this+0x2ac`.
+**There is room for two lines.** The ruby array begins at `this+0x26c`, which is
+two `0x1c` strides along — anchored by `FUN_0043f880` writing ruby to
+`this + line*0x1c + 0x26c`, so the boundary is established from the other side
+rather than assumed. Under the rule above, **49 of the 30,485 shipped English
+statements wrap to three or four lines**, which is past the end of that array;
+what the retail executable does with those is not established here.
+
+`FUN_0044c740` draws one line per call, line `n` at `n * 0x30`, and advances
+
+    local_c + FUN_0044c660(c)
+
+per character, where `local_c` is `0x24` and drops to `0x10` under
+`[UseEnglish]`. `0x30` is also the cell the font is configured with —
+`FUN_00422170` calls `FUN_00436b00(font, 0x30, 0x30)`.
+
+`FUN_0044c660` is a kerning table, not a measurement — it never looks the glyph
+up. It returns 0 for everything unless `[UseEnglish]`, and then, in the order it
+tests:
+
+| characters | delta |
+|---|---|
+| `j` `i` `l` | -7 |
+| `m` `w` | +8 |
+| `M` `W` `Q` | +11 |
+| `I` | -7 |
+| any other `A`..`Z` | +4 |
+| everything else | 0 |
+
+The `A`..`Z` gate comes *after* `i`, `j`, `l`, `m` and `w`, so every other
+lowercase letter, every digit and all punctuation get nothing. `daysengine`'s
+`playback::text` carries the table and the wrap; the transform from these units
+to screen pixels is **not recovered**, so where the block sits is this engine's
+choice while the pitch between lines and between characters is the game's.
 
 ---
 

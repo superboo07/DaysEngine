@@ -133,6 +133,19 @@ impl SystemSounds {
     }
 }
 
+/// One wrapped dialogue line, uploaded.
+struct DialogueLine<'r> {
+    width: u32,
+    height: u32,
+    texture: Texture<'r>,
+}
+
+/// The dialogue currently on screen, cached on the lines it was built from.
+struct DialogueBlock<'r> {
+    lines: Vec<String>,
+    drawn: Vec<DialogueLine<'r>>,
+}
+
 /// Everything the two loops both need.
 struct Player<'a> {
     vfs: &'a Vfs,
@@ -640,7 +653,8 @@ fn run_script(
         )
         .context("creating movie texture")?;
     let mut still_texture: Option<(String, Texture)> = None;
-    let mut text_texture: Option<(String, u32, u32, Texture)> = None;
+    // The wrapped lines and a texture each, cached on the lines themselves.
+    let mut text_texture: Option<DialogueBlock<'_>> = None;
     // One patch texture, rebuilt only when a mouth of a different size shows
     // up. Mouths are tens of pixels across and change three times a second, so
     // allocating per frame would be pure churn.
@@ -648,6 +662,8 @@ fn run_script(
 
     let mut stage = Stage::new(script);
     let config = Config::load(&player.game);
+    // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
+    let english = player.film.get_bool("UseEnglish").unwrap_or(false);
     // Male voice lines are dropped when the player has turned `MenVoice` off.
     stage.set_men_voice(config.flag(Flag::MenVoice));
 
@@ -954,45 +970,60 @@ fn run_script(
         }
 
         if let Some((speaker, line)) = visual.text {
-            // Cache on the rendered string: laying out a line costs 48x48 of
-            // glyph decode per character, which is wasteful at 24 fps.
+            // Broken into lines the way `FUN_0043f600` breaks them, then
+            // stacked at the recovered `0x30` pitch. Cached on the joined
+            // lines: laying one out costs a 48x48 glyph decode per character,
+            // which is wasteful at 24 fps.
             let display = if speaker.is_empty() {
                 line.to_string()
             } else {
                 format!("{speaker}: {line}")
             };
+            let lines = text::wrap(&display, english);
             let stale = text_texture
                 .as_ref()
-                .is_none_or(|(cached, ..)| cached != &display);
+                .is_none_or(|cached| cached.lines != lines);
             if stale {
-                let image = text::render_line(player.font, &display, [255, 255, 255]);
-                let mut texture = creator.create_texture_streaming(
-                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                    image.width as u32,
-                    image.height as u32,
-                )?;
-                texture.set_blend_mode(BlendMode::Blend);
-                texture.update(None, &image.rgba, image.width * 4)?;
-                text_texture = Some((display, image.width as u32, image.height as u32, texture));
-            }
-            if let Some((_, w, h, texture)) = &text_texture {
-                // Dialogue sits along the bottom of the stage. The original's
-                // exact box is in the UI layer, which is not built yet.
-                let text_scale = scale * 0.5;
-                let tw = *w as f32 * text_scale;
-                let th = *h as f32 * text_scale;
-                canvas
-                    .copy(
+                let mut drawn = Vec::new();
+                for one in &lines {
+                    let image = text::render_line(player.font, one, [255, 255, 255], english);
+                    let mut texture = creator.create_texture_streaming(
+                        PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                        image.width as u32,
+                        image.height as u32,
+                    )?;
+                    texture.set_blend_mode(BlendMode::Blend);
+                    texture.update(None, &image.rgba, image.width * 4)?;
+                    drawn.push(DialogueLine {
+                        width: image.width as u32,
+                        height: image.height as u32,
                         texture,
-                        None,
-                        FRect::new(
-                            dst.x + 16.0 * scale,
-                            dst.y + dst.h - th - 16.0 * scale,
-                            tw,
-                            th,
-                        ),
-                    )
-                    .map_err(|e| anyhow::anyhow!("drawing text: {e}"))?;
+                    });
+                }
+                text_texture = Some(DialogueBlock { lines, drawn });
+            }
+            if let Some(block_lines) = &text_texture {
+                // Dialogue sits along the bottom of the stage. The pitch
+                // between lines is the original's; where the block as a whole
+                // sits is this engine's, because the transform that turns the
+                // layout's units into screen pixels is not recovered.
+                let text_scale = scale * 0.5;
+                let pitch = text::LINE_PITCH as f32 * text_scale;
+                let block = pitch * block_lines.drawn.len() as f32;
+                for (n, line) in block_lines.drawn.iter().enumerate() {
+                    canvas
+                        .copy(
+                            &line.texture,
+                            None,
+                            FRect::new(
+                                dst.x + 16.0 * scale,
+                                dst.y + dst.h - block - 16.0 * scale + n as f32 * pitch,
+                                line.width as f32 * text_scale,
+                                line.height as f32 * text_scale,
+                            ),
+                        )
+                        .map_err(|e| anyhow::anyhow!("drawing text: {e}"))?;
+                }
             }
         }
 
@@ -1013,7 +1044,7 @@ fn run_script(
                         } else {
                             [255, 255, 255]
                         };
-                        let image = text::render_line(player.font, label, colour);
+                        let image = text::render_line(player.font, label, colour, english);
                         let mut texture = creator.create_texture_streaming(
                             PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
                             image.width as u32,
