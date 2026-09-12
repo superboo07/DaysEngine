@@ -26,7 +26,7 @@ use daysengine::ui::replay::Scenes;
 use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
 use daysengine::ui::select::{self, Choice, Input, Select};
-use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
+use daysengine::{install::ini::Ini, playback::scale, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
@@ -547,6 +547,8 @@ fn run_menu(
     play_menu_bgm(player, start.get("TitleBGM"));
 
     let mut texture: Option<Texture> = None;
+    // Cached resampling weights, rebuilt when the window changes size.
+    let mut scaler = scale::Scaler::default();
     // The slot the player picked on the save screen, waiting for the
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
@@ -744,20 +746,32 @@ fn run_menu(
             texture = None;
         }
 
-        if menu.dirty() || texture.is_none() {
+        // The screen's own size, and the rectangle it lands in. The art is
+        // resampled to that rectangle rather than stretched onto it by the
+        // driver — see `daysengine::playback::scale`.
+        let (screen_w, screen_h) = menu.screen().size();
+        let dst = letterbox(canvas, screen_w, screen_h);
+        let at = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
+        if menu.dirty() || texture.is_none() || at != size {
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
             let under = (menu.mode() == Mode::TITLE)
                 .then_some(backdrop.as_ref())
                 .flatten();
             let image = menu.compose(under);
-            size = (image.width, image.height);
+            let src = (image.width as usize, image.height as usize);
+            let want = (at.0 as usize, at.1 as usize);
+            let (w, h, rgba) = match scaler.resample(&image.rgba, src, want) {
+                Some(scaled) => (at.0, at.1, scaled),
+                None => (image.width, image.height, image.rgba),
+            };
+            size = at;
             let mut new = creator.create_texture_streaming(
                 PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                image.width,
-                image.height,
+                w,
+                h,
             )?;
-            new.update(None, &image.rgba, image.width as usize * 4)?;
+            new.update(None, &rgba, w as usize * 4)?;
             texture = Some(new);
         }
 
@@ -765,7 +779,7 @@ fn run_menu(
         canvas.clear();
         if let Some(texture) = &texture {
             canvas
-                .copy(texture, None, letterbox(canvas, size.0, size.1))
+                .copy(texture, None, dst)
                 .map_err(|e| anyhow::anyhow!("drawing the menu: {e}"))?;
         }
         canvas.present();
@@ -1046,7 +1060,10 @@ fn run_script(
             STAGE_HEIGHT,
         )
         .context("creating movie texture")?;
-    let mut still_texture: Option<(String, Texture)> = None;
+    let mut still_texture: Option<(String, (u32, u32), Texture)> = None;
+    // The movie frame resampled to the window, and the weights that did it.
+    let mut movie_scaled: Option<(u32, u32, Texture)> = None;
+    let mut scaler = scale::Scaler::default();
     // The wrapped lines and a texture each, cached on the lines themselves.
     let mut text_texture: Option<DialogueBlock<'_>> = None;
     // One patch texture, rebuilt only when a mouth of a different size shows
@@ -1409,28 +1426,73 @@ fn run_script(
             }
         }
 
+        // The frame the window actually shows, resampled to the letterbox
+        // rather than stretched onto it by the driver. The texture is rebuilt
+        // whenever the window resizes, because the weights and the upload size
+        // both follow it. See `daysengine::playback::scale`.
+        let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
         if let Some(frame) = visual.movie {
-            movie_texture
-                .update(None, &frame.rgba, frame.width as usize * 4)
-                .context("uploading movie frame")?;
-            canvas
-                .copy(&movie_texture, None, dst)
-                .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
+            let src = (frame.width as usize, frame.height as usize);
+            match scaler.resample(
+                &frame.rgba,
+                src,
+                (window_px.0 as usize, window_px.1 as usize),
+            ) {
+                Some(scaled) => {
+                    if movie_scaled
+                        .as_ref()
+                        .is_none_or(|(w, h, _)| (*w, *h) != window_px)
+                    {
+                        let texture = creator.create_texture_streaming(
+                            PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                            window_px.0,
+                            window_px.1,
+                        )?;
+                        movie_scaled = Some((window_px.0, window_px.1, texture));
+                    }
+                    if let Some((w, _, texture)) = &mut movie_scaled {
+                        texture
+                            .update(None, &scaled, *w as usize * 4)
+                            .context("uploading movie frame")?;
+                        canvas
+                            .copy(texture, None, dst)
+                            .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
+                    }
+                }
+                None => {
+                    movie_texture
+                        .update(None, &frame.rgba, frame.width as usize * 4)
+                        .context("uploading movie frame")?;
+                    canvas
+                        .copy(&movie_texture, None, dst)
+                        .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
+                }
+            }
         } else if let Some(still) = visual.still {
-            // Rebuild the texture only when the background actually changes.
+            // Rebuild the texture when the background changes or the window
+            // does, since the upload is now at the window's size.
             let stale = still_texture
                 .as_ref()
-                .is_none_or(|(path, _)| path != &still.path);
+                .is_none_or(|(path, size, _)| path != &still.path || *size != window_px);
             if stale {
+                let src = (still.width as usize, still.height as usize);
+                let (w, h, rgba) = match scaler.resample(
+                    &still.rgba,
+                    src,
+                    (window_px.0 as usize, window_px.1 as usize),
+                ) {
+                    Some(scaled) => (window_px.0, window_px.1, scaled),
+                    None => (still.width, still.height, still.rgba.clone()),
+                };
                 let mut texture = creator.create_texture_streaming(
                     PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                    still.width,
-                    still.height,
+                    w,
+                    h,
                 )?;
-                texture.update(None, &still.rgba, still.width as usize * 4)?;
-                still_texture = Some((still.path.clone(), texture));
+                texture.update(None, &rgba, w as usize * 4)?;
+                still_texture = Some((still.path.clone(), window_px, texture));
             }
-            if let Some((_, texture)) = &still_texture {
+            if let Some((_, _, texture)) = &still_texture {
                 canvas
                     .copy(texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing background: {e}"))?;

@@ -10,5 +10,6 @@
 pub mod compose;
 pub mod lipsync;
 pub mod mixer;
+pub mod scale;
 pub mod stage;
 pub mod text;
