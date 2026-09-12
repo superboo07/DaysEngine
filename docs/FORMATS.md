@@ -480,7 +480,44 @@ and unlocks `REPLAY`. Route 0 carries one further condition — a member at
 `+0x1f0` that the exe sets — which is **not recovered**.
 
 `AllClear` is a stored flag, not something to recompute: `FUN_0041fee0` sets it
-once the `EndNo` count of endings seen reaches the total.
+once the number of endings seen reaches `[EndingMax]`.
+
+### Which endings have been seen, and the title backdrop
+
+**Recovered but not yet implemented.** The picture *behind* the title is not
+fixed: it is the title card of the most recent ending, and a special one once
+every ending is seen. `FUN_0041fee0` is the chooser and picks, in order:
+
+1. `AllClear` set — `ENDLIST.INI [AllClear]`, `END-ALL-complete.png`.
+2. `EndClear` clear — `STARTSCRIPT.INI [BaseFile]`, `TitleBase.png`. This is
+   the fresh-install picture, and the only one this engine draws today.
+3. every ending seen — `[AllClear]` again, *and* the flag is set on the way
+   past, which is how `AllClear` comes to be stored in the first place.
+4. otherwise — ending number `EndNo`'s own card.
+
+`ENDLIST.INI` supplies the cards, read by `FUN_0041fc40` through the
+`[EndingList]="` key in `FILMENGINE.INI`:
+
+```text
+[EndingMax]="22"
+[Ending01]="System/EndTitle/END-05-5H-E00.png"
+...
+[Ending22]="System/EndTitle/END-SETSUNA.png"
+[AllClear]="System/EndTitle/END-ALL-complete.png"
+```
+
+The keys are 1-based but are pushed into a vector in order, so **slot `n` holds
+`[Ending(n+1)]`** and is addressed 0-based (`FUN_00420310`, stride `0x1c`).
+
+The per-ending flags are named for the INI key syntax, punctuation and all —
+`[End00]="` through `[End21]="`, 0-based, one per ending. `FUN_00420040` counts
+how many are set and compares against `[EndingMax]`; `days save --grep "[End"`
+lists them. So `EndNo` is an **index**, not a tally: `EndNo = 20` means the most
+recent ending was slot 20, i.e. `[Ending21]`.
+
+Two of the 22 cards are `.wmv`, not `.png` (`Ending16` and `Ending21`), so the
+title backdrop can be a movie. `STARTSCRIPT.INI [EndBGView]="1"` is the likely
+switch for that and is **not** recovered.
 
 **Trial is not recovered.** The retail executable holds no trial string and no
 reachable trial branch, so there is nothing to read; a trial build would be a

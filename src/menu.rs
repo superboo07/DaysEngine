@@ -197,9 +197,10 @@ impl SaveState {
     /// no reachable trial branch, so there is nothing to read. A trial build
     /// would be a different executable, not a different save.
     ///
-    /// The exe sets `AllClear` itself, in `FUN_0041fee0`, once the `EndNo`
-    /// count of endings seen reaches the total — so it is a stored flag and not
-    /// something to recompute here.
+    /// The exe sets `AllClear` itself, in `FUN_0041fee0`, once the number of
+    /// per-ending flags that are set reaches `[EndingMax]` — so it is a stored
+    /// flag and not something to recompute here. `EndNo` is *not* that count:
+    /// it is the index of the most recent ending. See [`crate::save`].
     pub fn from_flags(flags: &FlagStore) -> Self {
         let cleared = flags.flag("EndClear");
         SaveState {

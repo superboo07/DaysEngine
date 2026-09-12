@@ -889,9 +889,15 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
     println!("  AllClear          {}", flags.flag("AllClear"));
     println!("  EndClear          {}", flags.flag("EndClear"));
     match flags.get("EndNo").and_then(Value::as_int) {
-        Some(n) => println!("  EndNo             {n} endings seen"),
+        Some(n) => println!("  EndNo             most recent ending is #{n}"),
         None => println!("  EndNo             (not set)"),
     }
+    let seen = (0..)
+        .map(|n| format!("[End{n:02}]=\""))
+        .take_while(|name| flags.get(name).is_some())
+        .filter(|name| flags.flag(name))
+        .count();
+    println!("  [EndNN] flags     {seen} endings seen");
     println!();
     println!(
         "so the title screen shows {}, REPLAY {}",
