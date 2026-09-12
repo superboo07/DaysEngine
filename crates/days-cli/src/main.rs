@@ -85,6 +85,13 @@ enum Cmd {
         #[arg(long, short = 'o', default_value = ".")]
         out: PathBuf,
     },
+    /// Composite a UI screen to PNG, without a display.
+    ///
+    /// The screen is drawn exactly as the game draws it: base art from the
+    /// packs, widget sprites from the `_CHIP` sheet, positioned by the table in
+    /// the user's own SysMenuSDHQ.dll. `--active` selects widgets by 1-based
+    /// region ID, matching the `.CMAP`.
+    Ui(UiArgs),
     /// Decode the glyph store and render characters as ASCII art.
     Font {
         /// Characters to render. Omit to just report coverage.
@@ -102,6 +109,35 @@ enum Cmd {
         /// Script name, e.g. "00-00-A00".
         name: String,
     },
+}
+
+#[derive(clap::Args)]
+struct UiArgs {
+    /// Screen path stem as the DLL spells it, e.g. "System/Title/Title".
+    screen: String,
+    /// Resolution: standard, wide, note or full.
+    #[arg(long, short = 'r', default_value = "wide")]
+    resolution: String,
+    /// Region IDs to draw in their active (hover/selected) state.
+    #[arg(long = "active")]
+    active: Vec<usize>,
+    /// Alternate-state records to draw, by index into the trailing run.
+    #[arg(long = "extra")]
+    extra: Vec<usize>,
+    /// Base art, when the screen does not name it after the stem —
+    /// Exit/Popup and SaveLoad/SaveLoad pick theirs by context.
+    #[arg(long)]
+    base: Option<String>,
+    /// Image to draw behind the screen, e.g. the title's
+    /// STARTSCRIPT.INI [BaseFile], "System/Title/TitleBase.png".
+    #[arg(long)]
+    backdrop: Option<String>,
+    /// Report the recovered widget table instead of drawing.
+    #[arg(long)]
+    table: bool,
+    /// PNG to write.
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -175,6 +211,7 @@ fn main() -> Result<()> {
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
         Cmd::Render { name, at, out } => cmd_render(&game, &name, &at, &out)?,
+        Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -469,6 +506,105 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
         write_png(&path, &rgba, W as u32, H as u32)?;
         println!("{} {}  {described}", target, path.display());
     }
+    Ok(())
+}
+
+/// Reads the system-menu DLL, which is where the widget-to-sprite table lives.
+///
+/// Like the archive key, this comes out of the user's own install at runtime;
+/// none of it is embedded here.
+fn system_menu_dll(game: &Path) -> Result<Vec<u8>> {
+    let path = game.join("SysMenuSDHQ.dll");
+    std::fs::read(&path).with_context(|| {
+        format!(
+            "reading {} — the UI widget tables live in it",
+            path.display()
+        )
+    })
+}
+
+fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
+    use days_ui::{Resolution, Screen, WidgetState};
+
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let resolution = Resolution::from_name(&args.resolution)
+        .with_context(|| format!("unknown resolution {}", args.resolution))?;
+    let screen =
+        Screen::load_with_base(&vfs, &dll, &args.screen, args.base.as_deref(), resolution)?;
+
+    let (w, h) = screen.size();
+    println!(
+        "{} at {} — {w}x{h}, scale {:.2}, letterbox {}px, {} widgets \
+         ({}/{} boxes matched the table)",
+        screen.path,
+        resolution.name(),
+        screen.scale(),
+        screen.letterbox(),
+        screen.widget_count(),
+        screen.atlas().matched,
+        screen.widget_count(),
+    );
+
+    if args.table {
+        let atlas = screen.atlas();
+        println!("widget table at DLL offset {:#x}", atlas.offset);
+        for (i, wgt) in atlas.widgets.iter().enumerate() {
+            println!(
+                "  id {:3}  dst ({:4},{:4}) {:4}x{:<3}  src ({:4},{:4})",
+                i + 1,
+                wgt.dst.x,
+                wgt.dst.y,
+                wgt.dst.width,
+                wgt.dst.height,
+                wgt.src_x,
+                wgt.src_y
+            );
+        }
+        for (i, wgt) in atlas.extras.iter().enumerate() {
+            println!(
+                "  alt {:3}  dst ({:4},{:4}) {:4}x{:<3}  src ({:4},{:4})",
+                i, wgt.dst.x, wgt.dst.y, wgt.dst.width, wgt.dst.height, wgt.src_x, wgt.src_y
+            );
+        }
+        if args.out.is_none() {
+            return Ok(());
+        }
+    }
+
+    let mut states = vec![WidgetState::Resting; screen.widget_count()];
+    for id in &args.active {
+        let Some(slot) = id.checked_sub(1).and_then(|i| states.get_mut(i)) else {
+            bail!(
+                "region {id} is not one of this screen's {} widgets",
+                states.len()
+            );
+        };
+        *slot = WidgetState::Active;
+    }
+    // Alternate-state records are not per-widget, so they are appended as their
+    // own entries rather than replacing a widget's state.
+    for n in &args.extra {
+        states.push(WidgetState::Extra(*n));
+    }
+
+    let backdrop = args
+        .backdrop
+        .as_deref()
+        .map(|p| {
+            let bytes = vfs
+                .read_path(p)
+                .with_context(|| format!("reading backdrop {p}"))?;
+            days_ui::Image::decode_png(&bytes).map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+    let image = screen.compose_over(backdrop.as_ref(), &states);
+    let path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("screen.png"));
+    write_png(&path, &image.rgba, image.width, image.height)?;
+    println!("wrote {}", path.display());
     Ok(())
 }
 

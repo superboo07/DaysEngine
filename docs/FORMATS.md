@@ -98,27 +98,130 @@ parser over the real packs, not by reading the format spec:
 
 ## `.CMAP` — UI hit map
 
-    width   u32 LE
-    height  u32 LE
-    pixels  [u8; width * height]   region ID, 0 = no region
+```text
+width   u32 LE
+height  u32 LE
+pixels  [u8; width * height]   region ID, 0 = no region
+```
 
-One byte per pixel naming the widget under it. Shipped per screen at four
-resolutions, by filename suffix:
-
-| Suffix | Size | `DX9GRAPHIC.INI` key |
-|---|---|---|
-| *(none)* | 800x600 | `DisplayWidthSize` / `DisplayHeightSize` |
-| `_WIDE` | 800x450 | windowed widescreen |
-| `_WIDE_NOTE` | 1024x576 | `FullNoteWidth` / `FullNoteHeight` |
-| `_WIDE_FULL` | 1280x720 | `FullWideWidth` / `FullWideHeight` |
+One byte per pixel naming the widget under it. Hit-testing is a pixel lookup,
+not a geometry test, which is what lets the route map screens use non-rectangular
+widgets. Region IDs are dense from 1.
 
 Each screen is `NAME.PNG` (base art), `NAME_CHIP.PNG` (widget state sprites) and
-`NAME*.CMAP`. Region IDs are dense from 1.
+`NAME*.CMAP`, shipped at four resolutions by filename suffix:
 
-**Open question:** the packing of `_CHIP` sheets. For `TITLE` the five regions
-are 116x38 and the sheet is 584x78 — five sprites across, two state rows. For
-`MENUBAR` the region widths sum to 920 against a 799-wide sheet, so the layout
-wraps or is grouped by widget class. Needs pixel inspection.
+| Suffix | Size | Scale |
+|---|---|---|
+| *(none)* | 800x600 | 1.0, offset 75px |
+| `_WIDE` | 800x450 | 1.0 |
+| `_WIDE_NOTE` | 1024x576 | 1.28 |
+| `_WIDE_FULL` | 1280x720 | 1.6 |
+
+### The UI is authored at 800x450
+
+`_WIDE` is the native layout and the other three are it transformed. The
+`_WIDE_NOTE` and `_WIDE_FULL` maps are the 800x450 map scaled by 1.28 and 1.6;
+the 4:3 800x600 map is the same 800x450 content **offset 75 pixels down**,
+between letterbox bars. Region 1 of `TITLE` is at `(112, 353)` in `_WIDE`,
+`(112, 428)` in 4:3 (`353 + 75`), `(143, 452)` in `_WIDE_NOTE` (`x1.28`) and
+`(179, 565)` in `_WIDE_FULL` (`x1.6`).
+
+The engine does not need those constants. Both fall out of comparing the two
+maps the user already has:
+
+```text
+scale     = display_map.width / native_map.width
+letterbox = (display_map.height - native_map.height * scale) / 2
+```
+
+which gives 75px for 4:3 `TITLE` and 0 for the 800x75 `MENUBAR` strip with no
+special case for either. This also settles the playback geometry: stills are
+800x450, movies are 800x452 (encoder rounding), and 4:3 letterboxes both.
+
+---
+
+## `_CHIP` sprite sheets — the widget table in `SysMenuSDHQ.dll`
+
+`NAME_CHIP.PNG` holds *replacement* art for individual widgets, drawn over the
+base. On the title screen the base is the logo and five plain text labels; chip
+row 1 is those same five labels inside a rounded button frame (the selected
+state) and row 2 holds a greyed-out `REPLAY` (the disabled state).
+
+**Nothing in the data says which sprite belongs to which widget.** The packing
+is not recoverable from the sheet: `MENUBAR`'s 25 region widths sum to 920
+against a 799-wide sheet, in four widget sizes, and its widget 1 draws from
+`src_y = 67` while widgets 2..15 draw from rows 1 and 29.
+
+The mapping is a table of 32-bit floats in `SysMenuSDHQ.dll`, **six per widget,
+24 bytes**:
+
+```text
+dst_x  dst_y  width  height  src_x  src_y
+```
+
+in 800x450 space, one record per region ID in order. The screen setup walks it
+and per record calls a destination-rect setter with
+`(dst_x, dst_y + letterbox, width, height) * scale` and a source-rect setter
+with `(src_x, src_y, width, height)`. Destination and source share one size, so
+a chip sprite is never scaled relative to its widget.
+
+Records after the per-region run are alternate states — disabled art, alternate
+captions — reached by fixed address from code, so how many there are and what
+each means is per-screen knowledge the bytes do not carry.
+
+### How this was established
+
+By decompiling `SysMenuSDHQ.dll`, not by studying the sheets. The DLL holds the
+path strings for every UI screen; `Ghidra` decompilation of the title setup at
+`0x10020140` shows the `0x18`-stride walk, and the tables themselves live in
+`.data` from about `0x1004cc30`. Reading the bytes back as six floats reproduces
+the `.CMAP` region boxes exactly, which is the cross-check.
+
+Relevant addresses in the retail DLL (imagebase `0x10000000`):
+
+| Address | Role |
+|---|---|
+| `0x10020140` | title screen setup — the authority for the record layout |
+| `0x10020cf0` | re-places the same records on a resolution change |
+| `0x100207a0` | title action table: entry 0..4 -> Start, Load, Replay, Option, Exit |
+| `0x100206e0` | per-entry enabled test — entry 2 (Replay) is conditional |
+| `0x1001ff10` | picks the `.cmap` for the current resolution and loads it |
+| `0x1004cc30` | `TITLE` widget table; `0x1004ccc0` `TITLE_AC`, `0x1004cd68` `TITLE_CLEAR` |
+| `0x1004ce20` | `MENUBAR` widget table |
+
+### Finding the table without hardcoding an address
+
+The engine does **not** embed those offsets. It searches the user's own DLL for
+the table by content: the first four floats of record *i* are the bounding box
+of region *i + 1* in the screen's native `.CMAP`, so taking the boxes from the
+user's `.CMAP` and looking for a run of records that reproduces them at a
+24-byte stride finds the table and validates it at the same time.
+
+The match is scored rather than all-or-nothing, and anchored on any region
+rather than the first:
+
+- A region's bounding box can legitimately differ from its sprite rect —
+  regions that abut have their boxes clipped by the neighbour. The route map's
+  episode tabs do this, hence e.g. 11/15 boxes matching a table that is correct.
+- A screen can have untabled widgets ahead of tabled ones in ID order, so the
+  run does not always start at region 1.
+- Below a threshold (3 exact matches and a majority) the search reports failure
+  rather than drawing sprites from a wrong offset.
+
+### Screens whose layout is not in a table
+
+`SAVELOAD` and `REPLAY_PLAYDATA` are refused by the search, correctly: their
+slot rows are laid out by a loop at runtime — ten rows at a 33px pitch — so
+those rects exist nowhere in the binary. Those two screens need their layout
+reproduced in code. Every other screen recovers: title (all three variants),
+menubar, all three options pages, both backlogs, the exit popup, the replay
+popups, `REPLAY_HSCENE` and all 15 route maps.
+
+A few screens do not name their base art after the stem, because they share one
+chip sheet and hit map across several backgrounds: `Exit/Popup` uses
+`Popup_Exit.png` or `Popup_Title.png`, and `SaveLoad/SaveLoad` uses `Save.png`
+or `Load.png`.
 
 ---
 

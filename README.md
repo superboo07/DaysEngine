@@ -34,10 +34,13 @@ Early. What works today:
 | Archive key recovery | **Done** — read from the user's own executable, not embedded |
 | `.ORS` script format | **Decoded** — 14 commands, documented in `docs/FORMATS.md` |
 | `.CMAP` UI hit maps | **Decoded** |
+| `_CHIP` sprite atlases | **Decoded** — the widget table is recovered from the user's own `SysMenuSDHQ.dll` by content, not by a hardcoded address |
 | `FONTDATA.DAT` glyph store | **Decoded** — all 22,420 glyphs render |
 | Video / audio decode | **Done** — matches ffmpeg's own output |
 | Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
-| UI rendering (menus, title, save/load) | Not started |
+| UI rendering — title, menubar, options, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
+| UI rendering — save/load, replay grid | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover |
+| UI input handling / screen state machine | Not started |
 | Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
@@ -94,6 +97,23 @@ The plan is an offline extractor that reads *the user's own* DLL and emits a
 route-graph JSON on first run, so the logic is recovered from their install
 rather than redistributed by us.
 
+## Inspecting an install
+
+`days` runs from inside the game directory (it finds the game by sitting in it,
+or takes `-g <dir>`):
+
+```bash
+days list System --filter title      # what is in a pack
+days script 00-00-A00                # parse one script's timeline
+days render 00-00-A00 --at 00:39:00 -o /tmp/frames
+days ui System/Title/Title -r full --active 1 -o /tmp/title.png
+```
+
+`days ui` composites a UI screen without a display, the way `days render` does
+for playback, so the UI can be checked as an image diff on a machine with no
+GPU. `--table` prints the widget-to-sprite table recovered from the DLL instead
+of drawing.
+
 ## Layout
 
     crates/days-gpk    GPK archive reader + minimal PE resource parser
@@ -101,6 +121,7 @@ rather than redistributed by us.
     crates/days-script .ORS timeline parser
     crates/days-media  WMV3 / Vorbis decoding over the system ffmpeg
     crates/days-font   FONTDATA.DAT glyph store
+    crates/days-ui     CMAP hit maps, _CHIP atlases, screen compositing
     crates/days-engine mixer, timeline stage, text layout, SDL3 player
     crates/days-cli    `days` — offline inspection tools
     docs/FORMATS.md   reverse-engineered file format notes

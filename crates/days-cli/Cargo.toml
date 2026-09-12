@@ -16,6 +16,7 @@ days-script = { path = "../days-script", version = "=0.1.0" }
 days-media = { path = "../days-media", version = "=0.1.0" }
 days-font = { path = "../days-font", version = "=0.1.0" }
 days-engine = { path = "../days-engine", version = "=0.1.0" }
+days-ui = { path = "../days-ui", version = "=0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 png.workspace = true
