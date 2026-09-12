@@ -9,10 +9,12 @@
 
 pub mod compose;
 pub mod ini;
+pub mod menu;
 pub mod mixer;
 pub mod stage;
 pub mod text;
 
 pub use ini::Ini;
+pub use menu::{Action, Menu, Mode, SaveState, SystemSe};
 pub use mixer::Mixer;
 pub use stage::{Stage, Visual};

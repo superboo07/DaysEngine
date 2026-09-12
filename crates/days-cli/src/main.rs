@@ -92,6 +92,14 @@ enum Cmd {
     /// the user's own SysMenuSDHQ.dll. `--active` selects widgets by 1-based
     /// region ID, matching the `.CMAP`.
     Ui(UiArgs),
+    /// Drive the menu state machine without a display.
+    ///
+    /// Replays a script of menu events against the real screens and reports
+    /// where each one lands, optionally writing the final frame. This is how
+    /// the menus are checked: the SDL player draws through the GPU and cannot
+    /// be inspected from a test, but every decision the menu makes happens
+    /// here, on the user's own widget tables.
+    Menu(MenuArgs),
     /// Decode the glyph store and render characters as ASCII art.
     Font {
         /// Characters to render. Omit to just report coverage.
@@ -138,6 +146,35 @@ struct UiArgs {
     /// PNG to write.
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct MenuArgs {
+    /// Events to replay, comma separated: `down`, `up`, `enter`, `esc`,
+    /// `at:X,Y` to point at a pixel, and `click:X,Y` to point and confirm.
+    #[arg(long, short = 'e', default_value = "")]
+    events: String,
+    /// Resolution: standard, wide, note or full.
+    #[arg(long, short = 'r', default_value = "wide")]
+    resolution: String,
+    /// Treat the save as all-clear: the title becomes Title_AC.
+    #[arg(long)]
+    all_clear: bool,
+    /// Treat the first route as cleared: the title becomes Title_Clear.
+    #[arg(long)]
+    cleared: bool,
+    /// Unlock REPLAY, which is greyed out on a fresh save.
+    #[arg(long)]
+    replay: bool,
+    /// Image to draw behind the title, normally STARTSCRIPT.INI [BaseFile].
+    #[arg(long)]
+    backdrop: Option<String>,
+    /// PNG to write the final frame to.
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+    /// Try to open every mode and report which ones this engine can draw.
+    #[arg(long)]
+    check_all: bool,
 }
 
 fn main() -> Result<()> {
@@ -212,6 +249,7 @@ fn main() -> Result<()> {
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
         Cmd::Render { name, at, out } => cmd_render(&game, &name, &at, &out)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
+        Cmd::Menu(args) => cmd_menu(&game, &args)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -598,13 +636,14 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
             days_ui::Image::decode_png(&bytes).map_err(anyhow::Error::from)
         })
         .transpose()?;
-    let image = screen.compose_over(backdrop.as_ref(), &states);
-    let path = args
-        .out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("screen.png"));
-    write_png(&path, &image.rgba, image.width, image.height)?;
-    println!("wrote {}", path.display());
+    // Only write when asked to. Defaulting to a file in the working directory
+    // litters whatever the caller happened to be standing in, and the summary
+    // above is the useful part when you are just checking that a screen loads.
+    if let Some(path) = &args.out {
+        let image = screen.compose_over(backdrop.as_ref(), &states);
+        write_png(path, &image.rgba, image.width, image.height)?;
+        println!("wrote {}", path.display());
+    }
     Ok(())
 }
 
@@ -805,4 +844,129 @@ fn select_packs(dir: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
         Some(n) => Ok(vec![resolve_pack(dir, n)?]),
         None => packs(dir),
     }
+}
+
+/// Drives the menu state machine and reports where each event lands.
+fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
+    use days_engine::menu::{Action, Menu, Mode, SaveState};
+    use days_ui::{Image, Resolution};
+
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let resolution = Resolution::from_name(&args.resolution)
+        .with_context(|| format!("unknown resolution {}", args.resolution))?;
+    let save = SaveState {
+        all_clear: args.all_clear,
+        trial: false,
+        cleared_first: args.cleared,
+        cleared_replay: args.replay,
+    };
+
+    if args.check_all {
+        // Every mode SystemInit can dispatch to, opened at its own default
+        // variant. A refusal here is a screen this engine cannot draw yet, not
+        // a guess that happened to miss.
+        let modes = [
+            ("title", Mode::TITLE),
+            ("saveload", Mode::SAVELOAD),
+            ("option", Mode::OPTION),
+            ("replay", Mode::REPLAY),
+            ("routemap", Mode::ROUTEMAP),
+            ("som config", Mode::SOM_CONFIG),
+            ("replay popup", Mode::REPLAY_POPUP),
+            ("confirm popup", Mode::CONFIRM),
+        ];
+        for (name, mode) in modes {
+            let variant = if mode == Mode::TITLE {
+                save.title_variant()
+            } else {
+                mode.default_variant()
+            };
+            let stem = mode.stem(variant).unwrap_or_default();
+            match Menu::open(&vfs, &dll, mode, save, resolution) {
+                Ok(menu) => println!(
+                    "  mode {:>2}  {name:<14} {stem:<34} ok, {} widgets",
+                    mode.0,
+                    menu.screen().widget_count()
+                ),
+                Err(err) => println!("  mode {:>2}  {name:<14} {stem:<34} {err}", mode.0),
+            }
+        }
+        return Ok(());
+    }
+
+    let mut menu = Menu::open(&vfs, &dll, Mode::TITLE, save, resolution)
+        .context("opening the title screen")?;
+    println!(
+        "mode {} ({}) — {} widgets",
+        menu.mode().0,
+        menu.variant(),
+        menu.screen().widget_count()
+    );
+
+    for event in args
+        .events
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        let (action, label) = match event {
+            "down" => (menu.navigate(1), "down".to_string()),
+            "up" => (menu.navigate(-1), "up".to_string()),
+            "enter" => (menu.confirm(&vfs, &dll)?, "enter".to_string()),
+            "esc" => (menu.cancel(&vfs, &dll)?, "esc".to_string()),
+            "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),
+            other => {
+                // Points are written `at:X:Y` rather than `at:X,Y` so the comma
+                // stays free as the separator between events.
+                let (kind, point) = other
+                    .split_once(':')
+                    .filter(|(k, _)| *k == "at" || *k == "click")
+                    .with_context(|| {
+                        format!(
+                            "unknown menu event {other:?}; expected down, up, enter, \
+                             esc, yes, at:X:Y or click:X:Y"
+                        )
+                    })?;
+                let (x, y) = point
+                    .split_once(':')
+                    .with_context(|| format!("{other:?} needs both coordinates, as {kind}:X:Y"))?;
+                let x: u32 = x.parse().with_context(|| format!("bad x in {other:?}"))?;
+                let y: u32 = y.parse().with_context(|| format!("bad y in {other:?}"))?;
+                let pointed = menu.point_at(x, y);
+                if kind == "at" {
+                    (pointed, format!("at {x},{y}"))
+                } else {
+                    (menu.confirm(&vfs, &dll)?, format!("click {x},{y}"))
+                }
+            }
+        };
+        println!(
+            "  {label:<12} -> {action:?}  mode {} selection {:?}",
+            menu.mode().0,
+            menu.selection()
+        );
+        match action {
+            Action::Play => {
+                println!("  (would start the script)");
+                break;
+            }
+            Action::Quit => {
+                println!("  (would quit)");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(out) = &args.out {
+        let backdrop = match &args.backdrop {
+            Some(path) => Some(Image::decode_png(&vfs.read_path(path)?)?),
+            None => None,
+        };
+        let image = menu.compose(backdrop.as_ref());
+        write_png(out, &image.rgba, image.width, image.height)?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
 }

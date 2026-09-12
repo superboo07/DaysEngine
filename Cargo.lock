@@ -219,6 +219,7 @@ dependencies = [
  "days-gpk",
  "days-media",
  "days-script",
+ "days-ui",
  "days-vfs",
  "env_logger",
  "log",

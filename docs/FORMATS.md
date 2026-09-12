@@ -225,6 +225,109 @@ or `Load.png`.
 
 ---
 
+## The menu state machine — `SysMenuSDHQ.dll` exports
+
+The menus are not a tree the engine walks. The executable asks the DLL for a
+**mode** — one small integer — and `_SystemInit@8(mode, &module)` turns that
+number into one of eight singleton screen modules, so the entire menu graph is
+a single `switch`. Mode 1 is the one value `SystemInit` has no case for, which
+is exactly why it means "stop showing menus and start playing".
+
+| mode | module object | screen assets |
+|---|---|---|
+| 1 | — | not a menu: play the script |
+| 2 | `0x1004ff08` | `System/Title/{Title,Title_AC,Title_Clear}` |
+| 3 | `0x1004f350` | `System/SaveLoad/SaveLoad`, base `Save.png` / `Load.png` |
+| 4 | `0x1004fb00` | `System/Option/Option_{Def,Sound,SomCon}` |
+| 5 | `0x1004f620` | `System/Replay/Replay_%s` |
+| 6 | `0x1004e7c0` | `System/RouteMap/%02d/RouteMap%02d` |
+| 7 | `0x1004f2b0` | `System/Option/Pop_Som` |
+| 8 | `0x100506b0` | `System/Replay/Pop_Replay_%s` |
+| -1 | `0x1004f570` | `System/Exit/Popup` |
+
+Those objects live in `.data` and are built by C++ static initializers, so the
+DLL *file* holds no vtable pointer for them and Ghidra reads `.data` as zeros.
+They were named instead through the CRT static-init thunks, which name each
+class's constructor, and then by the `System/...` path literals in the
+neighbouring code: mode 2 is `FUN_1001fc80`, 3 `FUN_100111f0`, 4 `FUN_10005ba0`,
+5 `FUN_10019c10`, 6 `FUN_1000c0c0`, 7 `FUN_1001f3a0`, 8 `FUN_10018b50`, and
+-1 `FUN_1000a380`.
+
+`_getNextMode@8(mode, module)` reads back where to go, defaulting to 2 — the
+title — whenever a screen simply finishes:
+
+    3  picked a save -> 1,  -> 6 route map, cancelled -> -1, else -> 2
+    4  -> 7 som popup,      cancelled -> -1,             else -> 2
+    5  -> 1 or -> 8 popup,  cancelled -> -1,             else -> 2
+    6  cancelled -> -1,     else -> 3 or -> 1
+    7  always -> 4
+    8  -> 5 or -> 1
+
+Cancelling does not leave directly: it opens mode -1, the confirm popup. That
+popup is also why `SystemInit` ends with
+`if (mode != -1 && mode != 7 && mode != 8) FUN_100018b0(&popup, mode)` — it
+records the screen currently being opened at popup member `+0xa4`, so when the
+popup is later raised it knows both which question to ask and where to return.
+From the title that is `Popup_Exit.png`, "End this game?"; from anywhere else
+`Popup_Title.png`, "Return to Title Screen?". `_getNextMode@8(-1)` just returns
+`+0xa4`.
+
+The popup's own dispatch (`FUN_1000a8f0`) settles which of its two regions is
+which: **widget 0 is YES**, which records the affirmative answer at `+0xa0`,
+and **widget 1 is NO**, which returns the player to the remembered mode.
+
+### Title
+
+`FUN_10020140` picks the variant and the widget count together, and the count
+is literally `all_clear + 5`:
+
+    all_clear            -> Title_AC     6 widgets, table 0x1004ccc0
+    else trial           -> Title        5 widgets, table 0x1004cc30
+    else route 0 cleared -> Title_Clear  5 widgets, table 0x1004cd68
+    else                 -> Title        5 widgets, table 0x1004cc30
+
+Each table is followed by exactly **one** further 24-byte record — the greyed
+`REPLAY` caption, at `0x1004cca8`, `0x1004cd50` and `0x1004cde0` respectively,
+which is each table's base plus `count * 0x18`. This is the ground truth behind
+the warning in [`days_ui::Atlas::extras`]: only the first trailing record
+belongs to the screen, and the run after it is the next screen's table.
+
+Clicking a widget runs `FUN_100207a0`, gated by the enablement switch
+`FUN_100206e0`:
+
+| widget | label | mode | enabled when |
+|---|---|---|---|
+| 0 | START | 1 | always |
+| 1 | LOAD | 3 | always |
+| 2 | REPLAY | 5 | not a trial build **and** route 1 cleared |
+| 3 | OPTION | 4 | always |
+| 4 | EXIT | -1 | always |
+| 5 | *(commentary)* | 1 | all-clear only, so `Title_AC` only |
+
+Keyboard navigation (`FUN_10020910`) wraps `0..=4` and, when it lands on a
+disabled `REPLAY`, keeps moving the way it was already going — so the locked
+entry is stepped over in both directions and never selected. Widget 5 is
+outside that range: it is reached by pointer, or by entering from outside
+`0..=4`. Selection lives at `+0xb0` and starts unset.
+
+### What is not recovered
+
+The seven system sounds `FILMENGINE.INI` names — `SeCancel`, `SeSelect`,
+`SeClick`, `SeUp`, `SeDown`, `SeView`, `SeOpen` — are stored by the executable
+as seven separate `std::wstring` members on a `0x1c` stride from `+0x5a0`, in
+that order. The menu modules ask the host to play one **by index** (host vtable
+slot `0x50`, argument 2 on confirm), but no code computing that stride and no
+switch dispatching on the index was found, so which index names which sound is
+still open. `days_engine::menu::SystemSe` therefore carries the game's names and
+INI keys, and the engine picks the bindings itself.
+
+The three questions the title asks the host — all-clear (`+0xe8`), trial build
+(`+0x34`), and route *n* cleared (`+0xec`) — are answered out of
+`Save/GlobalFlag.DAT`, a `DFLT` + zlib container that is not decoded yet.
+`days_engine::menu::SaveState` defaults them to a fresh install.
+
+---
+
 ## `FONTDATA.DAT` / `FONTDATA_ENG.DAT` — font
 
     offsets  [u32; 65536]   absolute file offset of each glyph, 0 = undefined

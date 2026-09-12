@@ -39,8 +39,8 @@ Early. What works today:
 | Video / audio decode | **Done** — matches ffmpeg's own output |
 | Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
 | UI rendering — title, menubar, options, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
-| UI rendering — save/load, replay grid | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover |
-| UI input handling / screen state machine | Not started |
+| UI rendering — save/load, replay grid | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover; choosing them leaves the menu where it was |
+| UI input handling / screen state machine | **Works** — the title screen is live: pointer and keyboard, the game's own widget-to-mode table, the confirm popup, and the mode graph out of `SystemInit` |
 | Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
@@ -107,12 +107,18 @@ days list System --filter title      # what is in a pack
 days script 00-00-A00                # parse one script's timeline
 days render 00-00-A00 --at 00:39:00 -o /tmp/frames
 days ui System/Title/Title -r full --active 1 -o /tmp/title.png
+days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 ```
 
 `days ui` composites a UI screen without a display, the way `days render` does
 for playback, so the UI can be checked as an image diff on a machine with no
 GPU. `--table` prints the widget-to-sprite table recovered from the DLL instead
 of drawing.
+
+`days menu` replays a script of menu events — `down`, `up`, `enter`, `esc`,
+`at:X:Y`, `click:X:Y` — against the real screens and reports where each one
+lands. Every decision the menus make happens there, so the state machine is
+testable on a machine with no GPU even though the SDL player draws through one.
 
 ## Layout
 
@@ -122,7 +128,7 @@ of drawing.
     crates/days-media  WMV3 / Vorbis decoding over the system ffmpeg
     crates/days-font   FONTDATA.DAT glyph store
     crates/days-ui     CMAP hit maps, _CHIP atlases, screen compositing
-    crates/days-engine mixer, timeline stage, text layout, SDL3 player
+    crates/days-engine mixer, timeline stage, text layout, menus, SDL3 player
     crates/days-cli    `days` — offline inspection tools
     docs/FORMATS.md   reverse-engineered file format notes
     docs/DEPENDENCIES.md  dependency policy and audit checklist
