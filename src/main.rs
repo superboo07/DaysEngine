@@ -306,6 +306,7 @@ fn main() -> Result<()> {
                 &mut events,
                 &start,
                 MenuEntry::Title,
+                progress.as_mut(),
             )? {
                 Outcome::Quit => break,
                 Outcome::Play | Outcome::Finished => next = wanted.clone(),
@@ -335,10 +336,6 @@ fn main() -> Result<()> {
                 // There is nothing to save from the title — the player has no
                 // position — so this only happens from playback, where the
                 // save is taken before the menus open.
-                Outcome::SaveSlot(slot, _) => {
-                    log::info!("slot {slot} cannot be written from the title");
-                    continue;
-                }
             }
         }
         if !chained {
@@ -414,8 +411,6 @@ enum Outcome {
     Replay(String),
     /// Load a save slot and play what it names.
     LoadSlot(u32),
-    /// Write the player's position to a save slot, under this comment.
-    SaveSlot(u32, String),
     /// Close the game.
     Quit,
 }
@@ -517,6 +512,7 @@ fn run_menu(
     events: &mut EventPump,
     start: &Ini,
     entry: MenuEntry,
+    mut progress: Option<&mut Progress>,
 ) -> Result<Outcome> {
     // `[UseEnglish]` decides which way round the save line's date reads, and
     // how many characters of it are the chapter.
@@ -687,17 +683,65 @@ fn run_menu(
 
         // Outside the event loop: the dialog runs its own, and the borrow of
         // the pump has to have ended first.
+        //
+        // `FILMENGINE.INI [TextInput]` is what decides whether there is a
+        // dialog at all. `FUN_10014990` asks the host through `+0xd8`, and with
+        // the key clear it raises `+0x98` on the spot — no dialog, and
+        // `FUN_10011c30` writes `L""` as the comment. Only with the key set
+        // does it hand `+0xdc` a default and wait for `_CommentSet@4`.
         if let Some(slot) = naming.take() {
-            let existing = menu
-                .session()
-                .slots
-                .get(slot)
-                .map(|line| line.comment.clone())
-                .unwrap_or_default();
-            match run_comment(player, canvas, creator, events, &mut menu, &existing)? {
-                Some(comment) => return Ok(Outcome::SaveSlot(slot, comment)),
-                None => texture = None,
+            let taken = if menu.session().text_input {
+                let existing = menu
+                    .session()
+                    .slots
+                    .get(slot)
+                    .map(|line| line.comment.clone())
+                    .unwrap_or_default();
+                // Cancelling calls nothing, so nothing is taken and no save
+                // happens — `FUN_0042e4a0` simply never reaches `_CommentSet@4`.
+                run_comment(player, canvas, creator, events, &mut menu, &existing)?
+            } else {
+                Some(String::new())
+            };
+            texture = None;
+            if let Some(comment) = taken {
+                menu.begin_save(slot, comment);
             }
+        }
+
+        // The tick after the save was taken writes it, refreshes the page and
+        // puts `+0x98` down, leaving the player on the save screen.
+        if let Some((slot, comment)) = menu
+            .pending_save()
+            .map(|(slot, comment)| (slot, comment.to_owned()))
+        {
+            let line = match progress.as_deref_mut() {
+                Some(p) => {
+                    let game = player.game.clone();
+                    match p.save_to(&game, player.film, slot, english, Some(&comment)) {
+                        Ok(()) => {
+                            // The global store now holds the slot's display
+                            // line, so the menus have to see it.
+                            player.flags = p.global().clone();
+                            menu.session_mut().flags = p.global().clone();
+                            Some(saveload::Line::read(player.film, p.global(), slot, english))
+                        }
+                        Err(err) => {
+                            log::warn!("could not write slot {slot}: {err}");
+                            None
+                        }
+                    }
+                }
+                // Reached from the title, where the menus open the load screen
+                // and there is no position to write. Nothing is saved, and the
+                // screen comes back rather than sticking on the notice.
+                None => {
+                    log::info!("slot {slot} cannot be written without a position");
+                    None
+                }
+            };
+            menu.finish_save(slot, line.unwrap_or_default());
+            texture = None;
         }
 
         if menu.dirty() || texture.is_none() {
@@ -1275,6 +1319,7 @@ fn run_script(
                                 events,
                                 start_ini,
                                 MenuEntry::OverPlayback(mode, kind),
+                                progress.as_deref_mut(),
                             )?;
                             origin = Instant::now();
                             player.mixer.set_rate(bar_state.rate);
@@ -1283,27 +1328,22 @@ fn run_script(
                             bar_texture = None;
                             still_texture = None;
                             text_texture = None;
+                            // Saving no longer ends the menus: the screen
+                            // writes the slot itself and stays up, which is
+                            // what `FUN_10014c90` does.
+                            //
+                            // `Outcome::Play` means two different things
+                            // depending on who said it. From the bar's own
+                            // leave button (`+0x100(1)`) it means stop playing.
+                            // From a menu the bar opened it is `+0x4c(0)`, the
+                            // Close button, and `FUN_00425550` case 8 puts the
+                            // engine back into state 1 — the playback tick. So
+                            // here it means resume this script where it was
+                            // paused, and returning it would hand the outer
+                            // loop a finished script and land the player on the
+                            // title, which is the bug this whole path is about.
                             match outcome {
-                                Outcome::SaveSlot(slot, comment) => {
-                                    if let Some(p) = progress.as_deref_mut() {
-                                        let game = player.game.clone();
-                                        match p.save_to(
-                                            &game,
-                                            player.film,
-                                            slot,
-                                            english,
-                                            Some(&comment),
-                                        ) {
-                                            // The global store now holds the
-                                            // slot's display line, so the
-                                            // menus have to see it.
-                                            Ok(()) => player.flags = p.global().clone(),
-                                            Err(err) => {
-                                                log::warn!("could not write slot {slot}: {err}")
-                                            }
-                                        }
-                                    }
-                                }
+                                Outcome::Play => {}
                                 Outcome::Quit => return Ok(Outcome::Quit),
                                 other => return Ok(other),
                             }

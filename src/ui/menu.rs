@@ -547,6 +547,14 @@ pub struct Menu {
     font: Option<days_font::Font>,
     /// The save/load screen's rasterised rows for the page it is showing.
     rows: Option<saveload::Rows>,
+    /// A save the screen has taken and not yet committed: the module's `+0x98`,
+    /// with the comment its `+0x200` holds.
+    ///
+    /// While this is set the whole screen is inert — `FUN_10014910` answers
+    /// false for every widget — and `Popup_Save.png` draws over it. The next
+    /// tick commits, re-rasterises the rows and clears it, which is why saving
+    /// leaves the player on the save screen rather than closing it.
+    pending_save: Option<(u32, String)>,
 }
 
 impl Menu {
@@ -636,6 +644,7 @@ impl Menu {
             thumbnails: None,
             font: load_font(vfs),
             rows: None,
+            pending_save: None,
         };
         menu.load_thumbnails(vfs, dll);
         menu.refresh();
@@ -1103,6 +1112,10 @@ impl Menu {
                 self.confirm_replay(vfs, dll, widget)
             }
             Mode::REPLAY_POPUP => Ok(self.confirm_replay_popup(widget)),
+            // `FUN_10014910` answers false for every widget while `+0x98` is
+            // set, so a save that has been taken and not yet written swallows
+            // clicks rather than stacking another one behind it.
+            Mode::SAVELOAD if self.pending_save.is_some() => Ok(Action::Stay),
             Mode::SAVELOAD => self.confirm_saveload(vfs, dll, widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
@@ -1159,6 +1172,41 @@ impl Menu {
         self.kind = kind;
         self.page = 0;
         self.advance(vfs, dll, Mode::SAVELOAD)
+    }
+
+    /// Takes a save the player has asked for, without committing it.
+    ///
+    /// This is the module's `+0x98`. Both paths into it are
+    /// `FUN_10014990`'s save arm: with `FILMENGINE.INI [TextInput]` set the
+    /// screen hands the host a default comment through `+0xdc`, the executable
+    /// runs its dialog, and the dialog's OK calls back into `_CommentSet@4`,
+    /// which stores the text at `+0x200` and raises `+0x98`. With the key clear
+    /// there is no dialog at all: `+0x98` goes up straight away and
+    /// `FUN_10011c30` writes `L""` as the comment.
+    ///
+    /// Cancelling the dialog calls nothing, so nothing is taken.
+    pub fn begin_save(&mut self, slot: u32, comment: String) {
+        self.pending_save = Some((slot, comment));
+        self.refresh();
+    }
+
+    /// The save the screen is holding, if any.
+    pub fn pending_save(&self) -> Option<(u32, &str)> {
+        self.pending_save
+            .as_ref()
+            .map(|(slot, comment)| (*slot, comment.as_str()))
+    }
+
+    /// Commits the save the screen was holding: `FUN_10014c90`'s other arm.
+    ///
+    /// `FUN_10011c30` asks the host to write the slot, `FUN_10011ec0`
+    /// re-rasterises the page, and `+0x98` comes down — all without leaving the
+    /// screen. `line` is what the slot now reads as, so the row the player just
+    /// wrote shows its new timestamp immediately instead of after a re-entry.
+    pub fn finish_save(&mut self, slot: u32, line: saveload::Line) {
+        self.pending_save = None;
+        self.session.slots.insert(slot, line);
+        self.refresh();
     }
 
     /// Which job the save/load screen is doing.

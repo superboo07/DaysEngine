@@ -158,12 +158,34 @@
 //! every twenty characters and English wraps on whole words at forty, both
 //! measured in characters and both cut at three lines' worth.
 //!
+//! # Saving does not leave this screen
+//!
+//! Clicking a row on the save screen does not write anything. `FUN_10014990`
+//! records the row at `+0x1f4` and then asks the host `+0xd8` — which is
+//! `FILMENGINE.INI [TextInput]` — what to do next:
+//!
+//! * key set: hand `+0xdc` a default comment, which opens the executable's own
+//!   dialog. Its OK calls back into `_CommentSet@4`, which stores the text at
+//!   `+0x200` and raises `+0x98`. Cancel calls nothing, so nothing is taken.
+//! * key clear: raise `+0x98` on the spot, with no dialog at all. The comment
+//!   `FUN_10011c30` then writes is `L""`.
+//!
+//! `+0x98` is the save waiting to be written. While it is up `FUN_10014910`
+//! answers false for every widget, so the screen is inert, and the next tick
+//! of `FUN_10014c90` takes the other arm: `FUN_10011c30` asks the host to write
+//! the slot through `+0xa0`, `FUN_10011ec0` re-rasterises the page, and `+0x98`
+//! comes down. **The player is left on the save screen**, with the row they
+//! just wrote showing its new timestamp.
+//!
 //! # Still to build
 //!
-//! The popup that asks the player to confirm overwriting a slot:
-//! `FUN_100135c0` loads `System/SaveLoad/Popup_Save.png` whenever the module
-//! opens with `+0x94` set, which is the save job. Saving overwrites without
-//! asking until that is built.
+//! `Popup_Save.png` draws while `+0x98` is up — `FUN_100135c0` loads it
+//! whenever the module opens for the save job, and `FUN_1000ffe0` places its
+//! two sprites as bands 604x18 at (150, 371) and 604x17 at (150, 398), read out
+//! of the DLL's own `DAT_1004ae10` and `DAT_1004ae28`. **Which part of the
+//! image each band shows is not recovered** — the place call carries only the
+//! destination — so the notice is not drawn yet. The save itself behaves
+//! correctly without it.
 //!
 //! Keyboard navigation through the list (`FUN_10014c90`) is a transition table
 //! that is **not recovered**; the pointer works, and the arrow keys fall back
@@ -897,6 +919,29 @@ pub struct Line {
     pub comment: String,
 }
 
+impl Line {
+    /// One slot's line, out of the global store the screen reads it from.
+    ///
+    /// Split out of [`Slots::read`] so a slot just written can be put back
+    /// without re-reading all two hundred: `FUN_10011ec0` re-rasterises the
+    /// page straight after `FUN_10011c30` writes, and the row has to show the
+    /// new timestamp on that same pass.
+    pub fn read(film: &Ini, flags: &FlagStore, slot: u32, english: bool) -> Line {
+        let (key, sub) = save::slot_keys(film, slot);
+        let stored = flags.get(&key).and_then(Value::as_str).unwrap_or_default();
+        let (when, chapter) = split_line(stored, english);
+        Line {
+            when,
+            chapter,
+            comment: flags
+                .get(&sub)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
+}
+
 /// What the save/load screen knows about the slots, as host `+0x9c` answers.
 ///
 /// `FUN_0042a980` reports a slot as present only when **the file opens** — it
@@ -917,21 +962,7 @@ impl Slots {
             if !save::slot_path(game, film, slot).is_file() {
                 continue;
             }
-            let (key, sub) = save::slot_keys(film, slot);
-            let stored = flags.get(&key).and_then(Value::as_str).unwrap_or_default();
-            let (when, chapter) = split_line(stored, english);
-            rows.insert(
-                slot,
-                Line {
-                    when,
-                    chapter,
-                    comment: flags
-                        .get(&sub)
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                },
-            );
+            rows.insert(slot, Line::read(film, flags, slot, english));
         }
         Slots { rows }
     }
@@ -974,6 +1005,31 @@ impl Slots {
 
 #[cfg(test)]
 mod tests {
+
+    /// A slot just written is put back without re-reading the install, which
+    /// is what lets the page re-rasterise in place after `FUN_10011c30`.
+    #[test]
+    fn a_written_slot_goes_back_into_the_page_in_place() {
+        let mut slots = Slots::default();
+        assert!(!slots.filled(3));
+        slots.insert(
+            3,
+            Line {
+                when: "9/12/2026(Sat)15:17".to_string(),
+                chapter: "01".to_string(),
+                comment: "just saved".to_string(),
+            },
+        );
+        assert!(slots.filled(3));
+        assert_eq!(slots.get(3).map(|l| l.comment.as_str()), Some("just saved"));
+        // And the page the screen draws sees it without another read.
+        let page = slots.page(0);
+        assert_eq!(
+            page[3].1.map(|l| l.comment.as_str()),
+            Some("just saved"),
+            "row 3 of page 0 is slot 3"
+        );
+    }
     use super::*;
 
     fn at(year: i32, month: u32, day: u32, weekday: u32, hour: u32, minute: u32) -> Civil {
