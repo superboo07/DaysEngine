@@ -294,19 +294,18 @@ fn main() -> Result<()> {
     // position is already the graph's and must not be looked up again: a
     // script that several routes list would resolve back to the first of them.
     let mut chained = false;
-    // Set when the menus should open straight onto the save or load screen,
-    // which is what the control bar's own buttons ask for.
-    let mut open_saveload: Option<saveload::Kind> = None;
     loop {
         if menus && !chained {
-            let kind = open_saveload.take();
+            // The menus reached from here are the whole screen. The control
+            // bar's own buttons open theirs over playback, from inside the
+            // playback loop, and never come through this call.
             match run_menu(
                 &mut player,
                 &mut canvas,
                 &creator,
                 &mut events,
                 &start,
-                kind,
+                MenuEntry::Title,
             )? {
                 Outcome::Quit => break,
                 Outcome::Play | Outcome::Finished => next = wanted.clone(),
@@ -333,8 +332,8 @@ fn main() -> Result<()> {
                         continue;
                     }
                 },
-                // There is nothing to save from the title -- the player has no
-                // position -- so this only happens from playback, where the
+                // There is nothing to save from the title — the player has no
+                // position — so this only happens from playback, where the
                 // save is taken before the menus open.
                 Outcome::SaveSlot(slot, _) => {
                     log::info!("slot {slot} cannot be written from the title");
@@ -387,6 +386,21 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// How the menus were entered, which is what decides where leaving one goes.
+///
+/// The original has two menu drivers and this picks between them. See
+/// [`daysengine::ui::menu::Entry`] for the evidence; the short of it is that a
+/// screen the control bar opened lives in the playback object's own menu layer
+/// and returns to playback, while the title-rooted shell walks
+/// `_getNextMode@8`'s graph and ends at the title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuEntry {
+    /// The menus own the screen, starting at the title.
+    Title,
+    /// One screen over live playback, as host `+0xf8(code)` opens it.
+    OverPlayback(Mode, saveload::Kind),
 }
 
 /// Why a loop gave up control.
@@ -502,26 +516,35 @@ fn run_menu(
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     start: &Ini,
-    kind: Option<saveload::Kind>,
+    entry: MenuEntry,
 ) -> Result<Outcome> {
     // `[UseEnglish]` decides which way round the save line's date reads, and
     // how many characters of it are the chapter.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
     let session = build_session(player, start, english);
     apply_settings(&session, player.mixer);
-    let mut menu = Menu::open(
-        player.vfs,
-        &player.dll,
-        Mode::TITLE,
-        session,
-        MENU_RESOLUTION,
-    )
-    .context("opening the title screen")?;
-    // The bar's menu buttons open this module directly, which is
-    // `setSystemInit` code 4 to save and 5 to load.
-    if let Some(kind) = kind {
-        menu.open_saveload(player.vfs, &player.dll, kind)?;
-    }
+    // A bar-opened screen is not a title menu that then navigates: host
+    // `+0xf8` puts the playback object straight into its menu layer with that
+    // one module's code, so the module is the first screen there is.
+    let mut menu = match entry {
+        MenuEntry::Title => Menu::open(
+            player.vfs,
+            &player.dll,
+            Mode::TITLE,
+            session,
+            MENU_RESOLUTION,
+        )
+        .context("opening the title screen")?,
+        MenuEntry::OverPlayback(mode, kind) => Menu::open_over_playback(
+            player.vfs,
+            &player.dll,
+            mode,
+            kind,
+            session,
+            MENU_RESOLUTION,
+        )
+        .with_context(|| format!("opening menu mode {} over playback", mode.0))?,
+    };
 
     let backdrop = load_title_backdrop(player, start);
 
@@ -593,7 +616,7 @@ fn run_menu(
                 // Naming the save is what confirms it. The original hands this
                 // to Windows; `run_comment` draws the same dialog out of the
                 // executable's own template. Cancelling calls nothing, so no
-                // save happens -- which is what `FUN_0042e4a0` does by simply
+                // save happens — which is what `FUN_0042e4a0` does by simply
                 // not reaching `_CommentSet@4`.
                 Action::Save(slot) => naming = Some(slot),
                 Action::Quit => return Ok(Outcome::Quit),
@@ -603,9 +626,11 @@ fn run_menu(
                     apply_settings(menu.session(), player.mixer);
                     texture = None;
                 }
-                // The Option screen's close button. The original flushes here
-                // and tells the host to leave the menus with a mode whose
-                // meaning is not recovered, so this returns to the title.
+                // The Option screen's close button. `FUN_10007ef0` widget 3
+                // flushes the config object and then leaves the menus with
+                // `+0x4c(0)` — the same code the save/load screen's Close
+                // uses — so the flush happens here and where it lands is the
+                // entry's question, exactly as for every other screen.
                 Action::SettingsSaved => {
                     apply_settings(menu.session(), player.mixer);
                     if menu.session().config.dirty() {
@@ -615,8 +640,10 @@ fn run_menu(
                         }
                         menu.session_mut().config = config;
                     }
-                    menu.advance(player.vfs, &player.dll, Mode::TITLE)?;
-                    texture = None;
+                    match menu.leave(player.vfs, &player.dll)? {
+                        Action::Play => return Ok(Outcome::Play),
+                        _ => texture = None,
+                    }
                 }
                 // The DLL only records the request and this engine draws its
                 // menus at one size, so the request is logged rather than
@@ -1020,6 +1047,11 @@ fn run_script(
     let start = Instant::now();
 
     loop {
+        // The rate the clock runs at, from the speed widget that is lit. Read
+        // once per frame because every use of the clock in this iteration has
+        // to agree about it.
+        let rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
+
         for event in events.poll_iter() {
             match event {
                 Event::Quit { .. }
@@ -1034,7 +1066,7 @@ fn run_script(
                     if paused {
                         origin = Instant::now();
                     } else {
-                        offset = clock(origin, offset);
+                        offset = clock(origin, offset, rate);
                     }
                     paused = !paused;
                 }
@@ -1042,7 +1074,7 @@ fn run_script(
                     keycode: Some(key @ (Keycode::Right | Keycode::Left)),
                     ..
                 } => {
-                    let now = clock(origin, offset);
+                    let now = clock(origin, offset, rate);
                     let delta = 5 * FPS;
                     offset = if key == Keycode::Right {
                         Frame(now.0 + delta)
@@ -1081,7 +1113,7 @@ fn run_script(
         let at = if paused {
             offset
         } else {
-            clock(origin, offset)
+            clock(origin, offset, rate)
         };
         if stage.finished(at) {
             log::info!("script finished");
@@ -1109,7 +1141,9 @@ fn run_script(
             bar_state.gauge = Some(values);
             bar_state.gauge_raised = raised;
         }
-        bar_state.rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
+        // `set_speed` keeps these two in step; this is the resting case, for
+        // a session that has not touched a speed widget yet.
+        bar_state.rate = rate;
         if let Some(control) = &mut control {
             let (bw, bh) = control.strip();
             let strip = FRect::new(dst.x, dst.y, bw as f32 * scale, bh as f32 * scale);
@@ -1150,17 +1184,40 @@ fn run_script(
                             if paused {
                                 origin = Instant::now();
                             } else {
-                                offset = clock(origin, offset);
+                                offset = clock(origin, offset, rate);
                             }
                             paused = !paused;
                         }
-                        // Host `+0x8c` sets a member and the bar redraws from
-                        // it, which is what happens here. **It does not yet
-                        // make playback faster**: the clock is wall-clock and
-                        // the decoders run at their own rate, so scaling only
-                        // the timeline would run it ahead of the audio. The
-                        // rate is carried, the fast-forward is not implemented.
-                        bar::Act::Speed(index) => bar_state.speed = index,
+                        // Host `+0x8c` is `FUN_00424f90`, and it does three
+                        // things in this order: it stops the clock, sets the
+                        // rate, and starts the clock again.
+                        //
+                        // Pressing the rate that is already selected is the
+                        // one case that does none of that — the original
+                        // compares against its `+0x504` first and only stores
+                        // the lit index — so the clock is not disturbed by
+                        // pressing 1x twice.
+                        //
+                        // Otherwise `FUN_00424910` folds the frames run so far
+                        // into the base (`+0x540 = +0x544`) and `FUN_00424a10`
+                        // restarts from there, so the new rate applies from now
+                        // on and the frame never jumps backwards. That is the
+                        // fold-and-rebase below.
+                        //
+                        // The original also hands the rate to the media object
+                        // through `FUN_00431c90`, which is its vtable slot
+                        // `+0x38`, so the voices and BGM are retimed with the
+                        // timeline. This engine decodes through system libav
+                        // and **does not retime audio**: the timeline runs at
+                        // the chosen rate and the stage re-seeks the audio it
+                        // passes, which is audible at 12x and 24x. The rate
+                        // itself is the original's.
+                        bar::Act::Speed(index) => {
+                            if bar_state.set_speed(index) {
+                                offset = clock(origin, offset, rate);
+                                origin = Instant::now();
+                            }
+                        }
                         bar::Act::Seek(code) if code == bar::Seek::RESTART => {
                             offset = Frame::ZERO;
                             origin = Instant::now();
@@ -1173,17 +1230,21 @@ fn run_script(
                         // Host `+0x100(1)` leaves playback rather than moving
                         // along it, so this one goes back to the title.
                         bar::Act::Leave => return Ok(Outcome::Play),
-                        // `setSystemInit` takes these numbers: 4 opens the
-                        // save/load module to save, 5 to load, 2 the Option
-                        // screen. What 3 selects is an object `SystemInit`
-                        // has no case for and is **not recovered**.
+                        // These are `setSystemInit`'s own codes: 4 opens the
+                        // save/load module to save, 5 to load and 2 the Option
+                        // screen. Code 3 has a case too — it selects the module
+                        // object `DAT_1004ffc8` — but **which screen that is
+                        // has not been recovered**, so the bar's third menu
+                        // button is the one this engine cannot answer.
                         bar::Act::Menu(request) => {
-                            let kind = match request.0 {
-                                4 => Some(saveload::Kind::Save),
-                                5 => Some(saveload::Kind::Load),
+                            let opened = match request.0 {
+                                4 => Some((Mode::SAVELOAD, saveload::Kind::Save)),
+                                5 => Some((Mode::SAVELOAD, saveload::Kind::Load)),
+                                // The Option screen ignores the save/load job.
+                                2 => Some((Mode::OPTION, saveload::Kind::Load)),
                                 _ => None,
                             };
-                            let Some(kind) = kind else {
+                            let Some((mode, kind)) = opened else {
                                 log::info!(
                                     "the bar asked for menu {}, which is not recovered",
                                     request.0
@@ -1192,9 +1253,15 @@ fn run_script(
                             };
                             // Stop the script clock so playback resumes where
                             // it was, open the menus, then put it back.
-                            offset = clock(origin, offset);
-                            let outcome =
-                                run_menu(player, canvas, creator, events, start_ini, Some(kind))?;
+                            offset = clock(origin, offset, rate);
+                            let outcome = run_menu(
+                                player,
+                                canvas,
+                                creator,
+                                events,
+                                start_ini,
+                                MenuEntry::OverPlayback(mode, kind),
+                            )?;
                             origin = Instant::now();
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
@@ -1497,8 +1564,16 @@ fn run_script(
 }
 
 /// Current script frame from wall-clock elapsed time plus the seek offset.
-fn clock(origin: Instant, offset: Frame) -> Frame {
-    Frame(offset.0 + Frame::from_duration(origin.elapsed()).0)
+/// The frame playback is at: the base frame plus the scaled elapsed wall time.
+///
+/// `FUN_00422f70` is this function. `offset` is the executable's `+0x540`, the
+/// frame the clock was last re-based to; `origin` stands for the `timeGetTime`
+/// value it keeps at `+0x550`; and `rate` is the float at `+0x538` that host
+/// slot `+0x8c` stores out of the speed table. Folding the elapsed frames back
+/// into `offset` and taking a fresh `origin` is `FUN_00424910` followed by
+/// `FUN_00424a10`, which is exactly what the original does on a rate change.
+fn clock(origin: Instant, offset: Frame, rate: f32) -> Frame {
+    Frame(offset.0 + Frame::from_duration_at(origin.elapsed(), rate).0)
 }
 
 /// Resolves a script name to its pack path, preferring the configured language.

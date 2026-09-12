@@ -335,6 +335,17 @@ struct MenuArgs {
     /// Try to open every mode and report which ones this engine can draw.
     #[arg(long)]
     check_all: bool,
+    /// Open the screen the way the in-game control bar opens it, over live
+    /// playback, instead of starting at the title. Takes `setSystemInit`'s own
+    /// code, which is what the bar passes host `+0xf8`: 4 for the save screen,
+    /// 5 for the load screen, 2 for the Option screen.
+    ///
+    /// This is the entry that decides where Close goes, so it is the only way
+    /// to check that from here. With it, `-e click:X:Y` on Close reports
+    /// `Play` — leave the menus and resume — where a title-rooted run reports
+    /// `Opened(Mode(2))`.
+    #[arg(long, value_name = "CODE")]
+    from_bar: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -1660,6 +1671,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session};
     use daysengine::ui::options::{Dir, Display, Som};
     use daysengine::ui::replay::Scenes;
+    use daysengine::ui::saveload::Kind;
     use daysengine::ui::screen::Resolution;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -1732,25 +1744,70 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 Err(err) => println!("  mode {:>2}  {name:<14} {stem:<34} {err}", mode.0),
             }
         }
+        // The same screens again, opened the way the control bar opens them.
+        // These are a separate entry, not a separate screen: the art is the
+        // same and what differs is where Close goes, so both have to be walked.
+        println!("opened over playback, as host +0xf8 does:");
+        for (code, name, mode, kind) in [
+            (4u32, "save", Mode::SAVELOAD, Kind::Save),
+            (5, "load", Mode::SAVELOAD, Kind::Load),
+            (2, "option", Mode::OPTION, Kind::Load),
+        ] {
+            match Menu::open_over_playback(&vfs, &dll, mode, kind, session(), resolution) {
+                Ok(mut menu) => {
+                    let leaving = menu.leave(&vfs, &dll);
+                    println!(
+                        "  code {code}  {name:<14} mode {:>2}  ok, {} widgets, leaving -> {:?}",
+                        mode.0,
+                        menu.screen().widget_count(),
+                        leaving
+                    );
+                }
+                Err(err) => println!("  code {code}  {name:<14} mode {:>2}  {err}", mode.0),
+            }
+        }
         return Ok(());
     }
 
-    let mut menu = Menu::open(&vfs, &dll, Mode::TITLE, session(), resolution)
-        .context("opening the title screen")?;
+    // `--from-bar` is the whole point of this branch: a screen opened over
+    // playback is a different entry, and the entry is what decides where Close
+    // goes. Without it every run here is title-rooted, which is exactly the
+    // blind spot that let a bar-opened Close land on the title.
+    let mut menu = match args.from_bar {
+        None => Menu::open(&vfs, &dll, Mode::TITLE, session(), resolution)
+            .context("opening the title screen")?,
+        Some(code) => {
+            let (mode, kind) = match code {
+                4 => (Mode::SAVELOAD, Kind::Save),
+                5 => (Mode::SAVELOAD, Kind::Load),
+                // The Option screen has no save/load job to set.
+                2 => (Mode::OPTION, Kind::Load),
+                other => bail!(
+                    "--from-bar {other} is not a menu the control bar can open;                      it passes host +0xf8 code 4 (save), 5 (load) or 2 (option).                      Code 3 has a case in setSystemInit, selecting DAT_1004ffc8,                      but which screen that is has not been recovered."
+                ),
+            };
+            Menu::open_over_playback(&vfs, &dll, mode, kind, session(), resolution)
+                .with_context(|| format!("opening menu mode {} over playback", mode.0))?
+        }
+    };
     println!(
-        "mode {} ({}) — {} widgets",
+        "mode {} ({}) — {} widgets, entry {:?}",
         menu.mode().0,
         menu.variant(),
-        menu.screen().widget_count()
+        menu.screen().widget_count(),
+        menu.entry()
     );
     // The title's backdrop comes from the same save data, so report it here:
     // the widget table and the picture are the two halves of "which title".
+    // A bar-opened run has no title under it, so there is nothing to report.
     let chosen = chosen_backdrop(
         &vfs,
         &ending::load_list(&vfs, &start_script_ini(&vfs)),
         &flags,
     );
-    println!("backdrop {} ({:?})", chosen.path, chosen.reason);
+    if args.from_bar.is_none() {
+        println!("backdrop {} ({:?})", chosen.path, chosen.reason);
+    }
 
     for event in args
         .events
@@ -1809,9 +1866,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 println!("  (would replay {script})");
                 break;
             }
+            // The Option screen's Close flushes and then leaves like any
+            // other screen, so report where leaving lands — that is the half
+            // of this action that differs between the two entries.
             Action::SettingsSaved => {
-                println!("  (would write Config.DAT and return to the title)");
-                menu.advance(&vfs, &dll, Mode::TITLE)?;
+                let leaving = menu.leave(&vfs, &dll)?;
+                println!("  (would write Config.DAT) leaving -> {leaving:?}");
+                if leaving == Action::Play {
+                    println!("  (would resume playback)");
+                    break;
+                }
             }
             _ => {}
         }
@@ -2416,7 +2480,7 @@ fn check_edges(routes: &days_route::Routes, machine: &days_route::Machine) {
         }
     }
     // The nine that differ in the retail DLL are three scenes with two of
-    // `SetFeeling`'s arms swapped -- a bug in the game, reproduced rather than
+    // `SetFeeling`'s arms swapped — a bug in the game, reproduced rather than
     // corrected. A number other than nine here is a recovery problem.
     println!("  {credits} (scene, choice) pairs credit a script, {disagree} of them naming something the branch graph does not move to");
     println!("  {blind} scenes whose crediting could not be decoded");

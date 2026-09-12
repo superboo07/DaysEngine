@@ -200,7 +200,7 @@ pub const RESTART_LATCH_FRAMES: u32 = 0x48;
 /// 4  the save/load module, opened to save   (its +0x94 poked to 1)
 /// 5  the same module, opened to load        (+0x94 poked to 0)
 /// 2  the Option screen
-/// 3  an object `SystemInit` has no case for -- not recovered
+/// 3  an object `SystemInit` has no case for — not recovered
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuRequest(pub i32);
@@ -328,6 +328,32 @@ impl State {
             rate: SPEEDS[0],
             ..State::default()
         }
+    }
+
+    /// Applies host `+0x8c(index)`, the speed widgets' own call.
+    ///
+    /// Answers whether the clock has to be re-based, which is the part of
+    /// `FUN_00424f90` the engine has to act on rather than store:
+    ///
+    /// * Pressing the rate that is already in force does nothing but re-store
+    ///   the lit index. The original compares `index` against its `+0x504`
+    ///   before anything else and, when they match, writes only `+0x508` — so
+    ///   pressing 1x twice must not disturb a running clock.
+    /// * Any other index folds the frames run so far into the base and
+    ///   restarts from there (`FUN_00424910`, then `FUN_00424a10`), so the new
+    ///   rate applies from now on and the frame never jumps backwards.
+    /// * An index outside the table is clamped to 1x at index 0, not ignored:
+    ///   `(param_1 < 0) || (4 < param_1)` stores `0x3f800000` and rewrites the
+    ///   index to 0.
+    ///
+    /// The rate itself is [`SPEEDS`], which the original keeps as a float at
+    /// `+0x538` and this engine keeps in [`State::rate`].
+    pub fn set_speed(&mut self, index: usize) -> bool {
+        let index = if index < SPEEDS.len() { index } else { 0 };
+        let changed = index != self.speed;
+        self.speed = index;
+        self.rate = SPEEDS[index];
+        changed
     }
 }
 
@@ -718,6 +744,40 @@ impl Bar {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pressing the rate already in force must not disturb the clock:
+    /// `FUN_00424f90` compares against `+0x504` before doing anything else.
+    #[test]
+    fn pressing_the_rate_already_in_force_does_not_rebase_the_clock() {
+        let mut state = State::default();
+        assert!(!state.set_speed(0), "1x is the rate a session starts at");
+        assert!(state.set_speed(3), "12x is a change");
+        assert!(!state.set_speed(3), "12x again is not");
+        assert_eq!(state.speed, 3);
+    }
+
+    /// The index and the rate move together, because the bar draws from one
+    /// and the clock runs on the other.
+    #[test]
+    fn setting_a_speed_sets_the_rate_beside_it() {
+        let mut state = State::default();
+        for (index, rate) in SPEEDS.iter().enumerate() {
+            state.set_speed(index);
+            assert_eq!(state.speed, index);
+            assert_eq!(state.rate, *rate);
+        }
+    }
+
+    /// Out of range is clamped to 1x at index 0, not ignored: the original
+    /// stores `0x3f800000` and rewrites the index.
+    #[test]
+    fn an_out_of_range_speed_falls_back_to_1x() {
+        let mut state = State::default();
+        state.set_speed(2);
+        state.set_speed(SPEEDS.len());
+        assert_eq!(state.speed, 0);
+        assert_eq!(state.rate, 1.0);
+    }
     use super::*;
 
     /// A state in which everything the bar can ask about is available.

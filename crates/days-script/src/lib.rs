@@ -55,7 +55,31 @@ impl Frame {
     }
 
     pub fn from_duration(d: Duration) -> Frame {
-        Frame((d.as_secs_f64() * f64::from(FPS)) as u32)
+        Frame::from_duration_at(d, 1.0)
+    }
+
+    /// Elapsed wall time as frames, scaled by a playback rate.
+    ///
+    /// This is the shape of the executable's own clock. `FUN_00422f70` reads
+    /// the frame the session is at as
+    ///
+    /// ```text
+    /// frame = base + ROUND(elapsed_ms * fps * rate) / 1000
+    /// ```
+    ///
+    /// where `base` is the object's `+0x540`, `elapsed_ms` is `timeGetTime()`
+    /// less the origin it kept at `+0x550`, `fps` is `DAT_0050c468` and `rate`
+    /// is the float at `+0x538` that host slot `+0x8c` stores out of the speed
+    /// table. The millisecond truncation is the original's, so it is kept: the
+    /// product is formed from whole milliseconds and rounded before the
+    /// divide, which is not the same as scaling seconds directly.
+    ///
+    /// A rate of 1.0 is what `FUN_00423130` initialises `+0x538` to, so the
+    /// unscaled clock is this function with the rate the session starts at.
+    pub fn from_duration_at(d: Duration, rate: f32) -> Frame {
+        let ms = d.as_millis().min(u128::from(u32::MAX)) as u32;
+        let scaled = (f64::from(ms) * f64::from(FPS) * f64::from(rate)).round() / 1000.0;
+        Frame(scaled.clamp(0.0, f64::from(u32::MAX)) as u32)
     }
 
     pub fn as_seconds(self) -> f64 {
@@ -518,6 +542,46 @@ fn decode(bytes: &[u8]) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rated clock is the executable's own: `frame = ROUND(ms * fps * rate)
+    /// / 1000`, so a rate of 1.0 is the plain clock and the rest are multiples
+    /// of it.
+    #[test]
+    fn the_clock_scales_with_the_playback_rate() {
+        let one_second = std::time::Duration::from_secs(1);
+        assert_eq!(Frame::from_duration_at(one_second, 1.0), Frame(FPS));
+        assert_eq!(Frame::from_duration_at(one_second, 2.0), Frame(FPS * 2));
+        assert_eq!(Frame::from_duration_at(one_second, 4.0), Frame(FPS * 4));
+        assert_eq!(Frame::from_duration_at(one_second, 12.0), Frame(FPS * 12));
+        assert_eq!(Frame::from_duration_at(one_second, 24.0), Frame(FPS * 24));
+    }
+
+    /// The unrated clock has to stay exactly the 1x case, because every
+    /// existing caller is that case.
+    #[test]
+    fn the_plain_clock_is_the_rated_clock_at_1x() {
+        for ms in [0u64, 1, 41, 42, 999, 1000, 1001, 60_000, 1_234_567] {
+            let d = std::time::Duration::from_millis(ms);
+            assert_eq!(
+                Frame::from_duration(d),
+                Frame::from_duration_at(d, 1.0),
+                "{ms} ms"
+            );
+        }
+    }
+
+    /// A frame counted at one rate and then continued at another is the sum of
+    /// the two stretches, which is what re-basing the clock on a rate change
+    /// buys: time already played is never re-scaled.
+    #[test]
+    fn rebasing_on_a_rate_change_keeps_the_frames_already_run() {
+        let half = std::time::Duration::from_millis(500);
+        let at_1x = Frame::from_duration_at(half, 1.0);
+        let then_4x = Frame::from_duration_at(half, 4.0);
+        assert_eq!(at_1x, Frame(FPS / 2));
+        assert_eq!(then_4x, Frame(FPS * 2));
+        assert_eq!(Frame(at_1x.0 + then_4x.0), Frame(FPS / 2 + FPS * 2));
+    }
     use super::*;
 
     #[test]

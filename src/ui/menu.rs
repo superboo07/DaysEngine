@@ -110,7 +110,7 @@ impl Mode {
     /// Replay        +0x2b0  0 HScene   else PlayData
     /// RouteMap      +0x3d8  0 episode 1, single page
     /// ReplayPopup   +0x0c8  0 the two-widget popup, else the four-widget one
-    /// SaveLoad      +0x094  0 Load.png, else Save.png -- and SystemInit
+    /// SaveLoad      +0x094  0 Load.png, else Save.png — and SystemInit
     ///                       explicitly pokes 0 when it opens the module
     /// ```
     ///
@@ -348,9 +348,12 @@ pub enum Action {
     SettingsChanged,
     /// The Option screen was closed: the settings were flushed to disk.
     ///
-    /// The DLL flushes here and then tells the host to leave the menus, with a
-    /// mode whose meaning is **not recovered** — so this engine returns to the
-    /// title, which is where the screen was opened from.
+    /// `FUN_10007ef0` widget 3 flushes the config object — its `+0x2cc`
+    /// vtable slot `+8` — and then asks the host to leave the menus with
+    /// `+0x4c(0)`, the same code the save/load screen's Close uses. So where
+    /// this lands is [`Entry`]'s question rather than this action's: the engine
+    /// flushes and then leaves, which is playback when the bar opened the
+    /// screen and the title when the title did.
     SettingsSaved,
     /// The Option screen asked for a display mode this engine has to apply.
     ///
@@ -419,6 +422,90 @@ impl Session {
     }
 }
 
+/// Which of the original's two menu drivers is running.
+///
+/// This is not a flavour the engine invented to remember something: the
+/// executable really does have two separate menu drivers on two different
+/// objects, and which one is running is what decides where leaving a screen
+/// goes.
+///
+/// [`Entry::Title`] is the title-rooted shell, `FUN_0041d410`, `FUN_0041d9c0`
+/// and `FUN_0041dfa0`. Those three functions hold **every** call to
+/// `_getNextMode@8` in the executable — 14 of them, and no others, from
+/// Ghidra's reference index on the import thunk at `0x004a1ef6`. Leaving a
+/// screen there walks the mode graph `getNextMode` encodes, whose sink is the
+/// title.
+///
+/// [`Entry::Playback`] is the playback object's own menu layer, and it never
+/// consults `getNextMode` at all. Host slot `+0xf8` — the control bar's "open
+/// a menu" — sets that object's state member `+0x220` to 3 and stores the
+/// module's `setSystemInit` code at `+0x260`; `FUN_00427300` dispatches state 3
+/// to `FUN_00425550`, which runs whichever module `+0x260` names. Host slot
+/// `+0x4c` is what writes `+0x260`, and the code **0** means leave: case 6 of
+/// `FUN_00425550` falls through cases 7 and 8, and case 8 sets `+0x220 = 1` --
+/// the state `FUN_00427300` dispatches to `FUN_004253f0`, the playback tick.
+///
+/// So a screen the bar opened returns to playback when it is closed, and it
+/// reaches the title only if the player asks for the title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Entry {
+    /// The menus are the whole screen, entered from the title.
+    #[default]
+    Title,
+    /// The menus are over live playback, entered from the control bar.
+    Playback,
+}
+
+/// Where leaving a screen goes.
+///
+/// Split out from [`Menu`] so the rule can be checked without an install: the
+/// destination depends only on which driver is running and, for the title
+/// driver, on the mode the popup remembers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leaving {
+    /// Leave the menu layer and resume playback underneath.
+    Resume,
+    /// Open this mode.
+    To(Mode),
+}
+
+/// Where host `+0x4c(0)` — the Close button — goes.
+///
+/// See [`Entry`] for the evidence. Over playback `FUN_00425550` case 6 falls
+/// through to case 8, which sets `+0x220 = 1`, the playback tick. From the
+/// title the mode graph's sink is the title.
+pub fn leaving(entry: Entry, return_to: Mode) -> Leaving {
+    match entry {
+        Entry::Playback => Leaving::Resume,
+        Entry::Title => Leaving::To(return_to),
+    }
+}
+
+/// Where backing out of `mode` goes — the Escape key, and the screens' own
+/// back buttons that are not Close.
+///
+/// Three screens answer this themselves whichever driver is running, because
+/// each was opened from another screen rather than from a driver:
+/// SOMCON from the Option screen, the replay popup from the replay grid, and
+/// the route map from the save/load screen — the last of those is
+/// `_getNextMode@8` case 6, which answers mode 3 and never the title.
+///
+/// Everything else is the driver's question, and over playback the answer is
+/// the same as Close's, because `+0x4c(0)` is the only way out the modules the
+/// bar can open actually offer.
+pub fn backing_out(entry: Entry, mode: Mode, return_to: Mode) -> Leaving {
+    match mode {
+        Mode::CONFIRM => Leaving::To(return_to),
+        Mode::SOM_CONFIG => Leaving::To(Mode::OPTION),
+        Mode::REPLAY_POPUP => Leaving::To(Mode::REPLAY),
+        Mode::ROUTEMAP => Leaving::To(Mode::SAVELOAD),
+        _ => match entry {
+            Entry::Playback => Leaving::Resume,
+            Entry::Title => Leaving::To(Mode::CONFIRM),
+        },
+    }
+}
+
 /// The menu, as one screen plus the pointer state over it.
 pub struct Menu {
     mode: Mode,
@@ -430,6 +517,9 @@ pub struct Menu {
     /// Where the confirm popup returns to on cancel. `SystemInit` records this
     /// for every mode except the popups themselves.
     return_to: Mode,
+    /// Which driver is running, and so where leaving a screen goes. See
+    /// [`Entry`].
+    entry: Entry,
     resolution: Resolution,
     states: Vec<WidgetState>,
     dirty: bool,
@@ -460,13 +550,58 @@ pub struct Menu {
 }
 
 impl Menu {
-    /// Opens the mode's screen.
+    /// Opens the mode's screen, with the menus as the whole screen.
     pub fn open(
         vfs: &Vfs,
         dll: &[u8],
         mode: Mode,
         session: Session,
         resolution: Resolution,
+    ) -> Result<Menu, Error> {
+        Menu::open_with(
+            vfs,
+            dll,
+            mode,
+            session,
+            resolution,
+            Entry::Title,
+            Kind::Load,
+        )
+    }
+
+    /// Opens one screen the way the control bar opens it, over live playback.
+    ///
+    /// Host slot `+0xf8(code)` is a single call that does two things: it puts
+    /// the playback object into its menu layer (`+0x220 = 3`) and stores the
+    /// module's `setSystemInit` code at `+0x260`. There is no title screen
+    /// underneath — the module the bar asked for is the first screen the layer
+    /// opens — and `FUN_00425550` case 2 inits exactly that one code. So this
+    /// is a menu that starts at `mode` with [`Entry::Playback`], not a title
+    /// menu that then navigates.
+    ///
+    /// `kind` matters because the save and load screens are one module: codes 4
+    /// and 5 both select it and only poke its `+0x94` differently, so the job
+    /// has to be set before the art is chosen.
+    pub fn open_over_playback(
+        vfs: &Vfs,
+        dll: &[u8],
+        mode: Mode,
+        kind: Kind,
+        session: Session,
+        resolution: Resolution,
+    ) -> Result<Menu, Error> {
+        Menu::open_with(vfs, dll, mode, session, resolution, Entry::Playback, kind)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with(
+        vfs: &Vfs,
+        dll: &[u8],
+        mode: Mode,
+        session: Session,
+        resolution: Resolution,
+        entry: Entry,
+        kind: Kind,
     ) -> Result<Menu, Error> {
         let tab = options::Tab::DEFAULT;
         let view = replay::View::DEFAULT;
@@ -478,7 +613,7 @@ impl Menu {
             &variant,
             Mode::TITLE,
             tab,
-            Kind::Load,
+            kind,
             &session,
             resolution,
         )?;
@@ -489,6 +624,7 @@ impl Menu {
             screen,
             selection: None,
             return_to: Mode::TITLE,
+            entry,
             resolution,
             dirty: true,
             session,
@@ -496,7 +632,7 @@ impl Menu {
             view,
             page: 0,
             asked: None,
-            kind: Kind::Load,
+            kind,
             thumbnails: None,
             font: load_font(vfs),
             rows: None,
@@ -545,7 +681,7 @@ impl Menu {
             return;
         };
         // The selection is what opens the expanded comment, so this is rebuilt
-        // on every hover -- which is what the shipped screen does: its
+        // on every hover — which is what the shipped screen does: its
         // `FUN_10012900` re-runs the whole row rasterising before laying the
         // tooltip out.
         let hovered = self
@@ -665,7 +801,7 @@ impl Menu {
             // The expanded comment goes over the list, panel first. The panel
             // is cut from the chip sheet at the record's full height however
             // short it is drawn, so a one- or two-line panel is that art
-            // squashed -- the shipped sprite's own source rectangle.
+            // squashed — the shipped sprite's own source rectangle.
             if let Some(tip) = &rows.tooltip {
                 let panel = &tip.panel;
                 out.blit_downscaled(
@@ -759,7 +895,7 @@ impl Menu {
                 Some(scene) => replay::popup_enabled(scene, widget, &self.session.flags),
                 None => false,
             },
-            // Every widget, until the confirm popup goes up -- which this
+            // Every widget, until the confirm popup goes up — which this
             // engine does not raise, so `popup_up` is always false here.
             Mode::SAVELOAD => saveload::enabled(false, widget),
             _ => true,
@@ -1008,10 +1144,7 @@ impl Menu {
                 self.refresh();
                 Ok(Action::Stay)
             }
-            saveload::Act::Leave => {
-                let back = self.return_to;
-                self.advance(vfs, dll, back)
-            }
+            saveload::Act::Leave => self.leave(vfs, dll),
             saveload::Act::RouteMap => self.advance(vfs, dll, Mode::ROUTEMAP),
             saveload::Act::None => Ok(Action::Stay),
         }
@@ -1134,19 +1267,35 @@ impl Menu {
 
     /// Backs out of the current screen.
     ///
-    /// Every screen but the title returns to the confirm popup, which asks
-    /// whether to go back to the title; the title's own cancel asks whether to
-    /// quit. The two popups differ only in their background art, chosen from
-    /// the mode the popup remembers.
+    /// From the title, every screen but the title returns to the confirm popup,
+    /// which asks whether to go back to the title; the title's own cancel asks
+    /// whether to quit. The two popups differ only in their background art,
+    /// chosen from the mode the popup remembers.
+    ///
+    /// Over playback there is no popup on this path. The modules the bar can
+    /// open offer exactly one way out — host `+0x4c(0)`, the Close button --
+    /// and `FUN_00425550` takes that straight back to the playback tick, so
+    /// backing out over playback is the same thing as closing. **What the
+    /// over-playback driver would do with a popup answer is not recovered**:
+    /// `_SetReMenu@4` (`FUN_10001500`) stores the bar's own module code into
+    /// the popup's `+0xa4`, and `FUN_1000a8f0` answers `+0x4c(+0xa4)` on the
+    /// negative button and `+0x4c(1)` or `+0x4c(9)` on the positive one — but
+    /// 1 and 9 are the popup module's own `setSystemInit` codes, so what the
+    /// driver makes of that has not been established and is not guessed at
+    /// here.
+    ///
+    /// The route map is the one screen whose way out is neither of those. It is
+    /// opened from the save/load screen by `+0x4c(6)` (`FUN_10014990` widget
+    /// 0x15), and `_getNextMode@8` case 6 answers mode 3 — the save/load
+    /// screen — never the title. So it goes back to where it was opened from
+    /// under either driver. (Case 6 reaches that arm when the module's `+0x74`
+    /// is *clear*, which reads backwards for a leave flag; **which member the
+    /// route map's own back button sets is not recovered**, and this engine
+    /// does not depend on it.)
     pub fn cancel(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
-        match self.mode {
-            Mode::CONFIRM => {
-                let back = self.return_to;
-                self.advance(vfs, dll, back)
-            }
-            Mode::SOM_CONFIG => self.advance(vfs, dll, Mode::OPTION),
-            Mode::REPLAY_POPUP => self.advance(vfs, dll, Mode::REPLAY),
-            _ => self.advance(vfs, dll, Mode::CONFIRM),
+        match backing_out(self.entry, self.mode, self.return_to) {
+            Leaving::Resume => Ok(Action::Play),
+            Leaving::To(mode) => self.advance(vfs, dll, mode),
         }
     }
 
@@ -1174,10 +1323,40 @@ impl Menu {
         }
     }
 
+    /// Which driver is running. See [`Entry`].
+    pub fn entry(&self) -> Entry {
+        self.entry
+    }
+
+    /// Leaves the screen that is showing, which is host `+0x4c(0)`.
+    ///
+    /// The code 0 is the same call in both drivers and it means the same thing
+    /// — "I am done, take me out of here" — but the two drivers take it to
+    /// different places, which is the whole of this rule:
+    ///
+    /// * Over playback, `FUN_00425550` case 6 sees `+0x260 == 0` and falls
+    ///   through cases 7 and 8; case 8 sets `+0x220 = 1`, the state
+    ///   `FUN_00427300` hands to `FUN_004253f0`, the playback tick. Playback
+    ///   resumes where it was paused, so this is [`Action::Play`].
+    /// * From the title, the title-rooted shell walks `_getNextMode@8`'s graph
+    ///   instead, and every arm of it that is not another screen ends at mode
+    ///   2, the title.
+    pub fn leave(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
+        match leaving(self.entry, self.return_to) {
+            Leaving::Resume => Ok(Action::Play),
+            Leaving::To(mode) => self.advance(vfs, dll, mode),
+        }
+    }
+
     fn reopen(&mut self, vfs: &Vfs, dll: &[u8], next: Mode) -> Result<Action, Error> {
-        // The popup remembers where it came from; every other screen resets it,
-        // matching SystemInit, which records the outgoing mode for all but the
-        // popups themselves.
+        // `return_to` is only ever the popup's memory of where it was raised
+        // from, and the one thing that memory decides is which popup this is:
+        // the DLL picks `Popup_Title.png` or `Popup_Exit.png` off its own
+        // `+0x9c`, which `setSystemInit` pokes with 0 for code 1 and 1 for code
+        // 9. Raised from the title it asks about quitting; raised from anywhere
+        // else it asks about the title. It is *not* where leaving a screen
+        // goes — that is `leave`, and reading this member as the answer
+        // to that question is what sent a bar-opened screen to the title.
         let return_to = if next == Mode::CONFIRM {
             self.mode
         } else {
@@ -1311,6 +1490,95 @@ fn base_art(mode: Mode, return_to: Mode, kind: Kind) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    // Where every screen goes when it is left, from both entries. These are
+    // the cases nothing covered while the menus were being written, which is
+    // why a screen the control bar opened closed onto the title screen.
+
+    /// Close on a bar-opened screen resumes playback. This is the bug.
+    #[test]
+    fn closing_a_bar_opened_screen_resumes_playback() {
+        for mode in [Mode::SAVELOAD, Mode::OPTION, Mode::ROUTEMAP] {
+            assert_eq!(
+                leaving(Entry::Playback, mode),
+                Leaving::Resume,
+                "mode {} opened over playback must resume, not leave playback",
+                mode.0
+            );
+        }
+    }
+
+    /// ...and Close from the title still goes where it always did.
+    #[test]
+    fn closing_a_title_rooted_screen_goes_back_to_the_title() {
+        assert_eq!(leaving(Entry::Title, Mode::TITLE), Leaving::To(Mode::TITLE));
+    }
+
+    /// Backing out over playback is Close, because `+0x4c(0)` is the only exit
+    /// the modules the bar can open offer.
+    #[test]
+    fn backing_out_over_playback_resumes_rather_than_raising_the_popup() {
+        for mode in [Mode::SAVELOAD, Mode::OPTION] {
+            assert_eq!(
+                backing_out(Entry::Playback, mode, Mode::TITLE),
+                Leaving::Resume,
+                "mode {} must not raise the title popup over playback",
+                mode.0
+            );
+        }
+    }
+
+    /// Backing out of a title-rooted screen still asks the popup first.
+    #[test]
+    fn backing_out_from_the_title_raises_the_popup() {
+        assert_eq!(
+            backing_out(Entry::Title, Mode::SAVELOAD, Mode::TITLE),
+            Leaving::To(Mode::CONFIRM)
+        );
+        assert_eq!(
+            backing_out(Entry::Title, Mode::REPLAY, Mode::TITLE),
+            Leaving::To(Mode::CONFIRM)
+        );
+    }
+
+    /// The three screens opened from another screen answer for themselves,
+    /// whichever driver is running.
+    #[test]
+    fn a_screen_opened_from_another_screen_goes_back_to_it() {
+        for entry in [Entry::Title, Entry::Playback] {
+            assert_eq!(
+                backing_out(entry, Mode::SOM_CONFIG, Mode::TITLE),
+                Leaving::To(Mode::OPTION)
+            );
+            assert_eq!(
+                backing_out(entry, Mode::REPLAY_POPUP, Mode::TITLE),
+                Leaving::To(Mode::REPLAY)
+            );
+            // `_getNextMode@8` case 6 answers mode 3, never the title.
+            assert_eq!(
+                backing_out(entry, Mode::ROUTEMAP, Mode::TITLE),
+                Leaving::To(Mode::SAVELOAD)
+            );
+        }
+    }
+
+    /// The popup goes back to whatever raised it, under either driver.
+    #[test]
+    fn the_popup_returns_to_what_raised_it() {
+        for entry in [Entry::Title, Entry::Playback] {
+            assert_eq!(
+                backing_out(entry, Mode::CONFIRM, Mode::REPLAY),
+                Leaving::To(Mode::REPLAY)
+            );
+        }
+    }
+
+    /// The title driver is the default, so nothing that forgets to say which
+    /// entry it is silently becomes a bar entry.
+    #[test]
+    fn the_default_entry_is_the_title() {
+        assert_eq!(Entry::default(), Entry::Title);
+    }
     use super::*;
 
     #[test]

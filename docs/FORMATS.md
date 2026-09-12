@@ -687,14 +687,88 @@ asks the enabled test before playing SE index 2.
 `+0x8c` in `FUN_00424f90`. The English chip sheet labels the last two buttons
 `▶×16` and `▶×32`; the art is not the authority.
 
+`FUN_00424f90` does three things in order, and the order is the behaviour.
+Pressing the rate already in force is the one case that does none of them: it
+compares against `engine + 0x530` first and, when they match, writes only the
+lit index at `+0x534`. Otherwise it stops the clock (`FUN_00424910`, which folds
+the frames run so far into the base with `+0x540 = +0x544`), stores the rate as
+a float at `+0x538`, and starts the clock again (`FUN_00424a10`). An index
+outside the table is clamped to 1x at index 0 rather than ignored —
+`(param_1 < 0) || (4 < param_1)` stores `0x3f800000` and rewrites the index.
+
+The rate is what the clock runs on. `FUN_00422f70` reads the frame playback is
+at as
+
+    frame = +0x540 + ROUND((timeGetTime() - +0x550) * DAT_0050c468 * +0x538) / 1000
+
+so the base frame plus the elapsed wall time scaled by the rate, in whole
+milliseconds, with `+0x544` holding a high-water mark so the frame never goes
+backwards. Re-basing on every rate change is what keeps time already played
+from being re-scaled.
+
+`FUN_00424f90` also hands the rate to the media object, through
+`FUN_00431c90`, which is that object's vtable slot `+0x38` — so the original
+retimes the voices and BGM with the timeline. Dropping from 12x or 24x back
+below 4x additionally re-primes the media through `FUN_00431cd0`, guarded on
+the old index being above 2, the new one below 3, and `engine + 0x22c` clear.
+
 Where the host slots land is the executable's own state machine. `FUN_00427300`
 switches on `engine + 0x220`, which is host `+0x1f4` — an independent
 confirmation that the host interface sits at `engine + 0x2c`. State 1 plays,
-state 3 opens a menu (`FUN_00425550`, with the number `_SetReMenu@4` was given),
-state 4 moves the timeline (`FUN_00425bf0`, where code 1 restarts the script in
-place and codes 2 and 5 chain to whatever `_GetNextScriptFile@12` names) and
-state 5 leaves. **Which menu each `+0xf8` number selects is not recovered**, and
-the chaining codes are route-system territory.
+state 3 opens a menu (`FUN_00425550`), state 4 moves the timeline
+(`FUN_00425bf0`, where code 1 restarts the script in place and codes 2 and 5
+chain to whatever `_GetNextScriptFile@12` names) and state 5 leaves. The
+chaining codes are route-system territory.
+
+`+0xf8`'s numbers are `setSystemInit`'s own codes, so 4 is the save screen, 5
+the load screen and 2 the Option screen — the same three the title menu reaches.
+Code 3 has a case too, selecting the module object `DAT_1004ffc8`, but **which
+screen that object is has not been recovered**.
+
+### Leaving a menu the control bar opened
+
+The executable has **two** menu drivers, and which one is running is the whole
+of where Close goes.
+
+`FUN_0041d410`, `FUN_0041d9c0` and `FUN_0041dfa0` are the title-rooted shell.
+Between them they hold **every** call to `_getNextMode@8` — 14 of them and no
+others, from Ghidra's reference index on the import thunk at `0x004a1ef6` — so
+the mode graph above is that shell's, and its sink is mode 2, the title.
+
+`FUN_00425550` is the other one, and it never consults `_getNextMode@8` at all.
+Host slot `+0xf8` (`FUN_0042a430`) puts the playback object into state 3 and
+stores the module's code at `engine + 0x260`; `FUN_00425550` case 2 hands that
+code straight to `setSystemInit` and runs the one module it names. Host slot
+`+0x4c` (`FUN_0042c230`) is what writes `engine + 0x260`, and the code **0**
+means leave: case 6 sees it, falls through cases 7 and 8, and case 8 sets
+`engine + 0x220 = 1` — the state `FUN_00427300` dispatches to `FUN_004253f0`,
+the playback tick.
+
+So a screen the bar opened resumes playback when it is closed, and both the
+screens the bar can open close the same way: the save/load screen's Close is
+`+0x4c(0)` in `FUN_10014990` widget `0x14`, and the Option screen's is
+`+0x4c(0)` in `FUN_10007ef0` widget 3, after that widget flushes the config
+object through its own `+0x2cc` vtable slot `+8`.
+
+`_SetReMenu@4` is the exported half of the same idea and it is *not* this rule.
+It is a menu-DLL export (`FUN_10001500`) that writes the popup module's `+0xa4`
+— the same member `SystemInit` records the outgoing screen in, and the same one
+`_getNextMode@8(-1)` returns. `+0xf8` calls it with the code it was given and
+`+0x100` (leave playback) calls it with 0, so the popup, if it is raised, knows
+which screen to go back to. **What the over-playback driver does with a popup
+answer has not been recovered**: `FUN_1000a8f0` answers `+0x4c(+0xa4)` on the
+negative button and `+0x4c(1)` or `+0x4c(9)` on the positive one, and 1 and 9
+are the popup module's own `setSystemInit` codes.
+
+One member is worth writing down because it looks like this rule and is not.
+The DLL reads `engine + 0x2d0` through host slot `+0x44` and writes it through
+`+0x48`; `_getNextMode@8` case 3 returns mode 1 when it is not -1, which reads
+like "resume what was running". It is not: `FUN_10011d50` stores
+`page * 10 + row` into it when the player picks a filled row, and the module's
+own open, `FUN_100135c0`, clears it to -1 — so it is the **save slot the player
+picked**, -1 for none. `FUN_00423130` initialises it to -1 and
+`FUN_004253f0` ends the playback loop when it is anything else, which is how
+loading a slot from the menus stops the script that was running.
 
 ### The bar is a drop-down, and translucent
 
