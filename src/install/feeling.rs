@@ -32,7 +32,7 @@
 //! The shipped table never uses the second pair for anything real: across all
 //! 719 entries there are 283 non-zero amounts spread over 283 entries, so no
 //! script moves two counters at once. [`Deltas::for_script`] still returns both
-//! pairs and [`Feeling::apply`] still credits both, because that is what the
+//! pairs and [`credit`] still credits both, because that is what the
 //! reader does — but the second being live is untested by the retail data.
 //!
 //! Sixteen of the 719 entries key on a script that no route table names, so
@@ -44,7 +44,7 @@
 //!
 //! **Relative.** 25 of the 55 routes contain exactly one site of this, and
 //! every one of the 25 is character-for-character the same
-//! ([`Feeling::first_leads`]):
+//! ([`first_leads`]):
 //!
 //! ```text
 //! a = get(L"001");  b = get(L"002");
@@ -74,7 +74,7 @@
 //! control bar asks before drawing the gauge over a faded bar — reads that
 //! same member back. So the gauge is shown precisely when a delta moved `001`
 //! or `002`, and `FUN_10026050` clears it again through slot `+0x30(0)` once
-//! it has read the two values. [`Feeling::apply`] returns that flag.
+//! it has read the two values. [`credit`] returns that flag.
 //!
 //! # The table format
 //!
@@ -97,7 +97,7 @@
 //! and `FUN_10005ce0` (add and subtract), `FUN_10006000` (threshold),
 //! `FUN_10006230` (the head), `_ZeroReset@4`, all in `RouteProcSDHQ.dll`.
 
-use std::collections::BTreeMap;
+use days_save::FlagStore;
 
 /// The counter the left gauge bar draws, and the left side of the branch test.
 pub const FIRST: &str = "001";
@@ -222,101 +222,84 @@ impl Thresholds {
     }
 }
 
-/// The five counters, mirroring what the save's variable store holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Feeling {
-    values: BTreeMap<String, i32>,
+/// The save's variable store is where the counters live.
+///
+/// Not a store of their own: host slots `+0x08`/`+0x0c` (integers) and
+/// `+0x10`/`+0x14` (booleans) all reach the same member, `host + 0x14`, so the
+/// five counters share one `std::map<wstring, VARIANT>` with `ROUTE`, `SCENE`,
+/// the numbered gate flags and the `BS****` back-bookmarks. A player's own
+/// save has `001` as `VT_I4` and `946` as `VT_BOOL` side by side in it.
+///
+/// So these are operations **on that store** rather than a type of their own.
+/// A name never written reads as zero, which is what the game's store does:
+/// `FUN_00460810` creates a missing name on demand and the typed getter
+/// coerces it.
+///
+/// Credits a script's deltas, as `_SetFeeling@8` does with mode 1.
+///
+/// Returns whether the gauge should be shown — true when a delta moved
+/// [`FIRST`] or [`SECOND`], which is the condition `FUN_10005c60` signals
+/// through host slot `+0x30`. A zero amount is skipped entirely
+/// (`if (delta != 0)` guards the whole body), so the filler pairs never raise
+/// it.
+pub fn credit(store: &mut FlagStore, deltas: &Deltas, script: &str) -> bool {
+    apply(store, deltas, script, 1)
 }
 
-impl Feeling {
-    /// An empty set of counters. A name never written reads as zero, which is
-    /// also what the game's store does: a missing key is created on demand and
-    /// coerced to `VT_I4`, giving zero.
-    pub fn new() -> Feeling {
-        Feeling::default()
-    }
+/// Takes a script's deltas back off again, which is `FUN_10005ce0` — the
+/// mode-0 half of the same call, used when the player moves backwards.
+pub fn uncredit(store: &mut FlagStore, deltas: &Deltas, script: &str) -> bool {
+    apply(store, deltas, script, -1)
+}
 
-    /// One counter's value.
-    pub fn get(&self, name: &str) -> i32 {
-        self.values.get(name).copied().unwrap_or(0)
-    }
-
-    /// Sets one counter, as loading a save does.
-    pub fn set(&mut self, name: &str, value: i32) {
-        self.values.insert(name.to_string(), value);
-    }
-
-    /// Every counter that has a value, in name order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, i32)> {
-        self.values.iter().map(|(k, &v)| (k.as_str(), v))
-    }
-
-    /// Credits a script's deltas, as `_SetFeeling@8` does with mode 1.
-    ///
-    /// Returns whether the gauge should be shown — true when a delta moved
-    /// `001` or `002`, which is the condition `FUN_10005c60` signals through
-    /// host slot `+0x30`. A zero amount is skipped entirely (`if (delta != 0)`
-    /// guards the whole body), so the filler pairs never raise it.
-    pub fn apply(&mut self, deltas: &Deltas, script: &str) -> bool {
-        self.credit(deltas, script, 1)
-    }
-
-    /// Takes a script's deltas back off again, which is `FUN_10005ce0` — the
-    /// mode-0 half of the same call, used when the player moves backwards.
-    pub fn undo(&mut self, deltas: &Deltas, script: &str) -> bool {
-        self.credit(deltas, script, -1)
-    }
-
-    fn credit(&mut self, deltas: &Deltas, script: &str, sign: i32) -> bool {
-        let mut gauge = false;
-        for (name, amount) in deltas.for_script(script) {
-            if amount == 0 {
-                continue;
-            }
-            let now = self.get(&name) + sign * amount;
-            self.set(&name, now);
-            if name == FIRST || name == SECOND {
-                gauge = true;
-            }
+fn apply(store: &mut FlagStore, deltas: &Deltas, script: &str, sign: i32) -> bool {
+    let mut gauge = false;
+    for (name, amount) in deltas.for_script(script) {
+        if amount == 0 {
+            continue;
         }
-        gauge
-    }
-
-    /// Sets every counter the table head names to zero, as `_ZeroReset@4`
-    /// does at the start of a new game.
-    pub fn zero_reset(&mut self, names: &[String]) {
-        for name in names {
-            self.set(name, 0);
+        store.set_int(&name, store.int(&name) + sign * amount);
+        if name == FIRST || name == SECOND {
+            gauge = true;
         }
     }
+    gauge
+}
 
-    /// Whether a script's threshold is met, as `FUN_10006000` answers it.
-    ///
-    /// **Strictly greater**, and false for a script with no entry — both
-    /// straight off the disassembly, where the `jle` takes the false arm and
-    /// the no-match path falls into the same zero.
-    pub fn passes(&self, thresholds: &Thresholds, script: &str) -> bool {
-        match thresholds.for_script(script) {
-            Some((name, amount)) => self.get(&name) > amount,
-            None => false,
-        }
+/// Sets every counter the table head names to zero, as `_ZeroReset@4` does at
+/// the start of a new game.
+pub fn zero_reset(store: &mut FlagStore, names: &[String]) {
+    for name in names {
+        store.set_int(name, 0);
     }
+}
 
-    /// The branch test the 25 route handlers share: `if (get("002") < get("001"))`.
-    ///
-    /// True when [`FIRST`] is ahead of [`SECOND`] — the `if` arm. A tie is
-    /// false, because the comparison is a strict `<`.
-    pub fn first_leads(&self) -> bool {
-        self.get(SECOND) < self.get(FIRST)
+/// Whether a script's threshold is met, as `FUN_10006000` answers it.
+///
+/// **Strictly greater**, and false for a script with no entry — both straight
+/// off the disassembly, where the `jle` takes the false arm and the no-match
+/// path falls into the same zero.
+pub fn passes(store: &FlagStore, thresholds: &Thresholds, script: &str) -> bool {
+    match thresholds.for_script(script) {
+        Some((name, amount)) => store.int(&name) > amount,
+        None => false,
     }
+}
 
-    /// The two values the gauge draws, `(001, 002)`.
-    ///
-    /// `FUN_10026050` reads exactly these two names through host slot `+8` and
-    /// stores them as floats.
-    pub fn gauge(&self) -> (i32, i32) {
-        (self.get(FIRST), self.get(SECOND))
-    }
+/// The branch test the 25 route handlers share: `if (get("002") < get("001"))`.
+///
+/// True when [`FIRST`] is ahead of [`SECOND`] — the `if` arm. A tie is false,
+/// because the comparison is a strict `<`.
+pub fn first_leads(store: &FlagStore) -> bool {
+    store.int(SECOND) < store.int(FIRST)
+}
+
+/// The two values the gauge draws, `(001, 002)`.
+///
+/// `FUN_10026050` reads exactly these two names through host slot `+8` and
+/// stores them as floats.
+pub fn gauge(store: &FlagStore) -> (i32, i32) {
+    (store.int(FIRST), store.int(SECOND))
 }
 
 #[cfg(test)]
@@ -357,10 +340,10 @@ mod tests {
     #[test]
     fn both_pairs_are_credited() {
         let d = deltas("[01-00-B01]=\"001, 5, 002, 3\"\n");
-        let mut f = Feeling::new();
-        assert!(f.apply(&d, "01/01-00-B01"));
-        assert_eq!(f.get("001"), 5);
-        assert_eq!(f.get("002"), 3);
+        let mut f = FlagStore::default();
+        assert!(credit(&mut f, &d, "01/01-00-B01"));
+        assert_eq!(f.int("001"), 5);
+        assert_eq!(f.int("002"), 3);
     }
 
     /// The filler pair is skipped by the `!= 0` guard, so it never counts as a
@@ -368,8 +351,8 @@ mod tests {
     #[test]
     fn the_filler_pair_changes_nothing_and_does_not_raise_the_gauge() {
         let d = deltas("[00-00-A06]=\"000, 0, 000, 0\"\n");
-        let mut f = Feeling::new();
-        assert!(!f.apply(&d, "00/00-00-A06"));
+        let mut f = FlagStore::default();
+        assert!(!credit(&mut f, &d, "00/00-00-A06"));
         assert_eq!(f.iter().count(), 0);
     }
 
@@ -377,70 +360,70 @@ mod tests {
     #[test]
     fn a_hidden_counter_accrues_without_raising_the_gauge() {
         let d = deltas("[04-SE-K00]=\"004, 1, 000, 0\"\n");
-        let mut f = Feeling::new();
-        assert!(!f.apply(&d, "04/04-SE-K00"));
-        assert_eq!(f.get("004"), 1);
+        let mut f = FlagStore::default();
+        assert!(!credit(&mut f, &d, "04/04-SE-K00"));
+        assert_eq!(f.int("004"), 1);
     }
 
     #[test]
     fn undo_takes_the_same_deltas_back_off() {
         let d = deltas("[01-00-B01]=\"001, 5, 002, 3\"\n");
-        let mut f = Feeling::new();
-        f.apply(&d, "01/01-00-B01");
-        assert!(f.undo(&d, "01/01-00-B01"));
-        assert_eq!(f.get("001"), 0);
-        assert_eq!(f.get("002"), 0);
+        let mut f = FlagStore::default();
+        credit(&mut f, &d, "01/01-00-B01");
+        assert!(uncredit(&mut f, &d, "01/01-00-B01"));
+        assert_eq!(f.int("001"), 0);
+        assert_eq!(f.int("002"), 0);
     }
 
     #[test]
     fn zero_reset_clears_every_name_the_head_declares() {
         let d = deltas("");
-        let mut f = Feeling::new();
-        f.set("001", 40);
-        f.set("004", 2);
-        f.zero_reset(d.names());
-        assert_eq!(f.get("001"), 0);
-        assert_eq!(f.get("004"), 0);
+        let mut f = FlagStore::default();
+        f.set_int("001", 40);
+        f.set_int("004", 2);
+        zero_reset(&mut f, d.names());
+        assert_eq!(f.int("001"), 0);
+        assert_eq!(f.int("004"), 0);
         assert_eq!(f.iter().count(), 5);
     }
 
     /// The branch test is a strict `<`, so equal counters take the `else`.
     #[test]
     fn the_branch_test_is_strict_so_a_tie_goes_the_other_way() {
-        let mut f = Feeling::new();
-        f.set("001", 30);
-        f.set("002", 30);
-        assert!(!f.first_leads());
-        f.set("002", 29);
-        assert!(f.first_leads());
-        f.set("002", 31);
-        assert!(!f.first_leads());
+        let mut f = FlagStore::default();
+        f.set_int("001", 30);
+        f.set_int("002", 30);
+        assert!(!first_leads(&f));
+        f.set_int("002", 29);
+        assert!(first_leads(&f));
+        f.set_int("002", 31);
+        assert!(!first_leads(&f));
     }
 
     /// `jle` takes the false arm, so the threshold is passed only above it.
     #[test]
     fn a_threshold_is_strictly_greater_not_at_least() {
         let t = Thresholds::parse(format!("{HEAD}[01-00-N05]=\"002, 11\"\n").as_bytes());
-        let mut f = Feeling::new();
-        f.set("002", 11);
-        assert!(!f.passes(&t, "01/01-00-N05"));
-        f.set("002", 12);
-        assert!(f.passes(&t, "01/01-00-N05"));
+        let mut f = FlagStore::default();
+        f.set_int("002", 11);
+        assert!(!passes(&f, &t, "01/01-00-N05"));
+        f.set_int("002", 12);
+        assert!(passes(&f, &t, "01/01-00-N05"));
     }
 
     #[test]
     fn an_ungated_script_does_not_pass() {
         let t = Thresholds::parse(format!("{HEAD}[01-00-N05]=\"002, 11\"\n").as_bytes());
-        let f = Feeling::new();
-        assert!(!f.passes(&t, "05/05-KB-A00"));
+        let f = FlagStore::default();
+        assert!(!passes(&f, &t, "05/05-KB-A00"));
     }
 
     #[test]
     fn the_gauge_reads_the_two_named_counters() {
-        let mut f = Feeling::new();
-        f.set("001", 89);
-        f.set("002", 78);
-        f.set("004", 4);
-        assert_eq!(f.gauge(), (89, 78));
+        let mut f = FlagStore::default();
+        f.set_int("001", 89);
+        f.set_int("002", 78);
+        f.set_int("004", 4);
+        assert_eq!(gauge(&f), (89, 78));
     }
 }

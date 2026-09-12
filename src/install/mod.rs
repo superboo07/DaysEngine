@@ -8,6 +8,7 @@
 //! affection counters the branch system keeps ([`feeling`]) and the player's
 //! place in the branch graph ([`progress`]).
 
+pub mod clock;
 pub mod config;
 pub mod feeling;
 pub mod ini;

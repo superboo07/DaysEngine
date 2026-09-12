@@ -175,6 +175,18 @@ fn record(dll: &[u8], at: usize) -> Option<Widget> {
 /// enough regions to make a coincidence conceivable.
 const MIN_MATCHES: usize = 3;
 
+/// A run this long is believable on its own, whatever proportion of the
+/// screen's regions it covers.
+///
+/// The save/load screen is why: only twelve of its thirty-two regions can ever
+/// match a record, because ten rows are one full-width sprite behind two
+/// half-width hit regions each, and the other ten regions are the comment
+/// panels, which are taller than the rows they sit on. Twelve consecutive
+/// records reproducing twelve consecutive regions exactly is not a
+/// coincidence — sixteen bytes each, in order — so the table is read from that
+/// run and the rest filled in at its stride.
+const MIN_LONG_RUN: usize = 8;
+
 /// Fewest regions a segment should average before the split looks like the
 /// search fitting noise rather than reading a table.
 ///
@@ -258,7 +270,9 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
         .zip(boxes)
         .filter(|(w, want)| w.dst == **want)
         .count();
-    if matched < MIN_MATCHES.min(boxes.len()) || matched * 2 < boxes.len() {
+    let longest = segments.iter().map(|&(_, _, len)| len).max().unwrap_or(0);
+    let believable = matched * 2 >= boxes.len() || longest >= MIN_LONG_RUN;
+    if matched < MIN_MATCHES.min(boxes.len()) || !believable {
         return Err(Error::NoAtlas);
     }
 

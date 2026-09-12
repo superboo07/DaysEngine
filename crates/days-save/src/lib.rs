@@ -70,6 +70,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod slot;
+
+pub use slot::{Mark, Slot};
+
 use std::collections::BTreeMap;
 
 /// Magic at the head of `GlobalFlag.DAT`.
@@ -139,7 +143,7 @@ impl Value {
 ///
 /// Ordered, because the file is a `std::map` and therefore sorted by name;
 /// keeping that order means a dump reads the way the game wrote it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FlagStore {
     entries: BTreeMap<String, Value>,
 }
@@ -226,6 +230,39 @@ impl FlagStore {
         self.entries.get(name)
     }
 
+    /// Writes a value, creating the name if it is not there.
+    ///
+    /// The game's store does the same: `FUN_00460810` creates a missing name
+    /// on demand, which is why an unread counter reads zero rather than
+    /// failing.
+    pub fn set(&mut self, name: &str, value: Value) {
+        self.entries.insert(name.to_owned(), value);
+    }
+
+    /// An integer by name, zero when the name is absent.
+    ///
+    /// Zero rather than `None` because that is what the game's getter returns
+    /// for a name it has just created. A name holding some other type reads as
+    /// zero too, matching a typed getter against the wrong tag.
+    pub fn int(&self, name: &str) -> i32 {
+        self.get(name).and_then(Value::as_int).unwrap_or(0)
+    }
+
+    /// Sets an integer by name.
+    pub fn set_int(&mut self, name: &str, value: i32) {
+        self.set(name, Value::Int(value));
+    }
+
+    /// Sets a boolean by name, as `VT_BOOL`.
+    pub fn set_flag(&mut self, name: &str, value: bool) {
+        self.set(name, Value::Bool(value));
+    }
+
+    /// Removes a name entirely.
+    pub fn remove(&mut self, name: &str) -> Option<Value> {
+        self.entries.remove(name)
+    }
+
     /// Whether a boolean flag is set. Missing and non-boolean both read false.
     ///
     /// This matches the game, whose getter returns false for a name it does
@@ -250,22 +287,127 @@ impl FlagStore {
     }
 }
 
+impl FlagStore {
+    /// Encodes the store the way the game writes it.
+    ///
+    /// Byte for byte: the varint writer picks the shortest of its five lengths
+    /// and the entries come out in the `std::map`'s sorted order, so a store
+    /// read from a file and written back reproduces the file exactly. That is
+    /// checked against the player's own saves by `days save --roundtrip`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        self.write_into(&mut w);
+        w.bytes
+    }
+
+    pub(crate) fn write_into(&self, w: &mut Writer) {
+        w.raw(&MAGIC);
+        w.varint(self.entries.len() as i32);
+        for (name, value) in &self.entries {
+            w.string(name);
+            // -1 in every entry of every file seen; the game writes the
+            // VARIANT wrapper's own member here, which it never sets otherwise.
+            w.varint(-1);
+            match value {
+                Value::Int(n) => {
+                    w.varint(3);
+                    w.varint(*n);
+                }
+                Value::Float(f) => {
+                    w.varint(4);
+                    w.raw(&f.to_le_bytes());
+                }
+                Value::Str(s) => {
+                    w.varint(8);
+                    w.string(s);
+                }
+                Value::Bool(b) => {
+                    w.varint(11);
+                    w.varint(if *b { -1 } else { 0 });
+                }
+            }
+        }
+    }
+}
+
+/// The encoder, mirroring `FUN_004350b0` and `FUN_00434f70`.
+#[derive(Debug, Default)]
+pub(crate) struct Writer {
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl Writer {
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// Seven bits per byte, most significant group first, shortest encoding.
+    ///
+    /// The first byte carries only six bits of magnitude because `0x40` is the
+    /// sign, so the length thresholds are `0x40`, `0x2000`, `0x100000` and
+    /// `0x8000000` — the game's own ladder, not a general LEB128.
+    pub(crate) fn varint(&mut self, value: i32) {
+        let (sign, magnitude) = if value < 0 {
+            (0x40u8, (-1i64 - i64::from(value)) as u32)
+        } else {
+            (0, value as u32)
+        };
+        let groups = match magnitude {
+            0..0x40 => 1,
+            0x40..0x2000 => 2,
+            0x2000..0x100000 => 3,
+            0x100000..0x8000000 => 4,
+            _ => 5,
+        };
+        for i in (0..groups).rev() {
+            let shift = i * 7;
+            // The first group is six bits wide; the rest are seven.
+            let mask = if i == groups - 1 { 0x3f } else { 0x7f };
+            let mut byte = ((magnitude >> shift) as u8) & mask;
+            if i == groups - 1 {
+                byte |= sign;
+            }
+            if i != 0 {
+                byte |= 0x80;
+            }
+            self.bytes.push(byte);
+        }
+    }
+
+    /// Length in UTF-16 code units, then the units XORed with their index.
+    pub(crate) fn string(&mut self, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        self.varint(units.len() as i32);
+        for (i, u) in units.iter().enumerate() {
+            self.bytes.extend_from_slice(&(u ^ i as u16).to_le_bytes());
+        }
+    }
+}
+
 /// A cursor over the file, with the two primitives everything else is built on.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }
 
-    fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], Error> {
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+
+    pub(crate) fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.bytes.len());
+    }
+
+    pub(crate) fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], Error> {
         let end = self.pos.checked_add(n).ok_or(Error::Truncated { what })?;
         let slice = self
             .bytes
@@ -277,7 +419,7 @@ impl<'a> Reader<'a> {
 
     /// Seven bits per byte, high bit continues, `0x40` of the first byte means
     /// negative. Five bytes is the most the writer can emit, for a full i32.
-    fn varint(&mut self, what: &'static str) -> Result<i32, Error> {
+    pub(crate) fn varint(&mut self, what: &'static str) -> Result<i32, Error> {
         let offset = self.pos;
         let first = *self.bytes.get(self.pos).ok_or(Error::Truncated { what })?;
         self.pos += 1;
@@ -305,7 +447,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Length in characters, then UTF-16LE units each XORed with their index.
-    fn string(&mut self, index: usize) -> Result<String, Error> {
+    pub(crate) fn string(&mut self, index: usize) -> Result<String, Error> {
         let len = self.varint("a string length")?;
         if len < 0 || len as usize > self.remaining() / 2 {
             return Err(Error::StringTooLong { index, len });

@@ -46,6 +46,7 @@ use crate::install::vfs::Vfs;
 use crate::ui::options;
 use crate::ui::options::Dir;
 use crate::ui::replay::{self, Scenes};
+use crate::ui::saveload::{self, Kind, Slots};
 use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
 use days_save::FlagStore;
 
@@ -330,6 +331,10 @@ pub enum Action {
     /// The DLL only records the request; who acts on it is not recovered. See
     /// [`crate::ui::options::DisplayRequest`].
     Display(options::DisplayRequest),
+    /// Load a save slot and play what it names.
+    Load(u32),
+    /// Write the player's position to a save slot.
+    Save(u32),
     /// Quit the game.
     Quit,
 }
@@ -353,6 +358,8 @@ pub struct Session {
     pub display: options::Display,
     /// What the SOMCON tab knows.
     pub som: options::Som,
+    /// What the save/load screen shows for each slot.
+    pub slots: Slots,
 }
 
 impl Session {
@@ -366,6 +373,7 @@ impl Session {
             scenes: Scenes::from_scenes(Vec::new()),
             display: options::Display::default(),
             som: options::Som::default(),
+            slots: Slots::default(),
         }
     }
 }
@@ -395,6 +403,9 @@ pub struct Menu {
     page: usize,
     /// The scene the replay popup is asking about: `+0x2a8`.
     asked: Option<usize>,
+    /// Which job the save/load screen is doing: its `+0x94`, which
+    /// `setSystemInit` pokes with 1 for code 4 and 0 for code 5.
+    kind: Kind,
     /// The replay grid's thumbnail sheet for the current page, with the record
     /// table that cuts it up. Absent when the page's art will not load, which
     /// leaves the grid's empty frames showing.
@@ -420,6 +431,7 @@ impl Menu {
             &variant,
             Mode::TITLE,
             tab,
+            Kind::Load,
             &session,
             resolution,
         )?;
@@ -437,6 +449,7 @@ impl Menu {
             view,
             page: 0,
             asked: None,
+            kind: Kind::Load,
             thumbnails: None,
         };
         menu.load_thumbnails(vfs, dll);
@@ -454,6 +467,7 @@ impl Menu {
             &variant,
             return_to,
             self.tab,
+            self.kind,
             &self.session,
             self.resolution,
         )?;
@@ -626,6 +640,9 @@ impl Menu {
                 Some(scene) => replay::popup_enabled(scene, widget, &self.session.flags),
                 None => false,
             },
+            // Every widget, until the confirm popup goes up -- which this
+            // engine does not raise, so `popup_up` is always false here.
+            Mode::SAVELOAD => saveload::enabled(false, widget),
             _ => true,
         }
     }
@@ -815,6 +832,7 @@ impl Menu {
                 self.confirm_replay(vfs, dll, widget)
             }
             Mode::REPLAY_POPUP => Ok(self.confirm_replay_popup(widget)),
+            Mode::SAVELOAD => self.confirm_saveload(vfs, dll, widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
@@ -829,6 +847,60 @@ impl Menu {
             },
             _ => Ok(Action::Stay),
         }
+    }
+
+    /// The save/load screen's dispatch, from `FUN_10014990`.
+    ///
+    /// Picking a row names a slot; what happens to it is the engine's, because
+    /// the DLL only asks the host — host `+0x48` for a load and `+0xa0` for a
+    /// save. Picking an empty row on the Load screen does nothing at all,
+    /// which is `FUN_10011d50` refusing before it calls.
+    fn confirm_saveload(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        match saveload::action(self.kind, widget) {
+            saveload::Act::Row(row) => {
+                let slot = saveload::slot_of(self.page, row);
+                Ok(match self.kind {
+                    Kind::Load if !self.session.slots.filled(slot) => Action::Stay,
+                    Kind::Load => Action::Load(slot),
+                    Kind::Save => Action::Save(slot),
+                })
+            }
+            saveload::Act::Page(page) => {
+                if page == self.page {
+                    return Ok(Action::Stay);
+                }
+                self.page = page;
+                self.refresh();
+                Ok(Action::Stay)
+            }
+            saveload::Act::Leave => {
+                let back = self.return_to;
+                self.advance(vfs, dll, back)
+            }
+            saveload::Act::RouteMap => self.advance(vfs, dll, Mode::ROUTEMAP),
+            saveload::Act::None => Ok(Action::Stay),
+        }
+    }
+
+    /// Opens the save/load screen for one of its two jobs.
+    ///
+    /// `setSystemInit` code 4 is the save screen and code 5 the load screen;
+    /// both are this module with `+0x94` poked first, so the kind has to be
+    /// set before the art is chosen.
+    pub fn open_saveload(&mut self, vfs: &Vfs, dll: &[u8], kind: Kind) -> Result<Action, Error> {
+        self.kind = kind;
+        self.page = 0;
+        self.advance(vfs, dll, Mode::SAVELOAD)
+    }
+
+    /// Which job the save/load screen is doing.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The page of ten slots the save/load screen is showing.
+    pub fn page(&self) -> usize {
+        self.page
     }
 
     /// The Option screen's dispatch.
@@ -1037,6 +1109,7 @@ fn load_screen(
     variant: &str,
     return_to: Mode,
     tab: options::Tab,
+    kind: Kind,
     session: &Session,
     resolution: Resolution,
 ) -> Result<Screen, Error> {
@@ -1045,7 +1118,7 @@ fn load_screen(
         .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
     let base = match mode {
         Mode::OPTION => options::base_art(tab, session.som),
-        _ => base_art(mode, return_to),
+        _ => base_art(mode, return_to, kind),
     };
     Screen::load_with_base(vfs, dll, &stem, base, resolution)
 }
@@ -1087,11 +1160,16 @@ fn step(
 /// The confirm popup shares one chip sheet and hit map between two questions
 /// and picks the background from where it was opened: quitting from the title,
 /// returning to the title from anywhere else.
-fn base_art(mode: Mode, return_to: Mode) -> Option<&'static str> {
+fn base_art(mode: Mode, return_to: Mode, kind: Kind) -> Option<&'static str> {
     match mode {
         Mode::CONFIRM if return_to == Mode::TITLE => Some("System/Exit/Popup_Exit.png"),
         Mode::CONFIRM => Some("System/Exit/Popup_Title.png"),
-        Mode::SAVELOAD => Some("System/SaveLoad/Load.png"),
+        // One module, two jobs, chosen by `+0x94`. `setSystemInit` sets it:
+        // code 4 opens it to save and code 5 to load.
+        Mode::SAVELOAD => Some(match kind {
+            Kind::Load => "System/SaveLoad/Load.png",
+            Kind::Save => "System/SaveLoad/Save.png",
+        }),
         _ => None,
     }
 }
@@ -1368,11 +1446,11 @@ mod tests {
     #[test]
     fn the_popup_asks_a_different_question_depending_on_where_it_opened() {
         assert_eq!(
-            base_art(Mode::CONFIRM, Mode::TITLE),
+            base_art(Mode::CONFIRM, Mode::TITLE, Kind::Load),
             Some("System/Exit/Popup_Exit.png")
         );
         assert_eq!(
-            base_art(Mode::CONFIRM, Mode::OPTION),
+            base_art(Mode::CONFIRM, Mode::OPTION, Kind::Load),
             Some("System/Exit/Popup_Title.png")
         );
     }

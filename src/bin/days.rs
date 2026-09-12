@@ -125,6 +125,12 @@ enum Cmd {
         /// Only print flags whose name contains this, implies --all.
         #[arg(long)]
         grep: Option<String>,
+        /// Decode a save slot and print what it holds.
+        #[arg(long, value_name = "N")]
+        slot: Option<u32>,
+        /// Read every save file, write it back, and check the bytes match.
+        #[arg(long)]
+        roundtrip: bool,
     },
     /// Print the player's settings, as the Option screen reads them.
     ///
@@ -388,7 +394,20 @@ fn main() -> Result<()> {
         Cmd::Render { name, at, out, bar } => cmd_render(&game, &name, &at, &out, bar)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
-        Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
+        Cmd::Save {
+            all,
+            grep,
+            slot,
+            roundtrip,
+        } => {
+            if roundtrip {
+                cmd_save_roundtrip(&game)?
+            } else if let Some(n) = slot {
+                cmd_save_slot(&game, n)?
+            } else {
+                cmd_save(&game, all, grep.as_deref())?
+            }
+        }
         Cmd::Config => cmd_config(&game)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
         Cmd::Route {
@@ -1308,6 +1327,182 @@ fn start_script_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
 }
 
 /// Prints what the save data says the player has unlocked.
+/// Reads every save file the install has, writes it back, and compares bytes.
+///
+/// The strongest check there is on the encoders: the game's files are the
+/// specification, so reproducing them exactly means the writer agrees with
+/// `FUN_004350b0` and `FUN_00433340` on every varint length, every string
+/// cipher index and every record order — not just on what the reader happens
+/// to accept.
+fn cmd_save_roundtrip(game: &Path) -> Result<()> {
+    use daysengine::install::save::{flag_path, slot_path, FlagStore, Slot};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let film = film_ini(&vfs);
+    let mut checked = 0;
+    let mut differed = 0;
+
+    let path = flag_path(game, &film);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let store = FlagStore::parse(&bytes)?;
+            let back = store.to_bytes();
+            checked += 1;
+            if back == bytes {
+                println!(
+                    "{:<28} {:>7} bytes, {} flags  ok",
+                    "GlobalFlag.DAT",
+                    bytes.len(),
+                    store.len()
+                );
+            } else {
+                differed += 1;
+                println!(
+                    "{:<28} DIFFERS: {}",
+                    "GlobalFlag.DAT",
+                    first_difference(&bytes, &back)
+                );
+            }
+        }
+        Err(err) => println!("{}: {err}", path.display()),
+    }
+
+    for n in 0..100 {
+        let path = slot_path(game, &film, n);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        checked += 1;
+        match Slot::parse(&bytes) {
+            Ok(slot) => {
+                let back = slot.to_bytes();
+                if back == bytes {
+                    println!(
+                        "{name:<28} {:>7} bytes, {} story points, {} choices  ok",
+                        bytes.len(),
+                        slot.marks.len(),
+                        slot.choices.len()
+                    );
+                } else {
+                    differed += 1;
+                    println!("{name:<28} DIFFERS: {}", first_difference(&bytes, &back));
+                }
+            }
+            Err(err) => {
+                differed += 1;
+                println!("{name:<28} will not decode: {err}");
+            }
+        }
+    }
+    println!();
+    println!("{checked} files, {differed} that do not come back identical");
+
+    // The same again, but through the engine's own model of a slot rather
+    // than through the decoder alone: a slot the player saves has been round
+    // tripped through `Progress`, and the original game still has to read it.
+    let mut through = 0;
+    let mut lost = 0;
+    if let Ok(dll) = std::fs::read(game.join("RouteProcSDHQ.dll")) {
+        let global = load_flags(game, &vfs);
+        if let Ok(mut progress) = daysengine::install::progress::Progress::load(&vfs, &dll, global)
+        {
+            for n in 0..100 {
+                let Ok(bytes) = std::fs::read(slot_path(game, &film, n)) else {
+                    continue;
+                };
+                let Ok(slot) = Slot::parse(&bytes) else {
+                    continue;
+                };
+                through += 1;
+                progress.from_slot(slot);
+                if progress.to_slot().to_bytes() != bytes {
+                    lost += 1;
+                    log::warn!("slot {n} does not survive a pass through the engine");
+                }
+            }
+        }
+    }
+    println!("{through} slots read into the engine and written back, {lost} that changed");
+    Ok(())
+}
+
+/// Where two encodings first diverge, for a round-trip that failed.
+fn first_difference(a: &[u8], b: &[u8]) -> String {
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        Some(at) => format!(
+            "byte {at:#x}: the file has {:02x?}, we write {:02x?}",
+            &a[at..(at + 8).min(a.len())],
+            &b[at..(at + 8).min(b.len())]
+        ),
+        None => format!("the file is {} bytes, we write {}", a.len(), b.len()),
+    }
+}
+
+/// Prints what one save slot holds.
+fn cmd_save_slot(game: &Path, n: u32) -> Result<()> {
+    use daysengine::install::save::{load_slot, slot_keys, slot_path, Value};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let film = film_ini(&vfs);
+    let flags = load_flags(game, &vfs);
+    let path = slot_path(game, &film, n);
+
+    let Some(slot) = load_slot(game, &film, n) else {
+        println!("slot {n} ({}) is empty", path.display());
+        return Ok(());
+    };
+    let (head, sub) = slot_keys(&film, n);
+    println!("slot {n}  {}", path.display());
+    println!(
+        "  shown as   {}",
+        flags
+            .get(&head)
+            .and_then(Value::as_str)
+            .unwrap_or("(no line in the global store)")
+    );
+    println!(
+        "  comment    {}",
+        flags.get(&sub).and_then(Value::as_str).unwrap_or("")
+    );
+    println!(
+        "  script     {}  (engine version {})",
+        slot.script, slot.version
+    );
+    let int = |name: &str| slot.store.get(name).and_then(Value::as_int);
+    match (int("ROUTE"), int("SCENE")) {
+        (Some(r), Some(s)) => println!("  position   ROUTE {r} SCENE {s}"),
+        _ => println!("  position   ROUTE/SCENE are not in the store"),
+    }
+    println!("  store      {} entries", slot.store.len());
+    for name in ["001", "002", "000", "003", "004"] {
+        if let Some(v) = int(name) {
+            println!("      {name} = {v}");
+        }
+    }
+    println!(
+        "  {} story points, in the order they were reached:",
+        slot.marks.len()
+    );
+    for mark in slot.in_order() {
+        println!(
+            "      {:>3}  {:<14} {:<6} {} entries",
+            mark.order,
+            mark.script,
+            mark.story,
+            mark.store.len()
+        );
+    }
+    println!("  {} recorded choices:", slot.choices.len());
+    for (script, choice) in &slot.choices {
+        println!("      {script:<14} {choice}");
+    }
+    Ok(())
+}
+
 fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
     use daysengine::install::save::Value;
     use daysengine::SaveState;
@@ -1463,6 +1658,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     } else {
         load_flags(game, &vfs)
     };
+    let film = film_ini(&vfs);
+    let english = film.get_bool("UseEnglish").unwrap_or(false);
     let mut save = SaveState::from_flags(&flags, &start_script_ini(&vfs));
     save.all_clear |= args.all_clear;
     save.cleared_first |= args.cleared;
@@ -1483,6 +1680,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             full_screen: false,
         },
         som: Som::default(),
+        slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
     };
 
     if args.check_all {
@@ -1600,6 +1798,29 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         }
     }
 
+    // The save/load screen's rows carry text, and where that text sits inside
+    // a row is not recovered -- see `ui::saveload`. Print the lines, so what
+    // the screen would show is still checkable against the install.
+    if menu.mode() == Mode::SAVELOAD {
+        let slots = &menu.session().slots;
+        println!(
+            "  {:?} screen, page {} of {}, {} slots filled",
+            menu.kind(),
+            menu.page() + 1,
+            daysengine::ui::saveload::PAGES,
+            slots.len()
+        );
+        for (slot, line) in slots.page(menu.page()) {
+            match line {
+                Some(line) => println!(
+                    "    slot {slot:>3}  {:<24} {:<6} {}",
+                    line.when, line.chapter, line.comment
+                ),
+                None => println!("    slot {slot:>3}  (empty)"),
+            }
+        }
+    }
+
     if let Some(out) = &args.out {
         // With no override, draw what the save says: the same choice the
         // engine makes, so the PNG shows the title the player would see.
@@ -1646,7 +1867,8 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
     use daysengine::install::progress::Progress;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
-    let mut progress = Progress::load(&vfs, &route_dll(game)?)?;
+    let flags = load_flags(game, &vfs);
+    let mut progress = Progress::load(&vfs, &route_dll(game)?, flags)?;
     let answers: Vec<i32> = choices
         .split(',')
         .filter(|s| !s.trim().is_empty())
@@ -1685,7 +1907,7 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
 /// Prints the branch graph and the affection tables that drive it.
 fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) -> Result<()> {
     use days_route::{Machine, Routes};
-    use daysengine::install::feeling::{Deltas, Thresholds, FIRST, SECOND};
+    use daysengine::install::feeling::{self, Deltas, Thresholds, FIRST, SECOND};
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let dll = route_dll(game)?;
@@ -1766,8 +1988,11 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
         let first = table.first().map_or("(empty)", String::as_str);
         let last = table.last().map_or("(empty)", String::as_str);
         println!(
-            "  ROUTE {route:>2} (0x{route:02x})  {:>3} scenes  {first} .. {last}",
-            table.len()
+            "  ROUTE {route:>2} (0x{route:02x})  {:>3} scenes  chapter {}  {first} .. {last}",
+            table.len(),
+            machine
+                .chapter(route)
+                .map_or_else(|| "?".into(), |n| n.to_string())
         );
         if list_scenes || edges {
             for (scene, script) in table.iter().enumerate() {
@@ -1819,24 +2044,28 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
     // them live in the per-save store, which host slots +0x08/+0x0c reach
     // through `engine + 0x40` while the global store hangs off `engine + 0x3c`.
     println!();
-    match slot_feeling(game, &deltas) {
-        Some((slot, route, scene, feeling)) => {
-            let (a, b) = feeling.gauge();
+    match slot_feeling(game) {
+        Some((slot, route, scene, store)) => {
+            let (a, b) = feeling::gauge(&store);
             println!("{slot}: ROUTE {route}, SCENE {scene}");
-            for (name, value) in feeling.iter() {
+            for name in deltas.names() {
                 let drawn = if name == FIRST || name == SECOND {
                     "  (gauge)"
                 } else {
                     ""
                 };
-                println!("  {name} = {value}{drawn}");
+                println!("  {name} = {}{drawn}", store.int(name));
             }
             println!(
                 "  the branch test (get(\"{SECOND}\") < get(\"{FIRST}\")) takes the {} arm: {}",
-                if feeling.first_leads() { "if" } else { "else" },
+                if feeling::first_leads(&store) {
+                    "if"
+                } else {
+                    "else"
+                },
                 if a == b {
                     "the two are level, and the test is a strict <".to_string()
-                } else if feeling.first_leads() {
+                } else if feeling::first_leads(&store) {
                     format!("{FIRST} leads by {}", a - b)
                 } else {
                     format!("{SECOND} leads by {}", b - a)
@@ -1905,7 +2134,7 @@ fn paths<L>(step: &days_route::Step<L>, leaf: &dyn Fn(&L) -> String) -> Vec<Stri
                 Act::SetGlobalFlag(n, v) => Some(format!("global flag {n}={}", *v as u8)),
                 Act::Story(n) => Some(format!("SP{n:03}")),
                 Act::ClearStory(n) => Some(format!("clear SP{n}")),
-                Act::Ending => Some("register the ending".into()),
+                Act::Ending(n) => Some(format!("register ending {n}")),
                 Act::ClearRouteFlags => Some("clear the route's flags".into()),
                 Act::Host(_) => None,
             })
@@ -2107,19 +2336,11 @@ fn check_edges(routes: &days_route::Routes, machine: &days_route::Machine) {
     println!("  {blind} scenes whose crediting could not be decoded");
 }
 
-/// The counters out of the first readable save slot.
+/// The counters out of the first save slot that decodes.
 ///
-/// A slot is `"SLog"`, a version, the script it sits in, four bytes whose
-/// meaning is not recovered, and then a whole flag store — see
-/// `docs/FORMATS.md`. Rather than walk the head past the fields that are not
-/// recovered, this finds the embedded store by its own magic and parses that,
-/// which is the part the format is sure about.
-fn slot_feeling(
-    game: &Path,
-    deltas: &daysengine::install::feeling::Deltas,
-) -> Option<(String, i32, i32, daysengine::install::feeling::Feeling)> {
-    use daysengine::install::feeling::Feeling;
-
+/// A slot's own store is the whole of its state, so this is just the first
+/// `Slot` the install has, read in full rather than hunted for by magic.
+fn slot_feeling(game: &Path) -> Option<(String, i32, i32, days_save::FlagStore)> {
     let mut slots: Vec<_> = std::fs::read_dir(game.join("Save"))
         .ok()?
         .filter_map(Result::ok)
@@ -2136,26 +2357,16 @@ fn slot_feeling(
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        let Some(at) = bytes
-            .windows(days_save::MAGIC.len())
-            .position(|w| w == days_save::MAGIC)
-        else {
+        let Ok(slot) = days_save::Slot::parse(&bytes) else {
             continue;
         };
-        let Ok((store, _)) = days_save::FlagStore::parse_embedded(&bytes[at..]) else {
-            continue;
-        };
-        let int = |name: &str| store.get(name).and_then(|v| v.as_int()).unwrap_or(0);
-        let mut feeling = Feeling::new();
-        for name in deltas.names() {
-            feeling.set(name, int(name));
-        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("save slot")
             .to_string();
-        return Some((name, int("ROUTE"), int("SCENE"), feeling));
+        let (route, scene) = (slot.store.int("ROUTE"), slot.store.int("SCENE"));
+        return Some((name, route, scene, slot.store));
     }
     None
 }

@@ -22,6 +22,7 @@ use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
 use daysengine::ui::options::{Dir, Display, Som};
 use daysengine::ui::replay::Scenes;
+use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
 use daysengine::ui::select::{self, Choice, Input, Select};
 use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
@@ -272,7 +273,7 @@ fn main() -> Result<()> {
     // and not a refusal to start.
     let mut progress = match std::fs::read(game.join("RouteProcSDHQ.dll"))
         .map_err(|e| e.to_string())
-        .and_then(|dll| Progress::load(&vfs, &dll).map_err(|e| e.to_string()))
+        .and_then(|dll| Progress::load(&vfs, &dll, player.flags.clone()).map_err(|e| e.to_string()))
     {
         Ok(p) => Some(p),
         Err(err) => {
@@ -286,9 +287,20 @@ fn main() -> Result<()> {
     // position is already the graph's and must not be looked up again: a
     // script that several routes list would resolve back to the first of them.
     let mut chained = false;
+    // Set when the menus should open straight onto the save or load screen,
+    // which is what the control bar's own buttons ask for.
+    let mut open_saveload: Option<saveload::Kind> = None;
     loop {
         if menus && !chained {
-            match run_menu(&mut player, &mut canvas, &creator, &mut events, &start)? {
+            let kind = open_saveload.take();
+            match run_menu(
+                &mut player,
+                &mut canvas,
+                &creator,
+                &mut events,
+                &start,
+                kind,
+            )? {
                 Outcome::Quit => break,
                 Outcome::Play | Outcome::Finished => next = wanted.clone(),
                 // A replay names its own script, which the DLL's table spells
@@ -296,6 +308,30 @@ fn main() -> Result<()> {
                 Outcome::Replay(script) => {
                     next = script.rsplit('/').next().unwrap_or(&script).to_string();
                     log::info!("replaying {next}");
+                }
+                // Loading from the title puts the player wherever the slot
+                // says, so the position comes from the slot and not from a
+                // fresh `searchRoot` on the name.
+                Outcome::LoadSlot(slot) => match progress
+                    .as_mut()
+                    .and_then(|p| p.load_from(&game, &film, slot))
+                {
+                    Some(script) => {
+                        next = script.rsplit('/').next().unwrap_or(&script).to_string();
+                        chained = true;
+                        continue;
+                    }
+                    None => {
+                        log::warn!("slot {slot} would not load");
+                        continue;
+                    }
+                },
+                // There is nothing to save from the title -- the player has no
+                // position -- so this only happens from playback, where the
+                // save is taken before the menus open.
+                Outcome::SaveSlot(slot) => {
+                    log::info!("slot {slot} cannot be written from the title");
+                    continue;
                 }
             }
         }
@@ -323,6 +359,7 @@ fn main() -> Result<()> {
             &creator,
             &mut events,
             script,
+            &start,
             progress.as_mut(),
         )?;
         canvas.window_mut().set_title("DaysEngine")?;
@@ -354,6 +391,10 @@ enum Outcome {
     Finished,
     /// Play one replay scene's script, chosen on the replay screen.
     Replay(String),
+    /// Load a save slot and play what it names.
+    LoadSlot(u32),
+    /// Write the player's position to a save slot.
+    SaveSlot(u32),
     /// Close the game.
     Quit,
 }
@@ -402,7 +443,7 @@ fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
 /// A scene table that cannot be recovered is not fatal: the replay screen shows
 /// an empty grid and says why, which is the same rule every other missing asset
 /// follows.
-fn build_session(player: &Player, start: &Ini) -> Session {
+fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
     let scenes = match Scenes::recover(&player.dll) {
         Ok(scenes) => scenes,
         Err(err) => {
@@ -423,6 +464,9 @@ fn build_session(player: &Player, start: &Ini) -> Session {
             full_screen: false,
         },
         som: Som::default(),
+        // The screen reports a slot as present when its file opens, and takes
+        // the line it shows from the global store.
+        slots: Slots::read(&player.game, player.film, &player.flags, english),
     }
 }
 
@@ -449,8 +493,12 @@ fn run_menu(
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     start: &Ini,
+    kind: Option<saveload::Kind>,
 ) -> Result<Outcome> {
-    let session = build_session(player, start);
+    // `[UseEnglish]` decides which way round the save line's date reads, and
+    // how many characters of it are the chapter.
+    let english = player.film.get_bool("UseEnglish").unwrap_or(false);
+    let session = build_session(player, start, english);
     apply_settings(&session, player.mixer);
     let mut menu = Menu::open(
         player.vfs,
@@ -460,6 +508,11 @@ fn run_menu(
         MENU_RESOLUTION,
     )
     .context("opening the title screen")?;
+    // The bar's menu buttons open this module directly, which is
+    // `setSystemInit` code 4 to save and 5 to load.
+    if let Some(kind) = kind {
+        menu.open_saveload(player.vfs, &player.dll, kind)?;
+    }
 
     let backdrop = load_title_backdrop(player, start);
 
@@ -524,6 +577,8 @@ fn run_menu(
             match action {
                 Action::Play => return Ok(Outcome::Play),
                 Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
+                Action::Load(slot) => return Ok(Outcome::LoadSlot(slot)),
+                Action::Save(slot) => return Ok(Outcome::SaveSlot(slot)),
                 Action::Quit => return Ok(Outcome::Quit),
                 // Each change is already in the settings; this is where the
                 // engine picks the new volumes up.
@@ -683,6 +738,7 @@ fn run_script(
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     script: Script,
+    start_ini: &Ini,
     mut progress: Option<&mut Progress>,
 ) -> Result<Outcome> {
     player.mixer.stop_all();
@@ -896,8 +952,52 @@ fn run_script(
                         // Host `+0x100(1)` leaves playback rather than moving
                         // along it, so this one goes back to the title.
                         bar::Act::Leave => return Ok(Outcome::Play),
+                        // `setSystemInit` takes these numbers: 4 opens the
+                        // save/load module to save, 5 to load, 2 the Option
+                        // screen. What 3 selects is an object `SystemInit`
+                        // has no case for and is **not recovered**.
                         bar::Act::Menu(request) => {
-                            log::info!("the bar asked for menu {} over playback", request.0)
+                            let kind = match request.0 {
+                                4 => Some(saveload::Kind::Save),
+                                5 => Some(saveload::Kind::Load),
+                                _ => None,
+                            };
+                            let Some(kind) = kind else {
+                                log::info!(
+                                    "the bar asked for menu {}, which is not recovered",
+                                    request.0
+                                );
+                                continue;
+                            };
+                            // Stop the script clock so playback resumes where
+                            // it was, open the menus, then put it back.
+                            offset = clock(origin, offset);
+                            let outcome =
+                                run_menu(player, canvas, creator, events, start_ini, Some(kind))?;
+                            origin = Instant::now();
+                            // Every cached texture belonged to the menu's
+                            // renderer; drop them so playback rebuilds.
+                            bar_texture = None;
+                            still_texture = None;
+                            text_texture = None;
+                            match outcome {
+                                Outcome::SaveSlot(slot) => {
+                                    if let Some(p) = progress.as_deref_mut() {
+                                        let game = player.game.clone();
+                                        match p.save_to(&game, player.film, slot, english, None) {
+                                            // The global store now holds the
+                                            // slot's display line, so the
+                                            // menus have to see it.
+                                            Ok(()) => player.flags = p.global().clone(),
+                                            Err(err) => {
+                                                log::warn!("could not write slot {slot}: {err}")
+                                            }
+                                        }
+                                    }
+                                }
+                                Outcome::Quit => return Ok(Outcome::Quit),
+                                other => return Ok(other),
+                            }
                         }
                         bar::Act::Step(step) => {
                             log::info!("the bar asked for step {step}")

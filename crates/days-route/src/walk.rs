@@ -143,11 +143,14 @@ struct State {
 const MAX_STEPS: usize = 8_000;
 const MAX_DEPTH: usize = 32;
 
-/// Runs `entry` with `scene` as the answer to `get_int("SCENE")`.
+/// Runs `entry` with some of the save's variable store already answered.
 ///
-/// `stack` seeds the incoming arguments; handlers take `(buf, size, host)` so
-/// the caller passes `host` at `[ebp+0x10]`.
-pub fn run(img: &Image, entry: u32, scene: i32, args: &[(i32, Val)]) -> Node {
+/// `known` is the point of the walk: a handler's `switch` is on a value it
+/// asks the host for, so fixing that value is what turns the compiled switch
+/// back into an answer. `args` seeds the incoming arguments — the route
+/// handlers take `(buf, size, host)`, so the caller passes `host` at
+/// `[ebp+0x10]`.
+pub fn run(img: &Image, entry: u32, known: &[(&str, i32)], args: &[(i32, Val)]) -> Node {
     let mut st = State {
         regs: HashMap::new(),
         stack: args.iter().cloned().collect(),
@@ -155,7 +158,8 @@ pub fn run(img: &Image, entry: u32, scene: i32, args: &[(i32, Val)]) -> Node {
         effects: Vec::new(),
         flags: None,
     };
-    step(img, entry, &mut st, scene, 0)
+    let known: Vec<(String, i32)> = known.iter().map(|(n, v)| ((*n).to_owned(), *v)).collect();
+    step(img, entry, &mut st, &known, 0)
 }
 
 fn read(img: &Image, st: &State, op: &Op) -> Val {
@@ -203,7 +207,7 @@ fn write(st: &mut State, op: &Op, v: Val) {
     }
 }
 
-fn step(img: &Image, mut va: u32, st: &mut State, scene: i32, depth: usize) -> Node {
+fn step(img: &Image, mut va: u32, st: &mut State, known: &[(String, i32)], depth: usize) -> Node {
     if depth > MAX_DEPTH {
         return Node::Unrecovered(format!(
             "conditionals nested past {MAX_DEPTH} at {va:#010x}"
@@ -305,8 +309,10 @@ fn step(img: &Image, mut va: u32, st: &mut State, scene: i32, depth: usize) -> N
                 };
                 let ret = match (s, name) {
                     (slot::CHOICE, _) => Val::Choice,
-                    // `SCENE` is what this walk is parameterised on.
-                    (slot::GET_INT, Some(n)) if n == "SCENE" => Val::Imm(scene),
+                    // A name this walk is parameterised on answers itself.
+                    (slot::GET_INT, Some(ref n)) if lookup(known, n).is_some() => {
+                        Val::Imm(lookup(known, n).unwrap_or_default())
+                    }
                     (slot::GET_INT, Some(n)) => Val::Int(n),
                     (slot::GET_BOOL, Some(n)) => Val::Bool(n),
                     (slot::GET_GLOBAL_BOOL, Some(n)) => Val::GlobalBool(n),
@@ -359,11 +365,11 @@ fn step(img: &Image, mut va: u32, st: &mut State, scene: i32, depth: usize) -> N
                 continue;
             }
             Insn::Jcc { cc, to } => {
-                let known = match &st.flags {
+                let settled = match &st.flags {
                     Some((Val::Imm(a), Val::Imm(b))) => cc.holds(*a, *b),
                     _ => None,
                 };
-                match known {
+                match settled {
                     Some(true) => {
                         va = *to;
                         continue;
@@ -373,8 +379,8 @@ fn step(img: &Image, mut va: u32, st: &mut State, scene: i32, depth: usize) -> N
                         let (lhs, rhs) = st.flags.clone().unwrap_or((Val::Unknown, Val::Unknown));
                         let effects = std::mem::take(&mut st.effects);
                         let mut other = st.clone();
-                        let then = step(img, *to, st, scene, depth + 1);
-                        let els = step(img, va + d.len as u32, &mut other, scene, depth + 1);
+                        let then = step(img, *to, st, known, depth + 1);
+                        let els = step(img, va + d.len as u32, &mut other, known, depth + 1);
                         return Node::Branch {
                             effects,
                             cc: *cc,
@@ -401,6 +407,10 @@ fn step(img: &Image, mut va: u32, st: &mut State, scene: i32, depth: usize) -> N
         va += d.len as u32;
     }
     Node::Unrecovered(format!("ran past {MAX_STEPS} instructions near {va:#010x}"))
+}
+
+fn lookup(known: &[(String, i32)], name: &str) -> Option<i32> {
+    known.iter().find(|(n, _)| n == name).map(|(_, v)| *v)
 }
 
 /// One byte out of a `switch`'s index table, when the index is known.

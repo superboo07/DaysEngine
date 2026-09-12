@@ -39,7 +39,8 @@ Early. What works today:
 | Video / audio decode | **Done** — matches ffmpeg's own output |
 | Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
 | UI rendering — title, menubar, options, replay grid, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
-| UI rendering — save/load, replay play-data list | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover; choosing them leaves the menu where it was |
+| UI rendering — save/load | **Works** — the game's own LOAD/SAVE screen, its ten rows, ten page buttons and route-map button, from the player's art; picking a row loads or writes that slot. Its chip table needed the atlas matcher to believe a long exact run rather than a majority of regions, because ten of its rows are one sprite behind two hit regions each. **Where a row's text sits is not recovered** — the DLL renders the three columns into an off-screen surface and blits it — so the rows draw empty; `days menu` prints the lines |
+| UI rendering — replay play-data list | Not started — choosing it leaves the menu where it was |
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
 | Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
@@ -47,9 +48,9 @@ Early. What works today:
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Subtitles | **Works, the game's own way** — broken by `FUN_0043f600` (62 columns, word-wrapped at spaces, English only, `\n` as a hard break, ruby marks recognised), spaced by the recovered pitch and kerning table rather than by measuring the glyph, and placed by `FUN_0044bf30`: centred on each line's own width, anchored to the bottom, at the per-resolution scale, with `[LeftArrangement]` switching to a left-aligned block. The speaker name is not drawn, because the original never hands it to the text layer, and the whole block is behind the `TextView` setting |
 | Text box art, backlog | Not started |
-| Route / branch graph | **Recovered** — the 55 routes, their 1,857-entry script tables and all 55 transition state machines come out of the user's own `RouteProcSDHQ.dll`, the tables by content and the machines by decoding the handlers, with no address embedded. Scripts chain: a choice moves the player through the graph and credits what it earns. `days route --edges` prints every edge and checks the graph against the tables. **Progress is not saved** — writing `Save/SaveFileNNN.DAT` is not decoded, so a session's position is lost when the game closes |
+| Route / branch graph | **Recovered** — the 55 routes, their 1,857-entry script tables and all 55 transition state machines come out of the user's own `RouteProcSDHQ.dll`, the tables by content and the machines by decoding the handlers, with no address embedded. Scripts chain: a choice moves the player through the graph and credits what it earns. `days route --edges` prints every edge and checks the graph against the tables |
 | Affection gauge | **Recovered** — the five counters, both tables, the relative test that 25 routes branch on and the 13 absolute thresholds, plus the gauge's own geometry. `days route` shows a save's counters and which way the test falls. The gauge's three sprites are not composed: their source rectangles are not recovered |
-| Save file compatibility | Not started |
+| Save data | **Works, both ways** — `Save/SaveFileNNN.DAT` is a log of where the player is, every story point they reached with the state they reached it in, and the choice they made at every script. Read and written, along with `GlobalFlag.DAT` and the line the save screen shows. Every one of the 22 files in the test install reads and writes back **byte for byte identical**, so a save this engine writes is a save the original game reads. `days save --slot N` decodes one; `days save --roundtrip` is that check |
 
 ## Building
 
@@ -137,6 +138,8 @@ days ui System/Title/Title -r full --active 1 -o /tmp/title.png
 days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 days config                          # the player's settings, as the Option screen reads them
 days replay                          # the replay scene table, and what the save has unlocked
+days save --slot 0                   # decode a save slot: position, story points, choices
+days save --roundtrip                # read every save file, write it back, compare bytes
 days bar --pointer 400,40 -o /tmp/bar.png   # the control bar, widget by widget
 days render 00-00-A00 --at 00:39:00 --bar -o /tmp/frames   # ...over a real frame
 days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test

@@ -8,30 +8,46 @@
 //! answered against.
 //!
 //! ```text
-//! the save's variable store   ROUTE, SCENE, the five counters, the BS****
-//!                             back-bookmarks    (host +0x08 / +0x0c)
-//! the save's flag store       the numbered gate flags, SP***
-//!                             (host +0x10 / +0x14)
-//! the global flag store       SP***, EndClear, End%02d
-//!                             (host +0x18 / +0x1c)
+//! the save's store     ROUTE, SCENE, the five counters, the numbered gate
+//!                      flags, SP***, the BS**** back-bookmarks
+//!                      (host +0x08/+0x0c for ints, +0x10/+0x14 for flags --
+//!                       both reach the same member, host + 0x14)
+//! the global store     SP***, EndClear, EndNo, [EndNN], the save screen's
+//!                      display lines    (host +0x18/+0x1c)
 //! ```
 //!
-//! # What this does not do
+//! There are **two** stores and not three: the integer and boolean accessors
+//! differ only in the `VARIANT` coercion they apply, and a player's own save
+//! has `001` as `VT_I4` sitting beside `946` as `VT_BOOL` in one map.
 //!
-//! **None of it is written back to a save.** `Save/SaveFileNNN.DAT` is only
-//! decoded as far as its head and the flag store embedded in it, so a session's
-//! progress lives in memory and is gone when the game closes. Loading a save
-//! would seed these stores; writing one is not implemented.
+//! # Saving and loading
+//!
+//! A slot is a log rather than a snapshot — see [`days_save::slot`] — so
+//! writing one is a matter of handing over the store, the story points reached
+//! and the choices made, and loading one is putting them back. The global
+//! store carries what the save screen shows and everything the player has
+//! unlocked, and is written alongside.
 
-use crate::install::feeling::{Deltas, Feeling, Thresholds};
+use crate::install::feeling::{self, Deltas, Thresholds};
+use crate::install::ini::Ini;
+use crate::install::save::{self, Mark, Slot};
 use crate::install::vfs::Vfs;
 use days_route::{Act, Context, Machine, Next, Routes};
-use std::collections::BTreeSet;
+use days_save::{FlagStore, Value};
+use std::path::Path;
 
-/// The name the position is kept under in the save's variable store. The route
-/// DLL reads and writes both by these names and nothing else.
+/// The names the position is kept under in the save's store. The route DLL
+/// reads and writes both by these names and nothing else.
 const ROUTE: &str = "ROUTE";
 const SCENE: &str = "SCENE";
+
+/// The version a retail slot carries, and the one the shipped executable
+/// compares against.
+///
+/// Every slot in the player's install holds `1.0`. What
+/// `_GetVersionToRoute@4` computes is **not recovered**, so a slot written
+/// from nothing carries this and a slot rewritten carries whatever it had.
+const RETAIL_VERSION: f32 = 1.0;
 
 /// The stores the route DLL questions, and the tables it questions them
 /// against.
@@ -41,13 +57,10 @@ const SCENE: &str = "SCENE";
 /// and the answers come from here.
 #[derive(Debug, Default)]
 struct Stores {
-    /// The save's variable store. One map holds `ROUTE`, `SCENE`, the five
-    /// feeling counters and the `BS****` back-bookmarks alike —
-    /// `FUN_00460810` looks all of them up the same way, creating a missing
-    /// name on demand, which is why an unset counter reads zero.
-    vars: Feeling,
-    flags: BTreeSet<String>,
-    global: BTreeSet<String>,
+    /// The save's own store, which is the whole of a slot's state.
+    save: FlagStore,
+    /// The global store, out of `GlobalFlag.DAT`.
+    global: FlagStore,
     thresholds: Thresholds,
     /// The choice the player last made, or -1 when the box timed out. The
     /// engine stores it and the DLL reads it through host slot `+0x04`.
@@ -60,19 +73,19 @@ impl Context for Stores {
     }
 
     fn int(&self, name: &str) -> i32 {
-        self.vars.get(name)
+        self.save.int(name)
     }
 
     fn flag(&self, name: &str) -> bool {
-        self.flags.contains(name)
+        self.save.flag(name)
     }
 
     fn global_flag(&self, name: &str) -> bool {
-        self.global.contains(name)
+        self.global.flag(name)
     }
 
     fn threshold(&self, script: &str) -> bool {
-        self.vars.passes(&self.thresholds, script)
+        feeling::passes(&self.save, &self.thresholds, script)
     }
 }
 
@@ -83,6 +96,14 @@ pub struct Progress {
     machine: Machine,
     deltas: Deltas,
     stores: Stores,
+    /// The story points the player has reached, for the slot to carry.
+    marks: std::collections::BTreeMap<String, Mark>,
+    /// The choice made at each script, likewise.
+    choices: std::collections::BTreeMap<String, i32>,
+    /// The engine version a slot must match, from `_GetVersionToRoute@4`. Not
+    /// recovered, so slots are written with what they were read with, or with
+    /// the retail 1.0 for a slot written from nothing.
+    version: f32,
     /// Whether the affection gauge should be showing, which the DLL raises
     /// through host slot `+0x30` after a delta that moved `001` or `002`.
     gauge_raised: bool,
@@ -95,7 +116,15 @@ impl Progress {
     /// empty rather than refused: a script with no entry credits nothing and
     /// passes no gate, which is what the DLL's own substring search does with
     /// a file it could not load.
-    pub fn load(vfs: &Vfs, route_dll: &[u8]) -> Result<Progress, days_route::Error> {
+    /// `global` is the player's own `GlobalFlag.DAT`. It is a parameter and
+    /// not something this fills in later because saving writes the store back
+    /// over that file: a `Progress` built without it would erase everything
+    /// the player has unlocked the first time they saved.
+    pub fn load(
+        vfs: &Vfs,
+        route_dll: &[u8],
+        global: FlagStore,
+    ) -> Result<Progress, days_route::Error> {
         let read = |path: &str| match vfs.read_path(path) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -108,10 +137,14 @@ impl Progress {
             machine: Machine::recover(route_dll)?,
             deltas: Deltas::parse(&read("Ini/FeelingScript.ini")),
             stores: Stores {
+                global,
                 thresholds: Thresholds::parse(&read("Ini/StanderdScript.ini")),
                 choice: -1,
                 ..Default::default()
             },
+            marks: Default::default(),
+            choices: Default::default(),
+            version: RETAIL_VERSION,
             gauge_raised: false,
         })
     }
@@ -127,8 +160,8 @@ impl Progress {
         let full = qualify(script);
         match self.routes.find(&full) {
             Some((route, scene)) => {
-                self.stores.vars.set(ROUTE, route as i32);
-                self.stores.vars.set(SCENE, scene as i32);
+                self.stores.save.set_int(ROUTE, route as i32);
+                self.stores.save.set_int(SCENE, scene as i32);
                 log::info!("{full} is ROUTE {route} SCENE {scene}");
                 true
             }
@@ -141,7 +174,7 @@ impl Progress {
 
     /// The current `(ROUTE, SCENE)`.
     pub fn position(&self) -> (i32, i32) {
-        (self.stores.vars.get(ROUTE), self.stores.vars.get(SCENE))
+        (self.stores.save.int(ROUTE), self.stores.save.int(SCENE))
     }
 
     /// Records a decided choice and credits what it earns.
@@ -154,6 +187,14 @@ impl Progress {
     pub fn decide(&mut self, choice: i32) {
         self.stores.choice = choice;
         let (route, scene) = self.position();
+        // The engine records the answer against the script it was asked at,
+        // which is what a slot carries and what replaying reads back.
+        if let Some(here) = self
+            .routes
+            .script(route.max(0) as usize, scene.max(0) as usize)
+        {
+            self.choices.insert(here.to_owned(), choice);
+        }
         let Ok(scene) = u16::try_from(scene) else {
             return;
         };
@@ -163,7 +204,7 @@ impl Progress {
         else {
             return;
         };
-        if self.stores.vars.apply(&self.deltas, &script) {
+        if feeling::credit(&mut self.stores.save, &self.deltas, &script) {
             self.gauge_raised = true;
         }
         log::info!("choice {choice} credits the deltas of {script}");
@@ -179,13 +220,18 @@ impl Progress {
         let (acts, next) = self
             .machine
             .next(usize::try_from(route).ok()?, scene, &self.stores)?;
+        let here = self
+            .routes
+            .script(route.max(0) as usize, scene as usize)
+            .unwrap_or_default()
+            .to_owned();
         for act in &acts {
-            self.apply(act);
+            self.apply(act, &here);
         }
         let played = match next {
             Next::Scene { route, scene } => {
-                self.stores.vars.set(ROUTE, route as i32);
-                self.stores.vars.set(SCENE, scene as i32);
+                self.stores.save.set_int(ROUTE, route as i32);
+                self.stores.save.set_int(SCENE, scene as i32);
                 self.routes
                     .script(route as usize, scene as usize)?
                     .to_owned()
@@ -195,11 +241,11 @@ impl Progress {
             // than one name means the DLL rotates between them; nothing here
             // keeps that counter, so the first is played.
             Next::Named { names, scene } => {
-                self.stores.vars.set(SCENE, scene as i32);
+                self.stores.save.set_int(SCENE, scene as i32);
                 names.first()?.clone()
             }
             Next::Stop => {
-                self.stores.vars.set(ROUTE, -1);
+                self.stores.save.set_int(ROUTE, -1);
                 log::info!("the route ended");
                 return None;
             }
@@ -213,9 +259,117 @@ impl Progress {
         Some(played)
     }
 
+    /// Everything a slot carries, as it stands.
+    ///
+    /// A slot is a log: where the player is, the store, the story points and
+    /// the choices. The version is the one the slot was loaded with, so a slot
+    /// written back still matches what the shipped executable compares it
+    /// against and the original game still reads it.
+    pub fn to_slot(&self) -> Slot {
+        let (route, scene) = self.position();
+        Slot {
+            script: self
+                .routes
+                .script(route.max(0) as usize, scene.max(0) as usize)
+                .unwrap_or_default()
+                .to_owned(),
+            version: self.version,
+            store: self.stores.save.clone(),
+            marks: self.marks.clone(),
+            choices: self.choices.clone(),
+        }
+    }
+
+    /// Puts a slot back, as loading one does.
+    ///
+    /// The slot's own store replaces the save's, and its script decides the
+    /// position: the shipped loader hands the script and the version to
+    /// `FUN_0042a760` rather than trusting the `ROUTE`/`SCENE` in the store,
+    /// so a slot whose store disagrees with its script follows the script.
+    pub fn from_slot(&mut self, slot: Slot) -> Option<String> {
+        self.version = slot.version;
+        self.stores.save = slot.store;
+        self.marks = slot.marks;
+        self.choices = slot.choices;
+        self.stores.choice = -1;
+        self.gauge_raised = false;
+        if !self.enter(&slot.script) {
+            log::warn!("{} is in no route table", slot.script);
+        }
+        Some(slot.script)
+    }
+
+    /// The chapter the player is in — the `N` the save line spells `第N話`.
+    pub fn chapter(&self) -> u32 {
+        let (route, _) = self.position();
+        self.machine.chapter(route.max(0) as usize).unwrap_or(1)
+    }
+
+    /// The global store, which is what the save screen's display lines and
+    /// everything the player has unlocked live in.
+    pub fn global(&self) -> &days_save::FlagStore {
+        &self.stores.global
+    }
+
+    pub fn global_mut(&mut self) -> &mut days_save::FlagStore {
+        &mut self.stores.global
+    }
+
+    /// Writes the player's position into a slot, and the display line the save
+    /// screen shows for it into the global store.
+    ///
+    /// Both files are written: the slot, and `GlobalFlag.DAT`, which is where
+    /// the line lives. A slot with no line would show as empty on the screen
+    /// even though its file is there, because that is how the shipped screen
+    /// decides what to draw.
+    pub fn save_to(
+        &mut self,
+        game: &Path,
+        film: &Ini,
+        slot: u32,
+        english: bool,
+        comment: Option<&str>,
+    ) -> std::io::Result<()> {
+        use crate::install::clock;
+        use crate::ui::saveload;
+
+        let (head, tail) = saveload::display_line(clock::now(), self.chapter(), english);
+        let (key, sub) = save::slot_keys(film, slot);
+        // The two halves are stored joined; the reader splits the chapter back
+        // off by character count.
+        let comment = comment
+            .map(str::to_owned)
+            .or_else(|| {
+                self.stores
+                    .global
+                    .get(&sub)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        self.stores
+            .global
+            .set(&key, Value::Str(format!("{head}{tail}")));
+        self.stores.global.set(&sub, Value::Str(comment));
+
+        save::write_slot(game, film, slot, &self.to_slot())?;
+        save::write_flags(game, film, &self.stores.global)
+    }
+
+    /// Reads a slot back, returning the script to play.
+    pub fn load_from(&mut self, game: &Path, film: &Ini, slot: u32) -> Option<String> {
+        let data = save::load_slot(game, film, slot)?;
+        log::info!(
+            "loading slot {slot}: {} with {} story points",
+            data.script,
+            data.marks.len()
+        );
+        self.from_slot(data)
+    }
+
     /// The two values the gauge draws, and whether it should be showing.
     pub fn gauge(&self) -> ((i32, i32), bool) {
-        (self.stores.vars.gauge(), self.gauge_raised)
+        (feeling::gauge(&self.stores.save), self.gauge_raised)
     }
 
     /// Hides the gauge, which `FUN_10026050` does through slot `+0x30`.
@@ -223,35 +377,53 @@ impl Progress {
         self.gauge_raised = false;
     }
 
-    fn apply(&mut self, act: &Act) {
+    fn apply(&mut self, act: &Act, script: &str) {
         match act {
-            Act::SetInt(name, value) => self.stores.vars.set(name, *value),
-            Act::SetFlag(name, on) => set(&mut self.stores.flags, name, *on),
-            Act::SetGlobalFlag(name, on) => set(&mut self.stores.global, name, *on),
-            // The marker sets `SP%03d` in both stores; the clear path formats
-            // the number unpadded, which only differs below 100 and no story
-            // number is.
+            Act::SetInt(name, value) => self.stores.save.set_int(name, *value),
+            Act::SetFlag(name, on) => self.stores.save.set_flag(name, *on),
+            Act::SetGlobalFlag(name, on) => self.stores.global.set_flag(name, *on),
+            // The marker sets `SP%03d` in both stores, and records the story
+            // point in the slot's own log along with the store as it stands.
             Act::Story(n) => {
                 let name = format!("SP{n:03}");
-                set(&mut self.stores.flags, &name, true);
-                set(&mut self.stores.global, &name, true);
+                self.stores.save.set_flag(&name, true);
+                self.stores.global.set_flag(&name, true);
+                let order = self.marks.len() as i32;
+                self.marks.entry(name.clone()).or_insert_with(|| Mark {
+                    script: script.to_owned(),
+                    story: name,
+                    order,
+                    store: self.stores.save.clone(),
+                });
             }
-            Act::ClearStory(n) => set(&mut self.stores.flags, &format!("SP{n}"), false),
-            // Registering an ending and clearing a route's flags both need
-            // more of the save format than is decoded; they are logged so a
-            // session shows where they would have happened.
-            Act::Ending => log::info!("the route registered an ending"),
-            Act::ClearRouteFlags => log::info!("the route cleared its flags"),
+            // The DLL's clear path formats the number unpadded, which would
+            // disagree below 100; no story number is.
+            Act::ClearStory(n) => self.stores.save.set_flag(&format!("SP{n}"), false),
+            Act::Ending(n) => self.register_ending(*n),
+            // Gated in the DLL by a word only a developer machine sets, so
+            // this never runs in a shipped game -- see `days_route`.
+            Act::ClearRouteFlags => log::info!("the route asked to clear its flags"),
             Act::Host(slot) => log::debug!("the route called host slot {slot:#04x}"),
         }
     }
-}
 
-fn set(store: &mut BTreeSet<String>, name: &str, on: bool) {
-    if on {
-        store.insert(name.to_owned());
-    } else {
-        store.remove(name);
+    /// What `FUN_10006590` does when a route reaches an ending.
+    ///
+    /// The flag's name really is spelled with the trailing `]="`: the DLL
+    /// formats `[End%02d]="` and uses the whole thing as a key, and the
+    /// player's own `GlobalFlag.DAT` carries names of exactly that shape. The
+    /// number comes from the route handler as a literal.
+    ///
+    /// `EndNo` goes to the global store as an integer through host slot
+    /// `+0x24`; `EndClear` goes to both stores.
+    fn register_ending(&mut self, no: u32) {
+        self.stores
+            .global
+            .set_flag(&format!("[End{no:02}]=\""), true);
+        self.stores.global.set_flag("EndClear", true);
+        self.stores.global.set_int("EndNo", no as i32);
+        self.stores.save.set_flag("EndClear", true);
+        log::info!("ending {no} registered");
     }
 }
 
@@ -276,12 +448,21 @@ mod tests {
         assert_eq!(qualify(""), "");
     }
 
+    /// The counters, the numbered gate flags and the bookmarks are one map,
+    /// and a name can hold either type — which is what a player's own save
+    /// has, `001` as `VT_I4` beside `946` as `VT_BOOL`.
     #[test]
-    fn a_flag_set_false_is_absent_rather_than_present_and_zero() {
-        let mut s = BTreeSet::new();
-        set(&mut s, "972", true);
-        assert!(s.contains("972"));
-        set(&mut s, "972", false);
-        assert!(s.is_empty());
+    fn the_save_store_holds_both_types_under_one_namespace() {
+        let mut store = FlagStore::default();
+        store.set_int("001", 69);
+        store.set_flag("946", true);
+        assert_eq!(store.int("001"), 69);
+        assert!(store.flag("946"));
+        // A flag read as an integer is zero rather than an error, which is
+        // what a typed getter against the wrong tag gives.
+        assert_eq!(store.int("946"), 0);
+        assert!(!store.flag("001"));
+        // A name never written reads as zero: the store creates it on demand.
+        assert_eq!(store.int("never written"), 0);
     }
 }

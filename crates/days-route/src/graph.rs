@@ -126,8 +126,9 @@ pub enum Act {
     /// with the set path below 100 — every story number in the retail build is
     /// 100 or more, so it never does.
     ClearStory(u32),
-    /// Register an ending.
-    Ending,
+    /// Register an ending, by its number. The route handler passes it as a
+    /// literal, so which ending a scene is is recovered with the edge.
+    Ending(u32),
     /// Clear this route's numbered flags. Gated by a DLL word that only a
     /// developer machine sets — see [`Machine::dll_word`].
     ClearRouteFlags,
@@ -212,6 +213,8 @@ pub struct Machine {
     handlers: Vec<u32>,
     /// The same, for `_SetFeeling@8`.
     feeling: Vec<u32>,
+    /// `_GetStory@4`, which is one function rather than a dispatch.
+    chapters: Option<u32>,
     helpers: HashMap<u32, Helper>,
     /// `scene -> story number`, per route.
     story: Vec<BTreeMap<u16, u32>>,
@@ -234,12 +237,15 @@ impl Machine {
             None => Vec::new(),
         };
 
+        let chapters = img.exports.get("_GetStory@4").copied();
+
         let mut m = Machine {
             dll: dll.to_vec(),
             base: img.base,
             sections: img.sections.clone(),
             handlers,
             feeling,
+            chapters,
             helpers: HashMap::new(),
             story: Vec::new(),
         };
@@ -318,10 +324,34 @@ impl Machine {
         let raw = walk::run(
             &self.image(),
             entry,
-            scene as i32,
+            &[("SCENE", scene as i32)],
             &[(8, Val::Host), (0xc, Val::Imm(1))],
         );
         Some(self.build(&raw, route, scene, Vec::new(), &|e| self.credit_of(e)))
+    }
+
+    /// The chapter a route belongs to — the `N` in the save screen's
+    /// `第N話`.
+    ///
+    /// `_GetStory@4` is a 55-way switch on `ROUTE` that returns a small
+    /// number, and it is decoded rather than transcribed: the walker seeds
+    /// `ROUTE` and reads the constant the export returns. The retail build
+    /// groups the 55 routes into six chapters.
+    pub fn chapter(&self, route: usize) -> Option<u32> {
+        let entry = *self.chapters.as_ref()?;
+        let n = walk::run(
+            &self.image(),
+            entry,
+            &[("ROUTE", route as i32)],
+            &[(8, Val::Host)],
+        );
+        match n {
+            Raw::Do(leaf) => u32::try_from(leaf.returns?).ok(),
+            // Nothing in the export branches on anything but `ROUTE`, so a
+            // fork here means the walk did not settle; take neither arm rather
+            // than pick one.
+            Raw::Branch { .. } | Raw::Unrecovered(_) => None,
+        }
     }
 
     /// A word in the DLL's own `.data`, as the image initialises it.
@@ -378,7 +408,7 @@ impl Machine {
                             &walk::run(
                                 &img,
                                 at,
-                                scene as i32,
+                                &[("SCENE", scene as i32)],
                                 &[(8, Val::Host), (0xc, Val::Imm(1))],
                             ),
                             &mut out,
@@ -402,7 +432,7 @@ impl Machine {
             let raw = walk::run(
                 &img,
                 marker,
-                scene as i32,
+                &[],
                 &[
                     (8, Val::Host),
                     (0xc, Val::Imm(1)),
@@ -450,7 +480,7 @@ impl Machine {
         Some(walk::run(
             &self.image(),
             entry,
-            scene as i32,
+            &[("SCENE", scene as i32)],
             &[
                 (8, Val::Arg("buf")),
                 (0xc, Val::Arg("size")),
@@ -569,7 +599,11 @@ impl Machine {
                         out.push(Act::ClearStory(n));
                     }
                 }
-                Some(Helper::Ending) => out.push(Act::Ending),
+                Some(Helper::Ending) => {
+                    if let Some(Val::Imm(n)) = args.get(1) {
+                        out.push(Act::Ending(u32::try_from(*n).unwrap_or(0)));
+                    }
+                }
                 Some(Helper::ClearRouteFlags) => out.push(Act::ClearRouteFlags),
                 _ => {}
             }

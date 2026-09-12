@@ -1265,22 +1265,139 @@ checked together.
 reachable trial branch, so there is nothing to read; a trial build would be a
 different executable, not a different save. The engine answers `false`.
 
-## `Save/SaveFile00N.DAT` — a save slot
+## `Save/SaveFileNNN.DAT` — a save slot
 
-**Not yet decoded**, but it is built from the same primitives and its head
-parses with them:
+Not a snapshot of the engine: a **log**, which is what its magic says. It
+records where the player is, every story point they have reached with the state
+they reached it in, and the choice they made at every script. Loading replays
+that into the engine rather than restoring a memory image.
 
 ```text
-"SLog"                4 bytes
-varint  1             meaning unrecovered
-wstring               the script the slot is in, e.g. "05/05-A2-Z00"
-4 bytes               1.0f in the file checked; meaning unrecovered
-"FlgH" ...            a whole flag store, as above, embedded
+"SLog"                      4 bytes, compared on read
+records, until a 0 tag:
+    varint tag
+    tag 1   wstring script     where the player is
+            f32     version    checked against _GetVersionToRoute@4
+            FlgH    store      the save's store at that moment
+    tag 3   wstring script     a story point reached
+            wstring story      the SP*** flag its marker set
+            varint  order      how many story points preceded it
+            FlgH    store      the store as it was there
+    tag 4   wstring script     a script the player answered a choice at
+            varint  choice     the index they chose, -1 for none
+    tag 0   end of the file
 ```
 
-The two unrecovered fields are named here as what they are — unrecovered —
-rather than guessed at. `FUN_0042aea0` and `FUN_0042a980` locate these files
-through `[SaveFileName]=` and are where to start.
+Every other tag is refused, in the game's own words: "Undefined backlog entry."
+There is exactly one tag-1 record and it comes first; the tag-3 records follow
+in `std::map` order **by their story flag** and the tag-4 records in map order
+by script. The strings and varints are the same primitives `GlobalFlag.DAT`
+uses, cipher and all.
+
+Where each record comes from:
+
+- **tag 1** is the position. The loader hands the script and the version to
+  `FUN_0042a760`, which is what puts the player back — so a slot whose store
+  disagrees with its script follows the script.
+- **tag 3** is written by the story marker, host slot `+0x00` (`FUN_00428480`)
+  — the same call that sets `SP%03d` in both stores. `order` is the map's size
+  when the point was **first** recorded, so it is the order the player reached
+  them in and not the order they are stored in. Jumping back to a story point
+  erases every entry from it onward (`FUN_004331a0`), which is why `order` has
+  gaps in a save that has been rewound; one of the player's own slots does.
+- **tag 4** is the recorded choice. `FUN_00431740` stores it as each box
+  settles (`FUN_00428a50`) and reads it back instead of asking the player while
+  the engine is replaying (`FUN_00428a80`).
+
+**The version is checked.** `_GetVersionToRoute@4` reports a float and a slot
+whose tag-1 version differs is refused with a message box — "Script version
+does not match." / the Japanese equivalent, chosen by host `+0x5c`. Every slot
+in a retail install carries `1.0`; what the export computes is **not
+recovered**, so DaysEngine writes back whatever a slot was read with, and `1.0`
+for a slot written from nothing.
+
+### One store, not two
+
+A slot carries one `FlgH` map per record and that is the whole of its state.
+Host slots `+0x08`/`+0x0c` (integers) and `+0x10`/`+0x14` (booleans) all reach
+the same member, `host + 0x14`; only `+0x18`/`+0x1c` are a different store, the
+global one. So the feeling counters, the numbered gate flags, `SP***` and the
+`BS****` back-bookmarks share one map, and a name holds `VT_I4` or `VT_BOOL`
+depending on which setter last wrote it — a player's own save has `001` as
+`VT_I4` beside `946` as `VT_BOOL`.
+
+### The line the save screen shows
+
+A slot file says nothing about itself. The display line lives in the **global**
+store, under the key `[SaveConfig]="FILMEngine/SaveFile00%d"` formats, with the
+player's comment under the same name plus `_Sub`. `FUN_0042aea0` writes both
+when it writes the slot; `FUN_0042a980` reads them back and reports a slot as
+present only when **the file opens**.
+
+`FUN_10011b40` builds the line from the clock and the chapter number, stored as
+one string:
+
+```text
+Japanese   "%4d年%2d月%2d日(%s)%02d:%02d"  +  "第%d話"
+English    "%2d/%2d/%4d(%s)%02d:%02d"      +  "%02d"
+```
+
+The reader splits the chapter back off by character count — three for Japanese,
+two for English — which is exactly the length each tail has. The chapter is
+`_GetStory@4`, a 55-way switch on `ROUTE` returning 1..6; `days-route` decodes
+it the same way it decodes the branch graph.
+
+### How far this was checked
+
+Every one of the player's 22 save files — the 63KB global store with its 2,174
+flags and all 21 slots — **reads and writes back byte for byte identical**, and
+each slot also survives a pass through the engine's own model of it unchanged.
+That is the standard the writer is held to: a save DaysEngine writes is a save
+the original game reads. `days save --roundtrip` is that check.
+
+---
+
+## The save/load screen — mode 3, `System/SaveLoad`
+
+One module does both jobs, chosen by its `+0x94`. `setSystemInit` — a **second
+dispatch**, with its own numbering, separate from `SystemInit`'s mode integers
+— pokes it: code 4 opens the module to save, code 5 to load. Those are two of
+the numbers the control bar's own menu buttons produce, so the bar's four menu
+widgets are Save, Load, something `SystemInit` has no case for, and Option.
+
+Ten slots to a page and ten page buttons, so a hundred slots. The widget table
+has two bands of ten for the rows, and both do the same thing:
+
+```text
+0x00 .. 0x09   the ten rows
+0x0a .. 0x13   the ten page buttons
+0x14           leave
+0x15           the route map, Load screen only
+0x16 .. 0x1f   the ten rows again, the other band
+```
+
+`FUN_10014990` is that dispatch. The slot a row stands for is `page * 10 + row`,
+which is why the shipped `[SaveFileName]="Save/SaveFile00%d.DAT"` puts slot 14
+in `SaveFile0014.DAT`. Every widget is live unless the confirm popup is up
+(`FUN_10014910`): an empty slot is not greyed out, picking it simply does
+nothing.
+
+**This screen's chip table does not match its hit map the way every other
+screen's does.** Ten of its thirty-two regions are half of a row the sprite
+covers whole, and ten more are comment panels taller than the rows they sit on,
+so only twelve regions can ever reproduce a record. The twelve that do are
+consecutive, which is enough to anchor the table and fill the rest in at its
+stride — `days_ui::atlas` now believes a long exact run whatever proportion of
+the screen it covers.
+
+Not recovered: **where a row's text sits**. `FUN_10011ec0` renders the three
+columns into an off-screen surface — the object at `+0x110`, its pixels at
+`+0x114`, its pitch at `+0x118` — putting the timestamp at
+`(0, row * 0x30 + 2)`, the chapter at `(0x400, row * 0x30 + 2)` and the comment
+at `(0, row * 0x30 + 0x202)`, then blits it. Which rectangles that surface is
+blitted through has not been worked out, so the composited screen draws the
+rows empty rather than putting the text somewhere this engine chose.
+`days menu` prints the lines.
 
 ---
 
