@@ -28,7 +28,9 @@ Early. What works today:
 | Archive key recovery | **Done** — read from the user's own executable, not embedded |
 | `.ORS` script format | **Decoded** — 14 commands, documented in `docs/FORMATS.md` |
 | `.CMAP` UI hit maps | **Decoded** |
-| Video / audio playback | Not started |
+| `FONTDATA.DAT` glyph store | **Decoded** — all 22,420 glyphs render |
+| Video / audio decode | **Done** — matches ffmpeg's own output |
+| Playback / windowing | In progress |
 | UI rendering | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
@@ -87,8 +89,12 @@ rather than redistributed by us.
 
 ## Layout
 
-    crates/days-gpk   GPK archive reader + minimal PE resource parser
-    crates/days-cli   `days` — offline inspection tools
+    crates/days-gpk    GPK archive reader + minimal PE resource parser
+    crates/days-vfs    one case-insensitive namespace over all 30 packs
+    crates/days-script .ORS timeline parser
+    crates/days-media  WMV3 / Vorbis decoding over the system ffmpeg
+    crates/days-font   FONTDATA.DAT glyph store
+    crates/days-cli    `days` — offline inspection tools
     docs/FORMATS.md   reverse-engineered file format notes
     docs/DEPENDENCIES.md  dependency policy and audit checklist
 

@@ -124,12 +124,61 @@ wraps or is grouped by widget class. Needs pixel inspection.
 
 ## `FONTDATA.DAT` / `FONTDATA_ENG.DAT` — font
 
-39 MB. Opens with what appears to be 65,536 `u32` entries (256 KB — one slot per
-Unicode BMP code point) indexing into glyph data that follows. Values seen are
-`0x0004xxxx`, consistent with an offset biased by the 0x40000-byte header.
-Not yet decoded past the header.
+    offsets  [u32; 65536]   absolute file offset of each glyph, 0 = undefined
+    glyphs   ...            RLE streams
 
----
+The table is indexed **directly by Unicode BMP code point**, so it is
+`65536 * 4 = 0x40000` bytes and the first glyph starts at `0x40000`. The retail
+English font defines **22,420 glyphs**: ASCII, kana, CJK punctuation, all of CJK
+Unified Ideographs, and fullwidth forms. No Latin-1, Greek or Cyrillic.
+
+Each glyph paints into a fixed **48x48** cell, and there are **two planes**: a
+luminance plane and an alpha plane. The alpha plane is a dilated version of the
+shape, which is how the game keeps dialogue legible over moving video — a soft
+halo around a bright core. Latin glyphs sit at roughly half width inside the
+full-width cell, the usual arrangement for a CJK font.
+
+The stream is a byte RLE terminated by `0x00`:
+
+| Byte | Meaning |
+|---|---|
+| `0x00` | end of glyph; the rest of the cell stays transparent |
+| `0x01..=0x7f` | skip that many pixels |
+| `0x80..=0xff` | a run; a second byte `n` follows |
+
+For a run with control byte `c`:
+
+    length     = (n >> 4) + 1
+    luminance  = (c << 1) & 0xff
+    alpha      = (n & 0x0f) * 0x11
+
+A glyph may end before filling its cell — the decoder clears both planes first.
+So decoded pixel counts vary between glyphs even though the cell is fixed, and
+the pixel count is **not** a usable way to infer the cell size from the data.
+(Trying to do that is a dead end: the maximum across all 22,420 glyphs is
+exactly 2304, but almost every individual glyph falls short of it.)
+
+### How this was established
+
+By decompiling the shipped reader rather than guessing at the bytes. The exe
+carries an RTTI name `.?AVFontData@FILM@@`, and the relevant functions are:
+
+| Address | Role |
+|---|---|
+| `FUN_004368c0` | the RLE decoder above — the authority for this section |
+| `FUN_00436b00` | allocates both planes from a `(width, height)` pair |
+| `FUN_00422170` | calls it as `(0x30, 0x30)` — this is where 48x48 comes from |
+| `FUN_00436b90` | blit: look up `table[codepoint]`, decode, copy to `dst + y*pitch + x*4` |
+| `FUN_004367d0` | the same blit but max-blending, used to composite the outline |
+| `FUN_00436700` | composites the planes as `alpha<<24 \| lum<<16 \| lum<<8 \| lum` |
+
+Guessing at the encoding from the data alone had produced a self-consistent but
+wrong answer (skip runs of `c + 1` rather than `c`, and literal bytes rather
+than `(length, value)` pairs); it decoded without overrunning and still rendered
+noise. The decompiled function settled it in one pass.
+
+**Still open:** per-character advance width. The blit takes an explicit `x`, so
+the caller decides spacing; that caller has not been traced yet.
 
 ## Configuration
 

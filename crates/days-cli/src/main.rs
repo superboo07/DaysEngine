@@ -71,6 +71,17 @@ enum Cmd {
         #[arg(long)]
         dump_frame: Option<PathBuf>,
     },
+    /// Decode the glyph store and render characters as ASCII art.
+    Font {
+        /// Characters to render. Omit to just report coverage.
+        text: Option<String>,
+        /// Show the alpha (outline) plane instead of the luminance plane.
+        #[arg(long)]
+        alpha: bool,
+        /// Decode every defined glyph and report failures.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
     Timing {
@@ -144,6 +155,11 @@ fn main() -> Result<()> {
         Cmd::Assets => cmd_assets(&game)?,
         Cmd::Media { path, dump_frame } => cmd_media(&game, &path, dump_frame.as_deref())?,
         Cmd::Timing { name } => cmd_timing(&game, &name)?,
+        Cmd::Font {
+            text,
+            alpha,
+            verify,
+        } => cmd_font(&game, text.as_deref(), alpha, verify)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -386,6 +402,68 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
         );
     }
     println!("worst absolute difference: {worst:.3}s");
+    Ok(())
+}
+
+fn cmd_font(game: &Path, text: Option<&str>, alpha: bool, verify: bool) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    // The English build ships both; FONTDATA_ENG is the one the localised
+    // executable selects.
+    let bytes = vfs
+        .read_path("System/System/FONTDATA_ENG.DAT")
+        .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?;
+    let font = days_font::Font::parse(bytes)?;
+    println!("{} glyphs defined", font.glyph_count());
+
+    if verify {
+        let (mut ok, mut failed) = (0usize, 0usize);
+        for cp in 0..=0xffffu32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            match font.glyph(c) {
+                Ok(Some(_)) => ok += 1,
+                Ok(None) => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!("FAIL U+{cp:04X}: {err}");
+                }
+            }
+        }
+        println!("{ok} glyphs decoded, {failed} failed");
+        if failed > 0 {
+            bail!("{failed} glyphs failed to decode");
+        }
+    }
+
+    let ramp: Vec<char> = " .:-=+*#%@".chars().collect();
+    for c in text.unwrap_or("").chars() {
+        let Some(glyph) = font.glyph(c)? else {
+            println!("\nU+{:04X} {c:?}: no glyph", u32::from(c));
+            continue;
+        };
+        let plane = if alpha {
+            &glyph.alpha
+        } else {
+            &glyph.luminance
+        };
+        println!(
+            "\nU+{:04X} {c:?}  ink bounds {:?}  ({} plane)",
+            u32::from(c),
+            glyph.ink_bounds(),
+            if alpha { "alpha" } else { "luminance" }
+        );
+        for row in plane.chunks(days_font::CELL) {
+            let line: String = row
+                .iter()
+                .map(|&v| ramp[(usize::from(v) * (ramp.len() - 1)) / 255])
+                .collect();
+            if line.trim().is_empty() {
+                continue;
+            }
+            println!("  {line}");
+        }
+    }
     Ok(())
 }
 

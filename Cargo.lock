@@ -189,12 +189,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "days-font",
  "days-gpk",
  "days-media",
  "days-script",
  "days-vfs",
  "env_logger",
  "log",
+]
+
+[[package]]
+name = "days-font"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror",
 ]
 
 [[package]]

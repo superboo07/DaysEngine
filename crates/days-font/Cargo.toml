@@ -1,0 +1,10 @@
+[package]
+name = "days-font"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reader for FILMEngine's FONTDATA.DAT glyph store."
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
