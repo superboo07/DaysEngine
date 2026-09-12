@@ -27,11 +27,28 @@
 //! menubar, whose map is a 800x75 strip, it yields the same scales and no
 //! offset, with no special case for either.
 
-use crate::atlas::{self, Atlas, Widget};
-use crate::cmap::Cmap;
-use crate::image::Image;
-use crate::Error;
-use days_vfs::Vfs;
+use crate::vfs::Vfs;
+use days_ui::atlas::{self, Atlas, Widget};
+use days_ui::cmap::Cmap;
+use days_ui::Image;
+
+/// What can go wrong putting a screen together.
+///
+/// Reading and parsing the UI data is [`days_ui::Error`]; these two are about
+/// the install rather than the format, so they live with the code that goes
+/// looking in the packs.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Ui(#[from] days_ui::Error),
+    #[error("{0} is not in the packs")]
+    MissingAsset(String),
+    #[error(
+        "no widget table in SysMenuSDHQ.dll matches the hit map for {0}; \
+         the chip sprite positions cannot be recovered"
+    )]
+    NoAtlasFor(String),
+}
 
 /// The four sizes the game ships UI art for, named by `.CMAP` filename suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

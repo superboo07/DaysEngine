@@ -27,9 +27,9 @@
 //! the DLL's own dispatch — see [`Menu::confirm`].
 
 use crate::ini::Ini;
-use crate::save::FlagStore;
-use days_ui::{Resolution, Screen, WidgetState};
-use days_vfs::Vfs;
+use crate::screen::{Error, Resolution, Screen, WidgetState};
+use crate::vfs::Vfs;
+use days_save::FlagStore;
 
 /// A menu screen id, as the game itself numbers them.
 ///
@@ -272,7 +272,7 @@ impl Menu {
         mode: Mode,
         save: SaveState,
         resolution: Resolution,
-    ) -> Result<Menu, days_ui::Error> {
+    ) -> Result<Menu, Error> {
         let variant = if mode == Mode::TITLE {
             save.title_variant().to_string()
         } else {
@@ -289,10 +289,10 @@ impl Menu {
         save: SaveState,
         resolution: Resolution,
         return_to: Mode,
-    ) -> Result<Menu, days_ui::Error> {
+    ) -> Result<Menu, Error> {
         let stem = mode
             .stem(variant)
-            .ok_or_else(|| days_ui::Error::MissingAsset(format!("mode {}", mode.0)))?;
+            .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
         let base = base_art(mode, return_to);
         let screen = Screen::load_with_base(vfs, dll, &stem, base, resolution)?;
         let states = vec![WidgetState::Resting; screen.widget_count()];
@@ -433,7 +433,7 @@ impl Menu {
     /// each open their screen, and `EXIT` opens the confirm popup. No other
     /// screen's table is recovered, so elsewhere a click confirms nothing and
     /// only the cancel path is live.
-    pub fn confirm(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, days_ui::Error> {
+    pub fn confirm(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
         let Some(widget) = self.selection else {
             return Ok(Action::Stay);
         };
@@ -474,7 +474,7 @@ impl Menu {
     /// whether to go back to the title; the title's own cancel asks whether to
     /// quit. The two popups differ only in their background art, chosen from
     /// the mode the popup remembers.
-    pub fn cancel(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, days_ui::Error> {
+    pub fn cancel(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
         match self.mode {
             Mode::CONFIRM => {
                 let back = self.return_to;
@@ -491,7 +491,7 @@ impl Menu {
     /// [`Mode::PLAY`] has no screen — it is the one mode `SystemInit` has no
     /// case for — and quitting is the confirm popup's answer when it was opened
     /// from the title.
-    pub fn advance(&mut self, vfs: &Vfs, dll: &[u8], next: Mode) -> Result<Action, days_ui::Error> {
+    pub fn advance(&mut self, vfs: &Vfs, dll: &[u8], next: Mode) -> Result<Action, Error> {
         if next == Mode::PLAY {
             return Ok(Action::Play);
         }
@@ -499,7 +499,7 @@ impl Menu {
     }
 
     /// Answers the confirm popup with "yes".
-    pub fn confirm_popup(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, days_ui::Error> {
+    pub fn confirm_popup(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
         if self.mode != Mode::CONFIRM {
             return Ok(Action::Stay);
         }
@@ -510,7 +510,7 @@ impl Menu {
         }
     }
 
-    fn reopen(&mut self, vfs: &Vfs, dll: &[u8], next: Mode) -> Result<Action, days_ui::Error> {
+    fn reopen(&mut self, vfs: &Vfs, dll: &[u8], next: Mode) -> Result<Action, Error> {
         // The popup remembers where it came from; every other screen resets it,
         // matching SystemInit, which records the outgoing mode for all but the
         // popups themselves.

@@ -19,8 +19,6 @@
 //! * **Case is inconsistent.** Pack indices are mostly uppercase while the
 //!   `.INI` files use mixed case. Every lookup here is case-insensitive.
 
-#![forbid(unsafe_code)]
-
 use days_gpk::{Archive, Entry, Key};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

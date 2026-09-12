@@ -10,14 +10,14 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{bail, Context, Result};
-use days_engine::menu::{Action, Menu, Mode, SaveState, SystemSe};
-use days_engine::save::FlagStore;
-use days_engine::{ini::Ini, text, Mixer, Stage};
 use days_font::Font;
-use days_media::AudioBuffer;
 use days_script::{Frame, Script, FPS};
-use days_ui::Resolution;
-use days_vfs::Vfs;
+use daysengine::media::AudioBuffer;
+use daysengine::menu::{Action, Menu, Mode, SaveState, SystemSe};
+use daysengine::save::FlagStore;
+use daysengine::screen::Resolution;
+use daysengine::vfs::Vfs;
+use daysengine::{ini::Ini, text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
@@ -84,7 +84,7 @@ impl Sounds {
         let buffer = vfs
             .resolve_as(path, "ogg")
             .and_then(|h| vfs.read(h).ok())
-            .and_then(|bytes| match days_media::decode_audio(bytes) {
+            .and_then(|bytes| match daysengine::media::decode_audio(bytes) {
                 Ok(buffer) => Some(Arc::new(buffer)),
                 Err(err) => {
                     log::warn!("decoding {path}: {err}");
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
         None => discover_game_dir()?,
     };
     let vfs = Vfs::mount(&game)?;
-    log::info!("ffmpeg {}", days_media::ffmpeg_version());
+    log::info!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
     let start = Ini::parse_bytes(&vfs.read_path("Ini/STARTSCRIPT.INI")?);
     let film = Ini::parse_bytes(&vfs.read_path("Ini/FILMENGINE.INI")?);
@@ -194,8 +194,8 @@ fn main() -> Result<()> {
     let audio = sdl.audio().map_err(|e| anyhow::anyhow!("SDL audio: {e}"))?;
     let mixer = Mixer::new();
     let spec = AudioSpec {
-        freq: Some(days_media::SAMPLE_RATE as i32),
-        channels: Some(days_media::CHANNELS as i32),
+        freq: Some(daysengine::media::SAMPLE_RATE as i32),
+        channels: Some(daysengine::media::CHANNELS as i32),
         format: Some(AudioFormat::f32_sys()),
     };
     let stream = audio
@@ -221,7 +221,7 @@ fn main() -> Result<()> {
         mixer: &mixer,
         sounds: Sounds::default(),
         system_se: SystemSounds::from_ini(&film),
-        flags: days_engine::save::load_flags(&game, &film),
+        flags: daysengine::save::load_flags(&game, &film),
         // The widget tables are only needed for menus. A missing DLL is not
         // fatal to playing a script, so this is reported and left empty.
         dll: match std::fs::read(game.join("SysMenuSDHQ.dll")) {
@@ -471,7 +471,7 @@ fn play_menu_bgm(player: &mut Player, path: Option<&str>) {
             .vfs
             .read(handle)
             .ok()
-            .and_then(|bytes| days_media::decode_audio(bytes).ok())
+            .and_then(|bytes| daysengine::media::decode_audio(bytes).ok())
             .map(Arc::new)
     };
     let Some(looped) = load(bgm.looped) else {

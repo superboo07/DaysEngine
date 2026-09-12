@@ -1,6 +1,6 @@
-//! Reading the player's save data.
+//! Reader for `Save/GlobalFlag.DAT`, FILMEngine's global flag store.
 //!
-//! # `Save/GlobalFlag.DAT`
+//! # What the file is
 //!
 //! One `std::map<wstring, VARIANT>` written out whole. The game keeps every
 //! piece of persistent progress in it: a flag per script the player has seen,
@@ -68,11 +68,9 @@
 //! the varint, `FUN_00435010` for the string cipher, `FUN_0045c890` for the
 //! value tags, all in `SCHOOLDAYS HQ.exe`) rather than inferred from the bytes.
 
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use crate::ini::Ini;
 
 /// Magic at the head of `GlobalFlag.DAT`.
 ///
@@ -91,11 +89,7 @@ pub enum Error {
     #[error("varint at offset {offset} does not terminate within 5 bytes")]
     VarintTooLong { offset: usize },
     #[error("entry {index} ({name:?}) has unknown VARIANT type {vt}")]
-    UnknownType {
-        index: usize,
-        name: String,
-        vt: i32,
-    },
+    UnknownType { index: usize, name: String, vt: i32 },
     #[error("entry {index} declares a {len}-character string, longer than the rest of the file")]
     StringTooLong { index: usize, len: i32 },
     #[error("{unread} bytes left over after the declared {count} entries")]
@@ -243,7 +237,10 @@ impl<'a> Reader<'a> {
 
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], Error> {
         let end = self.pos.checked_add(n).ok_or(Error::Truncated { what })?;
-        let slice = self.bytes.get(self.pos..end).ok_or(Error::Truncated { what })?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(Error::Truncated { what })?;
         self.pos = end;
         Ok(slice)
     }
@@ -294,49 +291,6 @@ impl<'a> Reader<'a> {
         // Lone surrogates would be corruption; replace rather than reject, so
         // one bad display string cannot cost the player the whole file.
         Ok(String::from_utf16_lossy(&units))
-    }
-}
-
-/// Where `FILMENGINE.INI` says the global flag store lives.
-///
-/// The shipped INI says `Save/GlobalFlag.DAT`, but the key is what the engine
-/// reads, so a modified install keeps working. Backslashes are the separator
-/// on the platform the game was written for and mean nothing here, so they are
-/// mapped across.
-pub fn flag_path(game: &Path, film: &Ini) -> PathBuf {
-    let relative = film.get("FlagFileName").unwrap_or("Save/GlobalFlag.DAT");
-    game.join(relative.replace('\\', "/"))
-}
-
-/// Reads and decodes the global flag store.
-///
-/// A player who has never finished a chapter has no flag file at all, and that
-/// is not an error: it reads as an empty store, which is exactly a fresh
-/// install. Anything else — an unreadable or corrupt file — is logged and also
-/// treated as a fresh install, following the rule that a missing or broken
-/// asset costs the player a feature and never the session.
-pub fn load_flags(game: &Path, film: &Ini) -> FlagStore {
-    let path = flag_path(game, film);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            log::info!("no save data at {}: starting fresh", path.display());
-            return FlagStore::default();
-        }
-        Err(err) => {
-            log::warn!("reading {}: {err}", path.display());
-            return FlagStore::default();
-        }
-    };
-    match FlagStore::parse(&bytes) {
-        Ok(flags) => {
-            log::info!("{}: {} flags", path.display(), flags.len());
-            flags
-        }
-        Err(err) => {
-            log::warn!("decoding {}: {err}", path.display());
-            FlagStore::default()
-        }
     }
 }
 
@@ -420,7 +374,10 @@ mod tests {
             ("EndClear", Value::Bool(false)),
             ("EndNo", Value::Int(20)),
             ("Ratio", Value::Float(1.5)),
-            ("FILMEngine/SaveFile000_Sub", Value::Str("FINAL - TE AMO".into())),
+            (
+                "FILMEngine/SaveFile000_Sub",
+                Value::Str("FINAL - TE AMO".into()),
+            ),
         ];
         let store = FlagStore::parse(&encode(&entries)).expect("parses");
         assert_eq!(store.len(), entries.len());
@@ -488,29 +445,5 @@ mod tests {
         assert!(!store.flag("AllClear"));
         // An entry that exists but is not boolean is not a flag either.
         assert!(!store.flag("EndNo"));
-    }
-
-    #[test]
-    fn takes_the_path_from_the_ini() {
-        let film = Ini::parse("[FlagFileName]=\"Save\\GlobalFlag.DAT\"");
-        assert_eq!(
-            flag_path(Path::new("/game"), &film),
-            Path::new("/game/Save/GlobalFlag.DAT")
-        );
-    }
-
-    #[test]
-    fn falls_back_to_the_shipped_path() {
-        let film = Ini::parse("");
-        assert_eq!(
-            flag_path(Path::new("/game"), &film),
-            Path::new("/game/Save/GlobalFlag.DAT")
-        );
-    }
-
-    #[test]
-    fn a_missing_file_is_a_fresh_install() {
-        let film = Ini::parse("");
-        assert!(load_flags(Path::new("/nonexistent-game-dir"), &film).is_empty());
     }
 }

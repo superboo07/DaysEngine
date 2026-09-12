@@ -6,7 +6,6 @@ license.workspace = true
 description = "The game's own UI: CMAP hit maps, _CHIP sprite atlases and screen compositing."
 
 [dependencies]
-days-vfs = { path = "../days-vfs", version = "=0.1.0" }
 png.workspace = true
 thiserror.workspace = true
 log.workspace = true

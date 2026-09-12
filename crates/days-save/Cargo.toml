@@ -1,0 +1,9 @@
+[package]
+name = "days-save"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reader for FILMEngine's global flag store (Save/GlobalFlag.DAT)."
+
+[dependencies]
+thiserror.workspace = true

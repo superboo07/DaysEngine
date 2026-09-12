@@ -13,7 +13,7 @@
 //! reuses the SE mixer for lines that are not lip-synced — so the SE slots are
 //! not special-cased for sound effects.
 
-use days_media::AudioBuffer;
+use crate::media::AudioBuffer;
 use std::sync::{Arc, Mutex};
 
 /// How many `[PlaySe]` slots exist. Scripts address them as 1..=5.

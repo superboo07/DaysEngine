@@ -193,42 +193,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "days-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "days-engine",
- "days-font",
- "days-gpk",
- "days-media",
- "days-script",
- "days-ui",
- "days-vfs",
- "env_logger",
- "log",
- "png",
-]
-
-[[package]]
-name = "days-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "days-font",
- "days-gpk",
- "days-media",
- "days-script",
- "days-ui",
- "days-vfs",
- "env_logger",
- "log",
- "png",
- "sdl3",
- "thiserror",
-]
-
-[[package]]
 name = "days-font"
 version = "0.1.0"
 dependencies = [
@@ -246,11 +210,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "days-media"
+name = "days-save"
 version = "0.1.0"
 dependencies = [
- "log",
- "rusty_ffmpeg",
  "thiserror",
 ]
 
@@ -266,18 +228,27 @@ dependencies = [
 name = "days-ui"
 version = "0.1.0"
 dependencies = [
- "days-vfs",
  "log",
  "png",
  "thiserror",
 ]
 
 [[package]]
-name = "days-vfs"
+name = "daysengine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "days-font",
  "days-gpk",
+ "days-save",
+ "days-script",
+ "days-ui",
+ "env_logger",
  "log",
+ "png",
+ "rusty_ffmpeg",
+ "sdl3",
  "thiserror",
 ]
 

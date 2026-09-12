@@ -5,8 +5,8 @@
 //! nothing next to the 12 GB of assets already on disk — and it means the mixer
 //! gets random access without an ffmpeg context per playing sound.
 
-use crate::io::MemoryIo;
-use crate::{Error, CHANNELS, SAMPLE_RATE};
+use super::io::MemoryIo;
+use super::{Error, CHANNELS, SAMPLE_RATE};
 use rusty_ffmpeg::ffi;
 use std::ffi::c_int;
 

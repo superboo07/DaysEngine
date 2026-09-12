@@ -318,13 +318,13 @@ as seven separate `std::wstring` members on a `0x1c` stride from `+0x5a0`, in
 that order. The menu modules ask the host to play one **by index** (host vtable
 slot `0x50`, argument 2 on confirm), but no code computing that stride and no
 switch dispatching on the index was found, so which index names which sound is
-still open. `days_engine::menu::SystemSe` therefore carries the game's names and
+still open. `daysengine::menu::SystemSe` therefore carries the game's names and
 INI keys, and the engine picks the bindings itself.
 
 The three questions the title asks the host — all-clear (`+0xe8`), trial build
 (`+0x34`), and route *n* cleared (`+0xec`) — are answered out of
 `Save/GlobalFlag.DAT`; see that section below for which flag answers which, and
-`days_engine::menu::SaveState::from_flags`.
+`daysengine::menu::SaveState::from_flags`.
 
 ---
 

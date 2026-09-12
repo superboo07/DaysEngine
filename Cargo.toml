@@ -1,3 +1,40 @@
+# The engine itself is this crate. Only the file-format readers are split out,
+# because those are the parts another project could use on their own; the
+# runtime around them is one ordinary crate with ordinary modules.
+[package]
+name = "daysengine"
+description = "A cross-platform reimplementation of Overflow's FILMEngine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not the workspace value: the engine uses `as_chunks`, stable since 1.88. The
+# format-reader crates under crates/ are held to the lower workspace figure.
+rust-version = "1.88"
+repository.workspace = true
+
+[dependencies]
+days-gpk = { path = "crates/days-gpk", version = "=0.1.0" }
+days-script = { path = "crates/days-script", version = "=0.1.0" }
+days-font = { path = "crates/days-font", version = "=0.1.0" }
+days-ui = { path = "crates/days-ui", version = "=0.1.0" }
+days-save = { path = "crates/days-save", version = "=0.1.0" }
+rusty_ffmpeg = { workspace = true, features = ["link_system_ffmpeg"] }
+sdl3.workspace = true
+png.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[[bin]]
+name = "daysengine"
+path = "src/main.rs"
+
+[[bin]]
+name = "days"
+path = "src/bin/days.rs"
+
 [workspace]
 resolver = "2"
 members = ["crates/*"]

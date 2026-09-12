@@ -8,10 +8,10 @@
 //! can reference a hundred movies and thirty minutes of voice, and the game only
 //! ever needs the next few seconds.
 
+use crate::media::{AudioBuffer, VideoDecoder, VideoFrame};
+use crate::vfs::Vfs;
 use anyhow::{Context, Result};
-use days_media::{AudioBuffer, VideoDecoder, VideoFrame};
 use days_script::{Command, Fade, Frame, Script};
-use days_vfs::Vfs;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -259,14 +259,14 @@ impl Stage {
         Ok(())
     }
 
-    fn audio(&mut self, vfs: &Vfs, handle: days_vfs::Handle) -> Result<Arc<AudioBuffer>> {
+    fn audio(&mut self, vfs: &Vfs, handle: crate::vfs::Handle) -> Result<Arc<AudioBuffer>> {
         let key = vfs.entry(handle).name.clone();
         if let Some(cached) = self.audio_cache.get(&key) {
             return Ok(cached.clone());
         }
         let bytes = vfs.read(handle)?;
         let buffer =
-            Arc::new(days_media::decode_audio(bytes).with_context(|| format!("decoding {key}"))?);
+            Arc::new(crate::media::decode_audio(bytes).with_context(|| format!("decoding {key}"))?);
         self.audio_cache.insert(key, buffer.clone());
         Ok(buffer)
     }

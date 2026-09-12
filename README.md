@@ -122,16 +122,28 @@ testable on a machine with no GPU even though the SDL player draws through one.
 
 ## Layout
 
+The engine is one ordinary crate. Only the readers for the game's shipped file
+formats are split out, because those are the parts another project could use on
+their own — a modding tool wanting the archives has no business pulling in SDL
+and ffmpeg to get them.
+
+    src/              the engine: vfs, media, screen compositing, mixer,
+                      timeline stage, text layout, menus, INI, save lookup
+    src/main.rs       `daysengine` — the game
+    src/bin/days.rs   `days` — offline inspection tools
+
     crates/days-gpk    GPK archive reader + minimal PE resource parser
-    crates/days-vfs    one case-insensitive namespace over all 30 packs
     crates/days-script .ORS timeline parser
-    crates/days-media  WMV3 / Vorbis decoding over the system ffmpeg
     crates/days-font   FONTDATA.DAT glyph store
-    crates/days-ui     CMAP hit maps, _CHIP atlases, screen compositing
-    crates/days-engine mixer, timeline stage, text layout, menus, SDL3 player
-    crates/days-cli    `days` — offline inspection tools
+    crates/days-save   Save/GlobalFlag.DAT flag store
+    crates/days-ui     CMAP hit maps and _CHIP atlas recovery
+
     docs/FORMATS.md   reverse-engineered file format notes
     docs/DEPENDENCIES.md  dependency policy and audit checklist
+
+`src/media` is the one module that uses `unsafe`, and every occurrence is a call
+into the system libav — Rust requires the keyword on all FFI. The crate root
+denies `unsafe_code` and that module carries the only `allow`.
 
 ## Legal
 

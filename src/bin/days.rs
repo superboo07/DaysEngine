@@ -294,7 +294,7 @@ fn main() -> Result<()> {
 /// Pack paths look like `english/00/00-00-A00.ENG.ORS`; the route layer knows
 /// the script as `00-00-A00`, so strip the language directory and the `.ENG`
 /// infix.
-fn script_paths(vfs: &days_vfs::Vfs) -> Vec<(String, String)> {
+fn script_paths(vfs: &daysengine::vfs::Vfs) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vfs
         .paths()
         .filter(|p| p.starts_with("script/") && p.ends_with(".ors"))
@@ -313,7 +313,7 @@ fn script_paths(vfs: &days_vfs::Vfs) -> Vec<(String, String)> {
 }
 
 fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let mut histogram: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let (mut ok, mut failed) = (0usize, 0usize);
 
@@ -348,7 +348,7 @@ fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
 }
 
 fn cmd_script(game: &Path, name: &str) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, path) = script_paths(&vfs)
         .into_iter()
@@ -364,7 +364,7 @@ fn cmd_script(game: &Path, name: &str) -> Result<()> {
 }
 
 fn cmd_assets(game: &Path) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let mut missing: std::collections::BTreeMap<String, usize> = Default::default();
     let mut checked = 0usize;
 
@@ -399,8 +399,8 @@ fn cmd_assets(game: &Path) -> Result<()> {
 }
 
 fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
-    println!("ffmpeg {}", days_media::ffmpeg_version());
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    println!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
     let handle = vfs
         .resolve(path)
@@ -411,11 +411,11 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
     println!("{} ({} bytes)", name, bytes.len());
 
     if name.to_ascii_lowercase().ends_with(".wmv") {
-        let mut decoder = days_media::VideoDecoder::open(bytes)?;
+        let mut decoder = daysengine::media::VideoDecoder::open(bytes)?;
         println!("video {}x{}", decoder.width(), decoder.height());
         let mut frames = 0usize;
         let mut last = 0.0;
-        let mut first: Option<days_media::VideoFrame> = None;
+        let mut first: Option<daysengine::media::VideoFrame> = None;
         while let Some(frame) = decoder.next_frame()? {
             last = frame.timestamp;
             if first.is_none() {
@@ -436,7 +436,7 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
             println!("wrote first frame to {}", path.display());
         }
     } else {
-        let audio = days_media::decode_audio(bytes)?;
+        let audio = daysengine::media::decode_audio(bytes)?;
         println!(
             "audio {} frames, {:.3}s, peak {:.3}",
             audio.frames(),
@@ -449,7 +449,7 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
 
 /// Writes an RGBA frame as a binary PPM, dropping alpha. Enough to eyeball a
 /// decode without pulling in an image encoder.
-fn write_ppm(path: &Path, frame: &days_media::VideoFrame) -> Result<()> {
+fn write_ppm(path: &Path, frame: &daysengine::media::VideoFrame) -> Result<()> {
     let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
     out.extend(
         frame
@@ -469,7 +469,7 @@ fn write_ppm(path: &Path, frame: &days_media::VideoFrame) -> Result<()> {
 /// expected to cut a movie short, and we would rather find out here than by
 /// watching playback drift.
 fn cmd_timing(game: &Path, name: &str) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -490,7 +490,7 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
             println!("{path:<46} MISSING");
             continue;
         };
-        let mut decoder = days_media::VideoDecoder::open(vfs.read(handle)?)?;
+        let mut decoder = daysengine::media::VideoDecoder::open(vfs.read(handle)?)?;
         let mut frames = 0usize;
         while decoder.next_frame()?.is_some() {
             frames += 1;
@@ -511,7 +511,7 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
 fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> {
     use days_script::Frame;
 
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -531,8 +531,8 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
         .collect::<Result<_>>()?;
     targets.sort();
 
-    let mixer = days_engine::Mixer::new();
-    let mut stage = days_engine::Stage::new(script);
+    let mixer = daysengine::Mixer::new();
+    let mut stage = daysengine::Stage::new(script);
     std::fs::create_dir_all(out)?;
 
     const W: usize = 800;
@@ -548,7 +548,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
             visual.text.map(|(s, t)| format!("{s}: {t}")),
             visual.fade,
         );
-        let rgba = days_engine::compose::frame_rgba(&visual, &font, W, H);
+        let rgba = daysengine::compose::frame_rgba(&visual, &font, W, H);
 
         let path = out.join(format!(
             "{wanted}-{}.png",
@@ -575,9 +575,9 @@ fn system_menu_dll(game: &Path) -> Result<Vec<u8>> {
 }
 
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
-    use days_ui::{Resolution, Screen, WidgetState};
+    use daysengine::screen::{Resolution, Screen, WidgetState};
 
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -671,7 +671,7 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
 }
 
 fn cmd_font(game: &Path, text: Option<&str>, alpha: bool, verify: bool) -> Result<()> {
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     // The English build ships both; FONTDATA_ENG is the one the localised
     // executable selects.
     let bytes = vfs
@@ -863,23 +863,23 @@ fn select_packs(dir: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
 ///
 /// Shared by `menu` and `save` so both see the install the same way. A missing
 /// or unreadable file reads as a fresh install, which is what it means.
-fn load_flags(game: &Path, vfs: &days_vfs::Vfs) -> days_engine::save::FlagStore {
+fn load_flags(game: &Path, vfs: &daysengine::vfs::Vfs) -> daysengine::save::FlagStore {
     let film = match vfs.read_path("Ini/FILMENGINE.INI") {
-        Ok(bytes) => days_engine::Ini::parse_bytes(&bytes),
+        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
         Err(err) => {
             log::warn!("reading Ini/FILMENGINE.INI: {err}");
-            days_engine::Ini::parse("")
+            daysengine::Ini::parse("")
         }
     };
-    days_engine::save::load_flags(game, &film)
+    daysengine::save::load_flags(game, &film)
 }
 
 /// Prints what the save data says the player has unlocked.
 fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
-    use days_engine::save::Value;
-    use days_engine::SaveState;
+    use daysengine::save::Value;
+    use daysengine::SaveState;
 
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let flags = load_flags(game, &vfs);
     let save = SaveState::from_flags(&flags);
 
@@ -893,9 +893,15 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
         None => println!("  EndNo             (not set)"),
     }
     println!();
-    println!("so the title screen shows {}, REPLAY {}",
+    println!(
+        "so the title screen shows {}, REPLAY {}",
         save.title_variant(),
-        if save.replay_unlocked() { "unlocked" } else { "locked" });
+        if save.replay_unlocked() {
+            "unlocked"
+        } else {
+            "locked"
+        }
+    );
 
     if all || grep.is_some() {
         println!();
@@ -916,10 +922,11 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
-    use days_engine::menu::{Action, Menu, Mode, SaveState};
-    use days_ui::{Image, Resolution};
+    use days_ui::Image;
+    use daysengine::menu::{Action, Menu, Mode, SaveState};
+    use daysengine::screen::Resolution;
 
-    let vfs = days_vfs::Vfs::mount(game)?;
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;

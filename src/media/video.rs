@@ -1,7 +1,7 @@
 //! WMV3 video decoding.
 
-use crate::io::MemoryIo;
-use crate::Error;
+use super::io::MemoryIo;
+use super::Error;
 use rusty_ffmpeg::ffi;
 use std::ffi::c_int;
 
