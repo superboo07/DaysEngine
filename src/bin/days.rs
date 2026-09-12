@@ -85,6 +85,11 @@ enum Cmd {
         /// Directory to write PNGs into.
         #[arg(long, short = 'o', default_value = ".")]
         out: PathBuf,
+        /// Also drop the in-game control bar over the frame, with the pointer
+        /// inside the strip. Without this the bar is off, which is what the
+        /// engine shows while the pointer is anywhere else.
+        #[arg(long)]
+        bar: bool,
     },
     /// Composite a UI screen to PNG, without a display.
     ///
@@ -190,7 +195,18 @@ struct BarArgs {
     /// Milliseconds since the auto flag was set, for its animation frame.
     #[arg(long, default_value_t = 0)]
     elapsed: u32,
-    /// PNG to write the composited bar to.
+    /// Where the pointer is, in the strip's own pixels: `X,Y`, or `off` for
+    /// anywhere else on the screen. The bar is a drop-down, so `off` is what
+    /// fades it away.
+    #[arg(long, default_value = "0,0")]
+    pointer: String,
+    /// Milliseconds the pointer has been where `--pointer` says, so a ramp can
+    /// be seen part way through. Defaults to long enough to have settled.
+    #[arg(long)]
+    after: Option<u32>,
+    /// PNG to write the composited bar to. It has an alpha channel: the strip
+    /// is a layer the engine draws over the frame, not a picture with a black
+    /// bar in it.
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
 }
@@ -342,7 +358,7 @@ fn main() -> Result<()> {
             alpha,
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
-        Cmd::Render { name, at, out } => cmd_render(&game, &name, &at, &out)?,
+        Cmd::Render { name, at, out, bar } => cmd_render(&game, &name, &at, &out, bar)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
         Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
@@ -595,7 +611,29 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> {
+/// Blends an RGBA layer over an opaque RGBA frame, both the same width.
+///
+/// The layer may be shorter than the frame — the control bar is an 800x75 strip
+/// over an 800x452 picture — in which case the rest of the frame is untouched.
+fn blend_over(frame: &mut [u8], width: usize, height: usize, layer: &days_ui::Image) {
+    for y in 0..(layer.height as usize).min(height) {
+        for x in 0..(layer.width as usize).min(width) {
+            let s = (y * layer.width as usize + x) * 4;
+            let d = (y * width + x) * 4;
+            let a = u32::from(layer.rgba[s + 3]);
+            if a == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                let src = u32::from(layer.rgba[s + c]);
+                let under = u32::from(frame[d + c]);
+                frame[d + c] = ((src * a + under * (255 - a)) / 255) as u8;
+            }
+        }
+    }
+}
+
+fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> Result<()> {
     use days_script::Frame;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -626,6 +664,27 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
     let stacked = daysengine::ui::select::Layout::from_ini(&film_ini(&vfs))
         == daysengine::ui::select::Layout::Stacked;
 
+    // The control bar, with the pointer parked inside the strip and the ramp
+    // settled, so `--bar` shows the dropped-down state.
+    let control = if bar {
+        let dll = system_menu_dll(game)?;
+        match daysengine::ui::bar::Bar::load(&vfs, &dll, daysengine::ui::screen::Resolution::Wide) {
+            Ok(mut strip) => {
+                strip.point_at(Some((0, 0)), 0);
+                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1);
+                Some(strip)
+            }
+            Err(err) => {
+                eprintln!("the control bar is unavailable: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let bar_state =
+        daysengine::ui::bar::State::from_config(&daysengine::install::config::Config::load(game));
+
     const W: usize = 800;
     const H: usize = 452;
 
@@ -642,7 +701,18 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
                 .select
                 .map(|w| format!("{:?}/{:?} {}..{}", w.a, w.b, w.start, w.end)),
         );
-        let rgba = daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked);
+        let mut rgba =
+            daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked);
+
+        if let Some(strip) = &control {
+            // Blended over the frame, which is the check that matters: the
+            // strip is RGBA and the engine draws it over the picture. Had the
+            // layer been flattened onto black first, this is where a black band
+            // would show up.
+            let states = strip.states(None, bar_state, 0);
+            let layer = strip.compose_faded(&states);
+            blend_over(&mut rgba, W, H, &layer);
+        }
 
         let path = out.join(format!(
             "{wanted}-{}.png",
@@ -757,13 +827,48 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             args.elapsed
         );
     }
-    if let Some(widget) = args.hover {
-        println!("hovering widget {widget}");
+    // The bar is a drop-down: it is on screen only while the pointer is inside
+    // the strip, and it ramps in over 300ms and out over 1000ms. Drive that
+    // here so what gets drawn is what the engine would draw.
+    let mut bar = bar;
+    let at = if args.pointer.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        let (x, y) = args
+            .pointer
+            .split_once(',')
+            .with_context(|| format!("--pointer wants X,Y or `off`, got {}", args.pointer))?;
+        Some((x.trim().parse::<u32>()?, y.trim().parse::<u32>()?))
+    };
+    // Settling takes one update to start the ramp and one past its end to
+    // finish it, exactly as the original's two calls per frame do.
+    let settled = args
+        .after
+        .unwrap_or(bar::FADE_IN_MS.max(bar::FADE_OUT_MS) + 1);
+    bar.point_at(at, 0);
+    let hovered = bar.point_at(at, settled);
+    println!(
+        "pointer {} — the bar {}, alpha {}",
+        match at {
+            Some((x, y)) => format!("at ({x}, {y}) in the strip"),
+            None => "off the strip".to_string(),
+        },
+        if bar.fade().drawn() {
+            "is drawn"
+        } else {
+            "is not drawn"
+        },
+        bar.fade().alpha(),
+    );
+    let hovered = args.hover.or(hovered);
+    match hovered {
+        Some(widget) => println!("hovering widget {widget}"),
+        None => println!("no widget hovered"),
     }
 
     if let Some(out) = &args.out {
-        let states = bar.states(args.hover, state, args.elapsed);
-        let image = bar.compose(None, &states);
+        let states = bar.states(hovered, state, args.elapsed);
+        let image = bar.compose_faded(&states);
         write_png(out, &image.rgba, image.width, image.height)?;
         println!("wrote {}", out.display());
     }

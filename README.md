@@ -43,7 +43,7 @@ Early. What works today:
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
 | Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
-| In-game control bar | **Works** — all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that chain to the next script are blocked on the route graph, and which menu each one opens is not recovered. `days bar` prints the table |
+| In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that chain to the next script are blocked on the route graph, and which menu each one opens is not recovered. `days bar` prints the table |
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
@@ -114,7 +114,8 @@ days ui System/Title/Title -r full --active 1 -o /tmp/title.png
 days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 days config                          # the player's settings, as the Option screen reads them
 days replay                          # the replay scene table, and what the save has unlocked
-days bar --hover 12 -o /tmp/bar.png  # the in-game control bar, widget by widget
+days bar --pointer 400,40 -o /tmp/bar.png   # the control bar, widget by widget
+days render 00-00-A00 --at 00:39:00 --bar -o /tmp/frames   # ...over a real frame
 days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test
 ```
 
@@ -125,7 +126,10 @@ of drawing.
 
 `days bar` prints every control-bar widget with its box, whether the engine's
 own rules make it live, its caption and what it asks the host for, and renders
-the strip as the engine composites it. `days select` reports which of the six
+the strip as the engine composites it — as an RGBA layer, with `--pointer`
+driving the drop-down and `--after` catching the fade part way through.
+`days render --bar` blends that layer over a real playback frame, which is what
+shows whether the translucency is right. `days select` reports which of the six
 shipped hit maps a resolution really gets, the boxes in it, the label wrap
 limits, and where a normalised point lands.
 

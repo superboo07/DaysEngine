@@ -279,6 +279,22 @@ impl Screen {
         self.compose_over(None, states)
     }
 
+    /// Composites the screen as a **transparent layer**, for one that sits over
+    /// playback rather than replacing it.
+    ///
+    /// The full-screen menus own their background and are composited onto black.
+    /// The in-game control bar does not: `MENUBAR.PNG` is RGBA, and the engine
+    /// draws the strip's sprites over whatever frame is underneath. Flattening
+    /// it onto black first would fill the transparent part of the strip with a
+    /// black bar, which is not what the original shows.
+    pub fn compose_layer(&self, states: &[WidgetState]) -> Image {
+        let (w, h) = self.size();
+        let mut out = Image::empty(w, h);
+        self.blit_native(&mut out, &self.base);
+        self.draw_states(&mut out, states);
+        out
+    }
+
     /// Composites the screen over a backdrop, with extra sprites on top.
     ///
     /// Two things a screen draws are not widget states and so cannot be
@@ -326,7 +342,12 @@ impl Screen {
         }
 
         self.blit_native(&mut out, &self.base);
+        self.draw_states(&mut out, states);
+        out
+    }
 
+    /// Draws the non-resting widget sprites onto an already-started frame.
+    fn draw_states(&self, out: &mut Image, states: &[WidgetState]) {
         for (i, state) in states.iter().enumerate() {
             let widget = match state {
                 WidgetState::Resting => continue,
@@ -351,7 +372,6 @@ impl Screen {
                 self.place(widget),
             );
         }
-        out
     }
 }
 

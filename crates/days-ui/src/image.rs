@@ -111,10 +111,24 @@ impl Image {
                     continue;
                 }
                 let d = (dy as usize * self.width as usize + dx as usize) * 4;
-                for (channel, src) in self.rgba[d..d + 3].iter_mut().zip(p) {
-                    *channel = ((u32::from(src) * a + u32::from(*channel) * (255 - a)) / 255) as u8;
+                // Source-over, compositing the destination's alpha as well as
+                // its colour. On the opaque black a full screen starts from
+                // this reduces to `src * a + dst * (255 - a)`, but the in-game
+                // overlays — the control bar, whose own art is RGBA — are
+                // composited onto a transparent layer and handed to the caller
+                // to blend over the frame, and there the destination alpha is
+                // the whole point.
+                let ia = 255 - a;
+                let da = u32::from(self.rgba[d + 3]);
+                let out_a = a + da * ia / 255;
+                if out_a == 0 {
+                    continue;
                 }
-                self.rgba[d + 3] = 255;
+                for (channel, src) in self.rgba[d..d + 3].iter_mut().zip(p) {
+                    let c = u32::from(src) * a * 255 + u32::from(*channel) * da * ia;
+                    *channel = (c / (out_a * 255)) as u8;
+                }
+                self.rgba[d + 3] = out_a as u8;
             }
         }
     }
@@ -130,6 +144,31 @@ mod tests {
             *p = px;
         }
         img
+    }
+
+    #[test]
+    fn blitting_onto_a_transparent_layer_keeps_the_source_alpha() {
+        // An overlay is composited onto nothing and blended over the frame by
+        // the caller, so a half-transparent source pixel has to stay
+        // half-transparent rather than becoming opaque over black.
+        let src = solid(1, 1, [200, 100, 50, 128]);
+        let mut dst = Image::empty(1, 1);
+        dst.blit_scaled(&src, (0, 0, 1, 1), (0, 0, 1, 1));
+        let px = dst.pixel(0, 0).expect("in range");
+        assert_eq!(px[3], 128);
+        assert_eq!([px[0], px[1], px[2]], [200, 100, 50]);
+    }
+
+    #[test]
+    fn blitting_onto_opaque_black_is_unchanged_by_the_alpha_compositing() {
+        // The full-screen path starts from opaque black, where source-over
+        // reduces to the straight lerp it always was.
+        let src = solid(1, 1, [200, 100, 50, 128]);
+        let mut dst = Image::black(1, 1);
+        dst.blit_scaled(&src, (0, 0, 1, 1), (0, 0, 1, 1));
+        let px = dst.pixel(0, 0).expect("in range");
+        assert_eq!(px[3], 255);
+        assert_eq!(px[0], (200 * 128 / 255) as u8);
     }
 
     #[test]

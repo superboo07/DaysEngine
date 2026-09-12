@@ -197,8 +197,12 @@ impl Select {
     /// Normalised is what the host reports: slot `+0x144` hands back a pair of
     /// floats and `FUN_0044d450` compares them against `0.0`, `0.5` and `1.0`,
     /// which are the three doubles at `0x004d13d8`, `0x004d4fb0` and
-    /// `0x004d13d0`. The same pair goes to the `.CMAP` lookup, so both paths
-    /// take the same units.
+    /// `0x004d13d0`. The same pair goes to the `.CMAP` lookup, which indexes
+    /// the map in whole pixels (`FUN_00465bc0`), so something scales them up in
+    /// between; `FUN_00465c40` is where that happens and its decompilation
+    /// loses the x87 arguments, so **the scaling step itself is not
+    /// recovered**. Multiplying by the map's size is what reproduces the
+    /// shipped maps' own geometry, and that is what this does.
     ///
     /// The map is used only when the display really is one of the two sizes a
     /// map is shipped for; otherwise the fallback below is the whole of the hit

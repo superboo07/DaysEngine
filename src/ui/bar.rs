@@ -48,6 +48,19 @@
 //! `FUN_10025b90`, which asks for `+0xfc(1)` the first time and `+0xfc(2)` the
 //! second, and widget 3 asks for `+0xfc(2)` outright.
 //!
+//! # It is a drop-down, and it is translucent
+//!
+//! The bar is not a fixture along the top of the screen. It is on screen only
+//! while the pointer is inside the 800x75 strip, ramping in over 300ms and out
+//! over 1000ms once the pointer leaves — see [`Fade`], which is where the
+//! evidence for that lives, because the trigger is a value the hit map returns
+//! rather than anything the bar decides.
+//!
+//! And `MENUBAR.PNG` is RGBA: the strip's panels are semi-transparent and the
+//! frame underneath shows through them. So [`Bar::compose`] returns a *layer*,
+//! not a picture — flattening it onto black first would put a black band across
+//! the top of the screen, which is not what the original shows.
+//!
 //! # What the bar does not decide
 //!
 //! Where `+0xfc` actually lands is the executable's state machine
@@ -81,6 +94,93 @@ pub const SPEEDS: [f32; 5] = [1.0, 2.0, 4.0, 12.0, 24.0];
 /// `timeGetTime`.
 pub const FADE_IN_MS: u32 = 300;
 pub const FADE_OUT_MS: u32 = 1000;
+
+/// The bar's visibility: it is a drop-down, not a fixture.
+///
+/// `FUN_10024100` stores `lookup(pointer) - 1` at `this+0xd4` and then branches
+/// on it being **-2**:
+///
+/// ```text
+/// if (this+0xd4 == -2) {                       // pointer is off the strip
+///     if (DAT_100508c8 == 0) this+0xbc = 0;    // faded right out: bar is off
+///     else FUN_100255c0(this, 0, 1000);        // ramp out
+/// } else {
+///     if (DAT_100508c8 != 0xff) FUN_100255c0(this, 1, 300);
+///     this+0xbc = 1;
+/// }
+/// ```
+///
+/// -2 is what makes this a drop-down, and it is the hit map's doing rather than
+/// a sentinel the bar invents. The map object is the executable's `ClickableMap`
+/// (vtable `0x004d70c4`, stored by its constructor `FUN_00465830`, which the DLL
+/// obtains through host factory slot `+0xac` case 5), and its lookup
+/// `FUN_00465bc0` returns **-1 for a point outside the map's own rectangle** and
+/// the region id — 0 for no region — for one inside it. So off the strip gives
+/// `-1 - 1 = -2` and the bar goes away, while anywhere on the strip, widget or
+/// not, gives -1 or better and it stays. The strip is 800x75 at the top of the
+/// screen, because `ClickableMap`'s origin members are zeroed by that
+/// constructor and nothing in the bar's path ever sets them.
+///
+/// `this+0xbc` gates every resting sprite in `FUN_10024ca0`, and `DAT_100508c8`
+/// is a 0..255 alpha `FUN_10025690` applies to all of them at once as an ARGB
+/// modulation — so the whole strip fades as one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fade {
+    /// `DAT_100508c8`.
+    alpha: u8,
+    /// `DAT_100508c4`: the tick the ramp in progress started on, or `None` for
+    /// no ramp. The original clears it **only when a ramp completes**, so the
+    /// pointer leaving mid-fade-in does not restart the clock — the direction
+    /// flips against the old start and the alpha jumps. That is reproduced.
+    started: Option<u32>,
+    /// `this+0xbc`.
+    up: bool,
+}
+
+impl Fade {
+    /// One frame of the fade, given the clock and whether the pointer is over
+    /// the strip at all.
+    pub fn update(&mut self, now_ms: u32, over_strip: bool) {
+        if over_strip {
+            self.up = true;
+            if self.alpha != 0xff {
+                self.ramp(now_ms, true, FADE_IN_MS);
+            }
+        } else if self.alpha == 0 {
+            self.up = false;
+        } else {
+            self.ramp(now_ms, false, FADE_OUT_MS);
+        }
+    }
+
+    /// `FUN_100255c0`.
+    fn ramp(&mut self, now_ms: u32, rising: bool, over_ms: u32) {
+        let started = *self.started.get_or_insert(now_ms);
+        let elapsed = now_ms.saturating_sub(started);
+        if elapsed < over_ms {
+            let ramp = (elapsed * 255 / over_ms.max(1)) as u8;
+            self.alpha = if rising { ramp } else { 255 - ramp };
+        } else {
+            self.alpha = if rising { 255 } else { 0 };
+            self.started = None;
+        }
+    }
+
+    /// Whether the bar draws at all this frame.
+    pub fn drawn(&self) -> bool {
+        self.up
+    }
+
+    /// The alpha every one of the bar's sprites is modulated by.
+    pub fn alpha(&self) -> u8 {
+        self.alpha
+    }
+
+    /// Puts the bar straight into its hidden state, for a fresh script.
+    pub fn reset(&mut self) {
+        *self = Fade::default();
+    }
+}
 
 /// Frames within which a second press of widget 2 means "step back".
 ///
@@ -363,6 +463,7 @@ pub struct Bar {
     screen: Screen,
     /// Widget 2's latch, and the frame it was set on.
     latch: Option<u32>,
+    fade: Fade,
 }
 
 impl Bar {
@@ -374,11 +475,39 @@ impl Bar {
         Ok(Bar {
             screen: Screen::load(vfs, dll, PATH, resolution)?,
             latch: None,
+            fade: Fade::default(),
         })
     }
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// The strip's size in display pixels — an 800x75 band at the top of the
+    /// screen, scaled like any other UI art.
+    pub fn strip(&self) -> (u32, u32) {
+        self.screen.size()
+    }
+
+    /// One frame of the drop-down, given the pointer in the strip's own pixels.
+    ///
+    /// `over` is `None` when the pointer is not in the strip's rectangle at all,
+    /// which is the `-2` case that fades the bar out. A pointer inside the strip
+    /// but on no widget keeps it up, so this takes the position rather than the
+    /// hovered widget.
+    pub fn point_at(&mut self, over: Option<(u32, u32)>, now_ms: u32) -> Option<usize> {
+        self.fade.update(now_ms, over.is_some());
+        over.and_then(|(x, y)| self.hit(x, y))
+    }
+
+    pub fn fade(&self) -> Fade {
+        self.fade
+    }
+
+    /// Hides the bar again, for the start of a script.
+    pub fn reset(&mut self) {
+        self.fade.reset();
+        self.latch = None;
     }
 
     /// The widget under a point in the bar's own space, or `None`.
@@ -533,9 +662,37 @@ impl Bar {
         }
     }
 
-    /// Composites the bar over `under`, which is the frame it sits on top of.
-    pub fn compose(&self, under: Option<&Image>, states: &[WidgetState]) -> Image {
-        self.screen.compose_over(under, states)
+    /// Composites the strip as a transparent layer, faded.
+    ///
+    /// `MENUBAR.PNG` is RGBA and the engine draws the strip's sprites over
+    /// whatever frame is underneath, so this returns a layer for the caller to
+    /// blend rather than a picture with a black bar in it. The fade is applied
+    /// as one modulation over the whole layer, which is what `FUN_10025690`
+    /// does — it walks every sprite the bar owns and sets the same ARGB on each.
+    ///
+    /// One sprite escapes it in the original: `FUN_10025690` skips widget 0's
+    /// animation while `_GetAutoDraw@0` is non-zero, so that one stays at full
+    /// alpha. **What that export returns is not recovered**, so the exception is
+    /// not reproduced and the whole strip fades together.
+    pub fn compose(&self, states: &[WidgetState]) -> Image {
+        self.screen.compose_layer(states)
+    }
+
+    /// As [`Bar::compose`], with the fade already multiplied in.
+    ///
+    /// The SDL path does not use this: it caches the layer on its record list
+    /// and modulates the texture's alpha instead, so a ramp does not
+    /// recomposite the strip every frame. This is for the headless path, where
+    /// there is one image and no texture to modulate.
+    pub fn compose_faded(&self, states: &[WidgetState]) -> Image {
+        let mut layer = self.compose(states);
+        let alpha = u32::from(self.fade.alpha());
+        if alpha < 255 {
+            for px in layer.rgba.as_chunks_mut::<4>().0 {
+                px[3] = (u32::from(px[3]) * alpha / 255) as u8;
+            }
+        }
+        layer
     }
 }
 
@@ -552,6 +709,79 @@ mod tests {
             rate: SPEEDS[0],
             ..State::default()
         }
+    }
+
+    #[test]
+    fn the_bar_is_hidden_until_the_pointer_reaches_the_strip() {
+        let mut fade = Fade::default();
+        assert!(!fade.drawn());
+        assert_eq!(fade.alpha(), 0);
+
+        // Off the strip it stays away however long it is left.
+        fade.update(0, false);
+        fade.update(10_000, false);
+        assert!(!fade.drawn());
+
+        // The pointer arriving makes it draw at once, at alpha 0, and it ramps.
+        fade.update(0, true);
+        assert!(fade.drawn());
+        assert_eq!(fade.alpha(), 0);
+        fade.update(FADE_IN_MS / 2, true);
+        assert_eq!(fade.alpha(), 127);
+        fade.update(FADE_IN_MS, true);
+        assert_eq!(fade.alpha(), 255);
+    }
+
+    #[test]
+    fn the_pointer_leaving_ramps_out_and_then_takes_the_bar_away() {
+        let mut fade = Fade::default();
+        fade.update(0, true);
+        fade.update(FADE_IN_MS, true);
+        assert_eq!(fade.alpha(), 255);
+
+        // The ramp out is over the longer of the two windows, and the bar keeps
+        // drawing all the way through it.
+        fade.update(1_000, false);
+        assert!(fade.drawn());
+        fade.update(1_000 + FADE_OUT_MS / 2, false);
+        assert_eq!(fade.alpha(), 128);
+        assert!(fade.drawn());
+        fade.update(1_000 + FADE_OUT_MS, false);
+        assert_eq!(fade.alpha(), 0);
+        // It is still "up" on the frame the alpha hits zero; the next frame is
+        // the one that takes it away, which is the order `FUN_10024100` does it
+        // in — the test comes before the assignment.
+        fade.update(3_000, false);
+        assert!(!fade.drawn());
+    }
+
+    #[test]
+    fn a_reversal_mid_ramp_does_not_restart_the_clock() {
+        // `FUN_100255c0` clears its start tick only when a ramp completes, so
+        // flipping direction part way through keeps the old start and the alpha
+        // jumps. Shipped behaviour, reproduced rather than smoothed over.
+        let mut fade = Fade::default();
+        fade.update(0, true);
+        fade.update(FADE_IN_MS / 2, true);
+        assert_eq!(fade.alpha(), 127);
+        // Now leave. The out ramp measures from tick 0, not from now, so half
+        // of FADE_IN_MS into a 1000ms out ramp is barely any fall at all.
+        fade.update(FADE_IN_MS / 2, false);
+        assert_eq!(
+            fade.alpha(),
+            255 - (FADE_IN_MS / 2 * 255 / FADE_OUT_MS) as u8
+        );
+    }
+
+    #[test]
+    fn a_pointer_on_the_strip_but_on_no_widget_keeps_the_bar_up() {
+        // -1 from the hit map, not -2: the bar stays. This is the distinction
+        // the whole drop-down turns on.
+        let mut fade = Fade::default();
+        fade.update(0, true);
+        fade.update(FADE_IN_MS, true);
+        assert!(fade.drawn());
+        assert_eq!(fade.alpha(), 255);
     }
 
     #[test]

@@ -691,6 +691,50 @@ place and codes 2 and 5 chain to whatever `_GetNextScriptFile@12` names) and
 state 5 leaves. **Which menu each `+0xf8` number selects is not recovered**, and
 the chaining codes are route-system territory.
 
+### The bar is a drop-down, and translucent
+
+The bar is on screen only while the pointer is inside its strip.
+`FUN_10024100` keeps `lookup(pointer) - 1` at `this+0xd4` and branches on it
+being **-2**:
+
+    if (this+0xd4 == -2) {                       // pointer is off the strip
+        if (DAT_100508c8 == 0) this+0xbc = 0;    // faded right out: bar is off
+        else FUN_100255c0(this, 0, 1000);        // ramp out over 1000ms
+    } else {
+        if (DAT_100508c8 != 0xff) FUN_100255c0(this, 1, 300);
+        this+0xbc = 1;
+    }
+
+-2 is the hit map's doing, not a sentinel the bar invents. The map object is the
+executable's `ClickableMap` — vtable `0x004d70c4`, stored by its constructor
+`FUN_00465830`, which the DLL obtains through host factory slot `+0xac` case 5,
+and which is the **same class the choice box uses**. Its lookup `FUN_00465bc0`
+returns **-1 for a point outside the map's own rectangle** and the region id — 0
+for no region — for one inside it. So off the strip gives `-1 - 1 = -2` and the
+bar goes away, while anywhere on the strip, over a widget or not, gives -1 or
+better and it stays up.
+
+The strip is 800x75 at the top of the screen: `ClickableMap`'s origin members
+(`+0x14`, `+0x18`) are zeroed by that constructor and nothing in the bar's path
+sets them, and its own extent (`+0x1c`, `+0x20`) is the map's width and height,
+set by the loader `FUN_004659d0`. That loader also settles a format question in
+passing — it reads the file's **bytes** from offset 8 and widens each to a `u16`
+cell in memory, so one byte per pixel on disk is right and the widening is the
+loader's, not the format's.
+
+`this+0xbc` gates every resting sprite in `FUN_10024ca0`. `DAT_100508c8` is a
+0..255 alpha that `FUN_10025690` applies to all of the bar's sprites at once as
+an ARGB modulation, so the whole strip fades as one; `FUN_100255c0` ramps it,
+and clears its start tick **only when a ramp completes**, so a pointer leaving
+mid-fade-in does not restart the clock — the direction flips against the old
+start and the alpha jumps. One sprite escapes the modulation: `FUN_10025690`
+skips widget 0's animation while `_GetAutoDraw@0` is non-zero. **What that
+export returns is not recovered.**
+
+`MENUBAR.PNG` is **RGBA**, not opaque: the strip's panels are semi-transparent
+and the frame underneath shows through them, which is why the bar is composited
+as a layer and blended over the picture rather than drawn onto black.
+
 `MENUBAR.PNG` holds two buttons and nothing else, so the bar cannot be
 composited from hover states: `FUN_10024ca0` draws about fifteen sprites from
 the chip sheet every frame and `FUN_10021c20` is where each is given a record.
@@ -728,7 +772,11 @@ non-zero, which is what the shipped English install has.
 
 `FUN_0044d450` hit-tests in **normalised** coordinates — host slot `+0x144`
 hands back a pair of floats, and the bounds are the doubles `0.0`, `0.5` and
-`1.0` at `0x004d13d8`, `0x004d4fb0` and `0x004d13d0`. It uses the `.CMAP` only
+`1.0` at `0x004d13d8`, `0x004d4fb0` and `0x004d13d0`. The same pair goes to the
+`ClickableMap` lookup, which indexes whole pixels, so something scales them in
+between; that is `FUN_00465c40`, whose decompilation loses its x87 arguments, so
+**the scaling step itself is not recovered** — multiplying by the map's size is
+what reproduces the shipped maps' geometry. It uses the `.CMAP` only
 when `FUN_0040e830()` and `FUN_0040ea90()` both return 1, and otherwise splits
 the screen itself: **on x by default, on y for the `_H` layout**. The shipped
 maps agree exactly — `Select_2_Full.cmap` is two 640x720 halves and

@@ -677,6 +677,10 @@ fn run_script(
     let mut paused = false;
     let mut pointer = (0.0f32, 0.0f32);
     let mut buttons = (false, false);
+    // A wall clock for the bar's fade, which ramps in milliseconds of real time
+    // and so cannot hang off the script clock: the script clock stops when
+    // playback is paused, and the bar still has to fade.
+    let start = Instant::now();
 
     loop {
         for event in events.poll_iter() {
@@ -763,16 +767,22 @@ fn run_script(
         bar_state.paused = paused;
         bar_state.rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
         if let Some(control) = &mut control {
-            let (bw, bh) = control.screen().size();
+            let (bw, bh) = control.strip();
             let strip = FRect::new(dst.x, dst.y, bw as f32 * scale, bh as f32 * scale);
-            let over = |p: (f32, f32)| {
-                let sx = (p.0 - strip.x) / scale;
-                let sy = (p.1 - strip.y) / scale;
-                (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
-                    .then_some((sx as u32, sy as u32))
-            };
-            hovered = over(pointer).and_then(|(x, y)| control.hit(x, y));
+            // Whether the pointer is inside the strip's own rectangle at all is
+            // the question the bar's visibility turns on, so it is asked here
+            // and not derived from whether a widget was hit.
+            let sx = (pointer.0 - strip.x) / scale;
+            let sy = (pointer.1 - strip.y) / scale;
+            let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
+                .then_some((sx as u32, sy as u32));
+            let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            hovered = control.point_at(over, now_ms);
 
+            // A click only reaches the bar while the bar is actually on screen.
+            if buttons.0 && !control.fade().drawn() {
+                buttons.0 = false;
+            }
             if buttons.0 {
                 if let Some(widget) = hovered {
                     // Consume the press, so holding the button does not
@@ -1035,15 +1045,16 @@ fn run_script(
             }
         }
 
-        // The control bar last, over everything, as its own layer.
-        if let Some(control) = &control {
+        // The control bar last, over everything, as its own layer — and only
+        // while it is dropped down.
+        if let Some(control) = control.as_ref().filter(|c| c.fade().drawn()) {
             let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
             let records = control.records(hovered, bar_state, elapsed);
             let stale = bar_texture
                 .as_ref()
                 .is_none_or(|(cached, ..)| cached != &records);
             if stale {
-                let image = control.compose(None, &control.states(hovered, bar_state, elapsed));
+                let image = control.compose(&control.states(hovered, bar_state, elapsed));
                 let mut texture = creator.create_texture_streaming(
                     PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
                     image.width,
@@ -1053,10 +1064,15 @@ fn run_script(
                 texture.update(None, &image.rgba, image.width as usize * 4)?;
                 bar_texture = Some((records, image.width, image.height, texture));
             }
-            if let Some((_, w, h, texture)) = &bar_texture {
+            if let Some((_, w, h, texture)) = &mut bar_texture {
+                // The strip is cached on its record list and the fade applied
+                // as an alpha modulation, so ramping does not recomposite it
+                // 60 times a second. This is also how the original fades it:
+                // one ARGB set on every sprite the bar owns.
+                texture.set_alpha_mod(control.fade().alpha());
                 canvas
                     .copy(
-                        texture,
+                        &*texture,
                         None,
                         FRect::new(dst.x, dst.y, *w as f32 * scale, *h as f32 * scale),
                     )
