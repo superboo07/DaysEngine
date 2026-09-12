@@ -52,7 +52,7 @@ Exactly 14 commands exist across all 1,857 scripts:
 | Command | Arguments after start timecode | Count |
 |---|---|---|
 | `PrintText` | speaker, text | 30,486 |
-| `PlayVoice` | path, channel, speaker tag | 30,413 |
+| `PlayVoice` | path, male-voice flag, speaker tag | 30,413 |
 | `CreateBG` | `BGS`, image path | 13,024 |
 | `PlaySe` | slot (1-5), path | 3,552 |
 | `PlayMovie` | path, loop flag | 2,042 |
@@ -72,10 +72,10 @@ Notes:
   **timeline**, not a program counter. The engine is closer to a video editor's
   EDL than to a VN bytecode interpreter.
 - `PlaySe` slot 5 is sometimes handed a `Voice...` path — the game reuses the SE
-  mixer for non-lipsynced voice.
+  mixer for voice that is not meant to drive a mouth overlay.
 - **166 voice references point at clips that do not exist**, out of 50,653 asset
   references across all scripts. They cluster on `PlayVoice` statements whose
-  lipsync and speaker-tag fields were left blank, which reads as a scripter
+  male-voice and speaker-tag fields were left blank, which reads as a scripter
   marking "no clip for this line". One background PNG is likewise absent
   (`Event01/01-00/01-00-T00/01-00-T00-009`). A missing asset must not be fatal.
 - `MoveSom` drives a toy; the retail engine no-ops it without hardware.
@@ -91,8 +91,94 @@ parser over the real packs, not by reading the format spec:
 | `05-KC-F00` line 241 | A **semicolon inside dialogue** (`I know; I am, too.`). Statements have no escaping, so a `;` only terminates when the next non-whitespace character is `[` or the file ends. |
 | `05-KI-OP1` | Written with **`, ` separators instead of tabs**, plus a stray whitespace-only ` ;` statement. Fall back to comma splitting only when a statement contains no tab, so commas in ordinary dialogue stay literal. |
 | `03-KB-D10` line 29 | A `PrintText` with a **trailing empty field**. |
-| `05-SE-C08` line 81, and 129 others | `PlayVoice` with **empty lipsync and tag fields** but the tabs still written. Fields must be read by position with defaults, not matched against an exact arity. |
+| `05-SE-C08` line 81, and 129 others | `PlayVoice` with **empty male-voice and tag fields** but the tabs still written. Fields must be read by position with defaults, not matched against an exact arity. |
 | `01-00-E01` | Two timecodes with a **frame field of 26** in a 24 fps script. Fold the overflow in rather than rejecting. |
+
+### The male-voice flag
+
+`PlayVoice`'s second field is a 0/1 flag for "this line is a male character",
+not a lip-sync switch. The engine stores it on the voice object
+(`FUN_0044e3b0`, at `+0x48`) and `FUN_0044e800` refuses to start the clip when
+the flag is set and `SysMenuSDHQ.dll`'s `GetMenVoice` export returns zero. That
+export is a thunk to `FUN_100070c0`, which returns offset `+0xa8` of the menu
+config object — the field `FUN_10006ce0` loads from and `FUN_10006e40` saves to
+the `MenVoice` key of `Config.DAT`, and that the Option screen's widgets 10 and
+11 set.
+
+The data agrees: across all 1,857 scripts the flag is 1 for `mak` (9,848 lines)
+and `tai`, and 0 for `sek`, `kot`, `hik` and the rest. A handful of tags carry
+both values, `xxx` narration most of all.
+
+Nothing in the statement switches lip sync on or off. The speaker tag alone
+decides, by whether the current background ships overlays for it.
+
+### Lip sync — mouth overlays
+
+In a still-background scene the engine flaps a speaker's mouth by patching
+three small PNGs into the background. They sit in the `EventNN` pack beside the
+background frame they belong to, named `<background stem><TAG>.<A|B|C>.PNG`:
+
+```text
+Event00/00-00/00-00-A02/00-00-A02-001B.PNG        the background
+Event00/00-00/00-00-A02/00-00-A02-001BMAK.A.PNG   Makoto's mouth, closed
+Event00/00-00/00-00-A02/00-00-A02-001BMAK.B.PNG   open
+Event00/00-00/00-00-A02/00-00-A02-001BMAK.C.PNG   wide
+```
+
+Every overlay is a full 800x452 RGBA canvas, almost entirely transparent. The
+set belongs to the **background**, not to the voice: `-001`, `-001B` and `-001C`
+each carry their own, sometimes for a different speaker, so a background change
+mid-line changes which mouths are available. 8,923 sets ship across the six
+`EventNN` packs.
+
+The background object is a `FILMOBJ::ImageChar` (vftable `0x004d535c`,
+constructed at `FUN_00443900`), and the rules are:
+
+- **Registration.** The dispatcher `FUN_00438de0` calls vtable slot `+0x90` on
+  the current `BGS<n>` object with the statement's speaker tag; its `[CreateBG]`
+  arm walks the live voice list and registers every tag already speaking on the
+  new background, which is what carries a mouth across a background change.
+- **Path.** `FUN_004453e0` (slot `+0x90`) appends the tag to the background's
+  own path, then `FUN_00444f70` appends `.A`, `.B` or `.C` and `.png` (literals
+  at `0x004d5268`, `0x004d5270`, `0x004d5278`). The tag goes on exactly as the
+  script spells it — lowercase — and the case-insensitive pack lookup finds the
+  uppercase name. If any of the three is missing the tag goes into a
+  per-background reject set and that speaker never flaps on that background;
+  `xxx` narration lines simply have no art and so do nothing.
+- **Patch rectangle.** `FUN_00445240` derives it from the `.A` image's alpha,
+  and not as a bounding box: it takes the first opaque pixel in raster order as
+  the corner, counts the opaque pixels on that row for the width, and counts how
+  far that column stays opaque for the height. `FUN_00444b80` then copies that
+  rectangle into the background's surface with `memcpy` — no alpha blending.
+  Both only work because the shipped overlays are a solid opaque rectangle on a
+  transparent canvas, which the real files confirm: the scan yields exactly
+  x=392 y=160 48x43 for `00-00-A02-001BMAK`, matching the true opaque region,
+  and every alpha byte is 0 or 255.
+- **Cadence.** `FUN_00444cf0`, called from the object's update `FUN_00443e30`,
+  keeps ten slots (one per tag) with a phase counter. The counter steps on every
+  frame whose number is divisible by three — 8 Hz, phase-locked to the engine
+  clock rather than to the line — and the image is the counter modulo three. It
+  steps only while the clip is audible, with one exception: once it has left
+  `.A` it keeps stepping through silence until it comes back round to `.A`, so
+  the mouth always closes rather than freezing open. When the voice object is
+  gone it snaps to `.A`.
+- **Audible.** `FUN_0041ba90` builds the flags as the clip decodes, appending
+  one per tick and calling a tick silent when a single 16-bit sample lies in
+  `-59..=60`. `FUN_0041a830` looks a flag up by elapsed frame converted to 100ns
+  units by `FUN_00428140`, whose divisor `DAT_0050c468` is the engine-wide 24 —
+  written once at `0x0044a623`, and the same constant the `MM:SS:FF` parser
+  multiplies by.
+
+**Which sample the retail build tests is not reproducible.** `FUN_0041ba90`
+indexes relative to the decoder's current packet
+(`packet_bytes * n / 23 - consumed_samples`), so the answer depends on how the
+shipped Ogg reader chunks the stream; the same expression also advances the tick
+counter at 23 Hz while labelling the entries at 24. `src/lipsync.rs` samples at
+the frame's own position and keeps the threshold.
+
+`FILMOBJ::MovieChar` carries the same ten slots at `+0xe4` (`FUN_0044a2c0`), but
+no `MovieNN` pack in the retail install contains a single `.A`/`.B`/`.C`
+overlay, so nothing can drive it.
 
 ---
 
@@ -657,7 +743,7 @@ getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):
 | `BgmVolume` | int `0..=10` | 5 | Sound tab |
 | `SeVolume` | int `0..=10` | 5 | Sound tab |
 | `TextView` | bool | true | Def tab |
-| `MenVoice` | bool | true | Sound tab |
+| `MenVoice` | bool | true | Sound tab — plays male voice lines; see the `.ORS` male-voice flag |
 | `Mute` | bool | false | Sound tab |
 | `Skip` | bool | false | Def tab |
 | `AutoDraw` | bool | true | *(no widget recovered)* |

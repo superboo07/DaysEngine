@@ -8,11 +8,12 @@
 //! can reference a hundred movies and thirty minutes of voice, and the game only
 //! ever needs the next few seconds.
 
+use crate::lipsync::{self, Envelope, Mouth};
 use crate::media::{AudioBuffer, VideoDecoder, VideoFrame};
 use crate::vfs::Vfs;
 use anyhow::{Context, Result};
 use days_script::{Command, Fade, Frame, Script};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::Mixer;
@@ -51,6 +52,10 @@ pub struct Visual<'a> {
     pub choices: Option<(&'a str, Option<&'a str>)>,
     /// Fade overlay: colour and opacity in `0.0..=1.0`.
     pub fade: Option<([u8; 3], f32)>,
+    /// Mouth patches to draw over the still, each with the index of the image
+    /// showing this frame. Empty unless a tagged voice line is speaking over a
+    /// background that ships overlays for it.
+    pub mouths: Vec<(&'a Mouth, usize)>,
 }
 
 /// Tracks a fade in progress.
@@ -93,6 +98,27 @@ pub struct Stage {
     /// Decoded audio kept alive so repeated plays do not re-decode. Voice lines
     /// are one-shot but SE and BGM repeat constantly within a scene.
     audio_cache: HashMap<String, Arc<AudioBuffer>>,
+    /// Voice lines that could drive a mouth, keyed by speaker tag. The retail
+    /// engine keeps ten slots on the background object and matches an incoming
+    /// line against them by tag (`FUN_004448f0`), so a tag has one line at a
+    /// time.
+    voices: BTreeMap<String, VoiceLine>,
+    /// The player's `MenVoice` option. `FUN_0044e800` drops a clip whose
+    /// `[PlayVoice]` male-voice flag is set when this is off; the option's
+    /// default is on.
+    men_voice: bool,
+    /// Mouth art for the current background, by tag. A `None` is a tag this
+    /// background has no complete set for — the engine caches that rejection
+    /// per background too, and re-checking it every frame would mean three
+    /// failed pack lookups per speaker per frame.
+    mouths: BTreeMap<String, Option<Mouth>>,
+}
+
+/// A voice line that may be flapping a mouth.
+struct VoiceLine {
+    start: Frame,
+    end: Frame,
+    envelope: Envelope,
 }
 
 impl Stage {
@@ -104,7 +130,15 @@ impl Stage {
             still: None,
             fade: None,
             audio_cache: HashMap::new(),
+            men_voice: true,
+            voices: BTreeMap::new(),
+            mouths: BTreeMap::new(),
         }
+    }
+
+    /// Sets the player's `MenVoice` option, which gates male voice clips.
+    pub fn set_men_voice(&mut self, on: bool) {
+        self.men_voice = on;
     }
 
     pub fn script(&self) -> &Script {
@@ -165,6 +199,8 @@ impl Stage {
         self.still = None;
         self.fade = None;
         self.played = None;
+        self.voices.clear();
+        self.mouths.clear();
     }
 
     fn dispatch(
@@ -202,6 +238,21 @@ impl Stage {
                 }
                 self.still = Some(load_still(vfs, path)?);
                 self.movie = None;
+                // The overlays belong to the background, so a new one starts
+                // with none loaded — and then picks up every line still
+                // speaking, which is what lets a mouth carry across a
+                // background change mid-sentence (`FUN_00438de0`'s
+                // `[CreateBG]` arm).
+                self.mouths.clear();
+                let speaking: Vec<String> = self
+                    .voices
+                    .iter()
+                    .filter(|(_, v)| start >= v.start && start < v.end)
+                    .map(|(tag, _)| tag.clone())
+                    .collect();
+                for tag in speaking {
+                    self.load_mouth(vfs, &tag);
+                }
             }
             Command::PlayBgm { path } | Command::EndBgm { path } => {
                 let bgm = vfs
@@ -218,8 +269,29 @@ impl Stage {
                 let buffer = self.audio_by_path(vfs, path)?;
                 mixer.play_se(*slot, buffer);
             }
-            Command::PlayVoice { path, .. } => {
+            Command::PlayVoice {
+                path,
+                men_voice,
+                tag,
+            } => {
                 let buffer = self.audio_by_path(vfs, path)?;
+                // `FUN_0044e800` asks the menu DLL's `GetMenVoice` export and
+                // returns without playing when the option is off. The clip is
+                // dropped outright, so there is no mouth to drive either.
+                if *men_voice && !self.men_voice {
+                    return Ok(());
+                }
+                if !tag.is_empty() {
+                    self.voices.insert(
+                        tag.clone(),
+                        VoiceLine {
+                            start,
+                            end,
+                            envelope: Envelope::from_audio(&buffer),
+                        },
+                    );
+                    self.load_mouth(vfs, tag);
+                }
                 mixer.play_voice(buffer);
             }
             Command::BlackFade(direction) => {
@@ -257,6 +329,22 @@ impl Stage {
             Command::SkipFrame | Command::Next => {}
         }
         Ok(())
+    }
+
+    /// Loads the mouth set for `tag` on the current background, once.
+    fn load_mouth(&mut self, vfs: &Vfs, tag: &str) {
+        let Some(still) = &self.still else { return };
+        if self.mouths.contains_key(tag) {
+            return;
+        }
+        let mouth = match Mouth::load(vfs, &still.path, tag) {
+            Ok(mouth) => mouth,
+            Err(err) => {
+                log::warn!("loading {tag} mouth for {}: {err:#}", still.path);
+                None
+            }
+        };
+        self.mouths.insert(tag.to_string(), mouth);
     }
 
     fn audio(&mut self, vfs: &Vfs, handle: crate::vfs::Handle) -> Result<Arc<AudioBuffer>> {
@@ -304,6 +392,16 @@ impl Stage {
             fade: self.fade.as_ref().map(|f| (f.colour, f.opacity(at))),
             ..Default::default()
         };
+
+        visual.mouths = self
+            .voices
+            .iter()
+            .filter(|(_, v)| at >= v.start && at < v.end)
+            .filter_map(|(tag, v)| {
+                let mouth = self.mouths.get(tag)?.as_ref()?;
+                Some((mouth, lipsync::image_index(&v.envelope, v.start, at)))
+            })
+            .collect();
 
         for event in self.script.events.iter().filter(|e| e.is_active_at(at)) {
             match &event.command {

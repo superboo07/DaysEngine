@@ -636,8 +636,14 @@ fn run_script(
         .context("creating movie texture")?;
     let mut still_texture: Option<(String, Texture)> = None;
     let mut text_texture: Option<(String, u32, u32, Texture)> = None;
+    // One patch texture, rebuilt only when a mouth of a different size shows
+    // up. Mouths are tens of pixels across and change three times a second, so
+    // allocating per frame would be pure churn.
+    let mut mouth_texture: Option<(usize, usize, Texture)> = None;
 
     let mut stage = Stage::new(script);
+    // Male voice lines are dropped when the player has turned `MenVoice` off.
+    stage.set_men_voice(Config::load(&player.game).flag(Flag::MenVoice));
 
     // The clock is wall-clock based with an offset, so pausing and seeking are
     // both just adjustments to the offset rather than separate state machines.
@@ -733,6 +739,36 @@ fn run_script(
                     .copy(texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing background: {e}"))?;
             }
+        }
+
+        // Mouth patches, over the background and under the fade, matching the
+        // order the engine composites them in.
+        for (mouth, index) in &visual.mouths {
+            let stale = mouth_texture
+                .as_ref()
+                .is_none_or(|(w, h, _)| (*w, *h) != (mouth.width, mouth.height));
+            if stale {
+                let mut texture = creator.create_texture_streaming(
+                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                    mouth.width as u32,
+                    mouth.height as u32,
+                )?;
+                texture.set_blend_mode(BlendMode::Blend);
+                mouth_texture = Some((mouth.width, mouth.height, texture));
+            }
+            let Some((_, _, texture)) = &mut mouth_texture else {
+                continue;
+            };
+            texture.update(None, mouth.image(*index), mouth.width * 4)?;
+            let patch = FRect::new(
+                dst.x + mouth.x as f32 * scale,
+                dst.y + mouth.y as f32 * scale,
+                mouth.width as f32 * scale,
+                mouth.height as f32 * scale,
+            );
+            canvas
+                .copy(&*texture, None, patch)
+                .map_err(|e| anyhow::anyhow!("drawing mouth: {e}"))?;
         }
 
         if let Some(([r, g, b], opacity)) = visual.fade {

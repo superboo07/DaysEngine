@@ -45,6 +45,24 @@ pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize)
         );
     }
 
+    // Mouth patches go over the background and under everything else, because
+    // the engine writes them straight into the background's own surface
+    // (`FUN_00444b80`) before the frame is composited.
+    for (mouth, index) in &visual.mouths {
+        blit(
+            &mut out,
+            width,
+            height,
+            &Surface {
+                pixels: mouth.image(*index),
+                width: mouth.width,
+                height: mouth.height,
+            },
+            mouth.x,
+            mouth.y,
+        );
+    }
+
     if let Some((colour, opacity)) = visual.fade {
         let a = (opacity.clamp(0.0, 1.0) * 255.0) as u32;
         if a > 0 {

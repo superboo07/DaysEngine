@@ -15,6 +15,7 @@ pub mod compose;
 pub mod config;
 pub mod ending;
 pub mod ini;
+pub mod lipsync;
 #[allow(unsafe_code)]
 pub mod media;
 pub mod menu;

@@ -276,7 +276,7 @@ pub fn shows_current_value(
             _ => false,
         },
         // `FUN_1000a190` tests `widget == 10` in both of its first two arms, so
-        // the mark for voiced menus is always on widget 10 and widget 11 never
+        // the mark for male voice is always on widget 10 and widget 11 never
         // gets one. That is the shipped behaviour, bug and all; writing the
         // arm the author meant would make this screen differ from the game.
         Tab::Sound => match widget {
@@ -1024,11 +1024,11 @@ mod tests {
         assert!(!shows_current_value(Tab::Def, 0xc, &config, d, som));
     }
 
-    /// The mark for voiced menus is stuck on widget 10 in the shipped build,
+    /// The mark for male voice is stuck on widget 10 in the shipped build,
     /// because `FUN_1000a190` tests the same widget number in both arms. This
     /// pins that rather than quietly fixing it.
     #[test]
-    fn the_sound_tabs_voiced_menu_mark_is_stuck_where_the_dll_leaves_it() {
+    fn the_sound_tabs_male_voice_mark_is_stuck_where_the_dll_leaves_it() {
         let mut config = cfg();
         let d = Display::default();
         let som = Som::default();

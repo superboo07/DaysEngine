@@ -114,11 +114,16 @@ pub enum Command {
         speaker: String,
         text: String,
     },
-    /// Voice clip. `lipsync` is the engine's 0/1 flag; `tag` is a short speaker
-    /// code (`kot`, `sek`, `xxx` for narration).
+    /// Voice clip. `men_voice` is the engine's 0/1 flag for "this line is a
+    /// male character"; the retail engine drops the clip when the player has
+    /// turned the `MenVoice` option off (`FUN_0044e800` calls the menu DLL's
+    /// `GetMenVoice` export and returns without playing when it is zero).
+    /// `tag` is a short speaker code (`kot`, `sek`, `xxx` for narration) and is
+    /// what selects the lip-sync mouth overlays; see `crate::lipsync` in the
+    /// engine.
     PlayVoice {
         path: String,
-        lipsync: bool,
+        men_voice: bool,
         tag: String,
     },
     /// Still background. The only kind seen in retail data is `BGS`.
@@ -127,7 +132,8 @@ pub enum Command {
         path: String,
     },
     /// Sound effect on one of five mixer slots. Slot 5 is sometimes handed a
-    /// `Voice...` path — the game reuses the SE mixer for unlipsynced voice.
+    /// `Voice...` path — the game reuses the SE mixer for voice that is not
+    /// meant to drive a mouth overlay.
     PlaySe {
         slot: u8,
         path: String,
@@ -363,7 +369,7 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
 
     // Fields are read by position with a default, rather than matched against an
     // exact shape. Retail scripts are inconsistent about optional fields: some
-    // `PlayVoice` statements leave the lipsync flag and speaker tag empty but
+    // `PlayVoice` statements leave the male-voice flag and speaker tag empty but
     // still write the tabs (`05-SE-C08` line 81), and one `PrintText` has a
     // trailing empty field (`03-KB-D10` line 29). Only the fields a command
     // genuinely needs are required.
@@ -395,7 +401,7 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
             need(1, "a voice path")?;
             Command::PlayVoice {
                 path: field(0).to_string(),
-                lipsync: flag(field(1)),
+                men_voice: flag(field(1)),
                 tag: field(2).to_string(),
             }
         }
@@ -597,7 +603,7 @@ mod tests {
             voice.command,
             Command::PlayVoice {
                 path: "Voice00/00-00/00-00-A00/00-00-A00-0080".into(),
-                lipsync: true,
+                men_voice: true,
                 tag: "xxx".into()
             }
         );
