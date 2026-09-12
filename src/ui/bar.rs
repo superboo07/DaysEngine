@@ -272,8 +272,26 @@ pub struct State {
     /// own draw-message flag is set and the asset it names resolves. Disables
     /// widgets 4 and 5..9.
     pub message: bool,
-    /// Host `+0x88`: `FUN_00427490` — the `Skip` setting, or else the same
-    /// asset test. Required by widgets 5..9.
+    /// Host `+0x88`: `FUN_00427490`. Required by widgets 4 and 5..9.
+    ///
+    /// Two branches, and the second is the one that matters:
+    ///
+    /// ```text
+    /// if (_GetSkipFlag@0() == 0) return host->+0x18(engine + 0x188);
+    /// else                       return 1;
+    /// ```
+    ///
+    /// Host `+0x18` is `FUN_00428770`, a lookup of the given path in the pack
+    /// index the engine holds at `+0x3c`. `engine + 0x188` is **the script
+    /// being played**: `FUN_00423a70` takes the next entry off the pending
+    /// queue at `+0x154`, stores it there, and hands that same string to the
+    /// timeline object's loader `FUN_00430d20`; `FUN_00425bf0` state 7 refills
+    /// it from `_GetNextScriptFile@12` when a script chains.
+    ///
+    /// So while a script is playing the path resolves, `+0x18` answers
+    /// non-zero, and `+0x88` is true **whatever the `Skip` setting says**. The
+    /// setting is only a short circuit ahead of the lookup, not a gate on the
+    /// speed row.
     pub skippable: bool,
     /// Host `+0x98`: the member host `+0x94` sets. Required by widgets 15..24.
     pub stepping: bool,
@@ -314,16 +332,21 @@ pub struct State {
 }
 
 impl State {
-    /// Reads the parts of the state that live in `Config.DAT`.
+    /// The state a bar starts in over a script that is playing.
     ///
-    /// Two do: host `+0x88` is `FUN_00427490`, whose first act is
-    /// `_GetSkipFlag@0`, and `_GetSuperSkipFlag@0` is asked for directly.
-    /// Both exports return keys the settings screen writes. Everything else on
-    /// [`State`] is a live member of the running engine and has to come from
-    /// the caller.
+    /// One member comes from `Config.DAT`: widget 4 asks `_GetSuperSkipFlag@0`
+    /// directly, and that export returns a key the settings screen writes.
+    ///
+    /// [`State::skippable`] does **not**. Host `+0x88` short-circuits on
+    /// `_GetSkipFlag@0` and otherwise asks whether the playing script resolves
+    /// in the packs, which it does — a bar only exists over a loaded script.
+    /// So it is true here, and the speed widgets are live for every player
+    /// rather than only for one who has turned `Skip` on. Everything else on
+    /// [`State`] is a live member of the running engine and comes from the
+    /// caller.
     pub fn from_config(config: &Config) -> State {
         State {
-            skippable: config.flag(Flag::Skip),
+            skippable: true,
             super_skip: config.flag(Flag::SuperSkip),
             rate: SPEEDS[0],
             ..State::default()
@@ -745,6 +768,23 @@ impl Bar {
 #[cfg(test)]
 mod tests {
 
+    /// The speed row and the skip button are live for every player, not only
+    /// one who has turned `Skip` on. Host `+0x88` short-circuits on
+    /// `_GetSkipFlag@0` and otherwise asks whether the playing script resolves
+    /// in the packs, which over a loaded script it does.
+    #[test]
+    fn the_speed_row_is_live_whatever_the_skip_setting_says() {
+        let config = Config::parse_text("[Skip]=\"0\"\n[SuperSkip]=\"0\"\n");
+        let state = State::from_config(&config);
+        assert!(state.skippable, "+0x88 is true over a playing script");
+        for widget in 5..=9 {
+            assert!(
+                enabled(widget, state),
+                "speed widget {widget} must be live with Skip off"
+            );
+        }
+    }
+
     /// Pressing the rate already in force must not disturb the clock:
     /// `FUN_00424f90` compares against `+0x504` before doing anything else.
     #[test]
@@ -893,16 +933,18 @@ mod tests {
         assert!(enabled(0xe, replay));
     }
 
+    /// With host `+0x88` false — no script loaded — the skip button and the
+    /// speed row go dead together, and nothing else does.
     #[test]
-    fn the_speed_row_needs_the_skip_setting() {
-        let no_skip = State {
+    fn the_speed_row_and_skip_go_dead_together_without_a_script() {
+        let no_script = State {
             skippable: false,
             ..live()
         };
         for widget in 4..=9 {
-            assert!(!enabled(widget, no_skip));
+            assert!(!enabled(widget, no_script));
         }
-        assert!(enabled(3, no_skip));
+        assert!(enabled(3, no_script));
     }
 
     #[test]

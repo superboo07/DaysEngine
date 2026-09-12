@@ -645,9 +645,13 @@ fn run_menu(
                         _ => texture = None,
                     }
                 }
-                // The DLL only records the request and this engine draws its
-                // menus at one size, so the request is logged rather than
-                // silently dropped. See `daysengine::ui::options::DisplayRequest`.
+                // Still to build: the Option screen really does ask for a
+                // window size and a full-screen toggle, and the player should
+                // get them. The DLL only records the request — who acts on it
+                // is **not recovered** — so what the engine does with it is the
+                // engine's to decide, and right now it decides nothing. Logged
+                // so the gap is visible rather than silent. See
+                // `daysengine::ui::options::DisplayRequest`.
                 Action::Display(request) => {
                     log::info!("the Option screen asked for {request:?}; not applied");
                 }
@@ -1026,6 +1030,11 @@ fn run_script(
         }
     };
     let mut bar_state = bar::State::from_config(&config);
+    // A script always starts at 1x. The original does this twice over:
+    // `FUN_00423130` initialises the rate member `+0x538` to 1.0 when a session
+    // starts, and `FUN_004236f0` puts it back to 1.0 when a script is freed.
+    // The mixer outlives both, so it has to be told.
+    player.mixer.set_rate(bar_state.rate);
     // The bar's own fade, and the frame the auto flag was last set on.
     let mut auto_since = Instant::now();
     let mut hovered: Option<usize> = None;
@@ -1204,18 +1213,17 @@ fn run_script(
                         // on and the frame never jumps backwards. That is the
                         // fold-and-rebase below.
                         //
-                        // The original also hands the rate to the media object
-                        // through `FUN_00431c90`, which is its vtable slot
-                        // `+0x38`, so the voices and BGM are retimed with the
-                        // timeline. This engine decodes through system libav
-                        // and **does not retime audio**: the timeline runs at
-                        // the chosen rate and the stage re-seeks the audio it
-                        // passes, which is audible at 12x and 24x. The rate
-                        // itself is the original's.
+                        // The audio is retimed with the picture, because the
+                        // original retimes it: `FUN_00429500` hands the rate to
+                        // `FUN_004433d0`, which sets it on the stream through
+                        // `FUN_0041a050` and **mutes above 4.0** — so 1x, 2x
+                        // and 4x are heard, resampled, and 12x and 24x are
+                        // silent. `Mixer::set_rate` is both halves of that.
                         bar::Act::Speed(index) => {
                             if bar_state.set_speed(index) {
                                 offset = clock(origin, offset, rate);
                                 origin = Instant::now();
+                                player.mixer.set_rate(bar_state.rate);
                             }
                         }
                         bar::Act::Seek(code) if code == bar::Seek::RESTART => {
@@ -1252,8 +1260,14 @@ fn run_script(
                                 continue;
                             };
                             // Stop the script clock so playback resumes where
-                            // it was, open the menus, then put it back.
+                            // it was, open the menus, then put it back. The
+                            // menus play their own BGM through the same mixer
+                            // and are not on the rate-adjusted stream, so the
+                            // rate comes off for the duration and goes back on
+                            // return — otherwise a menu opened at 24x would be
+                            // silent.
                             offset = clock(origin, offset, rate);
+                            player.mixer.set_rate(1.0);
                             let outcome = run_menu(
                                 player,
                                 canvas,
@@ -1263,6 +1277,7 @@ fn run_script(
                                 MenuEntry::OverPlayback(mode, kind),
                             )?;
                             origin = Instant::now();
+                            player.mixer.set_rate(bar_state.rate);
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
                             bar_texture = None;

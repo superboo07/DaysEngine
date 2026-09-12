@@ -683,6 +683,22 @@ bracket the 25 into the same twelve groups:
 A press on a widget that is not live is swallowed *and silent*: the dispatch
 asks the enabled test before playing SE index 2.
 
+**`+0x88` is not the `Skip` setting**, though it starts with it.
+`FUN_00427490` is
+
+    if (_GetSkipFlag@0() == 0) return host->+0x18(engine + 0x188);
+    else                       return 1;
+
+and host `+0x18` is `FUN_00428770`, a lookup of that path in the pack index the
+engine keeps at `+0x3c`. `engine + 0x188` holds **the script being played**:
+`FUN_00423a70` takes the next entry off the pending queue at `+0x154`, stores it
+there and hands the same string to the timeline loader `FUN_00430d20`, and
+`FUN_00425bf0` state 7 refills it from `_GetNextScriptFile@12` when a script
+chains. A playing script resolves, so `+0x88` is true and the speed row and the
+skip button are live for every player — the setting is only a short circuit
+ahead of the lookup. The one case that answers false is no script loaded at
+all.
+
 **The rate table is `1, 2, 4, 12, 24`** — `DAT_004f99f0`, indexed by host slot
 `+0x8c` in `FUN_00424f90`. The English chip sheet labels the last two buttons
 `▶×16` and `▶×32`; the art is not the authority.
@@ -706,11 +722,35 @@ milliseconds, with `+0x544` holding a high-water mark so the frame never goes
 backwards. Re-basing on every rate change is what keeps time already played
 from being re-scaled.
 
-`FUN_00424f90` also hands the rate to the media object, through
-`FUN_00431c90`, which is that object's vtable slot `+0x38` — so the original
-retimes the voices and BGM with the timeline. Dropping from 12x or 24x back
-below 4x additionally re-primes the media through `FUN_00431cd0`, guarded on
-the old index being above 2, the new one below 3, and `engine + 0x22c` clear.
+`FUN_00424f90` retimes the audio with the picture, and **mutes it above 4x**.
+
+It hands the rate to two things. The movie object gets it through
+`FUN_00431c90`, that object's vtable slot `+0x38`. The script's audio stream
+gets it through `FUN_00429500`, which passes it to `FUN_004433d0` on the sound
+object at `engine + 0x30c`. `FUN_004433d0` does two things with it:
+
+* it forwards the rate to the stream with `FUN_0041a050`, which is a bare rate
+  message (`0x8005`) on the sound object. Nothing time-stretches, so the
+  original simply resamples and the pitch rises with the speed.
+* before that, it compares the rate against the **double** at `0x004d5080` —
+  the instruction is `FCOMP double ptr`, and the eight bytes there are `4.0`.
+  Above it, `+0x40` is latched and `FUN_00443650(this, 1)` mutes the stream; at
+  or below it, the stream follows whatever `_GetMute@0` says.
+
+So of the five rates in the table the first three are heard and **12x and 24x
+are silent**, which is also why dropping from 12x or 24x back below 4x re-primes
+the media through `FUN_00431cd0` — guarded on the old index being above 2, the
+new one below 3, and `engine + 0x22c` clear. Read as a 4-byte float those eight
+bytes are `0.0`, which would mute every rate; the operand width is the
+authority.
+
+The engine keeps two script sound streams, `engine + 0x304` and
+`engine + 0x30c`, both taking their volume from `_GetMasterVolume@4` category 2
+or 3 (`FUN_10006fd0` reads the Option module's `+0x9c` for 2 and returns a fixed
+level 2 for 3). Only `+0x30c` is rate-adjusted. **Which of the two is which has
+not been recovered**: nothing that opens them with a path has been found, and
+the `+0x304` that `FUN_00422170` sets up is a different base — that one is
+`base + 0x304` with `base = engine + 0x30`, the choice box.
 
 Where the host slots land is the executable's own state machine. `FUN_00427300`
 switches on `engine + 0x220`, which is host `+0x1f4` — an independent

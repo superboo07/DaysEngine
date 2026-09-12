@@ -158,17 +158,21 @@
 //! every twenty characters and English wraps on whole words at forty, both
 //! measured in characters and both cut at three lines' worth.
 //!
-//! # What else is not implemented
+//! # Still to build
 //!
-//! The popup that asks the player to confirm overwriting a slot, and the
-//! comment editor behind host `+0xdc`, which is a text field with an IME
-//! attached. Saving here writes the timestamp line and keeps whatever comment
-//! the slot already had. Keyboard navigation through the list
-//! (`FUN_10014c90`) is a transition table that is **not recovered**; the
-//! pointer works, and the arrow keys fall back to the generic order. The two
-//! sprites at `+0xf8` and `+0xfc`, placed from records `(page + 0x20) * 0x18`
-//! and `(page + 0x2a) * 0x18`, are the current page's indicator and sit past
-//! the thirty-two records the atlas recovers for this screen.
+//! The popup that asks the player to confirm overwriting a slot:
+//! `FUN_100135c0` loads `System/SaveLoad/Popup_Save.png` whenever the module
+//! opens with `+0x94` set, which is the save job. Saving overwrites without
+//! asking until that is built.
+//!
+//! Keyboard navigation through the list (`FUN_10014c90`) is a transition table
+//! that is **not recovered**; the pointer works, and the arrow keys fall back
+//! to the generic order.
+//!
+//! The two sprites at `+0xf8` and `+0xfc`, placed from records
+//! `(page + 0x20) * 0x18` and `(page + 0x2a) * 0x18`, are the current page's
+//! indicator and sit past the thirty-two records the atlas recovers for this
+//! screen.
 
 use crate::install::clock::Civil;
 use crate::install::ini::Ini;

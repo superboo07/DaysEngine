@@ -232,9 +232,14 @@ struct BarArgs {
     /// The host's message flag is set.
     #[arg(long)]
     message: bool,
-    /// Clear the Skip setting the speed row needs, overriding Config.DAT.
+    /// Answer host `+0x88` false: no script is loaded, so the path at
+    /// `engine + 0x188` does not resolve and `_GetSkipFlag@0` is clear.
+    ///
+    /// This is the only way that slot answers false. Over a playing script it
+    /// is true whatever the Skip setting says, so the speed row is live — the
+    /// default here.
     #[arg(long)]
-    no_skip: bool,
+    no_script: bool,
     /// Set the host member the ten step widgets need.
     #[arg(long)]
     stepping: bool,
@@ -861,7 +866,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         paused: args.paused,
         replay: args.replay,
         message: args.message,
-        skippable: !args.no_skip && State::from_config(&config).skippable,
+        skippable: !args.no_script && State::from_config(&config).skippable,
         stepping: args.stepping,
         speed: args.speed.min(bar::SPEEDS.len() - 1),
         ..State::default()
@@ -886,6 +891,19 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         state.skippable,
         state.stepping,
         bar::SPEEDS[state.speed],
+    );
+    // The rate retimes the audio as well as the picture, and past the
+    // threshold the streams keep running unheard. Worth printing, because it
+    // is the difference between "fast-forward is silent" as a bug and as the
+    // behaviour `FUN_004433d0` actually has.
+    println!(
+        "audio: resampled x{} and {}",
+        bar::SPEEDS[state.speed],
+        if bar::SPEEDS[state.speed] > daysengine::playback::mixer::MUTE_ABOVE {
+            "muted, above the 4.0 threshold"
+        } else {
+            "heard"
+        }
     );
     println!("fade in {}ms, out {}ms", bar::FADE_IN_MS, bar::FADE_OUT_MS);
 

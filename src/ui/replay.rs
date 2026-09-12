@@ -44,7 +44,7 @@
 //! picks, `FUN_1001f270` sets the step index to zero and plays element zero of
 //! that version's script list — and element zero is the same script in every
 //! version, so **the choice does not change what starts**. It selects a branch
-//! for later, in the part that is not implemented.
+//! for later, in the chaining that is still to build.
 
 use days_save::FlagStore;
 
