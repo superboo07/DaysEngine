@@ -1698,6 +1698,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         },
         som: Som::default(),
         slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
+        english,
     };
 
     if args.check_all {

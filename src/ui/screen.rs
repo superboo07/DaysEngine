@@ -251,6 +251,23 @@ impl Screen {
     }
 
     /// Maps a native-space rectangle into display space.
+    /// Places a rectangle given in 800x450 layout space, the way a widget is
+    /// placed.
+    ///
+    /// Widget records are whole pixels, but some screens offset a sprite inside
+    /// its record by half a pixel — the save/load rows sit 4.5 down their own
+    /// record — so this takes the rect as floats and rounds where [`Screen`]
+    /// rounds: after the scale, not before it.
+    pub fn place_layout(&self, rect: (f32, f32, f32, f32)) -> (i64, i64, u32, u32) {
+        let (x, y, w, h) = rect;
+        (
+            (f64::from(x) * self.scale).round() as i64,
+            (f64::from(y) * self.scale + self.letterbox).round() as i64,
+            (f64::from(w) * self.scale).round().max(1.0) as u32,
+            (f64::from(h) * self.scale).round().max(1.0) as u32,
+        )
+    }
+
     fn place(&self, w: &Widget) -> (i64, i64, u32, u32) {
         let round = |v: f64| v.round();
         (

@@ -8,8 +8,8 @@
 //! # The list
 //!
 //! Ten slots to a page, ten pages, so a hundred slots. The widget table has
-//! two bands of ten for the rows — the timestamp side and the comment side —
-//! and both do the same thing:
+//! two bands of ten for the rows, the left of the row and the right of it, and
+//! clicking either picks the same slot:
 //!
 //! ```text
 //! 0x00 .. 0x09   the ten rows
@@ -47,17 +47,87 @@
 //! each of those tails has, and is why the split is a constant rather than a
 //! search.
 //!
-//! # What is not recovered
+//! # Where a row's text sits
 //!
-//! **Where a row's text sits.** `FUN_10011ec0` does not draw the three columns
-//! onto the screen: it renders them into an off-screen surface — the object at
-//! `+0x110`, its pixels at `+0x114` and its pitch at `+0x118` — putting the
-//! timestamp at `(0, row * 0x30 + 2)`, the chapter at `(0x400, row * 0x30 + 2)`
-//! and the comment at `(0, row * 0x30 + 0x202)`, and then blits it. Which
-//! rectangles that surface is blitted through has not been worked out, so a
-//! composited screen here draws the rows empty rather than putting the text
-//! somewhere this engine chose. [`Slots`] has the lines; `days menu` prints
-//! them.
+//! No column is drawn to the screen directly. `FUN_100135c0` builds a
+//! 2048x1024 off-screen ARGB surface — a `FrameBuffer` at `+0x10c` wrapped by
+//! a `DX9Texture` at `+0x110`, with the buffer's pixels cached at `+0x114` and
+//! its pitch at `+0x118` — and `FUN_10011ec0` clears it and rasterises all
+//! thirty columns into it at once. Each column then has its own sprite, whose
+//! source rectangle cuts that surface and whose destination rectangle puts it
+//! on the screen. [`SURFACE`], [`source_rect`] and [`dest_rect`] are those
+//! three facts.
+//!
+//! The classes are RTTI names, not inferences: host `+0xac` allocates by type
+//! code, and codes 0, 3 and 4 construct `DX9Texture`, `DX9Sprite2D` and
+//! `FrameBuffer`. That matters because the sprite calls Ghidra renders as a
+//! chain of `float10` results are really `DX9Texture` slot `+8` (`x / width`)
+//! and slot `+0xc` (`y / height`) normalising pixels to texture coordinates,
+//! and `DX9Sprite2D` slot `+0x1c`, which takes an origin **and a size** and
+//! forwards `(u, v, u + du, v + dv)`. Reading that chain as written gives four
+//! coordinates in the wrong order; the disassembly gives the real one, and it
+//! pairs every `/ width` value with the other `/ width` value.
+//!
+//! On the surface, per row `r` (`FUN_10011ec0` agrees with `FUN_100135c0` on
+//! all three, which is the cross-check):
+//!
+//! ```text
+//! timestamp   x 0      y r * 48 + 2     548 x 48
+//! chapter     x 1024   y r * 48 + 2     548 x 48
+//! comment     x 0      y r * 48 + 514   986 x 48
+//! ```
+//!
+//! On screen, in the 800x450 layout space the widget records use, where
+//! `record` is the row's own record — the first band for the timestamp and
+//! chapter, the second for the comment:
+//!
+//! ```text
+//! timestamp   record[r].x        + 1.0    record[r].y + 4.5   252 x 24
+//! chapter     record[r].x        + 262.5  record[r].y + 4.5   252 x 24
+//! comment     record[r + 0x16].x + 2.0    record[.].y + 4.5   494 x 24
+//! ```
+//!
+//! So the two bands are not two hit regions over one drawing: each band is
+//! where one of the columns lands. Every one of those constants was read out
+//! of the player's own DLL with its operand width taken from the instruction
+//! (`flds` for a 4-byte float, `fmull`/`faddl` for an 8-byte double) rather
+//! than from Ghidra's `(float)_DAT_...`, which narrows doubles at the use site
+//! and has already turned a 2.5 into a 0.0 on this project once.
+//!
+//! The surface is about twice the screen, so the text is rasterised at the
+//! font's own 48-pixel cell and comes down to size in the blit. Only the height
+//! halves exactly, 48 to 24. The widths do not: the comment goes 986 to 494 and
+//! the stored line 548 to 252, so both columns are squeezed horizontally, the
+//! stored line's noticeably. These are the shipped constants and they are
+//! transcribed rather than rounded to the clean ratio they nearly are.
+//!
+//! English shifts three things, all off host `+0x5c`: the timestamp moves right
+//! by 5.0, the chapter by 15.0, and the comment is centred in its column by
+//! `235.5 - width / 4` clamped at zero, measured on the advance total
+//! `FUN_10011ec0` accumulates. See [`comment_centre`].
+//!
+//! # The comment column's gate is uninitialised memory
+//!
+//! The comment sprites are built, and the comment is rasterised, only when host
+//! `+0xd8` answers non-zero. That slot is `FUN_0042bad0`, which returns the
+//! plain member `+0x74` of the interface it is called on — and the interface is
+//! a **secondary base subobject** installed at `[object+0x2c]`, which
+//! `FUN_004217e0` does literally: `movl $0x4d2894,0x2c(%edx)`. So the member is
+//! object `+0xa0`.
+//!
+//! **Nothing in the executable ever writes object `+0xa0`.** A store-pattern
+//! scan over the disassembly of the whole `.text` finds six writes to
+//! `0xa0(reg)`, and every one is on another class — a `timeGetTime` stamp, an
+//! indexed array base, and three in library code. No method in the host's own
+//! code band references the member at all. The constructor does not zero it
+//! either: it sets five members explicitly and bulk-initialises nothing, and
+//! the object is a plain `malloc(0x7d0)` through `FUN_0047ad7d`, which does not
+//! clear what it hands back.
+//!
+//! So in the retail build whether the comment column appears is decided by
+//! uninitialised heap. This engine draws it, because its layout is recovered
+//! and the comment the save dialog writes has no other way to be seen; a fresh
+//! allocation that happens to read zero is the same screen without it.
 //!
 //! # What is not implemented
 //!
@@ -71,6 +141,7 @@
 use crate::install::clock::Civil;
 use crate::install::ini::Ini;
 use crate::install::save;
+use crate::playback::text;
 use days_save::{FlagStore, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -140,6 +211,307 @@ pub fn enabled(popup_up: bool, widget: usize) -> bool {
 /// The slot a row of a page stands for, from `FUN_10011d50`.
 pub fn slot_of(page: usize, row: usize) -> u32 {
     (page * PER_PAGE + row) as u32
+}
+
+/// The off-screen surface every column is rasterised into, from
+/// `FUN_100135c0`: `FrameBuffer` slot `+8` is called with `(0x800, 0x400,
+/// 0x208888)`, and `FUN_10011ec0` clears it as 0x400 rows of 0x2000 bytes,
+/// which is the same 2048 pixels of 32 bits.
+pub const SURFACE: (u32, u32) = (0x800, 0x400);
+
+/// Which of the three things a row shows.
+///
+/// Each is a separate `DX9Sprite2D` with its own source and destination rect —
+/// `+0x144 + row * 4`, `+0x16c + row * 4` and `+0x194 + row * 4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    /// The timestamp half of the stored line.
+    When,
+    /// The chapter half.
+    Chapter,
+    /// The player's own comment.
+    Comment,
+}
+
+impl Column {
+    pub const ALL: [Column; 3] = [Column::When, Column::Chapter, Column::Comment];
+
+    /// Where in the surface this column's glyphs start, and how wide the sprite
+    /// cuts it.
+    ///
+    /// The x origins are `FUN_10011ec0`'s own pen starts — 0, `0x400` and 0 —
+    /// and the widths are `_DAT_1003b138` (a `flds`, so 548.0f) and
+    /// `_DAT_1003b110` (986.0f).
+    const fn surface_span(self) -> (f32, f32) {
+        match self {
+            Column::When => (0.0, 548.0),
+            Column::Chapter => (1024.0, 548.0),
+            Column::Comment => (0.0, 986.0),
+        }
+    }
+
+    /// The width of the sprite that cuts this column out of [`SURFACE`].
+    pub const fn width(self) -> f32 {
+        self.surface_span().1
+    }
+
+    /// How many characters of the column are drawn, from `FUN_10011ec0`.
+    ///
+    /// A cap, not a measurement: the loop stops at this many characters however
+    /// wide they are. English buys the timestamp one more character and the
+    /// comment twenty more; the chapter is always twenty.
+    pub const fn cap(self, english: bool) -> usize {
+        match self {
+            Column::When => 0x14 + if english { 1 } else { 0 },
+            Column::Chapter => 0x14,
+            Column::Comment => 0x14 + if english { 0x14 } else { 0 },
+        }
+    }
+
+    /// Which of the row's two widget records places this column.
+    ///
+    /// `FUN_100135c0` reads `DAT_1004b048 + row * 0x18` for the timestamp and
+    /// the chapter and `DAT_1004b048 + (row + 0x16) * 0x18` for the comment, so
+    /// the second band of ten is not a duplicate: it is where the comment goes.
+    pub const fn record_of(self, row: usize) -> usize {
+        match self {
+            Column::When | Column::Chapter => row,
+            Column::Comment => row + 0x16,
+        }
+    }
+
+    /// The x this column is offset by inside its record, and the extra shift
+    /// English adds.
+    ///
+    /// `_DAT_10039798` (1.0), `_DAT_1003b118` (262.5) and `_DAT_10039748` (2.0),
+    /// all `faddl` so all doubles; the English shifts are `_DAT_1003b140`
+    /// (5.0f) and `_DAT_1003b13c` (15.0f), and the comment has none here —
+    /// it is centred instead, in [`comment_centre`].
+    const fn dest_x(self, english: bool) -> f32 {
+        let shift = if english { 1.0 } else { 0.0 };
+        match self {
+            Column::When => 1.0 + 5.0 * shift,
+            Column::Chapter => 262.5 + 15.0 * shift,
+            Column::Comment => 2.0,
+        }
+    }
+
+    /// How wide this column is drawn: `_DAT_1003b128` (252.0) for the two
+    /// halves of the stored line and `_DAT_1003b0d0` (494.0) for the comment,
+    /// both `fmull` so both doubles.
+    pub const fn dest_width(self) -> f32 {
+        match self {
+            Column::When | Column::Chapter => 252.0,
+            Column::Comment => 494.0,
+        }
+    }
+}
+
+/// One row of the surface, `_DAT_1003b130` — an `fmull`, so the double 48.0.
+pub const SURFACE_ROW_PITCH: f32 = 48.0;
+
+/// How tall each column's slice of the surface is, `_DAT_1003977c` — a `flds`,
+/// so the float 48.0. The same as the pitch, so the rows abut exactly.
+pub const SURFACE_ROW_HEIGHT: f32 = 48.0;
+
+/// Where in the row the glyphs of the stored line go, `_DAT_10039748` (2.0),
+/// and where the comment's go, `_DAT_1003b108` (514.0). Both `faddl`.
+const SURFACE_LINE_Y: f32 = 2.0;
+const SURFACE_COMMENT_Y: f32 = 514.0;
+
+/// How far down its record every column is drawn, `_DAT_1003b0c8` — an `faddl`,
+/// so the double 4.5.
+pub const DEST_Y: f32 = 4.5;
+
+/// How tall every column is drawn, `_DAT_1003a860` — an `fmull`, so the double
+/// 24.0. Half the surface's row, which is why the text is rasterised at the
+/// font's own cell and comes down to size in the blit.
+pub const DEST_HEIGHT: f32 = 24.0;
+
+/// The rectangle of [`SURFACE`] this column of this row occupies, as
+/// `(x, y, width, height)`.
+///
+/// From `FUN_100135c0`'s `DX9Sprite2D` slot `+0x1c` calls, whose two `/ width`
+/// arguments are the x pair and whose two `/ height` arguments are the y pair.
+/// `FUN_10011ec0` rasterises into the same places, which is the cross-check.
+pub fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
+    let (x, width) = column.surface_span();
+    let base = match column {
+        Column::When | Column::Chapter => SURFACE_LINE_Y,
+        Column::Comment => SURFACE_COMMENT_Y,
+    };
+    (
+        x,
+        row as f32 * SURFACE_ROW_PITCH + base,
+        width,
+        SURFACE_ROW_HEIGHT,
+    )
+}
+
+/// Where in the glyph surface a column's pen starts for a row.
+///
+/// The same origin [`source_rect`] cuts from, offset by nothing: `FUN_10011ec0`
+/// draws each glyph at the top of its slice.
+pub fn surface_pen(column: Column, row: usize) -> (i32, i32) {
+    let (x, y, _, _) = source_rect(column, row);
+    (x as i32, y as i32)
+}
+
+/// Where this column of this row is drawn, in the 800x450 layout space the
+/// widget records use, as `(x, y, width, height)`.
+///
+/// `record` is the row's own record — [`Column::record_of`] says which of the
+/// two bands — and `centre` is [`comment_centre`], which is zero for every
+/// column but an English comment.
+pub fn dest_rect(
+    column: Column,
+    record: days_ui::cmap::Rect,
+    english: bool,
+    centre: f32,
+) -> (f32, f32, f32, f32) {
+    (
+        record.x as f32 + column.dest_x(english) + centre,
+        record.y as f32 + DEST_Y,
+        column.dest_width(),
+        DEST_HEIGHT,
+    )
+}
+
+/// How far right an English comment is pushed, from `FUN_10011ec0`.
+///
+/// `_DAT_1003b0d8 - width / _DAT_1003b0e0`, clamped to zero below
+/// `_DAT_10039758` — an `fsubrl`, an `fdivl` and an `fcompl`, so 235.5, 4.0 and
+/// 0.0. `width` is the advance total the rasterising loop accumulated, in
+/// surface pixels, and the column comes down to the screen at very nearly half,
+/// so dividing by four is half the drawn width on screen. Taking that from
+/// 235.5 centres the comment in its 494-wide column, 11.5 short of true centre.
+/// Japanese comments are not moved at all.
+pub fn comment_centre(width: i32, english: bool) -> f32 {
+    if !english {
+        return 0.0;
+    }
+    let shift = 235.5 - width as f32 / 4.0;
+    if shift < 0.0 {
+        0.0
+    } else {
+        shift
+    }
+}
+
+/// The ten rows of a page, rasterised into one surface with the rectangles that
+/// put each column on the screen.
+///
+/// This is `FUN_10011ec0` and the sprite set-up in `FUN_100135c0` together: one
+/// [`SURFACE`]-sized buffer holding up to thirty columns of text, and a quad per
+/// column cutting it out and placing it.
+pub struct Rows {
+    /// The glyph surface, RGB carrying the font's luminance plane and alpha its
+    /// outline plane — the same two planes the shipped blitter writes.
+    pub surface: days_ui::Image,
+    /// One per drawn column, in row order.
+    pub quads: Vec<Quad>,
+}
+
+/// One column's sprite: what it cuts out of the surface and where it lands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quad {
+    /// The rectangle of [`Rows::surface`] this column occupies, in pixels.
+    pub src: (u32, u32, u32, u32),
+    /// Where it is drawn, in the 800x450 layout space the widget records use.
+    pub dst: (f32, f32, f32, f32),
+}
+
+impl Rows {
+    /// Rasterises a page's rows.
+    ///
+    /// A row whose slot has no file is skipped entirely, which is what the
+    /// shipped loop does: it only draws when the host's slot query answers 1.
+    /// `records` is the screen's widget table, and a row whose record is missing
+    /// is skipped rather than placed somewhere this engine chose.
+    pub fn render(
+        font: &days_font::Font,
+        slots: &Slots,
+        page: usize,
+        english: bool,
+        records: &[days_ui::atlas::Widget],
+    ) -> Rows {
+        let (width, height) = SURFACE;
+        let mut surface = days_ui::Image::empty(width, height);
+        let mut quads = Vec::new();
+
+        for row in 0..PER_PAGE {
+            let Some(line) = slots.get(slot_of(page, row)) else {
+                continue;
+            };
+            for column in Column::ALL {
+                let text: String = match column {
+                    Column::When => &line.when,
+                    Column::Chapter => &line.chapter,
+                    Column::Comment => &line.comment,
+                }
+                .chars()
+                .take(column.cap(english))
+                .collect();
+                if text.is_empty() {
+                    continue;
+                }
+                let Some(record) = records.get(column.record_of(row)) else {
+                    continue;
+                };
+
+                let drawn = draw_line(&mut surface, font, &text, surface_pen(column, row), english);
+                let centre = match column {
+                    Column::Comment => comment_centre(drawn, english),
+                    _ => 0.0,
+                };
+                let (sx, sy, sw, sh) = source_rect(column, row);
+                quads.push(Quad {
+                    src: (sx as u32, sy as u32, sw as u32, sh as u32),
+                    dst: dest_rect(column, record.dst, english, centre),
+                });
+            }
+        }
+
+        Rows { surface, quads }
+    }
+}
+
+/// Draws one line into the glyph surface and returns the advance it consumed.
+///
+/// The shipped blitter writes `alpha << 24 | lum << 16 | lum << 8 | lum` and
+/// keeps whichever value is larger (`FUN_004367d0`), so overlapping cells take
+/// the brighter pixel rather than compositing. [`text::render_line_with`]
+/// already produces exactly those two planes when asked for white, and already
+/// combines glyphs with `max` for the same reason, so the line goes in as one
+/// piece.
+fn draw_line(
+    surface: &mut days_ui::Image,
+    font: &days_font::Font,
+    text: &str,
+    (x, y): (i32, i32),
+    english: bool,
+) -> i32 {
+    let line = text::render_line_with(font, text, [0xff, 0xff, 0xff], &|c| {
+        text::menu_advance(c, english)
+    });
+    for sy in 0..line.height {
+        let dy = y + sy as i32;
+        if dy < 0 || dy >= surface.height as i32 {
+            continue;
+        }
+        for sx in 0..line.width {
+            let dx = x + sx as i32;
+            if dx < 0 || dx >= surface.width as i32 {
+                continue;
+            }
+            let src = (sy * line.width + sx) * 4;
+            let dst = (dy as usize * surface.width as usize + dx as usize) * 4;
+            for i in 0..4 {
+                surface.rgba[dst + i] = surface.rgba[dst + i].max(line.rgba[src + i]);
+            }
+        }
+    }
+    text.chars().map(|c| text::menu_advance(c, english)).sum()
 }
 
 /// The weekday names the timestamp uses.
@@ -381,6 +753,216 @@ mod tests {
             let joined = format!("{head}{tail}");
             assert_eq!(split_line(&joined, english), (head, tail));
         }
+    }
+
+    fn rect(x: u32, y: u32) -> days_ui::cmap::Rect {
+        days_ui::cmap::Rect {
+            x,
+            y,
+            width: 500,
+            height: 30,
+        }
+    }
+
+    /// The two functions that agree on this are `FUN_100135c0`, which cuts the
+    /// surface, and `FUN_10011ec0`, which draws into it. Both put the stored
+    /// line two pixels down its row and the comment at `0x202`, and both step
+    /// by `0x30`.
+    #[test]
+    fn the_surface_rows_are_where_the_rasteriser_writes_them() {
+        for row in 0..PER_PAGE {
+            let y = row as f32 * 48.0;
+            assert_eq!(source_rect(Column::When, row), (0.0, y + 2.0, 548.0, 48.0));
+            assert_eq!(
+                source_rect(Column::Chapter, row),
+                (1024.0, y + 2.0, 548.0, 48.0)
+            );
+            assert_eq!(
+                source_rect(Column::Comment, row),
+                (0.0, y + 514.0, 986.0, 48.0)
+            );
+            assert_eq!(surface_pen(Column::When, row), (0, y as i32 + 2));
+            assert_eq!(surface_pen(Column::Chapter, row), (1024, y as i32 + 2));
+            assert_eq!(surface_pen(Column::Comment, row), (0, y as i32 + 514));
+        }
+    }
+
+    /// Every column of every row has to fit, or the surface would be cut from
+    /// somewhere it was never drawn.
+    #[test]
+    fn every_source_rect_lies_inside_the_surface() {
+        for row in 0..PER_PAGE {
+            for column in Column::ALL {
+                let (x, y, w, h) = source_rect(column, row);
+                assert!(x + w <= SURFACE.0 as f32, "{column:?} row {row} runs wide");
+                assert!(y + h <= SURFACE.1 as f32, "{column:?} row {row} runs long");
+            }
+        }
+    }
+
+    /// The rows abut exactly: the slice is as tall as the step, so a glyph cell
+    /// ends where the next row's begins.
+    #[test]
+    fn the_rows_abut_without_overlapping() {
+        for row in 0..PER_PAGE - 1 {
+            let (_, y, _, h) = source_rect(Column::When, row);
+            let (_, next, _, _) = source_rect(Column::When, row + 1);
+            assert_eq!(y + h, next);
+        }
+    }
+
+    /// The timestamp and the chapter come off the first band of ten records and
+    /// the comment off the second, so the two bands are not duplicates.
+    #[test]
+    fn the_comment_is_placed_by_the_other_band() {
+        for row in 0..PER_PAGE {
+            assert_eq!(Column::When.record_of(row), row);
+            assert_eq!(Column::Chapter.record_of(row), row);
+            assert_eq!(Column::Comment.record_of(row), row + 0x16);
+        }
+    }
+
+    #[test]
+    fn the_columns_sit_where_the_dll_puts_them() {
+        let r = rect(20, 100);
+        assert_eq!(
+            dest_rect(Column::When, r, false, 0.0),
+            (21.0, 104.5, 252.0, 24.0)
+        );
+        assert_eq!(
+            dest_rect(Column::Chapter, r, false, 0.0),
+            (282.5, 104.5, 252.0, 24.0)
+        );
+        assert_eq!(
+            dest_rect(Column::Comment, r, false, 0.0),
+            (22.0, 104.5, 494.0, 24.0)
+        );
+    }
+
+    /// Host `+0x5c` moves the timestamp five right and the chapter fifteen, and
+    /// leaves the comment alone -- that one is centred instead.
+    #[test]
+    fn english_shifts_the_stored_line_but_not_the_comment() {
+        let r = rect(20, 100);
+        assert_eq!(dest_rect(Column::When, r, true, 0.0).0, 26.0);
+        assert_eq!(dest_rect(Column::Chapter, r, true, 0.0).0, 297.5);
+        assert_eq!(dest_rect(Column::Comment, r, true, 0.0).0, 22.0);
+    }
+
+    /// `235.5 - width / 4`, clamped at zero, and nothing at all in Japanese.
+    #[test]
+    fn an_english_comment_is_centred_in_its_column() {
+        assert_eq!(comment_centre(0, true), 235.5);
+        assert_eq!(comment_centre(942, true), 0.0);
+        // Past the point where the text fills the column, it stops moving
+        // rather than going negative.
+        assert_eq!(comment_centre(4000, true), 0.0);
+        assert_eq!(comment_centre(0, false), 0.0);
+        assert_eq!(comment_centre(400, false), 0.0);
+    }
+
+    /// A comment of exactly half the column's source width centres at a quarter
+    /// of the destination, which is the identity the constants encode.
+    #[test]
+    fn the_centring_is_half_the_column_less_half_the_drawn_width() {
+        let drawn = 400;
+        let column = Column::Comment.dest_width();
+        let on_screen = drawn as f32 * column / Column::Comment.width();
+        // 11.5 short of true centre, which is the shipped constant, not 247.
+        assert!(((column - on_screen) / 2.0 - comment_centre(drawn, true) - 11.5).abs() < 0.5);
+    }
+
+    #[test]
+    fn english_buys_the_timestamp_one_character_and_the_comment_twenty() {
+        assert_eq!(Column::When.cap(false), 0x14);
+        assert_eq!(Column::When.cap(true), 0x15);
+        assert_eq!(Column::Chapter.cap(false), 0x14);
+        assert_eq!(Column::Chapter.cap(true), 0x14);
+        assert_eq!(Column::Comment.cap(false), 0x14);
+        assert_eq!(Column::Comment.cap(true), 0x28);
+    }
+
+    /// The surface is twice the screen, so the comment halves exactly; the
+    /// stored line's columns are the shipped squash and are checked as such
+    /// rather than rounded to a clean ratio.
+    #[test]
+    fn the_surface_comes_down_to_the_screen_at_the_shipped_ratios() {
+        // The height is the only exact halving.
+        assert_eq!(SURFACE_ROW_HEIGHT / DEST_HEIGHT, 2.0);
+        // Neither width is: 494 doubled is 988, not 986.
+        assert!((Column::Comment.width() / Column::Comment.dest_width() - 1.996).abs() < 0.001);
+        assert!((Column::When.width() / Column::When.dest_width() - 2.175).abs() < 0.001);
+    }
+
+    fn font() -> days_font::Font {
+        days_font::Font::parse(vec![0u8; days_font::TABLE_BYTES]).unwrap()
+    }
+
+    fn records() -> Vec<days_ui::atlas::Widget> {
+        (0..0x20)
+            .map(|i| days_ui::atlas::Widget {
+                dst: rect(10, 20 * i as u32),
+                src_x: 0,
+                src_y: 0,
+            })
+            .collect()
+    }
+
+    fn filled(slot: u32) -> Slots {
+        let mut slots = Slots::default();
+        slots.insert(
+            slot,
+            Line {
+                when: "2012年 1月28日(土)18:02".into(),
+                chapter: "第6話".into(),
+                comment: "a comment".into(),
+            },
+        );
+        slots
+    }
+
+    /// A row with no file is not drawn at all, which is what the shipped loop
+    /// does: it only draws when the host's slot query answers 1.
+    #[test]
+    fn only_the_slots_with_a_file_get_quads() {
+        let rows = saveload_rows(&filled(3), 0);
+        assert_eq!(rows.quads.len(), 3);
+        assert!(saveload_rows(&Slots::default(), 0).quads.is_empty());
+    }
+
+    /// The page a row stands for moves it a whole page of slots, not a row.
+    #[test]
+    fn a_page_shows_its_own_ten_slots() {
+        assert!(saveload_rows(&filled(3), 1).quads.is_empty());
+        assert_eq!(saveload_rows(&filled(13), 1).quads.len(), 3);
+    }
+
+    fn saveload_rows(slots: &Slots, page: usize) -> Rows {
+        Rows::render(&font(), slots, page, false, &records())
+    }
+
+    /// The surface is the size the `FrameBuffer` is created at, and every quad
+    /// cuts it rather than reaching past it.
+    #[test]
+    fn the_rendered_quads_cut_the_surface_they_were_drawn_into() {
+        let rows = saveload_rows(&filled(7), 0);
+        assert_eq!((rows.surface.width, rows.surface.height), SURFACE);
+        for quad in &rows.quads {
+            let (x, y, w, h) = quad.src;
+            assert!(x + w <= rows.surface.width);
+            assert!(y + h <= rows.surface.height);
+        }
+    }
+
+    /// A row whose record the table does not carry is skipped rather than
+    /// placed somewhere this engine chose.
+    #[test]
+    fn a_row_with_no_record_is_left_undrawn() {
+        let short: Vec<days_ui::atlas::Widget> = records().into_iter().take(10).collect();
+        let rows = Rows::render(&font(), &filled(0), 0, false, &short);
+        // The comment's record is in the second band, which this table stops
+        // short of, so only the stored line's two columns are placed.
+        assert_eq!(rows.quads.len(), 2);
     }
 
     #[test]

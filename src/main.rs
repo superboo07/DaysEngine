@@ -471,6 +471,7 @@ fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
             full_screen: false,
         },
         som: Som::default(),
+        english,
         // The screen reports a slot as present when its file opens, and takes
         // the line it shows from the global store.
         slots: Slots::read(&player.game, player.film, &player.flags, english),

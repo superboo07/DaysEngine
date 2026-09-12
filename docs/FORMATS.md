@@ -1366,7 +1366,8 @@ the numbers the control bar's own menu buttons produce, so the bar's four menu
 widgets are Save, Load, something `SystemInit` has no case for, and Option.
 
 Ten slots to a page and ten page buttons, so a hundred slots. The widget table
-has two bands of ten for the rows, and both do the same thing:
+has two bands of ten for the rows, the left of a row and the right of it, and
+clicking either picks the same slot:
 
 ```text
 0x00 .. 0x09   the ten rows
@@ -1435,14 +1436,88 @@ units of the font being drawn with. Only the colours are ours: the original
 took the player's Windows theme, so there is nothing there to recover. Typing
 goes through SDL's text input, which is what carries an IME.
 
-Not recovered: **where a row's text sits**. `FUN_10011ec0` renders the three
-columns into an off-screen surface — the object at `+0x110`, its pixels at
-`+0x114`, its pitch at `+0x118` — putting the timestamp at
-`(0, row * 0x30 + 2)`, the chapter at `(0x400, row * 0x30 + 2)` and the comment
-at `(0, row * 0x30 + 0x202)`, then blits it. Which rectangles that surface is
-blitted through has not been worked out, so the composited screen draws the
-rows empty rather than putting the text somewhere this engine chose.
-`days menu` prints the lines.
+### Where a row's text sits
+
+No column is drawn to the screen directly. `FUN_100135c0` builds a 2048x1024
+off-screen ARGB surface — a `FrameBuffer` at `+0x10c`, wrapped by a
+`DX9Texture` at `+0x110`, with the buffer's pixels cached at `+0x114` and its
+pitch at `+0x118` — and `FUN_10011ec0` clears it and rasterises all thirty
+columns into it at once. Each column then gets its own `DX9Sprite2D`, at
+`+0x144 + row * 4`, `+0x16c + row * 4` and `+0x194 + row * 4`, with a source
+rectangle cutting the surface and a destination rectangle placing it.
+
+Those three class names are RTTI, not inference: host `+0xac` allocates by type
+code, and codes 0, 3 and 4 run the constructors that install
+`DX9Texture::vftable`, `DX9Sprite2D::vftable` and `FrameBuffer::vftable`. It
+matters, because Ghidra renders the source-rectangle set-up as a chain of
+`float10` results and it is nothing of the kind: `DX9Texture` slot `+8` is
+`x / width` and slot `+0xc` is `y / height` — pixels to texture coordinates —
+and `DX9Sprite2D` slot `+0x1c` takes an origin **and a size**, forwarding
+`(u, v, u + du, v + dv)` to slot `+0x18`. Read as decompiled, the four
+coordinates come out in the wrong order. The disassembly gives the real one,
+and it is self-checking: the two `/ width` values pair with each other and the
+two `/ height` values with each other.
+
+On the surface, per row `r`:
+
+```text
+timestamp   x 0      y r * 48 + 2     548 x 48
+chapter     x 1024   y r * 48 + 2     548 x 48
+comment     x 0      y r * 48 + 514   986 x 48
+```
+
+`FUN_10011ec0` rasterises into exactly those origins, which is the independent
+check on the cut. On screen, in the 800x450 layout space the widget records
+use, where the record is the row's own — the first band of ten for the stored
+line and the second for the comment, so the two bands are not duplicates:
+
+```text
+timestamp   record[r].x        + 1.0    record[r].y + 4.5   252 x 24
+chapter     record[r].x        + 262.5  record[r].y + 4.5   252 x 24
+comment     record[r + 0x16].x + 2.0    record[.].y + 4.5   494 x 24
+```
+
+Every one of those constants was read out of the DLL with its operand width
+taken from the instruction — `flds` for a 4-byte float, `fmull` / `faddl` for
+an 8-byte double — rather than from Ghidra's `(float)_DAT_...`, which narrows a
+double at the use site. Half of them are doubles sitting next to a zero word,
+so read as floats they come back `0.0`, which is the failure that once cost
+this project a zero-width gauge.
+
+Only the height is an exact halving, 48 to 24. The widths are not: 986 to 494
+and 548 to 252, so both columns are squeezed horizontally and the stored line's
+noticeably. Those are the shipped constants.
+
+English, off host `+0x5c`, moves the timestamp 5.0 right and the chapter 15.0,
+and centres the comment by `235.5 - width / 4` clamped at zero, where `width`
+is the advance total the rasterising loop accumulated. Japanese moves nothing.
+
+The glyphs go in through host `+0x58` — `FUN_00436c10`, which writes at
+`dst + y * pitch + x * 4` — and each pixel is
+`alpha << 24 | lum << 16 | lum << 8 | lum`, kept only where it exceeds what is
+already there (`FUN_004367d0`). So the surface carries the font's luminance
+plane as colour and its outline plane as alpha, which is what the engine's own
+line rasteriser produces.
+
+**The comment column's gate is uninitialised memory.** The comment sprites are
+built, and the comment rasterised, only when host `+0xd8` answers non-zero.
+That slot is `FUN_0042bad0`, returning the plain member `+0x74` of the
+interface it is called on — and the interface is a secondary base subobject at
+`[object+0x2c]`, which the constructor does literally
+(`movl $0x4d2894,0x2c(%edx)` in `FUN_004217e0`). So the member is object
+`+0xa0`, and **nothing in the executable ever writes it**: a store-pattern scan
+over the disassembly of the whole `.text` finds six writes to `0xa0(reg)`, all
+on other classes, and no method in the host's own code band so much as
+references it. The constructor does not zero it either — it sets five members
+explicitly and bulk-initialises nothing — and the object is a plain
+`malloc(0x7d0)` through `FUN_0047ad7d`. So in the retail build the column
+appears or not according to heap contents. DaysEngine draws it: the layout is
+recovered, and the comment the save dialog writes has no other way to be seen.
+
+Two more sprites, `+0xf8` and `+0xfc`, are placed from records
+`(page + 0x20) * 0x18` and `(page + 0x2a) * 0x18` — the current page's
+indicator. Those indices run past the thirty-two the atlas recovers for this
+screen, and they are **not implemented**.
 
 ---
 

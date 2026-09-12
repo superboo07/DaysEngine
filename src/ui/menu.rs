@@ -25,12 +25,16 @@
 //! hit map. Pointing at a widget swaps in its chip sprite; clicking runs the
 //! screen's action table. Each table is the DLL's own dispatch, transcribed
 //! where that screen's behaviour lives: the title's in [`Menu::confirm`], the
-//! Option screen's in [`crate::ui::options`], and the replay grid's and its popup's
-//! in [`crate::ui::replay`]. `SaveLoad` and `Replay_PlayData` have none yet.
+//! Option screen's in [`crate::ui::options`], the replay grid's and its popup's
+//! in [`crate::ui::replay`] and the save/load screen's in
+//! [`crate::ui::saveload`]. `Replay_PlayData` has none yet.
 //!
-//! A few screens also draw sprites that are not widget states — the Sound tab's
-//! volume bars and the replay grid's thumbnails — which is what
-//! `Menu::sprites` builds.
+//! A few screens also draw things that are not widget states. Those whose
+//! source is the same size as their destination go through `Menu::sprites` —
+//! the Sound tab's volume bars, cut from the chip sheet, and the replay grid's
+//! thumbnails. The save/load rows do not: their text is rasterised at twice the
+//! size it is drawn at, the way the original rasterises it, so
+//! [`Menu::load_rows`] builds that surface and [`Menu::compose`] blits it down.
 //!
 //! # Whose answer is it
 //!
@@ -287,6 +291,28 @@ impl SaveState {
     }
 }
 
+/// The player's own font, for the text the menus draw themselves.
+///
+/// The English build ships `FONTDATA_ENG.DAT` beside the Japanese
+/// `FONTDATA.DAT` and prefers it, which is the order the engine reads them in
+/// everywhere else. A font that will not parse is a missing asset: it logs and
+/// the text it would have drawn is left out.
+fn load_font(vfs: &Vfs) -> Option<days_font::Font> {
+    let bytes = vfs
+        .read_path("System/System/FONTDATA_ENG.DAT")
+        .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"));
+    match bytes
+        .map_err(|e| e.to_string())
+        .and_then(|b| days_font::Font::parse(b).map_err(|e| e.to_string()))
+    {
+        Ok(font) => Some(font),
+        Err(err) => {
+            log::warn!("no menu font: {err}");
+            None
+        }
+    }
+}
+
 /// `STARTSCRIPT.INI [EndBGView]`, the ending-backdrop switch.
 ///
 /// `FUN_0041f600` reads this key into the startup config and does two things
@@ -360,6 +386,12 @@ pub struct Session {
     pub som: options::Som,
     /// What the save/load screen shows for each slot.
     pub slots: Slots,
+    /// `FILMENGINE.INI [UseEnglish]`, which is what host `+0x5c` answers.
+    ///
+    /// The menus ask it constantly — it picks the timestamp format, the
+    /// character caps on a save row and where each column sits — so it is
+    /// carried here rather than threaded through every call.
+    pub english: bool,
 }
 
 impl Session {
@@ -374,6 +406,7 @@ impl Session {
             display: options::Display::default(),
             som: options::Som::default(),
             slots: Slots::default(),
+            english: false,
         }
     }
 }
@@ -410,6 +443,12 @@ pub struct Menu {
     /// table that cuts it up. Absent when the page's art will not load, which
     /// leaves the grid's empty frames showing.
     thumbnails: Option<(days_ui::Image, replay::Thumbnails)>,
+    /// The player's own font, for the text a screen draws itself rather than
+    /// picking out of its art. Absent when the install has no readable
+    /// `FONTDATA`, which leaves that text undrawn and the screen usable.
+    font: Option<days_font::Font>,
+    /// The save/load screen's rasterised rows for the page it is showing.
+    rows: Option<saveload::Rows>,
 }
 
 impl Menu {
@@ -451,8 +490,11 @@ impl Menu {
             asked: None,
             kind: Kind::Load,
             thumbnails: None,
+            font: load_font(vfs),
+            rows: None,
         };
         menu.load_thumbnails(vfs, dll);
+        menu.load_rows();
         menu.refresh();
         Ok(menu)
     }
@@ -478,8 +520,32 @@ impl Menu {
         self.return_to = return_to;
         self.selection = None;
         self.load_thumbnails(vfs, dll);
+        self.load_rows();
         self.refresh();
         Ok(())
+    }
+
+    /// Rasterises the save/load screen's rows for the page it is showing.
+    ///
+    /// Rebuilt on entering the screen and on turning a page, which is when the
+    /// shipped `FUN_10011ec0` runs: the surface holds one page at a time.
+    pub fn load_rows(&mut self) {
+        self.rows = None;
+        if self.mode != Mode::SAVELOAD {
+            return;
+        }
+        let Some(font) = &self.font else {
+            log::warn!("no font, so the save/load rows stay empty");
+            return;
+        };
+        self.rows = Some(saveload::Rows::render(
+            font,
+            &self.session.slots,
+            self.page,
+            self.session.english,
+            &self.screen.atlas().widgets,
+        ));
+        self.dirty = true;
     }
 
     /// Loads the thumbnail sheet for the page the replay grid is showing.
@@ -564,15 +630,27 @@ impl Menu {
     pub fn compose(&mut self, backdrop: Option<&days_ui::Image>) -> days_ui::Image {
         self.dirty = false;
         let sprites = self.sprites();
-        self.screen
-            .compose_over_sprites(backdrop, &self.states, &sprites)
+        let mut out = self
+            .screen
+            .compose_over_sprites(backdrop, &self.states, &sprites);
+        // The save/load rows are not widget sprites: their source is twice the
+        // size of their destination, so they are blitted with the averaging
+        // downscale rather than the point-sampled one the art uses.
+        if let Some(rows) = &self.rows {
+            for quad in &rows.quads {
+                out.blit_downscaled(&rows.surface, quad.src, self.screen.place_layout(quad.dst));
+            }
+        }
+        out
     }
 
     /// The sprites this screen draws that are not widget states.
     ///
     /// Two screens have them: the Sound tab's three volume bars, cut from the
     /// chip sheet, and the replay grid's thumbnails, cut from the page's own
-    /// sheet. See [`options::volume_bar`] and [`replay::Thumbnails`].
+    /// sheet. See [`options::volume_bar`] and [`replay::Thumbnails`]. Both are
+    /// drawn at their source size; the save/load rows are not, so they take the
+    /// separate path in [`Menu::compose`].
     fn sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
         let mut out = Vec::new();
         match self.mode {
@@ -870,6 +948,7 @@ impl Menu {
                     return Ok(Action::Stay);
                 }
                 self.page = page;
+                self.load_rows();
                 self.refresh();
                 Ok(Action::Stay)
             }
