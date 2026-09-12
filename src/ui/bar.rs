@@ -287,10 +287,23 @@ pub struct State {
     /// the double at `0x10039748`.
     pub rate: f32,
     /// Host `+0x154`: while set, `FUN_10024ca0` draws the gauge even when the
-    /// bar itself is faded out — the gauge block appears twice, once inside the
-    /// "bar is up" test and once outside it under this flag. **What the member
-    /// is is not recovered**; this is only the difference it makes.
-    pub gauge_pinned: bool,
+    /// bar itself is faded out — the gauge block appears twice, once inside
+    /// the "bar is up" test and once outside it under this flag.
+    ///
+    /// The member is `engine + 0x79c`, and what raises it is a feeling
+    /// change: `FUN_10005c60` in `RouteProcSDHQ.dll` sets it through host slot
+    /// `+0x30` after crediting a delta, but only when the counter it moved was
+    /// `001` or `002` — the two the gauge draws. `FUN_10026050` clears it
+    /// again through the same slot once it has read the two values. So the
+    /// gauge surfaces over a faded bar exactly when the affection counters
+    /// just moved. See [`crate::install::feeling`].
+    pub gauge_raised: bool,
+    /// The two counters the gauge draws, `(001, 002)`, if they are known.
+    ///
+    /// `FUN_10026050` asks the host for these two by name through slot `+8`.
+    /// They live in the save's variable store, so a bar drawn without save
+    /// state has nothing to show and this is `None`.
+    pub gauge: Option<(i32, i32)>,
 }
 
 impl State {
@@ -552,12 +565,12 @@ impl Bar {
     /// art underneath. Records outside the widget run are alternates; the
     /// widget run's own records are the hover art.
     ///
-    /// Not reproduced, and why: the gauge's three moving pieces, which
-    /// `FUN_10026540` sizes from two values the host looks up by name
-    /// (`FUN_10026050`, through the flag interface) — that is the route
-    /// system's data, and the engine has no source for it yet — and
-    /// `this+0x90`, whose record `FUN_10021c20` does not assign, so where its
-    /// art comes from is **not recovered**.
+    /// The gauge's three moving pieces are not in this list and cannot be:
+    /// they are not chip records at all. `FUN_10026540` sets their
+    /// destination and source rectangles itself, from the two counters — see
+    /// [`gauge`] for that geometry. `this+0x90` is also absent, because
+    /// `FUN_10021c20` assigns it no record, so where its art comes from is
+    /// **not recovered**.
     pub fn records(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Vec<usize> {
         let mut out = Vec::new();
 
@@ -593,11 +606,11 @@ impl Bar {
             if !state.auto {
                 out.push(record::AUTO_RESTING);
             }
-            if !state.gauge_pinned {
+            if !state.gauge_raised {
                 out.push(record::GAUGE_BED);
             }
         }
-        if state.gauge_pinned {
+        if state.gauge_raised {
             out.push(record::GAUGE_BED);
         }
 
@@ -935,5 +948,221 @@ mod tests {
         assert_eq!(auto_frame(200, 4), AUTO_FIRST_RECORD + 1);
         // And it wraps after thirteen.
         assert_eq!(auto_frame(13_000, 0), AUTO_FIRST_RECORD);
+    }
+}
+
+/// The affection gauge the bar carries, and the geometry that sizes it.
+///
+/// # What it shows
+///
+/// Two counters, `001` and `002`, out of the save's variable store —
+/// [`crate::install::feeling`] is where they come from and what they mean.
+/// `FUN_10026050` reads exactly those two by name through host slot `+8`,
+/// keeps them as floats, and derives a signed **lead** for each side:
+///
+/// ```text
+/// lead_first  = (first  - second) * 2.5      this+0x48
+/// lead_second = (second - first ) * 2.5      this+0x4c
+/// ```
+///
+/// so the two are always negatives of each other and only their difference is
+/// ever drawn — the gauge shows which counter is ahead and by how much, never
+/// either total.
+///
+/// # Reading the constants
+///
+/// The scale is `2.5`, and getting that right needed care: Ghidra renders
+/// `_DAT_1003d858` as `(float)`, and read as a float its bytes are `0.0` —
+/// a value that is self-consistent (a zero-width gauge) and wrong. It is a
+/// **double**, narrowed at the use site. The same applies to [`BIAS`] and
+/// [`FLOOR`]. The `.data` constants next to them really are floats.
+///
+/// # The three pieces
+///
+/// `FUN_10026540` sizes three sprites and sets a visibility flag for each.
+/// Which one is up is decided by the same biased comparison each time: a
+/// side's piece appears only once its lead passes [`FLOOR`] once [`BIAS`] is
+/// added, which needs a lead of `(417.0 - 208.5) / 2.5`, a little over 83
+/// points. Below that neither side's piece is up and the third, level piece is
+/// drawn instead — so in ordinary play, where the two counters run within a
+/// few points of each other, the level piece is the one on screen.
+///
+/// The destination rectangles below are `FUN_10026540`'s, exactly. The
+/// **source** rectangles are not: the original builds them through four
+/// chained calls on the object at `this+0x1c` whose vtable this module has not
+/// identified, so which of those four values is x, y, width and height is
+/// **not recovered**, and the pieces are therefore not composed yet.
+pub mod gauge {
+    /// `_DAT_1003d858`, a double: points of lead to pixels.
+    pub const SCALE: f32 = 2.5;
+    /// `_DAT_1003d878`, a double: added to a lead before it is tested.
+    pub const BIAS: f32 = 208.5;
+    /// `_DAT_1003d870`, a double: a biased lead at or below this hides the
+    /// side's piece. The comparison is `<=`, so exactly `FLOOR` is hidden.
+    pub const FLOOR: f32 = 417.0;
+    /// `DAT_1004d0b0` / `DAT_1004d0c8`, the longest either side's bar is drawn.
+    pub const MAX_LEN: f32 = 485.0;
+    /// `DAT_1004d0a8`, where the first side's bar starts.
+    pub const LEFT: f32 = 188.0;
+    /// `DAT_1004d0c0`, the second side's bar's offset from its computed end.
+    pub const RIGHT_OFFSET: f32 = 118.0;
+    /// `DAT_1004d0ac` / `DAT_1004d0c4`, the bars' top edge.
+    pub const TOP: f32 = 9.0;
+    /// `DAT_1004d0b4` / `DAT_1004d0cc`, their height before the `+1`.
+    pub const HEIGHT: f32 = 9.0;
+    /// `_DAT_1003d860`, a double: the level piece's fixed width.
+    pub const LEVEL_WIDTH: f32 = 418.0;
+    /// `_DAT_10039738`, a double: taken off both origins.
+    const HALF: f32 = 0.5;
+    /// `_DAT_10039798`, a double: added to both extents.
+    const ONE: f32 = 1.0;
+
+    /// A destination rectangle, before the display scale is applied.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Rect {
+        pub x: f32,
+        pub y: f32,
+        pub w: f32,
+        pub h: f32,
+    }
+
+    /// Which of the three pieces is up, and where each goes.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Pieces {
+        /// `this+0x98`, up under `this+0xc4`: the second counter is far ahead.
+        pub second: Option<Rect>,
+        /// `this+0x9c`, up under `this+0xc8`: the first counter is far ahead.
+        pub first: Option<Rect>,
+        /// `this+0xa0`, up under `this+0xcc`: neither is, which is the usual
+        /// case.
+        pub level: Option<Rect>,
+    }
+
+    /// The lead each side has, scaled: `(first, second)`.
+    pub fn leads(first: i32, second: i32) -> (f32, f32) {
+        let d = (first - second) as f32 * SCALE;
+        (d, -d)
+    }
+
+    /// Sizes the three pieces from the two counters, as `FUN_10026540` does.
+    pub fn pieces(first: i32, second: i32) -> Pieces {
+        let (lead_first, lead_second) = leads(first, second);
+
+        // `this+0x98`: driven by the second side's lead, anchored at LEFT.
+        let second_piece = bar(lead_second).map(|len| Rect {
+            x: LEFT - HALF,
+            y: TOP - HALF,
+            w: len + ONE,
+            h: HEIGHT + ONE,
+        });
+
+        // `this+0x9c`: the original computes the remaining width *before*
+        // clamping the length, so a lead past MAX_LEN pushes the origin
+        // negative rather than pinning it. That ordering is reproduced.
+        let first_piece = bar(lead_first).map(|len| {
+            let remaining = MAX_LEN - (lead_first + BIAS);
+            Rect {
+                x: remaining + RIGHT_OFFSET - HALF,
+                y: TOP - HALF,
+                w: len + ONE,
+                h: HEIGHT + ONE,
+            }
+        });
+
+        // `this+0xa0`: up only while *neither* side's piece is.
+        let level = (second_piece.is_none() && first_piece.is_none()).then_some(Rect {
+            x: LEFT - HALF,
+            y: TOP - HALF,
+            w: LEVEL_WIDTH,
+            h: HEIGHT + ONE,
+        });
+
+        Pieces {
+            second: second_piece,
+            first: first_piece,
+            level,
+        }
+    }
+
+    /// One side's bar length, or `None` while its piece is down.
+    ///
+    /// `_DAT_10039758` is `0.0`, so the "below zero" clamp only fires for a
+    /// negative bias-adjusted length, which the `FLOOR` test has already
+    /// excluded — it is transcribed because it is there, not because it can
+    /// be reached.
+    fn bar(lead: f32) -> Option<f32> {
+        let len = lead + BIAS;
+        if len <= FLOOR {
+            return None;
+        }
+        Some(len.clamp(0.0, MAX_LEN))
+    }
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use super::gauge::*;
+
+    /// The two leads are one number and its negation, so the gauge can only
+    /// ever show a difference.
+    #[test]
+    fn the_two_leads_are_opposite() {
+        assert_eq!(leads(89, 78), (27.5, -27.5));
+        assert_eq!(leads(78, 89), (-27.5, 27.5));
+        assert_eq!(leads(40, 40), (0.0, -0.0));
+    }
+
+    /// The counters in a real save run a few points apart, which is nowhere
+    /// near the threshold, so the level piece is what is on screen.
+    #[test]
+    fn ordinary_counters_show_the_level_piece_alone() {
+        let p = pieces(69, 62);
+        assert!(p.first.is_none());
+        assert!(p.second.is_none());
+        assert_eq!(
+            p.level,
+            Some(Rect {
+                x: 187.5,
+                y: 8.5,
+                w: 418.0,
+                h: 10.0
+            })
+        );
+    }
+
+    /// A lead has to clear `(FLOOR - BIAS) / SCALE` before its side's piece
+    /// appears at all — 83.4 points, which is most of the game's range.
+    #[test]
+    fn a_side_needs_a_large_lead_before_its_piece_appears() {
+        assert!(pieces(83, 0).first.is_none());
+        assert!(pieces(84, 0).first.is_some());
+        assert!(pieces(0, 84).second.is_some());
+    }
+
+    /// The moment one side's piece comes up the level piece goes down: the
+    /// three are never on together.
+    #[test]
+    fn the_level_piece_yields_to_a_leading_side() {
+        let p = pieces(120, 0);
+        assert!(p.first.is_some());
+        assert!(p.level.is_none());
+        assert!(p.second.is_none());
+    }
+
+    /// The bar stops growing at MAX_LEN.
+    #[test]
+    fn a_runaway_lead_is_clamped_to_the_bar_length() {
+        let p = pieces(0, 10_000).second.unwrap();
+        assert_eq!(p.w, MAX_LEN + 1.0);
+    }
+
+    /// The `<=` in the visibility test means exactly FLOOR is still hidden.
+    #[test]
+    fn a_lead_landing_exactly_on_the_floor_stays_hidden() {
+        let exact = (FLOOR - BIAS) / SCALE;
+        assert_eq!(exact, 83.4);
+        // 83.4 is not reachable from integer counters, so the boundary is
+        // checked through the same arithmetic the real values take.
+        assert!(pieces(83, 0).first.is_none());
     }
 }

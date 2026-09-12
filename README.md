@@ -47,7 +47,8 @@ Early. What works today:
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Subtitles | **Works, the game's own way** — broken by `FUN_0043f600` (62 columns, word-wrapped at spaces, English only, `\n` as a hard break, ruby marks recognised), spaced by the recovered pitch and kerning table rather than by measuring the glyph, and placed by `FUN_0044bf30`: centred on each line's own width, anchored to the bottom, at the per-resolution scale, with `[LeftArrangement]` switching to a left-aligned block. The speaker name is not drawn, because the original never hands it to the text layer, and the whole block is behind the `TextView` setting |
 | Text box art, backlog | Not started |
-| Route / branch graph | **Blocked on reverse engineering** — see below |
+| Route / branch graph | **Partly recovered** — the 55 routes and their 1,857-entry script tables come out of the user's own `RouteProcSDHQ.dll` by content, with no address embedded; `days route` prints the graph and locates any script in it. The per-route transition logic exists only as compiled x86 and is **not recovered**, so scripts do not chain yet — see below |
+| Affection gauge | **Recovered** — the five counters, both tables, the relative test that 25 routes branch on and the 13 absolute thresholds, plus the gauge's own geometry. `days route` shows a save's counters and which way the test falls. The gauge's three sprites are not composed: their source rectangles are not recovered |
 | Save file compatibility | Not started |
 
 ## Building
@@ -78,8 +79,8 @@ updating, that is deliberate — see `docs/DEPENDENCIES.md`.
 
 **No bundled game data.** Anything derived from the game is derived at runtime
 from the user's own files. The GPK decryption key is read out of their
-`SCHOOLDAYS HQ.exe` rather than hardcoded here, and the route graph will be
-extracted from their `RouteProcSDHQ.dll` the same way.
+`SCHOOLDAYS HQ.exe` rather than hardcoded here, and the route tables are read
+out of their `RouteProcSDHQ.dll` the same way.
 
 **The game's own UI.** FILMEngine's interface is fully data-driven: each screen
 is a base PNG, a `_CHIP` sprite sheet of widget states, and a `.CMAP` — a
@@ -95,12 +96,21 @@ original one.
 The branch graph is not in the scripts. `.ORS` files are linear timelines:
 `[Next]` carries only an end timecode and `[SetSELECT]` carries only the two
 choice labels, with no targets. Routing lives compiled inside
-`RouteProcSDHQ.dll` (1,825 script names, exports `GetNextScriptFile`,
-`SetScript`, `SetFeeling`, `GetStory`).
+`RouteProcSDHQ.dll`, which the executable defers to entirely.
 
-The plan is an offline extractor that reads *the user's own* DLL and emits a
-route-graph JSON on first run, so the logic is recovered from their install
-rather than redistributed by us.
+Half of it turned out to be data. Progress is two integers in the save,
+`ROUTE` and `SCENE`, and each of the 55 routes has an array of script names
+indexed by `SCENE`. Those arrays are found in the user's own DLL by content —
+runs of pointers to strings shaped like a script path — and cross-check exactly
+against the code, against each other and against the script pack. That is
+`crates/days-route`, and nothing it knows is embedded here.
+
+The other half is not data. Each route's "given this scene and the player's
+choice, which scene next" is a compiled `switch` with the answers as immediate
+operands, spread over 55 functions, and there is no table of edges anywhere in
+the file. Recovering those edges needs a disassembly pass that has not been
+done, so the engine can say where a script sits in the graph but not yet what
+follows it. `docs/FORMATS.md` has the entry points.
 
 ## Inspecting an install
 
@@ -118,6 +128,8 @@ days replay                          # the replay scene table, and what the save
 days bar --pointer 400,40 -o /tmp/bar.png   # the control bar, widget by widget
 days render 00-00-A00 --at 00:39:00 --bar -o /tmp/frames   # ...over a real frame
 days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test
+days route                           # the 55 routes, the affection tables, the save's counters
+days route 00-00-A04                 # where one script sits, what it credits, what gates it
 ```
 
 `days ui` composites a UI screen without a display, the way `days render` does

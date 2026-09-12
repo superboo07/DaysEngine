@@ -145,8 +145,30 @@ pub struct FlagStore {
 }
 
 impl FlagStore {
-    /// Decodes a flag store.
+    /// Decodes a flag store that is the whole of `bytes`.
+    ///
+    /// A `GlobalFlag.DAT` is exactly one store, so anything left over is
+    /// corruption rather than a store that happens to be shorter. Use
+    /// [`FlagStore::parse_embedded`] for the copy inside a save slot, which is
+    /// followed by the rest of the slot.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let (store, read) = Self::parse_embedded(bytes)?;
+        let unread = bytes.len() - read;
+        if unread != 0 {
+            return Err(Error::TrailingBytes {
+                count: store.len(),
+                unread,
+            });
+        }
+        Ok(store)
+    }
+
+    /// Decodes a store that is followed by other data, returning it and how
+    /// many bytes it took.
+    ///
+    /// `Save/SaveFile00N.DAT` embeds a whole store partway through itself, so
+    /// there the end of the store is not the end of the file.
+    pub fn parse_embedded(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let mut r = Reader::new(bytes);
 
         let magic = r.take(4, "the magic")?;
@@ -184,11 +206,7 @@ impl FlagStore {
             entries.insert(name, value);
         }
 
-        let unread = r.remaining();
-        if unread != 0 {
-            return Err(Error::TrailingBytes { count, unread });
-        }
-        Ok(Self { entries })
+        Ok((Self { entries }, bytes.len() - r.remaining()))
     }
 
     /// Builds a store from entries already in hand.

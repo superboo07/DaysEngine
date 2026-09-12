@@ -1305,19 +1305,202 @@ to keep in sync than a muxed stream.
 
 ## `RouteProcSDHQ.dll` — the branch graph
 
-Not yet decoded. A 512 KB x86 DLL holding 1,825 script-name strings and
-exporting:
+A third shipped binary beside the executable and the menu DLL, and it owns
+every branching decision in the game. The executable decides nothing: its
+timeline-move state (`FUN_00425bf0` case 7) calls
+`_GetNextScriptFile@12(engine + 0x2c, buf, 0x104)` and plays whatever name
+comes back.
 
-    CheckInputScript  CheckScript      CheckScriptNo    GetBackScriptFile
-    GetNextScriptFile GetPackFile      GetPackMax       GetPatchMax
-    GetReadScriptCount GetRouteMapPage GetScriptMax     GetStory
-    GetVersionToRoute LoadInitScript   SetDigScript     SetFeeling
-    SetPackName       SetRoot          SetScript        ZeroReset
-    searchRoot
+### Progress is two integers
 
-The routing appears to be compiled code rather than a data table — the disasm
-shows long chains of `cmp`/`jne` against an index followed by a string push,
-which is what a large `switch` returning names compiles to.
+`ROUTE` and `SCENE` are named entries in the **save's** variable store — not
+`GlobalFlag.DAT`. There are two stores, reached through different members of
+the host interface:
 
-Plan: a Ghidra headless script that recovers the graph from the user's own copy
-and emits JSON at first run.
+```text
+host +0x08 / +0x0c   get / set an int    the per-save store   [host + 0x14]
+host +0x10 / +0x14   get / set a bool    the per-save store
+host +0x18 / +0x1c   get / set a bool    the global store     [host + 0x10]
+```
+
+Both are the same `std::map<wstring, VARIANT>` the flag store already
+documents, and `FUN_00460810` is the lookup that creates a missing name on
+demand — which is why an unset counter reads as zero. `SaveFile000.DAT` holds
+`ROUTE = 39`, `SCENE = 6` in its embedded store.
+
+`_SetRoot@12` is just `set("ROUTE", a); set("SCENE", b)`.
+
+### 55 routes, each a table and a state machine
+
+Four exports switch 55 ways on `ROUTE`, one case per route, `0 .. 0x36`:
+
+```text
+GetNextScriptFile   FUN_10006870   (SCENE, choice) -> next SCENE, and the name
+SetFeeling          FUN_1000bba0   credits the chosen scene's feeling deltas
+searchRoot          FUN_10007d50   which (ROUTE, SCENE) a script name sits at
+SetScript           FUN_10008a70   plain table[ROUTE][SCENE] lookup
+```
+
+`GetNextScriptFile` loops up to ten times: a route handler that returns 0 after
+changing `ROUTE` falls through and the next route is dispatched, which is how a
+route transition happens.
+
+`searchRoot` takes a route to start from and walks forward, **wrapping at
+`0x36` back to 0**. A name that is in no table therefore spins forever — the
+`default` arm that would bail out is unreachable past the wrap. `days-route`
+returns "not found" after one pass rather than reproducing that.
+
+Each route's case in `GetNextScriptFile` is a `switch (SCENE)` whose arms call
+a per-route emitter with a literal next-scene number. The emitter
+(`FUN_1000d3d0` for route 0) sets `ROUTE` and `SCENE` and copies
+`table[scene]` into the caller's buffer. Branch arms read host `+0x04` — the
+choice the player just made — and a few read the feeling counters; see below.
+Some arms also record a bookmark, `set("BS<script>", SCENE)`, which is what
+`GetBackScriptFile` rewinds through.
+
+**The transition logic is not recovered.** It exists only as compiled x86
+across those 55 functions; there is no table of edges anywhere. The entry
+points above are where to start.
+
+### The name tables, and how they are found
+
+Each route has an array of pointers to wide script paths in `.rdata`, indexed
+by `SCENE`. `crates/days-route` recovers these from the user's own DLL by
+**content** — runs of consecutive pointers that resolve to a string shaped like
+`NN/NN-XX-Ynn` — with no address embedded anywhere. That was checked against
+the code three ways before being believed:
+
+- the 55 `searchRoot` handlers reference exactly one `.data` address each, and
+  those 55 addresses are **exactly** the 55 run starts the content scan finds;
+- `_SetScript@16`'s own 55-way switch indexes the same 55 addresses;
+- route 0's handler bounds its loop at `< 0x15`, and that run is 21 long.
+
+The result is 55 routes and 1,857 names, against 1,857 `.ORS` files in
+`Script.GPK`, agreeing on 1,855. The four that differ are shipped facts:
+`03/03-B2-A00` and `03/03-KB-E00` are named by a table but do not ship (both
+sequences begin at `A01` and `E01`), and `01/01-00-OP2` and `05/05-9O-B00`
+ship but are named by no table.
+
+Immediately after each name array sits a second array of the **same names as
+narrow strings**, without the directory prefix. Nothing here reads it; it is
+noted so a future scan does not mistake it for a table.
+
+### Story numbers: the `SP%03d` flags
+
+Beside emitting a name, each route maps some scenes to a global story number
+(`FUN_1000d320` for route 0: scenes 0, 3, 0xe, 0x14 to 100, 101, 102, 103).
+Host slot `+0x00` turns that into `SP%03d` and sets it true in **both** stores.
+Route 0's numbers are exactly the `SP100`..`SP103` a real save carries. These
+are the route-map markers `GetRouteMapPage` reads.
+
+The DLL's own clear path formats `SP%d` without the padding, which would
+disagree for a number below 100; every story number in the retail build is 100
+or more, so it never does.
+
+### Endings
+
+`FUN_10006590` writes an ending: set `[End%02d]="` and `EndClear` in the global
+store if unset, `EndNo` to the ending number, and `EndClear` in the save store.
+`docs/FORMATS.md`'s title-screen section already covers how those are read.
+
+### Affection: `FEELINGSCRIPT.INI` and `STANDERDSCRIPT.INI`
+
+Five named counters live in the save store alongside `ROUTE` and `SCENE`. Both
+tables declare the same five in their head:
+
+```text
+[Number]="5"
+[flag0]="002"  [flag1]="000"  [flag2]="001"  [flag3]="003"  [flag4]="004"
+```
+
+Neither file is parsed. Given a script path the reader drops the first three
+characters (`00/00-00-A04` becomes `00-00-A04`), builds the literal
+`[00-00-A04]="` and **searches the whole file text for it**, then reads fields
+split on `, ` and ending at a `,` or a `"`:
+
+```text
+FEELINGSCRIPT.INI   [00-00-A04]="002, 5, 000, 0"    two (name, amount) pairs
+STANDERDSCRIPT.INI  [01-00-N05]="002, 11"           one (name, amount) pair
+```
+
+`_SetFeeling@8(host, 1)` is called on every decided choice, from the playback
+tick `FUN_00431740`. It resolves which scene the choice leads to, takes that
+scene's name from the same table, and credits its deltas: `FUN_10005c60` adds,
+`FUN_10005ce0` subtracts for moving backwards, and both skip a zero amount
+outright.
+
+What each counter is worth is very uneven:
+
+| Name | Drawn | Read by |
+|---|---|---|
+| `001`, `002` | both gauge bars | the relative test below, at 25 routes; thresholds at 10 scripts |
+| `004` | no | thresholds at 3 scripts |
+| `000` | no | nothing — it is the filler |
+| `003` | no | nothing |
+
+`000` is named in 1,144 of the 1,438 delta slots with an amount of zero,
+because the reader always consumes two pairs and an entry wanting one pads the
+other. Across all 719 entries there are 283 non-zero amounts over 283 entries,
+so **no shipped script moves two counters at once**. Sixteen entries key on a
+script no route table names.
+
+Two mechanisms use the counters, and neither is a bar filling to a threshold:
+
+- **Relative.** 25 of the 55 routes contain exactly one site, and all 25 are
+  identical: `a = get("001"); b = get("002"); if (b < a) ... else ...`. Which
+  counter is *ahead*, never by how much; a tie takes the `else`. Every other
+  branch in the game is decided by the player's choice.
+- **Absolute.** `FUN_10006000` answers whether a script's `STANDERDSCRIPT.INI`
+  counter is past its amount. `cmp eax,[ebp-0x14]` then `jle` makes it
+  **strictly greater** — `[01-00-N05]="002, 11"` passes at 12. It has exactly
+  13 call sites, one per entry.
+
+That two of the five are on the gauge is not the bar's decision. `FUN_10005c60`
+ends with `if (name == "001" || name == "002") host->slot_0x30(1)`, slot `+0x30`
+writes `engine + 0x79c`, and slot `+0x154` — which the control bar asks before
+drawing the gauge over a faded-out bar — reads that member back. So the gauge
+surfaces exactly when those two move, and `FUN_10026050` clears it again
+through `slot_0x30(0)` once it has read them.
+
+`_ZeroReset@4` walks the head's name list setting each to 0; that list, built
+by `FUN_10006230`, is the only thing that ever touches `000` and `003`.
+
+### The gauge geometry
+
+`FUN_10026050` reads the two counters through host slot `+8` and derives a
+signed lead for each side, then `FUN_10026540` sizes three sprites:
+
+```text
+lead_first  = (first  - second) * 2.5       this+0x48
+lead_second = (second - first ) * 2.5       this+0x4c
+```
+
+A side's piece is up only while `lead + 208.5 > 417.0`, which needs a lead of
+over 83 points; below that neither is up and a third, fixed-width piece is
+drawn instead, which is what is on screen in ordinary play. Lengths clamp to
+485.0.
+
+The scale, bias and floor are **doubles** narrowed at the use site. Ghidra
+prints them as `(float)_DAT_...`, and read as floats their bytes give `0.0` —
+self-consistent, and wrong. The `.data` constants beside them (188.0, 9.0,
+485.0, 118.0, 418.0) really are floats.
+
+The pieces' **source** rectangles are **not recovered**: the original builds
+them through four chained calls on an object at `this+0x1c` whose vtable has
+not been identified, so which value is x, y, width and height is unknown and
+the pieces are not composed yet. The destination rectangles are in
+`src/ui/bar.rs`.
+
+### Exports
+
+```text
+CheckInputScript  CheckScript      CheckScriptNo    GetBackScriptFile
+GetNextScriptFile GetPackFile      GetPackMax       GetPatchMax
+GetReadScriptCount GetRouteMapPage GetScriptMax     GetStory
+GetVersionToRoute LoadInitScript   SetDigScript     SetFeeling
+SetPackName       SetRoot          SetScript        ZeroReset
+searchRoot
+```
+
+`LoadInitScript` reads both affection tables into globals and parses their
+heads. The rest are not recovered.

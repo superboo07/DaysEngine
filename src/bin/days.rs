@@ -143,6 +143,18 @@ enum Cmd {
         #[arg(long)]
         unlocked: bool,
     },
+    /// Print the branch graph recovered from the user's RouteProcSDHQ.dll.
+    ///
+    /// The 55 routes and their script-name tables, and the two affection
+    /// tables that go with them. With a script named, says where it sits in
+    /// the graph, what it credits and what it is gated on.
+    Route {
+        /// A script to locate, e.g. "00-00-A04" or "00/00-00-A04".
+        name: Option<String>,
+        /// List every scene of every route, not just a summary line each.
+        #[arg(long)]
+        scenes: bool,
+    },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
     Timing {
@@ -364,6 +376,7 @@ fn main() -> Result<()> {
         Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
         Cmd::Config => cmd_config(&game)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
+        Cmd::Route { name, scenes } => cmd_route(&game, name.as_deref(), scenes)?,
         Cmd::Bar(args) => cmd_bar(&game, &args)?,
         Cmd::Select(args) => cmd_select(&game, &args)?,
         Cmd::Verify { pack } => {
@@ -1585,4 +1598,202 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         println!("wrote {}", out.display());
     }
     Ok(())
+}
+
+/// Reads `RouteProcSDHQ.dll`, which owns every branching decision the game
+/// makes.
+fn route_dll(game: &Path) -> Result<Vec<u8>> {
+    let path = game.join("RouteProcSDHQ.dll");
+    std::fs::read(&path).with_context(|| {
+        format!(
+            "reading {} — the branch graph's script tables live in it",
+            path.display()
+        )
+    })
+}
+
+/// Prints the branch graph and the affection tables that drive it.
+fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
+    use days_route::Routes;
+    use daysengine::install::feeling::{Deltas, Thresholds, FIRST, SECOND};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let routes = Routes::recover(&route_dll(game)?)?;
+
+    let read = |path: &str| match vfs.read_path(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::warn!("reading {path}: {err}");
+            Vec::new()
+        }
+    };
+    let deltas = Deltas::parse(&read("Ini/FeelingScript.ini"));
+    let thresholds = Thresholds::parse(&read("Ini/StanderdScript.ini"));
+
+    if let Some(name) = name {
+        // Both spellings are in use: the tables store "00/00-00-A04" and the
+        // feeling tables key on "00-00-A04".
+        let full = if name.contains('/') {
+            name.to_string()
+        } else {
+            format!("{}/{name}", &name[..2])
+        };
+        match routes.find(&full) {
+            Some((route, scene)) => {
+                println!("{full}  ROUTE {route} (0x{route:02x})  SCENE {scene}");
+                let table = routes.route(route).unwrap_or_default();
+                println!("  route {route} has {} scenes", table.len());
+            }
+            None => println!("{full} is in no route table"),
+        }
+        let credits = deltas.for_script(&full);
+        if credits.is_empty() {
+            println!("  credits nothing");
+        } else {
+            for (counter, amount) in &credits {
+                let drawn = if counter == FIRST || counter == SECOND {
+                    " (on the gauge)"
+                } else if *amount == 0 {
+                    " (filler)"
+                } else {
+                    ""
+                };
+                println!("  credits {counter} {amount:+}{drawn}");
+            }
+        }
+        match thresholds.for_script(&full) {
+            Some((counter, amount)) => {
+                println!("  gated on {counter} > {amount}");
+            }
+            None => println!("  not gated"),
+        }
+        return Ok(());
+    }
+
+    println!("{} routes, {} scenes", routes.len(), routes.iter().count());
+    println!();
+    for route in 0..routes.len() {
+        let table = routes.route(route).unwrap_or_default();
+        let first = table.first().map_or("(empty)", String::as_str);
+        let last = table.last().map_or("(empty)", String::as_str);
+        println!(
+            "  ROUTE {route:>2} (0x{route:02x})  {:>3} scenes  {first} .. {last}",
+            table.len()
+        );
+        if list_scenes {
+            for (scene, script) in table.iter().enumerate() {
+                let credits = deltas.for_script(script);
+                let moved: Vec<String> = credits
+                    .iter()
+                    .filter(|(_, a)| *a != 0)
+                    .map(|(c, a)| format!("{c}{a:+}"))
+                    .collect();
+                let gate = thresholds
+                    .for_script(script)
+                    .map(|(c, a)| format!("  gated {c}>{a}"))
+                    .unwrap_or_default();
+                println!(
+                    "      {scene:>3}  {script}{}{gate}",
+                    if moved.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", moved.join(" "))
+                    }
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("affection counters: {}", deltas.names().join(", "));
+    println!("  {FIRST} and {SECOND} are the two the gauge draws");
+
+    // The counters are not in GlobalFlag.DAT: ROUTE, SCENE and the five of
+    // them live in the per-save store, which host slots +0x08/+0x0c reach
+    // through `engine + 0x40` while the global store hangs off `engine + 0x3c`.
+    println!();
+    match slot_feeling(game, &deltas) {
+        Some((slot, route, scene, feeling)) => {
+            let (a, b) = feeling.gauge();
+            println!("{slot}: ROUTE {route}, SCENE {scene}");
+            for (name, value) in feeling.iter() {
+                let drawn = if name == FIRST || name == SECOND {
+                    "  (gauge)"
+                } else {
+                    ""
+                };
+                println!("  {name} = {value}{drawn}");
+            }
+            println!(
+                "  the branch test (get(\"{SECOND}\") < get(\"{FIRST}\")) takes the {} arm: {}",
+                if feeling.prefers_second() {
+                    "if"
+                } else {
+                    "else"
+                },
+                if a == b {
+                    "the two are level, and the test is a strict <".to_string()
+                } else if feeling.prefers_second() {
+                    format!("{FIRST} leads by {}", a - b)
+                } else {
+                    format!("{SECOND} leads by {}", b - a)
+                }
+            );
+        }
+        None => println!("no save slot to read the counters from"),
+    }
+    Ok(())
+}
+
+/// The counters out of the first readable save slot.
+///
+/// A slot is `"SLog"`, a version, the script it sits in, four bytes whose
+/// meaning is not recovered, and then a whole flag store — see
+/// `docs/FORMATS.md`. Rather than walk the head past the fields that are not
+/// recovered, this finds the embedded store by its own magic and parses that,
+/// which is the part the format is sure about.
+fn slot_feeling(
+    game: &Path,
+    deltas: &daysengine::install::feeling::Deltas,
+) -> Option<(String, i32, i32, daysengine::install::feeling::Feeling)> {
+    use daysengine::install::feeling::Feeling;
+
+    let mut slots: Vec<_> = std::fs::read_dir(game.join("Save"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("SaveFile") && n.ends_with(".DAT"))
+        })
+        .collect();
+    slots.sort();
+
+    for path in slots {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(at) = bytes
+            .windows(days_save::MAGIC.len())
+            .position(|w| w == days_save::MAGIC)
+        else {
+            continue;
+        };
+        let Ok((store, _)) = days_save::FlagStore::parse_embedded(&bytes[at..]) else {
+            continue;
+        };
+        let int = |name: &str| store.get(name).and_then(|v| v.as_int()).unwrap_or(0);
+        let mut feeling = Feeling::new();
+        for name in deltas.names() {
+            feeling.set(name, int(name));
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("save slot")
+            .to_string();
+        return Some((name, int("ROUTE"), int("SCENE"), feeling));
+    }
+    None
 }
