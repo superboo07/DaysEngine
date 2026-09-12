@@ -132,6 +132,8 @@ dependencies = [
  "anyhow",
  "clap",
  "days-gpk",
+ "days-script",
+ "days-vfs",
  "env_logger",
  "log",
 ]
@@ -142,6 +144,23 @@ version = "0.1.0"
 dependencies = [
  "log",
  "miniz_oxide",
+ "thiserror",
+]
+
+[[package]]
+name = "days-script"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror",
+]
+
+[[package]]
+name = "days-vfs"
+version = "0.1.0"
+dependencies = [
+ "days-gpk",
+ "log",
  "thiserror",
 ]
 

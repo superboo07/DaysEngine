@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 days-gpk = { path = "../days-gpk", version = "=0.1.0" }
+days-vfs = { path = "../days-vfs", version = "=0.1.0" }
+days-script = { path = "../days-script", version = "=0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 log.workspace = true

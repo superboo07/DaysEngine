@@ -50,6 +50,19 @@ enum Cmd {
         /// Restrict to one pack.
         pack: Option<String>,
     },
+    /// Parse every .ORS script and report anything the parser cannot handle.
+    Scripts {
+        /// Also print a per-command histogram.
+        #[arg(long)]
+        stats: bool,
+    },
+    /// Parse one script and print its timeline.
+    Script {
+        /// Script name, e.g. "00-00-A00".
+        name: String,
+    },
+    /// Check that every asset path referenced by every script resolves.
+    Assets,
 }
 
 fn main() -> Result<()> {
@@ -93,7 +106,7 @@ fn main() -> Result<()> {
         }
         Cmd::Extract { pack, out, filter } => {
             let p = resolve_pack(&game, &pack)?;
-            let mut ar = Archive::open(&p, &key)?;
+            let ar = Archive::open(&p, &key)?;
             let entries: Vec<_> = ar
                 .entries()
                 .iter()
@@ -112,11 +125,14 @@ fn main() -> Result<()> {
             }
             eprintln!("extracted {} entries to {}", entries.len(), root.display());
         }
+        Cmd::Scripts { stats } => cmd_scripts(&game, stats)?,
+        Cmd::Script { name } => cmd_script(&game, &name)?,
+        Cmd::Assets => cmd_assets(&game)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
             for p in packs {
-                let mut ar = Archive::open(&p, &key)?;
+                let ar = Archive::open(&p, &key)?;
                 let entries: Vec<_> = ar.entries().to_vec();
                 for e in &entries {
                     match ar.read(e) {
@@ -136,6 +152,135 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every `.ORS` in the Script pack, as (script name, logical path).
+///
+/// Pack paths look like `english/00/00-00-A00.ENG.ORS`; the route layer knows
+/// the script as `00-00-A00`, so strip the language directory and the `.ENG`
+/// infix.
+fn script_paths(vfs: &days_vfs::Vfs) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vfs
+        .paths()
+        .filter(|p| p.starts_with("script/") && p.ends_with(".ors"))
+        .map(|p| {
+            let stem = p.rsplit('/').next().unwrap_or(p);
+            let name = stem
+                .trim_end_matches(".ors")
+                .trim_end_matches(".eng")
+                .trim_end_matches(".jpn")
+                .to_uppercase();
+            (name, p.to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let mut histogram: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let (mut ok, mut failed) = (0usize, 0usize);
+
+    for (name, path) in script_paths(&vfs) {
+        let bytes = vfs.read_path(&path)?;
+        match days_script::Script::parse(&name, &bytes) {
+            Ok(script) => {
+                ok += 1;
+                for e in &script.events {
+                    *histogram.entry(command_name(&e.command)).or_default() += 1;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                eprintln!("FAIL {name}: {err}");
+            }
+        }
+    }
+
+    if stats {
+        let mut rows: Vec<_> = histogram.iter().collect();
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (cmd, n) in rows {
+            println!("{n:>8}  {cmd}");
+        }
+    }
+    println!("{ok} scripts parsed, {failed} failed");
+    if failed > 0 {
+        bail!("{failed} scripts failed to parse");
+    }
+    Ok(())
+}
+
+fn cmd_script(game: &Path, name: &str) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let wanted = name.to_uppercase();
+    let (_, path) = script_paths(&vfs)
+        .into_iter()
+        .find(|(n, _)| *n == wanted)
+        .with_context(|| format!("no script named {name}"))?;
+    let script = days_script::Script::parse(&wanted, &vfs.read_path(&path)?)?;
+
+    println!("{} — length {}", script.name, script.length);
+    for e in &script.events {
+        println!("  {} -> {}  {:?}", e.start, e.end, e.command);
+    }
+    Ok(())
+}
+
+fn cmd_assets(game: &Path) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let mut missing: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut checked = 0usize;
+
+    for (name, path) in script_paths(&vfs) {
+        let script = days_script::Script::parse(&name, &vfs.read_path(&path)?)?;
+        for e in &script.events {
+            let (asset, ext) = match &e.command {
+                days_script::Command::PlayVoice { path, .. } => (path, "ogg"),
+                days_script::Command::PlaySe { path, .. } => (path, "ogg"),
+                days_script::Command::PlayBgm { path } => (path, "ogg"),
+                days_script::Command::EndBgm { path } => (path, "ogg"),
+                days_script::Command::CreateBg { path, .. } => (path, "png"),
+                days_script::Command::PlayMovie { path, .. } => (path, "wmv"),
+                days_script::Command::EndRoll { path } => (path, "wmv"),
+                _ => continue,
+            };
+            checked += 1;
+            if vfs.resolve_as(asset, ext).is_none() {
+                *missing.entry(format!("{asset}.{ext}")).or_default() += 1;
+            }
+        }
+    }
+
+    for (path, n) in &missing {
+        println!("MISSING x{n:<4} {path}");
+    }
+    println!(
+        "{checked} references checked, {} distinct missing",
+        missing.len()
+    );
+    Ok(())
+}
+
+fn command_name(c: &days_script::Command) -> &'static str {
+    use days_script::Command as C;
+    match c {
+        C::PrintText { .. } => "PrintText",
+        C::PlayVoice { .. } => "PlayVoice",
+        C::CreateBg { .. } => "CreateBG",
+        C::PlaySe { .. } => "PlaySe",
+        C::PlayMovie { .. } => "PlayMovie",
+        C::PlayBgm { .. } => "PlayBgm",
+        C::EndBgm { .. } => "EndBGM",
+        C::EndRoll { .. } => "EndRoll",
+        C::BlackFade(_) => "BlackFade",
+        C::WhiteFade(_) => "WhiteFade",
+        C::SetSelect { .. } => "SetSELECT",
+        C::MoveSom { .. } => "MoveSom",
+        C::SkipFrame => "SkipFRAME",
+        C::Next => "Next",
+    }
 }
 
 /// Finds the game without being told where it is.

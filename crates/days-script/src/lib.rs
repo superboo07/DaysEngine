@@ -1,0 +1,741 @@
+//! Parser for FILMEngine `.ORS` scripts.
+//!
+//! An `.ORS` file is a **timeline**, not a program. Every statement carries a
+//! start and an end timecode and the engine plays the whole file against one
+//! clock, closer to a video editor's EDL than to VN bytecode:
+//!
+//! ```text
+//! [PlayMovie]=00:04:05\tMovie00/00-00/00-00-A00/00-00-A00-001\t0\t00:11:00;
+//! [PrintText]=00:30:13\tMakoto\t......\t00:31:11;
+//! ```
+//!
+//! Statements are `[Command]=arg\targ\t...;`. The first argument is always the
+//! start timecode and the last is always the end timecode, except for
+//! [`Command::SkipFrame`] and [`Command::Next`], which carry a single timecode.
+//!
+//! Timecodes are `MM:SS:FF` at **24 fps** — the frames field runs 0..=23 across
+//! all 1,857 retail scripts, and the movies are 24 fps.
+
+#![forbid(unsafe_code)]
+
+use std::time::Duration;
+
+/// Frames per second of the script clock, and of every movie in the game.
+pub const FPS: u32 = 24;
+
+/// A point on the script timeline, in frames from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Frame(pub u32);
+
+impl Frame {
+    pub const ZERO: Frame = Frame(0);
+
+    /// Parses an `MM:SS:FF` timecode.
+    ///
+    /// Out-of-range frame fields are folded in rather than rejected: two
+    /// statements in the retail English scripts carry `:26` in a 24 fps field
+    /// (`01-00-E01`), and the original engine plays them without complaint.
+    pub fn parse(s: &str) -> Result<Frame, Error> {
+        let bad = || Error::BadTimecode(s.to_string());
+        let mut parts = s.trim().split(':');
+        let mm: u32 = parts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+        let ss: u32 = parts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+        let ff: u32 = parts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        if ff >= FPS {
+            log::debug!("timecode {s} has an out-of-range frame field; folding it in");
+        }
+        Ok(Frame((mm * 60 + ss) * FPS + ff))
+    }
+
+    pub fn as_duration(self) -> Duration {
+        Duration::from_nanos(u64::from(self.0) * 1_000_000_000 / u64::from(FPS))
+    }
+
+    pub fn from_duration(d: Duration) -> Frame {
+        Frame((d.as_secs_f64() * f64::from(FPS)) as u32)
+    }
+
+    pub fn as_seconds(self) -> f64 {
+        f64::from(self.0) / f64::from(FPS)
+    }
+}
+
+impl std::fmt::Display for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_seconds = self.0 / FPS;
+        write!(
+            f,
+            "{:02}:{:02}:{:02}",
+            total_seconds / 60,
+            total_seconds % 60,
+            self.0 % FPS
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("malformed timecode {0:?}")]
+    BadTimecode(String),
+    #[error("line {line}: [{command}] wants {want} arguments, got {got}")]
+    Arity {
+        line: usize,
+        command: String,
+        want: &'static str,
+        got: usize,
+    },
+    #[error("line {line}: {value:?} is not a valid {what}")]
+    BadValue {
+        line: usize,
+        what: &'static str,
+        value: String,
+    },
+    #[error("script is not valid UTF-8 or UTF-16")]
+    BadEncoding,
+}
+
+/// Direction of a screen fade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fade {
+    /// Fade from the colour to the scene.
+    In,
+    /// Fade from the scene to the colour.
+    Out,
+}
+
+/// One statement's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Dialogue line. The speaker is a display name, not an ID.
+    PrintText {
+        speaker: String,
+        text: String,
+    },
+    /// Voice clip. `lipsync` is the engine's 0/1 flag; `tag` is a short speaker
+    /// code (`kot`, `sek`, `xxx` for narration).
+    PlayVoice {
+        path: String,
+        lipsync: bool,
+        tag: String,
+    },
+    /// Still background. The only kind seen in retail data is `BGS`.
+    CreateBg {
+        kind: String,
+        path: String,
+    },
+    /// Sound effect on one of five mixer slots. Slot 5 is sometimes handed a
+    /// `Voice...` path — the game reuses the SE mixer for unlipsynced voice.
+    PlaySe {
+        slot: u8,
+        path: String,
+    },
+    PlayMovie {
+        path: String,
+        looping: bool,
+    },
+    PlayBgm {
+        path: String,
+    },
+    /// BGM for the ending sequence.
+    EndBgm {
+        path: String,
+    },
+    /// Ending credits movie.
+    EndRoll {
+        path: String,
+    },
+    BlackFade(Fade),
+    WhiteFade(Fade),
+    /// A binary choice. **Carries no targets** — where each choice leads is
+    /// decided by `RouteProcSDHQ.dll`, not by the script. `b` is `None` when
+    /// the script writes `null`, which makes it a single-option prompt.
+    SetSelect {
+        a: String,
+        b: Option<String>,
+    },
+    /// Drives a peripheral. No-op without hardware.
+    MoveSom {
+        intensity: i32,
+    },
+    /// Total script length. Always the first statement.
+    SkipFrame,
+    /// End of script. Always the last statement.
+    Next,
+}
+
+/// A statement: a command and the window it occupies on the timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub start: Frame,
+    pub end: Frame,
+    pub command: Command,
+}
+
+impl Event {
+    /// True while `at` falls inside `[start, end)`.
+    pub fn is_active_at(&self, at: Frame) -> bool {
+        at >= self.start && at < self.end
+    }
+
+    pub fn duration(&self) -> Frame {
+        Frame(self.end.0.saturating_sub(self.start.0))
+    }
+}
+
+/// A parsed script, with events sorted by start time.
+#[derive(Debug, Clone, Default)]
+pub struct Script {
+    /// Script name as the route layer knows it, e.g. `"00-00-A00"`.
+    pub name: String,
+    /// Total length, from `[SkipFRAME]`.
+    pub length: Frame,
+    pub events: Vec<Event>,
+}
+
+impl Script {
+    /// Parses a script from raw pack bytes.
+    ///
+    /// Handles both encodings the engine supports: the English scripts are
+    /// UTF-8, and `FILMENGINE.INI [UnicodeFile]` selects UTF-16LE elsewhere.
+    pub fn parse(name: &str, bytes: &[u8]) -> Result<Script, Error> {
+        let text = decode(bytes)?;
+        Self::parse_str(name, &text)
+    }
+
+    pub fn parse_str(name: &str, text: &str) -> Result<Script, Error> {
+        let mut events = Vec::new();
+        let mut length = Frame::ZERO;
+
+        for (line, raw) in statements(text) {
+            let Some((command, body)) = split_statement(raw) else {
+                continue;
+            };
+            let args: Vec<&str> = split_fields(body);
+            let event = parse_command(line, command, &args)?;
+            if let Command::SkipFrame = event.command {
+                length = event.end;
+            }
+            events.push(event);
+        }
+
+        // Statements appear in start order in retail data, but nothing in the
+        // format guarantees it and the player relies on it.
+        events.sort_by_key(|e| (e.start, e.end));
+
+        if length == Frame::ZERO {
+            length = events.iter().map(|e| e.end).max().unwrap_or(Frame::ZERO);
+            log::warn!("{name} has no [SkipFRAME]; inferred length {length}");
+        }
+
+        Ok(Script {
+            name: name.to_string(),
+            length,
+            events,
+        })
+    }
+
+    /// Events whose window contains `at`.
+    pub fn active_at(&self, at: Frame) -> impl Iterator<Item = &Event> {
+        self.events.iter().filter(move |e| e.is_active_at(at))
+    }
+
+    /// Events starting in `(after, upto]` — the frames to fire when the clock
+    /// advances. Half-open at the bottom so a frame is never fired twice.
+    pub fn events_between(&self, after: Frame, upto: Frame) -> impl Iterator<Item = &Event> {
+        self.events
+            .iter()
+            .filter(move |e| e.start > after && e.start <= upto)
+    }
+
+    /// The choice this script ends on, if any.
+    pub fn selection(&self) -> Option<&Event> {
+        self.events
+            .iter()
+            .find(|e| matches!(e.command, Command::SetSelect { .. }))
+    }
+}
+
+/// Splits a script into `(line_number, statement)` pairs.
+///
+/// Statements end at `;`, but the format has no escaping and dialogue is free
+/// text, so a bare `;` inside a line is ambiguous. `05-KC-F00` contains
+/// `I know; I am, too.` — splitting naively there swallows the rest of the
+/// statement and mis-parses the tail as a timecode.
+///
+/// The disambiguator: a `;` only terminates a statement when the next
+/// non-whitespace character is `[` (the start of the next statement) or the
+/// input ends. Every other `;` is literal text.
+fn statements(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut rest = text;
+    let mut search_from = 0usize;
+
+    while let Some(rel) = rest[search_from..].find(';') {
+        let end = search_from + rel;
+        let tail = &rest[end + 1..];
+        // `;` also terminates when an empty statement follows: `05-KI-OP1` has a
+        // stray ` ;` between two real statements, and treating the preceding
+        // `;` as literal would swallow it into the previous statement's last
+        // field.
+        let next = tail.trim_start_matches(['\r', '\n', ' ', '\t']);
+        let terminates = next.starts_with('[') || next.starts_with(';') || next.is_empty();
+        if !terminates {
+            // Literal semicolon inside a text field; keep looking.
+            search_from = end + 1;
+            continue;
+        }
+
+        let stmt = &rest[..end];
+        line += stmt.matches('\n').count();
+        let trimmed = stmt.trim_start_matches(['\r', '\n', ' ', '\t', '\u{feff}']);
+        if !trimmed.is_empty() {
+            out.push((line, trimmed));
+        }
+        rest = tail;
+        search_from = 0;
+    }
+    out
+}
+
+/// Splits a statement body into fields.
+///
+/// Fields are tab-separated, except in `05-KI-OP1`, which a scripter wrote with
+/// `, ` separators. That script ships in the retail game and plays, so accept
+/// both: fall back to commas only when there is no tab at all, so commas inside
+/// ordinary dialogue stay untouched.
+fn split_fields(body: &str) -> Vec<&str> {
+    if body.contains('\t') {
+        body.split('\t').map(str::trim_end).collect()
+    } else {
+        body.split(',').map(str::trim).collect()
+    }
+}
+
+/// `[Command]=body` -> `("Command", "body")`.
+fn split_statement(stmt: &str) -> Option<(&str, &str)> {
+    let rest = stmt.strip_prefix('[')?;
+    let close = rest.find("]=")?;
+    Some((&rest[..close], &rest[close + 2..]))
+}
+
+fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Error> {
+    let arity = |want: &'static str| Error::Arity {
+        line,
+        command: command.to_string(),
+        want,
+        got: args.len(),
+    };
+
+    // Single-timecode forms.
+    if matches!(command, "SkipFRAME" | "Next") {
+        if args.len() != 1 {
+            return Err(arity("1"));
+        }
+        let at = Frame::parse(args[0])?;
+        // `SkipFRAME` declares the script's total length, so it spans the whole
+        // timeline. `Next` is an end marker, so it sits at a point — giving it a
+        // zero start would sort it to the front of the event list.
+        return Ok(if command == "SkipFRAME" {
+            Event {
+                start: Frame::ZERO,
+                end: at,
+                command: Command::SkipFrame,
+            }
+        } else {
+            Event {
+                start: at,
+                end: at,
+                command: Command::Next,
+            }
+        });
+    }
+
+    if args.len() < 2 {
+        return Err(arity("at least 2"));
+    }
+    let start = Frame::parse(args[0])?;
+    let end = Frame::parse(args[args.len() - 1])?;
+    let mid = &args[1..args.len() - 1];
+
+    // Fields are read by position with a default, rather than matched against an
+    // exact shape. Retail scripts are inconsistent about optional fields: some
+    // `PlayVoice` statements leave the lipsync flag and speaker tag empty but
+    // still write the tabs (`05-SE-C08` line 81), and one `PrintText` has a
+    // trailing empty field (`03-KB-D10` line 29). Only the fields a command
+    // genuinely needs are required.
+    let field = |i: usize| mid.get(i).copied().unwrap_or_default();
+    let need = |n: usize, want: &'static str| -> Result<(), Error> {
+        if mid.len() < n {
+            Err(Error::Arity {
+                line,
+                command: command.to_string(),
+                want,
+                got: args.len(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    let flag = |v: &str| !matches!(v.trim(), "" | "0");
+
+    let command = match command {
+        "PrintText" => {
+            need(2, "a speaker and a line of text")?;
+            Command::PrintText {
+                speaker: field(0).to_string(),
+                text: field(1).to_string(),
+            }
+        }
+        "PlayVoice" => {
+            need(1, "a voice path")?;
+            Command::PlayVoice {
+                path: field(0).to_string(),
+                lipsync: flag(field(1)),
+                tag: field(2).to_string(),
+            }
+        }
+        "CreateBG" => {
+            need(2, "a kind and an image path")?;
+            Command::CreateBg {
+                kind: field(0).to_string(),
+                path: field(1).to_string(),
+            }
+        }
+        "PlaySe" => {
+            need(2, "a slot and a sound path")?;
+            let slot = field(0);
+            Command::PlaySe {
+                slot: slot.trim().parse().map_err(|_| Error::BadValue {
+                    line,
+                    what: "SE slot",
+                    value: slot.to_string(),
+                })?,
+                path: field(1).to_string(),
+            }
+        }
+        "PlayMovie" => {
+            need(1, "a movie path")?;
+            Command::PlayMovie {
+                path: field(0).to_string(),
+                looping: flag(field(1)),
+            }
+        }
+        "PlayBgm" | "EndBGM" | "EndRoll" => {
+            need(1, "a path")?;
+            let path = field(0).to_string();
+            match command {
+                "PlayBgm" => Command::PlayBgm { path },
+                "EndBGM" => Command::EndBgm { path },
+                _ => Command::EndRoll { path },
+            }
+        }
+        "BlackFade" | "WhiteFade" => {
+            need(1, "a direction")?;
+            let fade = match field(0).trim() {
+                "IN" => Fade::In,
+                "OUT" => Fade::Out,
+                other => {
+                    return Err(Error::BadValue {
+                        line,
+                        what: "fade direction",
+                        value: other.to_string(),
+                    })
+                }
+            };
+            if command == "BlackFade" {
+                Command::BlackFade(fade)
+            } else {
+                Command::WhiteFade(fade)
+            }
+        }
+        "SetSELECT" => {
+            need(1, "at least one choice label")?;
+            let b = field(1);
+            Command::SetSelect {
+                a: unquote(field(0)),
+                b: (!b.trim().is_empty() && b.trim() != "null").then(|| unquote(b)),
+            }
+        }
+        "MoveSom" => {
+            need(1, "an intensity")?;
+            let n = field(0);
+            Command::MoveSom {
+                intensity: n.trim().parse().map_err(|_| Error::BadValue {
+                    line,
+                    what: "MoveSom intensity",
+                    value: n.to_string(),
+                })?,
+            }
+        }
+        other => {
+            // An unknown command is a gap in our vocabulary, not bad data. Log
+            // it loudly and drop the statement rather than refusing the script.
+            log::warn!("line {line}: unknown command [{other}]; ignoring");
+            return Ok(Event {
+                start,
+                end,
+                command: Command::MoveSom { intensity: 0 },
+            });
+        }
+    };
+
+    Ok(Event {
+        start,
+        end,
+        command,
+    })
+}
+
+/// Choice labels are wrapped in single quotes in the script.
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('\'').to_string()
+}
+
+/// Decodes script bytes as UTF-16LE if there is a BOM, otherwise UTF-8.
+fn decode(bytes: &[u8]) -> Result<String, Error> {
+    if let Some(rest) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
+            .collect();
+        return String::from_utf16(&units).map_err(|_| Error::BadEncoding);
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|_| Error::BadEncoding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timecode_is_24fps() {
+        assert_eq!(Frame::parse("00:00:00").unwrap(), Frame(0));
+        assert_eq!(Frame::parse("00:00:23").unwrap(), Frame(23));
+        assert_eq!(Frame::parse("00:01:00").unwrap(), Frame(24));
+        assert_eq!(Frame::parse("01:00:00").unwrap(), Frame(60 * 24));
+        assert_eq!(
+            Frame::parse("01:35:15").unwrap(),
+            Frame((60 + 35) * 24 + 15)
+        );
+        assert!(Frame::parse("nope").is_err());
+    }
+
+    /// `01-00-E01` ships `00:20:26` in a 24 fps field. The retail engine plays
+    /// it, so we fold the overflow in rather than rejecting the script.
+    #[test]
+    fn tolerates_the_retail_frame_field_typo() {
+        assert_eq!(Frame::parse("00:20:26").unwrap(), Frame(20 * 24 + 26));
+    }
+
+    #[test]
+    fn timecode_round_trips_through_display() {
+        for tc in ["00:00:00", "01:35:15", "13:59:23"] {
+            assert_eq!(Frame::parse(tc).unwrap().to_string(), tc);
+        }
+    }
+
+    /// The opening of 00-00-A00, verbatim.
+    const OPENING: &str = "[SkipFRAME]=01:35:15;\n\n\
+        [PlaySe]=00:00:00\t1\tSe00/00-00/00-00-A00/SE00-00-A00-002\t00:07:12;\n\n\
+        [PlayMovie]=00:00:00\tMovie00/00-00/00-00-A00/00-00-A00-000\t0\t00:04:05;\n\n\
+        [BlackFade]=00:04:05\tIN\t00:04:17;\n\n\
+        [PrintText]=00:30:13\tMakoto\t......\t00:31:11;\n\n\
+        [PlayVoice]=00:30:13\tVoice00/00-00/00-00-A00/00-00-A00-0080\t1\txxx\t00:31:11;\n\n\
+        [Next]=01:35:15;\n";
+
+    #[test]
+    fn parses_a_real_script_opening() {
+        let s = Script::parse_str("00-00-A00", OPENING).unwrap();
+        assert_eq!(s.length, Frame::parse("01:35:15").unwrap());
+        assert_eq!(s.events.len(), 7);
+
+        assert!(matches!(
+            &s.events.iter().find(|e| matches!(e.command, Command::PlaySe { .. })).unwrap().command,
+            Command::PlaySe { slot: 1, path } if path.ends_with("SE00-00-A00-002")
+        ));
+        assert!(matches!(
+            &s.events
+                .iter()
+                .find(|e| matches!(e.command, Command::PlayMovie { .. }))
+                .unwrap()
+                .command,
+            Command::PlayMovie { looping: false, .. }
+        ));
+        assert!(s
+            .events
+            .iter()
+            .any(|e| e.command == Command::BlackFade(Fade::In)));
+
+        let text = s
+            .events
+            .iter()
+            .find(|e| matches!(e.command, Command::PrintText { .. }))
+            .unwrap();
+        assert_eq!(text.start, Frame::parse("00:30:13").unwrap());
+        assert_eq!(text.end, Frame::parse("00:31:11").unwrap());
+        assert_eq!(
+            text.command,
+            Command::PrintText {
+                speaker: "Makoto".into(),
+                text: "......".into()
+            }
+        );
+
+        let voice = s
+            .events
+            .iter()
+            .find(|e| matches!(e.command, Command::PlayVoice { .. }))
+            .unwrap();
+        assert_eq!(
+            voice.command,
+            Command::PlayVoice {
+                path: "Voice00/00-00/00-00-A00/00-00-A00-0080".into(),
+                lipsync: true,
+                tag: "xxx".into()
+            }
+        );
+    }
+
+    #[test]
+    fn select_labels_are_unquoted_and_null_becomes_none() {
+        let s = Script::parse_str(
+            "t",
+            "[SetSELECT]=01:32:16\t'Let's break up'\t'Abort the baby'\t01:37:16;\n\
+             [SetSELECT]=00:43:06\t'So'\tnull\t00:48:06;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.events[1].command,
+            Command::SetSelect {
+                a: "Let's break up".into(),
+                b: Some("Abort the baby".into())
+            }
+        );
+        assert_eq!(
+            s.events[0].command,
+            Command::SetSelect {
+                a: "So".into(),
+                b: None
+            }
+        );
+    }
+
+    #[test]
+    fn windows_and_firing_ranges() {
+        let s = Script::parse_str("t", OPENING).unwrap();
+        let at = Frame::parse("00:30:20").unwrap();
+        assert!(s
+            .active_at(at)
+            .any(|e| matches!(e.command, Command::PrintText { .. })));
+
+        // Advancing across a start fires it exactly once.
+        let before = Frame::parse("00:30:12").unwrap();
+        let after = Frame::parse("00:30:13").unwrap();
+        assert_eq!(s.events_between(before, after).count(), 2); // text + voice
+        assert_eq!(s.events_between(after, after).count(), 0);
+    }
+
+    /// `05-KC-F00` line 241: a semicolon inside dialogue must not end the
+    /// statement.
+    #[test]
+    fn semicolon_inside_dialogue_is_literal() {
+        let s = Script::parse_str(
+            "05-KC-F00",
+            "[PrintText]=02:52:05\tMakoto\tI know; I am, too.\t02:56:09;\n\
+             [Next]=02:56:09;\n",
+        )
+        .unwrap();
+        let text = s
+            .events
+            .iter()
+            .find(|e| matches!(e.command, Command::PrintText { .. }))
+            .unwrap();
+        assert_eq!(
+            text.command,
+            Command::PrintText {
+                speaker: "Makoto".into(),
+                text: "I know; I am, too.".into()
+            }
+        );
+        assert_eq!(text.end, Frame::parse("02:56:09").unwrap());
+        assert_eq!(s.events.len(), 2);
+    }
+
+    /// `03-KB-D10` line 29 has a trailing empty field after the dialogue.
+    #[test]
+    fn trailing_empty_fields_are_dropped() {
+        let s = Script::parse_str(
+            "03-KB-D10",
+            "[PrintText]=00:16:19\tTaisuke\tHi.\t\t00:24:01;",
+        )
+        .unwrap();
+        assert_eq!(
+            s.events[0].command,
+            Command::PrintText {
+                speaker: "Taisuke".into(),
+                text: "Hi.".into()
+            }
+        );
+    }
+
+    /// `05-KI-OP1` is written with `, ` separators instead of tabs, and has a
+    /// stray whitespace-only statement.
+    #[test]
+    fn comma_separated_script_parses() {
+        let s = Script::parse_str(
+            "05-KI-OP1",
+            "[SkipFRAME]=02:04:20;\r\n\r\n\
+             [PlaySe]=00:00:00, 1, BGM/Vocal/SDV02, 02:04:20;\r\n\r\n\
+             [PlayMovie]=00:00:00, System/OP/SDHQ_KOTONOHA, 0, 02:04:20;\r\n\r\n\
+              ;\r\n\r\n\
+             [Next]=02:04:20;\r\n",
+        )
+        .unwrap();
+        assert_eq!(s.length, Frame::parse("02:04:20").unwrap());
+        assert!(s.events.iter().any(|e| e.command
+            == Command::PlaySe {
+                slot: 1,
+                path: "BGM/Vocal/SDV02".into()
+            }));
+        assert!(s.events.iter().any(|e| e.command
+            == Command::PlayMovie {
+                path: "System/OP/SDHQ_KOTONOHA".into(),
+                looping: false
+            }));
+    }
+
+    /// Commas inside dialogue must not be treated as separators when the
+    /// statement is tab-delimited.
+    #[test]
+    fn commas_in_tab_delimited_dialogue_are_literal() {
+        let s = Script::parse_str(
+            "t",
+            "[PrintText]=00:00:00\tSekai\tWell, well, well.\t00:00:10;",
+        )
+        .unwrap();
+        assert_eq!(
+            s.events[0].command,
+            Command::PrintText {
+                speaker: "Sekai".into(),
+                text: "Well, well, well.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn utf16_scripts_decode() {
+        let mut bytes = vec![0xff, 0xfe];
+        for u in "[Next]=00:00:01;".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let s = Script::parse("t", &bytes).unwrap();
+        assert_eq!(s.events[0].command, Command::Next);
+    }
+}

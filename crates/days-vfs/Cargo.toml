@@ -1,0 +1,11 @@
+[package]
+name = "days-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Virtual filesystem over a School Days HQ installation's GPK packs."
+
+[dependencies]
+days-gpk = { path = "../days-gpk", version = "=0.1.0" }
+thiserror.workspace = true
+log.workspace = true

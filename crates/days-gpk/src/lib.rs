@@ -51,6 +51,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub mod pe;
 
@@ -195,9 +196,13 @@ impl Entry {
 }
 
 /// An open GPK archive. Holds the index in memory and reads entry bytes lazily.
+///
+/// Reads go through `&self` behind a mutex so one archive can be shared with a
+/// decode thread. Entries are large enough (hundreds of KB) that the lock is
+/// never the bottleneck.
 pub struct Archive {
     path: PathBuf,
-    file: File,
+    file: Mutex<File>,
     entries: Vec<Entry>,
     /// Lowercased name -> index into `entries`.
     by_name: HashMap<String, usize>,
@@ -247,7 +252,7 @@ impl Archive {
         log::debug!("opened {} with {} entries", path.display(), entries.len());
         Ok(Archive {
             path,
-            file,
+            file: Mutex::new(file),
             entries,
             by_name,
         })
@@ -271,16 +276,18 @@ impl Archive {
     }
 
     /// Reads and decodes a single entry.
-    pub fn read(&mut self, entry: &Entry) -> Result<Vec<u8>, Error> {
+    pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, Error> {
         let stored = entry.stored_len();
         let mut buf = Vec::with_capacity(entry.header.len() + stored as usize);
         buf.extend_from_slice(&entry.header);
-        self.file
-            .seek(SeekFrom::Start(entry.offset))
-            .map_err(io(&self.path))?;
-        let mut tail = vec![0u8; stored as usize];
-        self.file.read_exact(&mut tail).map_err(io(&self.path))?;
-        buf.extend_from_slice(&tail);
+        {
+            let mut file = self.file.lock().expect("archive mutex poisoned");
+            file.seek(SeekFrom::Start(entry.offset))
+                .map_err(io(&self.path))?;
+            let mut tail = vec![0u8; stored as usize];
+            file.read_exact(&mut tail).map_err(io(&self.path))?;
+            buf.extend_from_slice(&tail);
+        }
 
         if !entry.is_compressed() {
             return Ok(buf);
@@ -303,9 +310,9 @@ impl Archive {
     }
 
     /// Convenience: look up by name and read in one step.
-    pub fn read_named(&mut self, name: &str) -> Option<Result<Vec<u8>, Error>> {
-        let entry = self.find(name)?.clone();
-        Some(self.read(&entry))
+    pub fn read_named(&self, name: &str) -> Option<Result<Vec<u8>, Error>> {
+        let entry = self.find(name)?;
+        Some(self.read(entry))
     }
 }
 

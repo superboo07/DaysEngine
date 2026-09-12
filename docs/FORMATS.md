@@ -73,8 +73,26 @@ Notes:
   EDL than to a VN bytecode interpreter.
 - `PlaySe` slot 5 is sometimes handed a `Voice...` path — the game reuses the SE
   mixer for non-lipsynced voice.
+- **166 voice references point at clips that do not exist**, out of 50,653 asset
+  references across all scripts. They cluster on `PlayVoice` statements whose
+  lipsync and speaker-tag fields were left blank, which reads as a scripter
+  marking "no clip for this line". One background PNG is likewise absent
+  (`Event01/01-00/01-00-T00/01-00-T00-009`). A missing asset must not be fatal.
 - `MoveSom` drives a toy; the retail engine no-ops it without hardware.
 - **`Next` and `SetSELECT` carry no targets.** The branch graph is not here.
+
+### Retail data quirks the parser must absorb
+
+All 1,857 scripts parse once these are handled. Each was found by running the
+parser over the real packs, not by reading the format spec:
+
+| Script | Quirk |
+|---|---|
+| `05-KC-F00` line 241 | A **semicolon inside dialogue** (`I know; I am, too.`). Statements have no escaping, so a `;` only terminates when the next non-whitespace character is `[` or the file ends. |
+| `05-KI-OP1` | Written with **`, ` separators instead of tabs**, plus a stray whitespace-only ` ;` statement. Fall back to comma splitting only when a statement contains no tab, so commas in ordinary dialogue stay literal. |
+| `03-KB-D10` line 29 | A `PrintText` with a **trailing empty field**. |
+| `05-SE-C08` line 81, and 129 others | `PlayVoice` with **empty lipsync and tag fields** but the tabs still written. Fields must be read by position with defaults, not matched against an exact arity. |
+| `01-00-E01` | Two timecodes with a **frame field of 26** in a 24 fps script. Fold the overflow in rather than rejecting. |
 
 ---
 
@@ -135,6 +153,11 @@ followed by a raw zlib stream).
   **no audio stream**. ffmpeg decodes these natively.
 - **Audio**: Ogg Vorbis, separate from the video. `DX8SOUND.INI` declares the
   mixer format as 44.1 kHz, 16-bit, stereo.
+- **Background music is split into intro and loop halves.** A script asks for
+  `BGM/SD_BGM/sdbgm07`; the pack holds `SDBGM07_INT.OGG` and `SDBGM07_LOOP.OGG`.
+  The intro plays once, then the loop repeats until the track is replaced. Nine
+  tracks ship loop-only (`sdbgm14`, `18`, `20`, `28`, `29`, `31`, `32`, `33`).
+  `BGM/Vocal/SDV*` are plain one-shot files, played through `[PlaySe]`.
 - **Stills**: PNG, 8-bit, colour type 6 (RGBA).
 
 Because video carries no audio, playback is a video decoder plus an independent
