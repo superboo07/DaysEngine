@@ -39,9 +39,10 @@
 //! different build of the DLL. Instead the table is **found by its content**:
 //! the first four floats of record *i* are exactly the bounding box of region
 //! *i + 1* in the screen's native-resolution `.CMAP`. So we take the boxes from
-//! the user's own `.CMAP`, search the DLL's data sections for a run of records
-//! whose destination rects match all of them at a 24-byte stride, and read the
-//! source coordinates out of the match.
+//! the user's own `.CMAP`, search the DLL's data sections for records whose
+//! destination rects reproduce them at a 24-byte stride, and read the source
+//! coordinates out of the match. Those records are not always one run — see
+//! below.
 //!
 //! That is self-validating. It is also tolerant in one direction and strict in
 //! the other: a region's bounding box can legitimately differ from its sprite
@@ -51,10 +52,30 @@
 //! tolerated is a weak match: below the threshold we report that the table was
 //! not found rather than drawing sprites from the wrong offsets.
 //!
-//! Some screens have no table to find. The save/load slot rows and the replay
-//! thumbnail grids are laid out by a loop at runtime — ten rows at a 33px pitch
-//! — so their rects exist nowhere in the binary. Those screens need their
-//! layout reproduced in code; the search says so rather than guessing.
+//! # A table is not always one run
+//!
+//! `TITLE` and the three `OPTION` screens keep one record per region, in region
+//! order, back to back. The replay grid does not: its nineteen regions are
+//! three separate stretches of one larger table — the two tab headers and the
+//! back button, then the four page buttons eight records later, then the twelve
+//! thumbnails eight records after that — because the records in between are the
+//! other states of the same widgets. Insisting on one run there does not fail
+//! cleanly; it lands on a stretch that reproduces fifteen of the nineteen boxes
+//! and draws every sprite from the wrong offset.
+//!
+//! So the search is **segmented**: it takes the longest run it can anchor at
+//! region 1, continues from wherever that stops, and repeats. A screen whose
+//! table really is one run comes out as a single segment, which is the old
+//! behaviour exactly. [`Atlas::segments`] reports how many it took, because two
+//! is a fact about the screen and twelve would be a sign the search is fitting
+//! noise.
+//!
+//! # Some screens still have no table
+//!
+//! `SAVELOAD` and `REPLAY_PLAYDATA` lay their slot rows out with a loop at
+//! runtime — ten rows at a 33px pitch — so those rects exist nowhere in the
+//! binary. Both need their layout reproduced in code; the search says so rather
+//! than guessing.
 //!
 //! # Native resolution
 //!
@@ -86,14 +107,26 @@ pub struct Atlas {
     /// Records that follow the per-region run: alternate states (hover,
     /// pressed, disabled) and caption sprites.
     ///
-    /// **Best effort.** The table is contiguous but nothing in the data marks
-    /// its end — the shipped code reaches these by fixed address, so how many
-    /// there are and what each one means is per-screen knowledge, not something
-    /// the bytes carry. The run is cut at the first record that cannot be a
-    /// sprite for this sheet, so trailing entries may belong to another screen.
+    /// **Best effort.** Nothing in the data marks where a table ends — the
+    /// shipped code reaches these by fixed address, so how many there are and
+    /// what each one means is per-screen knowledge rather than something the
+    /// bytes carry. The run starts after the last segment and is cut at the
+    /// first record that cannot be a sprite for this sheet, so trailing entries
+    /// may belong to another screen.
     pub extras: Vec<Widget>,
-    /// Byte offset of the table in the DLL image, for diagnostics.
+    /// Byte offset of region 1's record in the DLL image, for diagnostics.
+    ///
+    /// For a screen whose leading regions are laid out at runtime this is
+    /// extrapolated back from the first segment, so it is where the record
+    /// *would* be rather than somewhere a match was seen.
     pub offset: usize,
+    /// Where each stretch of consecutive regions was found, as
+    /// `(first region index, byte offset, how many regions)`.
+    ///
+    /// One entry means the table is a single run. More means the screen's
+    /// records are interleaved with other states of the same widgets, which is
+    /// how the replay grid is laid out.
+    pub segments: Vec<(usize, usize, usize)>,
     /// How many regions' bounding boxes the table reproduced exactly, out of
     /// `widgets.len()`. Anything short of all of them means those widgets'
     /// boxes are clipped by a neighbour, not that the table is wrong.
@@ -142,6 +175,14 @@ fn record(dll: &[u8], at: usize) -> Option<Widget> {
 /// enough regions to make a coincidence conceivable.
 const MIN_MATCHES: usize = 3;
 
+/// Fewest regions a segment should average before the split looks like the
+/// search fitting noise rather than reading a table.
+///
+/// The replay grid is nineteen regions in three segments; a screen that came
+/// back as one segment per region would be matching individual records
+/// anywhere in the DLL, which proves nothing.
+const MIN_SEGMENT_REGIONS: usize = 3;
+
 /// Finds the widget table for a screen.
 ///
 /// `boxes` are the region bounding boxes from the screen's **native 800x450**
@@ -153,55 +194,79 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
         return Err(Error::NoAtlas);
     }
 
-    // Anchor on every region in turn, not just the first. A screen can have
-    // widgets that are laid out at runtime sitting ahead of tabled ones in ID
-    // order — the save/load screen's slot rows do exactly that — so insisting
-    // the table start at region 1 would miss tables that are really there.
-    let mut best: Option<(usize, usize)> = None;
-    let mut seen = Vec::new();
-    for (k, anchor) in boxes.iter().enumerate() {
-        let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
-            .iter()
-            .flat_map(|v| (*v as f32).to_le_bytes())
-            .collect();
-        let mut at = 0usize;
-        while let Some(found) = find_bytes(dll, &needle, at) {
-            at = found + 4;
-            let Some(start) = found.checked_sub(k * RECORD) else {
-                continue;
-            };
-            if seen.contains(&start) {
-                continue;
-            }
-            seen.push(start);
-            let score = boxes
-                .iter()
-                .enumerate()
-                .filter(|(i, want)| {
-                    record(dll, start + i * RECORD).is_some_and(|w| w.dst == **want)
-                })
-                .count();
-            if best.is_none_or(|(_, b)| score > b) {
-                best = Some((start, score));
-            }
-        }
+    // Walk the regions, taking the longest run of records that reproduces them
+    // from wherever the last run stopped. Most screens need one pass; the
+    // replay grid needs three.
+    let mut segments: Vec<(usize, usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    while at < boxes.len() {
+        let Some((offset, len)) = longest_run(dll, boxes, at) else {
+            // No record anywhere reproduces this region's box. That is a region
+            // laid out at runtime; skip it and look for the next segment.
+            at += 1;
+            continue;
+        };
+        segments.push((at, offset, len));
+        at += len;
     }
 
-    let (start, matched) = best.ok_or(Error::NoAtlas)?;
-    if matched < MIN_MATCHES.min(boxes.len()) || matched * 2 < boxes.len() {
+    // Segments must not be so short that the search is really matching
+    // coincidences rather than reading a table.
+    if segments.is_empty() || segments.len() > boxes.len() / MIN_SEGMENT_REGIONS + 1 {
         return Err(Error::NoAtlas);
     }
 
     // The table, not the hit map, is what drawing uses: a clipped bounding box
     // would place the sprite a pixel or two off, and the table is the rect the
     // original blits with.
-    let mut widgets = Vec::with_capacity(boxes.len());
-    for i in 0..boxes.len() {
-        widgets.push(record(dll, start + i * RECORD).ok_or(Error::NoAtlas)?);
+    let mut slots: Vec<Option<Widget>> = vec![None; boxes.len()];
+    for &(first, offset, len) in &segments {
+        for i in 0..len {
+            slots[first + i] = record(dll, offset + i * RECORD);
+        }
     }
 
+    // A region no segment reproduced is one laid out at runtime — the save/load
+    // screen's slot rows are the case this exists for. Its record is still in
+    // the table, at the stride from the nearest segment; it just does not look
+    // like its own hit region.
+    for (i, slot) in slots.iter_mut().enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        let near = segments
+            .iter()
+            .min_by_key(|(first, _, len)| {
+                i.abs_diff(if i < *first { *first } else { first + len - 1 })
+            })
+            .expect("checked non-empty above");
+        let (first, offset, _) = *near;
+        let at = if i >= first {
+            offset.checked_add((i - first) * RECORD)
+        } else {
+            offset.checked_sub((first - i) * RECORD)
+        };
+        *slot = at.and_then(|at| record(dll, at));
+    }
+
+    let widgets: Vec<Widget> = slots
+        .into_iter()
+        .collect::<Option<_>>()
+        .ok_or(Error::NoAtlas)?;
+    let matched = widgets
+        .iter()
+        .zip(boxes)
+        .filter(|(w, want)| w.dst == **want)
+        .count();
+    if matched < MIN_MATCHES.min(boxes.len()) || matched * 2 < boxes.len() {
+        return Err(Error::NoAtlas);
+    }
+
+    // Alternate states follow the last segment, which is where the screen's own
+    // records carry on past the ones the hit map names.
+    let (_, last_offset, last_len) = *segments.last().expect("covered every region");
     let mut extras = Vec::new();
-    let mut p = start + boxes.len() * RECORD;
+    let mut p = last_offset + last_len * RECORD;
     while extras.len() < MAX_EXTRAS {
         let Some(w) = record(dll, p) else { break };
         // A sprite for this screen has to fit inside this screen's sheet.
@@ -212,12 +277,64 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
         p += RECORD;
     }
 
+    let (first, first_offset, _) = segments[0];
     Ok(Atlas {
+        offset: first_offset.saturating_sub(first * RECORD),
         widgets,
         extras,
-        offset: start,
+        segments,
         matched,
     })
+}
+
+/// The longest run of consecutive records reproducing `boxes[from..]`.
+///
+/// Returns where it starts and how many regions it covers. A record is taken as
+/// this region's when its rect is the box exactly, or when the box merely
+/// contains it — a hit map's region can be clipped by a neighbour, or run wider
+/// than the sprite it belongs to, and neither means the record is the wrong one.
+/// The run is anchored on an exact match so that a containment rule can never
+/// start one.
+fn longest_run(dll: &[u8], boxes: &[Rect], from: usize) -> Option<(usize, usize)> {
+    let anchor = boxes[from];
+    let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
+        .iter()
+        .flat_map(|v| (*v as f32).to_le_bytes())
+        .collect();
+
+    let mut best: Option<(usize, usize)> = None;
+    let mut at = 0usize;
+    while let Some(found) = find_bytes(dll, &needle, at) {
+        at = found + 4;
+        if record(dll, found).is_none() {
+            continue;
+        }
+        let mut len = 1usize;
+        while from + len < boxes.len() {
+            let Some(w) = record(dll, found + len * RECORD) else {
+                break;
+            };
+            if !fits(&w.dst, &boxes[from + len]) {
+                break;
+            }
+            len += 1;
+        }
+        if best.is_none_or(|(_, b)| len > b) {
+            best = Some((found, len));
+        }
+    }
+    best
+}
+
+/// Whether a record's rect can be the sprite for a region with this box.
+fn fits(rect: &Rect, box_: &Rect) -> bool {
+    rect == box_
+        || (rect.x >= box_.x
+            && rect.y >= box_.y
+            && rect.x + rect.width <= box_.x + box_.width.max(rect.width)
+            && rect.y + rect.height <= box_.y + box_.height.max(rect.height)
+            && rect.x < box_.x + box_.width
+            && rect.y < box_.y + box_.height)
 }
 
 /// `slice::find` for bytes, from `from`.
