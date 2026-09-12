@@ -204,9 +204,9 @@ pub struct MenuRequest(pub i32);
 /// `FUN_00425bf0` is the state-4 handler that consumes these, and the three
 /// codes below are the ones the bar can produce. Code 1 restarts the script in
 /// place; codes 2 and 5 both end up at the "this script is finished" path,
-/// which loads whatever `_GetNextScriptFile@12` names — **and that is the route
-/// system, which this engine does not have yet**, so the codes travel out of
-/// here unresolved rather than being turned into a seek this module invents.
+/// which loads whatever `_GetNextScriptFile@12` names. The codes travel out of
+/// here unresolved: which script that is belongs to the branch graph, not to
+/// this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seek(pub i32);
 

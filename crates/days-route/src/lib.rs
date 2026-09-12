@@ -25,9 +25,12 @@
 //! searchRoot          finds the (ROUTE, SCENE) a script name sits at
 //! ```
 //!
+//! The first two are recovered here by decoding them; the third is reproduced
+//! by [`Routes::find_from`] searching the tables in the same order.
+//!
 //! and a fourth, `_SetScript@16`, is a plain `table[ROUTE][SCENE]` lookup.
 //!
-//! # What this crate recovers, and what it does not
+//! # What this crate recovers
 //!
 //! The **name tables** are data: 55 arrays of pointers to wide strings in
 //! `.rdata`, one array per route, indexed by `SCENE`. Those are what
@@ -35,11 +38,11 @@
 //! contains, to map a script back to its `(ROUTE, SCENE)` the way `searchRoot`
 //! does, and to resolve a scene the way `_SetScript@16` does.
 //!
-//! The **transition logic is not recovered**. Each route's
+//! The **transition logic** is not data at all: each route's
 //! `GetNextScriptFile` case is a compiled `switch (SCENE)` whose arms call an
-//! emitter with a literal next-scene number, so the edges exist only as x86,
-//! not as a table anywhere. Recovering them needs a disassembly pass over 55
-//! functions and has not been done. The entry points are in `docs/FORMATS.md`.
+//! emitter with a literal next-scene number, so the edges exist only as x86.
+//! [`Machine`] recovers them by decoding those 55 functions out of the same
+//! DLL — see [`graph`] for how, and for the checks it was held to.
 //!
 //! # Finding the tables without hardcoding an address
 //!
@@ -70,75 +73,35 @@
 
 #![forbid(unsafe_code)]
 
-/// What went wrong recovering the route tables.
+pub mod graph;
+mod pe;
+mod walk;
+mod x86;
+
+pub use graph::{Act, Cmp, Context, Crediting, Machine, Next, Step, Term, Transition};
+
+use pe::{u16le, u32le, Section};
+
+/// What went wrong recovering the route system.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("not a PE image: {0}")]
     NotPe(&'static str),
     #[error("no route tables found in the DLL")]
     NoTables,
-}
-
-/// One PE section, reduced to the mapping this crate needs.
-#[derive(Debug, Clone, Copy)]
-struct Section {
-    /// Virtual address of the section's first byte.
-    va: u32,
-    /// Bytes the section occupies once loaded.
-    vsize: u32,
-    /// Offset of the section's first byte in the file.
-    raw: u32,
-    /// Bytes the section occupies in the file, which can be less than `vsize`.
-    rsize: u32,
-}
-
-fn u16le(b: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?))
-}
-
-fn u32le(b: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
+    #[error("the DLL exports no {0}")]
+    NoExport(&'static str),
+    #[error("GetNextScriptFile does not dispatch the way the retail build does")]
+    NoDispatch,
 }
 
 /// The image base and section table of a 32-bit PE.
-///
-/// Read rather than assumed: the DLL's base happens to be `0x10000000`, but
-/// that is a field in the file, not something this crate should know.
 fn sections(dll: &[u8]) -> Result<(u32, Vec<Section>), Error> {
-    if dll.get(..2) != Some(b"MZ") {
-        return Err(Error::NotPe("no MZ signature"));
-    }
-    let pe = u32le(dll, 0x3c).ok_or(Error::NotPe("truncated at e_lfanew"))? as usize;
-    if dll.get(pe..pe + 4) != Some(b"PE\0\0") {
-        return Err(Error::NotPe("no PE signature"));
-    }
-    let count = u16le(dll, pe + 6).ok_or(Error::NotPe("truncated file header"))? as usize;
-    let opt_size = u16le(dll, pe + 20).ok_or(Error::NotPe("truncated file header"))? as usize;
-    let opt = pe + 24;
-    if u16le(dll, opt) != Some(0x10b) {
-        return Err(Error::NotPe("not a 32-bit PE32 image"));
-    }
-    let base = u32le(dll, opt + 28).ok_or(Error::NotPe("truncated optional header"))?;
-
-    let table = opt + opt_size;
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let h = table + i * 40;
-        out.push(Section {
-            va: base + u32le(dll, h + 12).ok_or(Error::NotPe("truncated section table"))?,
-            vsize: u32le(dll, h + 8).ok_or(Error::NotPe("truncated section table"))?,
-            rsize: u32le(dll, h + 16).ok_or(Error::NotPe("truncated section table"))?,
-            raw: u32le(dll, h + 20).ok_or(Error::NotPe("truncated section table"))?,
-        });
-    }
-    Ok((base, out))
+    let img = pe::Image::parse(dll)?;
+    Ok((img.base, img.sections))
 }
 
 /// Where a virtual address lands in the file, if it is backed by file bytes.
-///
-/// A section's virtual size can exceed what the file holds — the tail is zero
-/// filled at load — so an address past `rsize` has no bytes to read and is
-/// refused rather than read from the next section.
 fn to_file(secs: &[Section], va: u32) -> Option<usize> {
     secs.iter().find_map(|s| {
         let off = va.checked_sub(s.va)?;

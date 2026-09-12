@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
 use daysengine::install::config::{Channel, Config, Flag};
+use daysengine::install::progress::Progress;
 use daysengine::install::save::FlagStore;
 use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
@@ -265,12 +266,31 @@ fn main() -> Result<()> {
         && start.get("StartMode").unwrap_or("Title") == "Title"
         && !player.dll.is_empty();
 
+    // The branch graph, out of the player's own `RouteProcSDHQ.dll`. Without
+    // it a script plays and stops, which is what the engine did before the
+    // route system was recovered — so a missing or unreadable DLL is a warning
+    // and not a refusal to start.
+    let mut progress = match std::fs::read(game.join("RouteProcSDHQ.dll"))
+        .map_err(|e| e.to_string())
+        .and_then(|dll| Progress::load(&vfs, &dll).map_err(|e| e.to_string()))
+    {
+        Ok(p) => Some(p),
+        Err(err) => {
+            log::warn!("the branch graph is unavailable, so scripts will not chain: {err}");
+            None
+        }
+    };
+
     let mut next = wanted.clone();
+    // Set when the last script chained into this one, in which case the
+    // position is already the graph's and must not be looked up again: a
+    // script that several routes list would resolve back to the first of them.
+    let mut chained = false;
     loop {
-        if menus {
+        if menus && !chained {
             match run_menu(&mut player, &mut canvas, &creator, &mut events, &start)? {
                 Outcome::Quit => break,
-                Outcome::Play => next = wanted.clone(),
+                Outcome::Play | Outcome::Finished => next = wanted.clone(),
                 // A replay names its own script, which the DLL's table spells
                 // as a path; `find_script` wants the trailing name.
                 Outcome::Replay(script) => {
@@ -279,6 +299,12 @@ fn main() -> Result<()> {
                 }
             }
         }
+        if !chained {
+            if let Some(p) = progress.as_mut() {
+                p.enter(&next);
+            }
+        }
+        chained = false;
         let (name, path) = find_script(&vfs, &next, english)?;
         log::info!("playing {name} from {path}");
         let script = Script::parse(&name, &vfs.read_path(&path)?)?;
@@ -291,10 +317,26 @@ fn main() -> Result<()> {
         canvas
             .window_mut()
             .set_title(&format!("DaysEngine — {name}"))?;
-        let outcome = run_script(&mut player, &mut canvas, &creator, &mut events, script)?;
+        let outcome = run_script(
+            &mut player,
+            &mut canvas,
+            &creator,
+            &mut events,
+            script,
+            progress.as_mut(),
+        )?;
         canvas.window_mut().set_title("DaysEngine")?;
-        // A script that ran out returns to the title, as the game does. Quitting
-        // out of one ends the session either way.
+        // A script that reached its end hands over to the branch graph, which
+        // is what the executable's state 4 does. When the graph names nothing
+        // — the route ended, or the script was not in it — the session goes
+        // back to the title, as the game does. Quitting ends it either way.
+        if outcome == Outcome::Finished {
+            if let Some(script) = progress.as_mut().and_then(Progress::advance) {
+                next = script.rsplit('/').next().unwrap_or(&script).to_string();
+                chained = true;
+                continue;
+            }
+        }
         if outcome == Outcome::Quit || !menus {
             break;
         }
@@ -308,6 +350,8 @@ fn main() -> Result<()> {
 enum Outcome {
     /// Start playing the script.
     Play,
+    /// The script reached its end, so the branch graph decides what follows.
+    Finished,
     /// Play one replay scene's script, chosen on the replay screen.
     Replay(String),
     /// Close the game.
@@ -639,6 +683,7 @@ fn run_script(
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     script: Script,
+    mut progress: Option<&mut Progress>,
 ) -> Result<Outcome> {
     player.mixer.stop_all();
 
@@ -763,7 +808,7 @@ fn run_script(
         };
         if stage.finished(at) {
             log::info!("script finished");
-            return Ok(Outcome::Play);
+            return Ok(Outcome::Finished);
         }
 
         stage.seek_to(at, player.vfs, player.mixer)?;
@@ -780,6 +825,13 @@ fn run_script(
         // `FUN_10021c20` gives the base sprite the same half-pixel inset every
         // other sprite gets, so the origin is the only placement there is.
         bar_state.paused = paused;
+        // The gauge draws the two counters the branch system keeps, and shows
+        // over a faded bar only while a delta has raised it.
+        if let Some(p) = progress.as_deref() {
+            let (values, raised) = p.gauge();
+            bar_state.gauge = Some(values);
+            bar_state.gauge_raised = raised;
+        }
         bar_state.rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
         if let Some(control) = &mut control {
             let (bw, bh) = control.strip();
@@ -837,12 +889,13 @@ fn run_script(
                             origin = Instant::now();
                         }
                         // Everything past a restart lands in the executable's
-                        // state 4, which chains to the next script — the route
-                        // system, which this engine does not have. Leaving
-                        // playback is the closest honest answer, and the two
-                        // menu requests have no screen to open over playback
-                        // yet, so they are logged rather than half-done.
-                        bar::Act::Seek(_) | bar::Act::Leave => return Ok(Outcome::Play),
+                        // state 4, which is the "this script is finished" path:
+                        // it asks `_GetNextScriptFile@12` what follows and
+                        // plays that.
+                        bar::Act::Seek(_) => return Ok(Outcome::Finished),
+                        // Host `+0x100(1)` leaves playback rather than moving
+                        // along it, so this one goes back to the title.
+                        bar::Act::Leave => return Ok(Outcome::Play),
                         bar::Act::Menu(request) => {
                             log::info!("the bar asked for menu {} over playback", request.0)
                         }
@@ -890,7 +943,14 @@ fn run_script(
                         .system_se
                         .play(se, player.vfs, &mut player.sounds, player.mixer);
                     if let select::Event::Decided(index, _) = event {
+                        // The engine credits the choice's deltas the moment
+                        // the box settles, before the script has ended --
+                        // `FUN_00431740` calls `_SetFeeling@8(host, 1)` right
+                        // after storing the index.
                         log::info!("choice decided: {index}");
+                        if let Some(p) = progress.as_deref_mut() {
+                            p.decide(index);
+                        }
                     }
                 }
                 select::Event::Nothing => {}

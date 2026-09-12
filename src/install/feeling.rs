@@ -44,7 +44,7 @@
 //!
 //! **Relative.** 25 of the 55 routes contain exactly one site of this, and
 //! every one of the 25 is character-for-character the same
-//! ([`Feeling::prefers_second`]):
+//! ([`Feeling::first_leads`]):
 //!
 //! ```text
 //! a = get(L"001");  b = get(L"002");
@@ -202,7 +202,7 @@ impl Deltas {
 }
 
 /// `STANDERDSCRIPT.INI`: the thirteen scripts gated on a counter's value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Thresholds {
     text: String,
 }
@@ -304,9 +304,9 @@ impl Feeling {
 
     /// The branch test the 25 route handlers share: `if (get("002") < get("001"))`.
     ///
-    /// True when `002` is behind `001` — the `if` arm. A tie is false, because
-    /// the comparison is a strict `<`.
-    pub fn prefers_second(&self) -> bool {
+    /// True when [`FIRST`] is ahead of [`SECOND`] — the `if` arm. A tie is
+    /// false, because the comparison is a strict `<`.
+    pub fn first_leads(&self) -> bool {
         self.get(SECOND) < self.get(FIRST)
     }
 
@@ -410,11 +410,11 @@ mod tests {
         let mut f = Feeling::new();
         f.set("001", 30);
         f.set("002", 30);
-        assert!(!f.prefers_second());
+        assert!(!f.first_leads());
         f.set("002", 29);
-        assert!(f.prefers_second());
+        assert!(f.first_leads());
         f.set("002", 31);
-        assert!(!f.prefers_second());
+        assert!(!f.first_leads());
     }
 
     /// `jle` takes the false arm, so the threshold is passed only above it.

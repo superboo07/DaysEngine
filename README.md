@@ -43,11 +43,11 @@ Early. What works today:
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
 | Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
-| In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that chain to the next script are blocked on the route graph, and which menu each one opens is not recovered. `days bar` prints the table |
+| In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that move to the next script hand over to the branch graph; which menu each one opens is not recovered. `days bar` prints the table |
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Subtitles | **Works, the game's own way** — broken by `FUN_0043f600` (62 columns, word-wrapped at spaces, English only, `\n` as a hard break, ruby marks recognised), spaced by the recovered pitch and kerning table rather than by measuring the glyph, and placed by `FUN_0044bf30`: centred on each line's own width, anchored to the bottom, at the per-resolution scale, with `[LeftArrangement]` switching to a left-aligned block. The speaker name is not drawn, because the original never hands it to the text layer, and the whole block is behind the `TextView` setting |
 | Text box art, backlog | Not started |
-| Route / branch graph | **Partly recovered** — the 55 routes and their 1,857-entry script tables come out of the user's own `RouteProcSDHQ.dll` by content, with no address embedded; `days route` prints the graph and locates any script in it. The per-route transition logic exists only as compiled x86 and is **not recovered**, so scripts do not chain yet — see below |
+| Route / branch graph | **Recovered** — the 55 routes, their 1,857-entry script tables and all 55 transition state machines come out of the user's own `RouteProcSDHQ.dll`, the tables by content and the machines by decoding the handlers, with no address embedded. Scripts chain: a choice moves the player through the graph and credits what it earns. `days route --edges` prints every edge and checks the graph against the tables. **Progress is not saved** — writing `Save/SaveFileNNN.DAT` is not decoded, so a session's position is lost when the game closes |
 | Affection gauge | **Recovered** — the five counters, both tables, the relative test that 25 routes branch on and the 13 absolute thresholds, plus the gauge's own geometry. `days route` shows a save's counters and which way the test falls. The gauge's three sprites are not composed: their source rectangles are not recovered |
 | Save file compatibility | Not started |
 
@@ -102,15 +102,27 @@ Half of it turned out to be data. Progress is two integers in the save,
 `ROUTE` and `SCENE`, and each of the 55 routes has an array of script names
 indexed by `SCENE`. Those arrays are found in the user's own DLL by content —
 runs of pointers to strings shaped like a script path — and cross-check exactly
-against the code, against each other and against the script pack. That is
-`crates/days-route`, and nothing it knows is embedded here.
+against the code, against each other and against the script pack.
 
 The other half is not data. Each route's "given this scene and the player's
 choice, which scene next" is a compiled `switch` with the answers as immediate
 operands, spread over 55 functions, and there is no table of edges anywhere in
-the file. Recovering those edges needs a disassembly pass that has not been
-done, so the engine can say where a script sits in the graph but not yet what
-follows it. `docs/FORMATS.md` has the entry points.
+the file. So `crates/days-route` **decodes them**, out of the user's own DLL, at
+run time. It finds the 55 handlers through the PE export table and the export's
+own dispatch switch, then walks each one symbolically with `SCENE` fixed to the
+scene being asked about — which folds away the two different shapes the
+compiler gave those switches and leaves only the branching that depends on
+something a save knows. Anything outside the decoder's instruction subset is
+reported as not recovered rather than guessed past.
+
+It reproduces a Ghidra decompilation of all 55 handlers exactly, arm for arm,
+across 1,840 of them. All 1,857 scenes get a transition, no edge names a scene
+no table has, and every scene is reachable from the first. `SetFeeling` — a
+second, separately compiled 55-way switch that decides what a choice earns —
+decodes independently and agrees with the branch graph on 1,426 of the 1,435
+pairs where they overlap. The nine that differ are a bug in the shipped game:
+at three choices it credits the branch you did not take, which the engine
+reproduces. Nothing about any of it is embedded here.
 
 ## Inspecting an install
 
@@ -129,7 +141,8 @@ days bar --pointer 400,40 -o /tmp/bar.png   # the control bar, widget by widget
 days render 00-00-A00 --at 00:39:00 --bar -o /tmp/frames   # ...over a real frame
 days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test
 days route                           # the 55 routes, the affection tables, the save's counters
-days route 00-00-A04                 # where one script sits, what it credits, what gates it
+days route 00-00-A04                 # where one script sits, what follows it, what it credits
+days route --edges                   # every recovered edge, and the graph's own cross-checks
 ```
 
 `days ui` composites a UI screen without a display, the way `days render` does

@@ -1341,26 +1341,118 @@ searchRoot          FUN_10007d50   which (ROUTE, SCENE) a script name sits at
 SetScript           FUN_10008a70   plain table[ROUTE][SCENE] lookup
 ```
 
-`GetNextScriptFile` loops up to ten times: a route handler that returns 0 after
-changing `ROUTE` falls through and the next route is dispatched, which is how a
-route transition happens.
+`GetNextScriptFile` loops up to ten times, re-reading `ROUTE` each pass, but in
+the retail build it can never dispatch a second route: every one of the 48
+`return 0` sites across the 55 handlers is immediately preceded by the same
+call, which sets `ROUTE` to **-1** and copies an empty name. -1 is outside the
+export's `0..=0x36` switch, so the next pass takes its `default` and returns 0.
+The loop runs at most twice.
+
+**Route transitions do not happen by falling through.** They happen because an
+arm calls *another route's* emitter: route 0's last scene calls route 1's,
+which sets `ROUTE` to 1 and copies out of route 1's table. The emitter carries
+the destination route as a literal, which is what makes a transition visible
+from the arm that takes it.
 
 `searchRoot` takes a route to start from and walks forward, **wrapping at
 `0x36` back to 0**. A name that is in no table therefore spins forever — the
 `default` arm that would bail out is unreachable past the wrap. `days-route`
 returns "not found" after one pass rather than reproducing that.
 
+### The state machines, and how they are decoded
+
 Each route's case in `GetNextScriptFile` is a `switch (SCENE)` whose arms call
 a per-route emitter with a literal next-scene number. The emitter
 (`FUN_1000d3d0` for route 0) sets `ROUTE` and `SCENE` and copies
 `table[scene]` into the caller's buffer. Branch arms read host `+0x04` — the
-choice the player just made — and a few read the feeling counters; see below.
-Some arms also record a bookmark, `set("BS<script>", SCENE)`, which is what
+choice the player just made — and a few read the feeling counters. Some arms
+also record a bookmark, `set("BS<script>", SCENE)`, which is what
 `GetBackScriptFile` rewinds through.
 
-**The transition logic is not recovered.** It exists only as compiled x86
-across those 55 functions; there is no table of edges anywhere. The entry
-points above are where to start.
+There is no table of edges anywhere: they exist only as compiled x86.
+`crates/days-route` recovers them by **decoding those 55 functions out of the
+user's own DLL**, with no address written down — the handler addresses come
+from `_GetNextScriptFile@12`'s own dispatch switch, which is found through the
+PE export table.
+
+The decoder does not try to recognise the two shapes of `switch` the compiler
+emitted (a jump table for the big routes, an `if`/`else if` chain for the small
+ones). It **seeds `SCENE` with the value being asked about** and executes the
+handler symbolically: the chain's comparisons then fold to constants and the
+jump table's index resolves, and what survives is exactly the branching that
+depends on something only known at run time. Anything outside the covered
+instruction subset ends the walk as "not recovered" rather than being guessed
+past.
+
+The helpers an arm calls are classified the same way, by decoding them:
+
+```text
+sets ROUTE to a literal, and indexes a name table   an emitter
+sets ROUTE to -1, no table                          the route is over
+sets SCENE, writes a literal script name            a fixed script
+formats "SP%d"                                      the story-number marker
+formats "[End%02d]=\"" and touches EndClear          an ending
+formats "[%s]=\"" and reads a counter back           a StanderdScript gate
+formats "[%s]=\"" and makes no host call             a FeelingScript credit
+clears a run of numbered flags                      the route's flag reset
+```
+
+The last two share a format string and are told apart by what they do with the
+entry, not by their addresses.
+
+#### What the arms branch on
+
+Across all 55 routes, every surviving comparison is one of these:
+
+| what is read | host slot | sites |
+|---|---|---|
+| the choice just made | `+0x04` | 485 |
+| a numbered flag in the save's flag store (`801`-`804`, `926`-`999`) | `+0x10` | 83 |
+| two feeling counters against each other (`001` vs `002`) | `+0x08` | 25 |
+| a `StanderdScript.ini` gate | — | 13 |
+| a `BS****` back-bookmark against a literal | `+0x08` | 2 |
+| a word in the DLL's own `.data` | — | 46 |
+| host `+0x34` | `+0x34` | 1 |
+
+The 25 counter comparisons are at exactly the 25 routes the affection work
+found independently, and the 13 gate sites resolve to exactly the 13 entries
+`StanderdScript.ini` declares.
+
+Two of those are not save data at all:
+
+- One `.data` word gates the per-route flag reset at 44 sites. `DllMain`
+  zeroes it on attach and sets it only after loading both feeling INIs from the
+  absolute path `Z:\SCHOOLDAYSHQ\Ini\` — a developer machine's drive. On any
+  install it stays 0, so **a route never clears its numbered flags** and they
+  accumulate for the life of a save.
+- The other is read once, by route 0. Nothing writes it: a scan of the whole
+  file finds a single reference to its address, which is the `cmp` that reads
+  it.
+
+**Host slot `+0x34` always returns 0 in the retail build.** It returns a member
+of the engine object; the constructor stores 0 there, and the only code that
+stores 1 is `FUN_00421b30`, which nothing references — no call, no jump, no
+address taken, confirmed by Ghidra's reference index and by a byte scan of the
+whole image. So route 0's last scene always hands over to route 1 scene 0, and
+the branch it would otherwise take — a `Notice_SDHQ` screen, or a rotation
+through `PV/SEKAI-OP`, `PV/KOTONOHA-OP` and `PV/SETUNA-OP` — is unreachable.
+That rotation is the one arm of the 1,840 that is **not recovered**: it selects
+by `x & 0x80000001`, a signed modulo the decoder does not model. It is behind
+the always-false test, so nothing reaches it.
+
+#### How far this was checked
+
+- Against a Ghidra decompilation of all 55 handlers, the recovered trees
+  reproduce every one of their **1,840 `case` arms** exactly — same emitter,
+  same literal next scene, on every path.
+- All **1,857 scenes** have a transition, **no edge** names a scene no table
+  has, and **every** scene is reachable from `ROUTE 0 SCENE 0`.
+- The story numbers the markers assign account for every `SP***` flag in a real
+  save.
+- `_SetFeeling@8` works its destination out for itself rather than being told
+  it. Decoded independently, the two exports agree on **1,426** of the **1,435**
+  `(scene, choice)` pairs that credit a script. The nine that differ are three
+  scenes where the shipped DLL has two arms swapped — see the affection section.
 
 ### The name tables, and how they are found
 
@@ -1424,10 +1516,28 @@ STANDERDSCRIPT.INI  [01-00-N05]="002, 11"           one (name, amount) pair
 ```
 
 `_SetFeeling@8(host, 1)` is called on every decided choice, from the playback
-tick `FUN_00431740`. It resolves which scene the choice leads to, takes that
-scene's name from the same table, and credits its deltas: `FUN_10005c60` adds,
-`FUN_10005ce0` subtracts for moving backwards, and both skip a zero amount
-outright.
+tick `FUN_00431740` — at the moment the box settles, right after the index is
+stored and long before the script has ended. It is **its own 55-way switch**,
+not the branch graph's: each route's arm works out from `SCENE` and the choice
+which scene the player is about to move to, takes that scene's name from the
+same table, and credits its deltas. `FUN_10005c60` adds, `FUN_10005ce0`
+subtracts for moving backwards, and both skip a zero amount outright.
+
+Most scenes credit nothing — only the forks do — so the branch graph's
+destination cannot stand in for it. Decoded, the two exports agree on 1,426 of
+the 1,435 `(scene, choice)` pairs that credit anything.
+
+The other nine are a **shipped bug**. At three scenes — route 4 scene `0x16`,
+route 5 scenes `0x15` and `0x18` — two of `SetFeeling`'s arms are the other way
+round from the branch graph's:
+
+```text
+route 4 scene 0x16   moves to     choice 0 -> 0x1c, else -> 0x15
+                     credits      choice 0 -> 0x15, else -> 0x1c
+```
+
+So the player goes one way and is credited for the other. `DaysEngine`
+reproduces it: `SetFeeling` is what credits, and this is what it credits.
 
 What each counter is worth is very uneven:
 

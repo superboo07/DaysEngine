@@ -154,6 +154,21 @@ enum Cmd {
         /// List every scene of every route, not just a summary line each.
         #[arg(long)]
         scenes: bool,
+        /// Print the recovered transition for every scene, and check the
+        /// graph against the name tables.
+        #[arg(long)]
+        edges: bool,
+        /// Walk the graph from a script, the way playback does: chain from
+        /// scene to scene, answering each choice box in turn.
+        #[arg(long, value_name = "SCRIPT")]
+        play: Option<String>,
+        /// The choices to answer with while walking, e.g. "0,1,0". Runs out
+        /// to -1, which is what a choice box that times out reports.
+        #[arg(long, value_name = "LIST", default_value = "")]
+        choices: String,
+        /// How many scripts to play before stopping.
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
     },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
@@ -376,7 +391,17 @@ fn main() -> Result<()> {
         Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
         Cmd::Config => cmd_config(&game)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
-        Cmd::Route { name, scenes } => cmd_route(&game, name.as_deref(), scenes)?,
+        Cmd::Route {
+            name,
+            scenes,
+            edges,
+            play,
+            choices,
+            steps,
+        } => match play {
+            Some(from) => cmd_route_play(&game, &from, &choices, steps)?,
+            None => cmd_route(&game, name.as_deref(), scenes, edges)?,
+        },
         Cmd::Bar(args) => cmd_bar(&game, &args)?,
         Cmd::Select(args) => cmd_select(&game, &args)?,
         Cmd::Verify { pack } => {
@@ -1612,13 +1637,60 @@ fn route_dll(game: &Path) -> Result<Vec<u8>> {
     })
 }
 
+/// Walks the branch graph from a script, the way playback chains through it.
+///
+/// This drives the same [`Progress`] the game does — `enter` to place the
+/// player, `decide` when a choice settles, `advance` when a script ends — so
+/// what it prints is what would be played.
+fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Result<()> {
+    use daysengine::install::progress::Progress;
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let mut progress = Progress::load(&vfs, &route_dll(game)?)?;
+    let answers: Vec<i32> = choices
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse())
+        .collect::<std::result::Result<_, _>>()
+        .context("--choices takes a comma-separated list of numbers")?;
+
+    if !progress.enter(from) {
+        println!("{from} is in no route table, so nothing follows it");
+        return Ok(());
+    }
+    let mut answers = answers.into_iter();
+    let mut played = from.to_string();
+    for step in 0..steps {
+        let (route, scene) = progress.position();
+        let ((first, second), raised) = progress.gauge();
+        println!(
+            "{step:>3}  ROUTE {route:>2} SCENE {scene:>3}  {played}   001={first} 002={second}{}",
+            if raised { "  (gauge up)" } else { "" }
+        );
+        // A choice box settles before the script ends, so the answer is given
+        // first and the transition taken after.
+        progress.decide(answers.next().unwrap_or(-1));
+        match progress.advance() {
+            Some(next) => played = next,
+            None => {
+                println!("     the graph names nothing after this");
+                return Ok(());
+            }
+        }
+    }
+    println!("     stopped after {steps} scripts");
+    Ok(())
+}
+
 /// Prints the branch graph and the affection tables that drive it.
-fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
-    use days_route::Routes;
+fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) -> Result<()> {
+    use days_route::{Machine, Routes};
     use daysengine::install::feeling::{Deltas, Thresholds, FIRST, SECOND};
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
-    let routes = Routes::recover(&route_dll(game)?)?;
+    let dll = route_dll(game)?;
+    let routes = Routes::recover(&dll)?;
+    let machine = Machine::recover(&dll)?;
 
     let read = |path: &str| match vfs.read_path(path) {
         Ok(bytes) => bytes,
@@ -1667,6 +1739,23 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
             }
             None => println!("  not gated"),
         }
+        if let Some((route, scene)) = routes.find(&full) {
+            if let Some(n) = machine.story(route, scene as u16) {
+                println!("  marks story number {n} (SP{n:03})");
+            }
+            if let Some(step) = machine.step(route, scene as u16) {
+                for line in transitions(&step) {
+                    println!("  next: {line}");
+                }
+            }
+            // What `_SetFeeling@8` credits here, which is its own switch and
+            // not the branch graph's destination.
+            if let Some(step) = machine.crediting(route, scene as u16) {
+                for line in creditings(&step) {
+                    println!("  credits on the way out: {line}");
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -1680,7 +1769,7 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
             "  ROUTE {route:>2} (0x{route:02x})  {:>3} scenes  {first} .. {last}",
             table.len()
         );
-        if list_scenes {
+        if list_scenes || edges {
             for (scene, script) in table.iter().enumerate() {
                 let credits = deltas.for_script(script);
                 let moved: Vec<String> = credits
@@ -1692,16 +1781,34 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
                     .for_script(script)
                     .map(|(c, a)| format!("  gated {c}>{a}"))
                     .unwrap_or_default();
+                let story = machine
+                    .story(route, scene as u16)
+                    .map(|n| format!("  SP{n:03}"))
+                    .unwrap_or_default();
                 println!(
-                    "      {scene:>3}  {script}{}{gate}",
+                    "      {scene:>3}  {script}{}{gate}{story}",
                     if moved.is_empty() {
                         String::new()
                     } else {
                         format!("  [{}]", moved.join(" "))
                     }
                 );
+                if edges {
+                    match machine.step(route, scene as u16) {
+                        Some(step) => {
+                            for line in transitions(&step) {
+                                println!("           -> {line}");
+                            }
+                        }
+                        None => println!("           -> (no handler)"),
+                    }
+                }
             }
         }
+    }
+
+    if edges {
+        check_edges(&routes, &machine);
     }
 
     println!();
@@ -1726,14 +1833,10 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
             }
             println!(
                 "  the branch test (get(\"{SECOND}\") < get(\"{FIRST}\")) takes the {} arm: {}",
-                if feeling.prefers_second() {
-                    "if"
-                } else {
-                    "else"
-                },
+                if feeling.first_leads() { "if" } else { "else" },
                 if a == b {
                     "the two are level, and the test is a strict <".to_string()
-                } else if feeling.prefers_second() {
+                } else if feeling.first_leads() {
                     format!("{FIRST} leads by {}", a - b)
                 } else {
                     format!("{SECOND} leads by {}", b - a)
@@ -1743,6 +1846,265 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool) -> Result<()> {
         None => println!("no save slot to read the counters from"),
     }
     Ok(())
+}
+
+/// One line per path through a scene's recovered decision tree.
+///
+/// The tree's forks are the questions the handler asks the host, so a line
+/// reads as the conditions that hold followed by what is played.
+fn transitions(step: &days_route::Transition) -> Vec<String> {
+    use days_route::Next;
+    paths(step, &|n| match n {
+        Next::Scene { route, scene } => format!("ROUTE {route} SCENE {scene}"),
+        Next::Named { names, scene } => format!("SCENE {scene}, playing {}", names.join(" or ")),
+        Next::Stop => "the route ends".into(),
+        Next::Nothing => "nothing".into(),
+    })
+}
+
+/// One line per path through a scene's recovered crediting tree.
+fn creditings(step: &days_route::Crediting) -> Vec<String> {
+    paths(step, &|c| match c {
+        Some(script) => format!("the deltas of {script}"),
+        None => "nothing".into(),
+    })
+}
+
+/// One line per path through a decision tree, with `leaf` naming the result.
+fn paths<L>(step: &days_route::Step<L>, leaf: &dyn Fn(&L) -> String) -> Vec<String> {
+    use days_route::{Act, Cmp, Step, Term};
+
+    fn term(t: &Term) -> String {
+        match t {
+            Term::Const(n) => n.to_string(),
+            Term::Choice => "choice".into(),
+            Term::Int(n) => format!("counter {n}"),
+            Term::Flag(n) => format!("flag {n}"),
+            Term::GlobalFlag(n) => format!("global flag {n}"),
+            Term::Threshold(s) => format!("gate({s})"),
+            Term::HostSlot(s) => format!("host+{s:#04x}"),
+            Term::DllWord(a) => format!("dll word {a:#010x}"),
+        }
+    }
+    fn cmp(c: Cmp, negated: bool) -> &'static str {
+        match (c, negated) {
+            (Cmp::Eq, false) | (Cmp::Ne, true) => "==",
+            (Cmp::Ne, false) | (Cmp::Eq, true) => "!=",
+            (Cmp::Lt, false) | (Cmp::Ge, true) => "<",
+            (Cmp::Le, false) | (Cmp::Gt, true) => "<=",
+            (Cmp::Gt, false) | (Cmp::Le, true) => ">",
+            (Cmp::Ge, false) | (Cmp::Lt, true) => ">=",
+        }
+    }
+    fn acts(a: &[Act]) -> String {
+        let named: Vec<String> = a
+            .iter()
+            .filter_map(|x| match x {
+                Act::SetInt(n, v) => Some(format!("{n}={v}")),
+                Act::SetFlag(n, v) => Some(format!("flag {n}={}", *v as u8)),
+                Act::SetGlobalFlag(n, v) => Some(format!("global flag {n}={}", *v as u8)),
+                Act::Story(n) => Some(format!("SP{n:03}")),
+                Act::ClearStory(n) => Some(format!("clear SP{n}")),
+                Act::Ending => Some("register the ending".into()),
+                Act::ClearRouteFlags => Some("clear the route's flags".into()),
+                Act::Host(_) => None,
+            })
+            .collect();
+        if named.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", named.join(", "))
+        }
+    }
+    fn walk<L>(
+        step: &Step<L>,
+        leaf: &dyn Fn(&L) -> String,
+        conds: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        match step {
+            Step::If {
+                lhs,
+                cmp: c,
+                rhs,
+                then,
+                els,
+            } => {
+                let side = |negated| format!("{} {} {}", term(lhs), cmp(*c, negated), term(rhs));
+                conds.push(side(false));
+                walk(then, leaf, conds, out);
+                conds.pop();
+                conds.push(side(true));
+                walk(els, leaf, conds, out);
+                conds.pop();
+            }
+            Step::Do { acts: a, next: n } => {
+                let when = if conds.is_empty() {
+                    String::new()
+                } else {
+                    format!("when {}: ", conds.join(" and "))
+                };
+                out.push(format!("{when}{}{}", leaf(n), acts(a)));
+            }
+            Step::Unrecovered(why) => out.push(format!("not recovered: {why}")),
+        }
+    }
+    let mut out = Vec::new();
+    walk(step, leaf, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Checks the recovered graph against the name tables it points into.
+///
+/// Three things have to hold if the recovery is right: every edge names a
+/// scene that route's table actually has, every scene has an answer, and the
+/// whole graph hangs together from the first scene of route 0 — which is where
+/// `StartScript.ini` puts the player.
+fn check_edges(routes: &days_route::Routes, machine: &days_route::Machine) {
+    use days_route::{Next, Step, Transition};
+    use std::collections::{HashSet, VecDeque};
+
+    fn leaves<'a>(step: &'a Transition, out: &mut Vec<&'a Next>) {
+        match step {
+            Step::If { then, els, .. } => {
+                leaves(then, out);
+                leaves(els, out);
+            }
+            Step::Do { next, .. } => out.push(next),
+            Step::Unrecovered(_) => {}
+        }
+    }
+
+    let (mut scenes, mut answered, mut dangling, mut unrecovered) = (0, 0, 0, 0);
+    let mut reachable: HashSet<(usize, u16)> = HashSet::new();
+    let mut queue: VecDeque<(usize, u16)> = VecDeque::new();
+    if routes.script(0, 0).is_some() {
+        reachable.insert((0, 0));
+        queue.push_back((0, 0));
+    }
+
+    for route in 0..routes.len() {
+        let table = routes.route(route).unwrap_or_default();
+        scenes += table.len();
+        for scene in 0..table.len() {
+            let Some(step) = machine.step(route, scene as u16) else {
+                continue;
+            };
+            let mut out = Vec::new();
+            leaves(&step, &mut out);
+            if out.is_empty() {
+                unrecovered += 1;
+                continue;
+            }
+            if out.iter().any(|n| !matches!(n, Next::Nothing)) {
+                answered += 1;
+            }
+            for n in out {
+                if let Next::Scene { route: r, scene: s } = n {
+                    if routes.script(*r as usize, *s as usize).is_none() {
+                        dangling += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some((route, scene)) = queue.pop_front() {
+        let Some(step) = machine.step(route, scene) else {
+            continue;
+        };
+        let mut out = Vec::new();
+        leaves(&step, &mut out);
+        for n in out {
+            let to = match n {
+                Next::Scene { route: r, scene: s } => (*r as usize, *s),
+                Next::Named { scene: s, .. } => (route, *s),
+                _ => continue,
+            };
+            if routes.script(to.0, to.1 as usize).is_some() && reachable.insert(to) {
+                queue.push_back(to);
+            }
+        }
+    }
+
+    println!();
+    println!("the recovered graph:");
+    println!("  {scenes} scenes, {answered} with a transition");
+    println!("  {unrecovered} scenes whose handler could not be decoded");
+    println!("  {dangling} edges naming a scene no table has");
+    println!(
+        "  {} scenes reachable from ROUTE 0 SCENE 0, {} not",
+        reachable.len(),
+        scenes - reachable.len()
+    );
+    let stories = machine.stories().count();
+    println!("  {stories} scenes mark a story number");
+
+    // `_SetFeeling@8` works out the destination itself rather than being told
+    // it, so the two exports agreeing is a check on both: for every scene and
+    // every choice, what the crediting names must be the script the branch
+    // graph moves to.
+    struct Choice(i32);
+    impl days_route::Context for Choice {
+        fn choice(&self) -> i32 {
+            self.0
+        }
+        fn int(&self, _: &str) -> i32 {
+            0
+        }
+        fn flag(&self, _: &str) -> bool {
+            false
+        }
+        fn global_flag(&self, _: &str) -> bool {
+            false
+        }
+        fn threshold(&self, _: &str) -> bool {
+            false
+        }
+    }
+    fn undecoded<L>(step: &Step<L>) -> bool {
+        match step {
+            Step::If { then, els, .. } => undecoded(then) || undecoded(els),
+            Step::Do { .. } => false,
+            Step::Unrecovered(_) => true,
+        }
+    }
+
+    let (mut credits, mut disagree, mut blind) = (0, 0, 0);
+    for route in 0..routes.len() {
+        for scene in 0..routes.route(route).map_or(0, <[String]>::len) {
+            if machine
+                .crediting(route, scene as u16)
+                .is_none_or(|c| undecoded(&c))
+            {
+                blind += 1;
+            }
+            for choice in -1..4 {
+                let cx = Choice(choice);
+                let Some(script) = machine.credited(route, scene as u16, &cx) else {
+                    continue;
+                };
+                credits += 1;
+                let to = match machine.next(route, scene as u16, &cx) {
+                    Some((_, Next::Scene { route: r, scene: s })) => {
+                        routes.script(r as usize, s as usize)
+                    }
+                    _ => None,
+                };
+                if to != Some(script.as_str()) {
+                    disagree += 1;
+                    log::info!(
+                        "route {route} scene {scene} choice {choice}: credits {script} but moves to {to:?}"
+                    );
+                }
+            }
+        }
+    }
+    // The nine that differ in the retail DLL are three scenes with two of
+    // `SetFeeling`'s arms swapped -- a bug in the game, reproduced rather than
+    // corrected. A number other than nine here is a recovery problem.
+    println!("  {credits} (scene, choice) pairs credit a script, {disagree} of them naming something the branch graph does not move to");
+    println!("  {blind} scenes whose crediting could not be decoded");
 }
 
 /// The counters out of the first readable save slot.
