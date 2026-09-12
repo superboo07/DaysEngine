@@ -14,9 +14,15 @@ from playing the original.
 Drop the binaries into your existing game folder — next to `SCHOOLDAYS HQ.exe` —
 and run them. No arguments, no configuration, no separate asset extraction step:
 
-    cd "/path/to/School Days HQ" && ./days key
+    cd "/path/to/School Days HQ" && ./daysengine
 
-(Pass `--game <dir>` if you would rather keep the binaries somewhere else.)
+That reads the start script out of the game's own `STARTSCRIPT.INI` and plays
+it. Space pauses, Left/Right seek five seconds, R restarts, Esc quits. Name a
+script to play that one instead (`./daysengine 01-00-A00`), and pass
+`--game <dir>` if you would rather keep the binaries elsewhere.
+
+`./days` is the companion inspection tool — `key`, `list`, `extract`, `verify`,
+`scripts`, `script`, `assets`, `media`, `timing`, `font`, `render`.
 
 ## Status
 
@@ -30,8 +36,9 @@ Early. What works today:
 | `.CMAP` UI hit maps | **Decoded** |
 | `FONTDATA.DAT` glyph store | **Decoded** — all 22,420 glyphs render |
 | Video / audio decode | **Done** — matches ffmpeg's own output |
-| Playback / windowing | In progress |
-| UI rendering | Not started |
+| Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
+| UI rendering (menus, title, save/load) | Not started |
+| Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
 
@@ -94,6 +101,7 @@ rather than redistributed by us.
     crates/days-script .ORS timeline parser
     crates/days-media  WMV3 / Vorbis decoding over the system ffmpeg
     crates/days-font   FONTDATA.DAT glyph store
+    crates/days-engine mixer, timeline stage, text layout, SDL3 player
     crates/days-cli    `days` — offline inspection tools
     docs/FORMATS.md   reverse-engineered file format notes
     docs/DEPENDENCIES.md  dependency policy and audit checklist

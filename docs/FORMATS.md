@@ -178,7 +178,11 @@ than `(length, value)` pairs); it decoded without overrunning and still rendered
 noise. The decompiled function settled it in one pass.
 
 **Still open:** per-character advance width. The blit takes an explicit `x`, so
-the caller decides spacing; that caller has not been traced yet.
+the caller decides spacing; that caller has not been traced yet. The engine
+currently measures the advance off each glyph's luminance plane (*not* the alpha
+plane, which is dilated and would space text several pixels too wide) and adds a
+fixed gap. That spaces proportionally and looks right, but is not guaranteed to
+match the original pixel for pixel.
 
 ## Configuration
 

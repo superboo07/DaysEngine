@@ -71,6 +71,20 @@ enum Cmd {
         #[arg(long)]
         dump_frame: Option<PathBuf>,
     },
+    /// Composite frames of a script to PNG, without a display.
+    ///
+    /// This is the regression check for playback: timing, fades and text layout
+    /// all show up as an image rather than as "it looked wrong when I ran it".
+    Render {
+        /// Script name, e.g. "00-00-A00".
+        name: String,
+        /// Timecodes to render, as MM:SS:FF. Repeatable.
+        #[arg(long = "at", required = true)]
+        at: Vec<String>,
+        /// Directory to write PNGs into.
+        #[arg(long, short = 'o', default_value = ".")]
+        out: PathBuf,
+    },
     /// Decode the glyph store and render characters as ASCII art.
     Font {
         /// Characters to render. Omit to just report coverage.
@@ -160,6 +174,7 @@ fn main() -> Result<()> {
             alpha,
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
+        Cmd::Render { name, at, out } => cmd_render(&game, &name, &at, &out)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -402,6 +417,68 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
         );
     }
     println!("worst absolute difference: {worst:.3}s");
+    Ok(())
+}
+
+fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> {
+    use days_script::Frame;
+
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let wanted = name.to_uppercase();
+    let (_, script_path) = script_paths(&vfs)
+        .into_iter()
+        .find(|(n, _)| *n == wanted)
+        .with_context(|| format!("no script named {name}"))?;
+    let script = days_script::Script::parse(&wanted, &vfs.read_path(&script_path)?)?;
+    let font = days_font::Font::parse(
+        vfs.read_path("System/System/FONTDATA_ENG.DAT")
+            .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?,
+    )?;
+
+    // Targets are rendered in order and the stage is only ever advanced forward,
+    // so the timeline is exercised the same way playback exercises it.
+    let mut targets: Vec<Frame> = at
+        .iter()
+        .map(|s| Frame::parse(s).map_err(anyhow::Error::from))
+        .collect::<Result<_>>()?;
+    targets.sort();
+
+    let mixer = days_engine::Mixer::new();
+    let mut stage = days_engine::Stage::new(script);
+    std::fs::create_dir_all(out)?;
+
+    const W: usize = 800;
+    const H: usize = 452;
+
+    for target in targets {
+        stage.seek_to(target, &vfs, &mixer)?;
+        let visual = stage.visual_at(target);
+        let described = format!(
+            "movie={} still={} text={:?} fade={:?}",
+            visual.movie.is_some(),
+            visual.still.map(|s| s.path.as_str()).unwrap_or("-"),
+            visual.text.map(|(s, t)| format!("{s}: {t}")),
+            visual.fade,
+        );
+        let rgba = days_engine::compose::frame_rgba(&visual, &font, W, H);
+
+        let path = out.join(format!(
+            "{wanted}-{}.png",
+            target.to_string().replace(':', "-")
+        ));
+        write_png(&path, &rgba, W as u32, H as u32)?;
+        println!("{} {}  {described}", target, path.display());
+    }
+    Ok(())
+}
+
+fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(rgba)?;
     Ok(())
 }
 

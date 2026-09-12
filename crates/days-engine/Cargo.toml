@@ -1,13 +1,9 @@
 [package]
-name = "days-cli"
+name = "days-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Offline tools for inspecting a School Days HQ install."
-
-[[bin]]
-name = "days"
-path = "src/main.rs"
+description = "The DaysEngine runtime: timeline playback, mixing and presentation."
 
 [dependencies]
 days-gpk = { path = "../days-gpk", version = "=0.1.0" }
@@ -15,9 +11,12 @@ days-vfs = { path = "../days-vfs", version = "=0.1.0" }
 days-script = { path = "../days-script", version = "=0.1.0" }
 days-media = { path = "../days-media", version = "=0.1.0" }
 days-font = { path = "../days-font", version = "=0.1.0" }
-days-engine = { path = "../days-engine", version = "=0.1.0" }
-anyhow.workspace = true
-clap.workspace = true
+sdl3.workspace = true
 png.workspace = true
+anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[[bin]]
+name = "daysengine"
+path = "src/main.rs"
