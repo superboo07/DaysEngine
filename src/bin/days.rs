@@ -121,6 +121,23 @@ enum Cmd {
         #[arg(long)]
         grep: Option<String>,
     },
+    /// Print the player's settings, as the Option screen reads them.
+    ///
+    /// `Config.DAT` is a deflated `.INI` next to the executable. This shows the
+    /// ten settings the Option screen loads, with the volume levels worked
+    /// through the DLL's own attenuation formula, and every other key the file
+    /// carries.
+    Config,
+    /// Print the replay scene table recovered from the user's SysMenuSDHQ.dll.
+    ///
+    /// The forty-one scenes, which page each sits on, the save flag that
+    /// unlocks it and the script a click starts. With no save data to hand it
+    /// still lists the table; with save data it marks what is unlocked.
+    Replay {
+        /// Only show scenes the save data has unlocked.
+        #[arg(long)]
+        unlocked: bool,
+    },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
     Timing {
@@ -147,7 +164,7 @@ struct UiArgs {
     #[arg(long)]
     base: Option<String>,
     /// Image to draw behind the screen, e.g. the title's
-    /// STARTSCRIPT.INI [BaseFile], "System/Title/TitleBase.png".
+    /// STARTSCRIPT.INI `[BaseFile]`, "System/Title/TitleBase.png".
     #[arg(long)]
     backdrop: Option<String>,
     /// Report the recovered widget table instead of drawing.
@@ -160,8 +177,9 @@ struct UiArgs {
 
 #[derive(clap::Args)]
 struct MenuArgs {
-    /// Events to replay, comma separated: `down`, `up`, `enter`, `esc`,
-    /// `at:X,Y` to point at a pixel, and `click:X,Y` to point and confirm.
+    /// Events to replay, comma separated: `down`, `up`, `left`, `right`,
+    /// `enter`, `esc`, `at:X:Y` to point at a pixel, and `click:X:Y` to point
+    /// and confirm.
     #[arg(long, short = 'e', default_value = "")]
     events: String,
     /// Resolution: standard, wide, note or full.
@@ -265,6 +283,8 @@ fn main() -> Result<()> {
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
         Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
+        Cmd::Config => cmd_config(&game)?,
+        Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -958,9 +978,89 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Prints the player's settings the way the Option screen reads them.
+fn cmd_config(game: &Path) -> Result<()> {
+    use daysengine::config::{Channel, Config, Flag};
+
+    let path = Config::path(game);
+    let config = Config::load(game);
+    println!("{}", path.display());
+    println!();
+    println!("volumes (level, then the attenuation the DLL's formula gives):");
+    for channel in Channel::ALL {
+        println!(
+            "  {:<12} {:>2}/10   {:>6.1} dB   gain {:.3}",
+            channel.key(),
+            config.volume(channel),
+            config.attenuation_db(channel),
+            config.gain(channel),
+        );
+    }
+    println!("  {:<12} {:>6.3}", "MasterVolume", config.master_volume());
+    println!();
+    println!("settings:");
+    for flag in Flag::ALL {
+        println!("  {:<12} {}", flag.key(), config.flag(flag));
+    }
+    Ok(())
+}
+
+/// Prints the replay scene table recovered from the user's own menu DLL.
+fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
+    use daysengine::replay::{Scenes, HSCENE_PER_PAGE};
+
+    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let flags = load_flags(game, &vfs);
+    let scenes = Scenes::recover(&dll)?;
+
+    println!(
+        "{} scenes over {} pages of {HSCENE_PER_PAGE}",
+        scenes.len(),
+        scenes.pages()
+    );
+    println!();
+    let mut open = 0usize;
+    for (index, scene) in scenes.iter().enumerate() {
+        let unlocked = scenes.unlocked(index, &flags);
+        if unlocked {
+            open += 1;
+        }
+        if only_unlocked && !unlocked {
+            continue;
+        }
+        println!(
+            "  {index:>2}  page {} slot {:>2}  {}  {:<14} {}",
+            index / HSCENE_PER_PAGE,
+            index % HSCENE_PER_PAGE,
+            if unlocked { "unlocked" } else { "locked  " },
+            scene.flag,
+            scene.first_script().unwrap_or("(no script recovered)"),
+        );
+        for choice in &scene.choices {
+            println!(
+                "        version {:<14} {}  {}",
+                choice.flag,
+                if flags.flag(&choice.flag) {
+                    "seen  "
+                } else {
+                    "unseen"
+                },
+                choice.scripts.first().map_or("(not recovered)", |s| s),
+            );
+        }
+    }
+    println!();
+    println!("{open} of {} unlocked by this save", scenes.len());
+    Ok(())
+}
+
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
-    use daysengine::menu::{Action, Menu, Mode, SaveState};
+    use daysengine::config::Config;
+    use daysengine::menu::{Action, Menu, Mode, SaveState, Session};
+    use daysengine::options::{Dir, Display, Som};
+    use daysengine::replay::Scenes;
     use daysengine::screen::Resolution;
 
     let vfs = daysengine::vfs::Vfs::mount(game)?;
@@ -980,6 +1080,23 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     save.all_clear |= args.all_clear;
     save.cleared_first |= args.cleared;
     save.cleared_replay |= args.replay;
+
+    // The settings are read but never written here: an inspection tool has no
+    // business rewriting the player's own `Config.DAT`.
+    let session = || Session {
+        save,
+        flags: flags.clone(),
+        config: Config::load(game),
+        scenes: Scenes::recover(&dll).unwrap_or_else(|err| {
+            log::warn!("no replay scene table: {err}");
+            Scenes::from_scenes(Vec::new())
+        }),
+        display: Display {
+            wide: resolution != Resolution::Standard,
+            full_screen: false,
+        },
+        som: Som::default(),
+    };
 
     if args.check_all {
         // Every mode SystemInit can dispatch to, opened at its own default
@@ -1002,7 +1119,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 mode.default_variant()
             };
             let stem = mode.stem(variant).unwrap_or_default();
-            match Menu::open(&vfs, &dll, mode, save, resolution) {
+            match Menu::open(&vfs, &dll, mode, session(), resolution) {
                 Ok(menu) => println!(
                     "  mode {:>2}  {name:<14} {stem:<34} ok, {} widgets",
                     mode.0,
@@ -1014,7 +1131,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut menu = Menu::open(&vfs, &dll, Mode::TITLE, save, resolution)
+    let mut menu = Menu::open(&vfs, &dll, Mode::TITLE, session(), resolution)
         .context("opening the title screen")?;
     println!(
         "mode {} ({}) — {} widgets",
@@ -1038,8 +1155,10 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         .filter(|e| !e.is_empty())
     {
         let (action, label) = match event {
-            "down" => (menu.navigate(1), "down".to_string()),
-            "up" => (menu.navigate(-1), "up".to_string()),
+            "down" => (menu.navigate(Dir::Down), "down".to_string()),
+            "up" => (menu.navigate(Dir::Up), "up".to_string()),
+            "left" => (menu.navigate(Dir::Left), "left".to_string()),
+            "right" => (menu.navigate(Dir::Right), "right".to_string()),
             "enter" => (menu.confirm(&vfs, &dll)?, "enter".to_string()),
             "esc" => (menu.cancel(&vfs, &dll)?, "esc".to_string()),
             "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),
@@ -1052,7 +1171,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                     .with_context(|| {
                         format!(
                             "unknown menu event {other:?}; expected down, up, enter, \
-                             esc, yes, at:X:Y or click:X:Y"
+                             esc, yes, left, right, at:X:Y or click:X:Y"
                         )
                     })?;
                 let (x, y) = point
@@ -1081,6 +1200,14 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             Action::Quit => {
                 println!("  (would quit)");
                 break;
+            }
+            Action::PlayReplay(script) => {
+                println!("  (would replay {script})");
+                break;
+            }
+            Action::SettingsSaved => {
+                println!("  (would write Config.DAT and return to the title)");
+                menu.advance(&vfs, &dll, Mode::TITLE)?;
             }
             _ => {}
         }

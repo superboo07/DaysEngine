@@ -12,23 +12,29 @@
 #![deny(unsafe_code)]
 
 pub mod compose;
+pub mod config;
 pub mod ending;
 pub mod ini;
 #[allow(unsafe_code)]
 pub mod media;
 pub mod menu;
 pub mod mixer;
+pub mod options;
+pub mod replay;
 pub mod save;
 pub mod screen;
 pub mod stage;
 pub mod text;
 pub mod vfs;
 
+pub use config::Config;
 pub use days_save::FlagStore;
 pub use ending::{title_backdrop, Backdrop, EndingList};
 pub use ini::Ini;
 pub use menu::{Action, Menu, Mode, SaveState, SystemSe};
 pub use mixer::Mixer;
+pub use options::Tab;
+pub use replay::{Scene, Scenes};
 pub use screen::{Resolution, Screen, WidgetState};
 pub use stage::{Stage, Visual};
 pub use vfs::Vfs;

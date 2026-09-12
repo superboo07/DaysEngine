@@ -226,6 +226,11 @@ impl Screen {
         &self.atlas
     }
 
+    /// The `_CHIP` sheet, for a screen that draws a sprite of its own from it.
+    pub fn chip(&self) -> &Image {
+        &self.chip
+    }
+
     /// Number of widgets, i.e. of hit regions.
     pub fn widget_count(&self) -> usize {
         self.atlas.widgets.len()
@@ -272,6 +277,37 @@ impl Screen {
     /// leaves the rest resting.
     pub fn compose(&self, states: &[WidgetState]) -> Image {
         self.compose_over(None, states)
+    }
+
+    /// Composites the screen over a backdrop, with extra sprites on top.
+    ///
+    /// Two things a screen draws are not widget states and so cannot be
+    /// expressed as one: the Sound tab's three volume bars, which are one
+    /// record stretched to the width of however many level cells are filled,
+    /// and the replay grid's thumbnails, which come from a second sheet
+    /// entirely. Both are sprites the screen's own module builds at draw time,
+    /// so they arrive here already worked out, each paired with the sheet it is
+    /// cut from.
+    pub fn compose_over_sprites(
+        &self,
+        backdrop: Option<&Image>,
+        states: &[WidgetState],
+        sprites: &[(&Image, Widget)],
+    ) -> Image {
+        let mut out = self.compose_over(backdrop, states);
+        for (sheet, widget) in sprites {
+            out.blit_scaled(
+                sheet,
+                (
+                    widget.src_x,
+                    widget.src_y,
+                    widget.dst.width,
+                    widget.dst.height,
+                ),
+                self.place(widget),
+            );
+        }
+        out
     }
 
     /// Composites the screen over a backdrop.

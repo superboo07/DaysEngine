@@ -12,9 +12,12 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
+use daysengine::config::{Channel, Config, Flag};
 use daysengine::ending;
 use daysengine::media::AudioBuffer;
-use daysengine::menu::{Action, Menu, Mode, SaveState, SystemSe};
+use daysengine::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
+use daysengine::options::{Dir, Display, Som};
+use daysengine::replay::Scenes;
 use daysengine::save::FlagStore;
 use daysengine::screen::Resolution;
 use daysengine::vfs::Vfs;
@@ -139,6 +142,8 @@ struct Player<'a> {
     dll: Vec<u8>,
     /// What the player has unlocked, out of their `Save/GlobalFlag.DAT`.
     flags: FlagStore,
+    /// The install root, which is where `Config.DAT` is written back.
+    game: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -217,6 +222,7 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
 
     let mut player = Player {
+        game: game.clone(),
         vfs: &vfs,
         font: &font,
         mixer: &mixer,
@@ -244,14 +250,21 @@ fn main() -> Result<()> {
         && start.get("StartMode").unwrap_or("Title") == "Title"
         && !player.dll.is_empty();
 
+    let mut next = wanted.clone();
     loop {
         if menus {
             match run_menu(&mut player, &mut canvas, &creator, &mut events, &start)? {
                 Outcome::Quit => break,
-                Outcome::Play => {}
+                Outcome::Play => next = wanted.clone(),
+                // A replay names its own script, which the DLL's table spells
+                // as a path; `find_script` wants the trailing name.
+                Outcome::Replay(script) => {
+                    next = script.rsplit('/').next().unwrap_or(&script).to_string();
+                    log::info!("replaying {next}");
+                }
             }
         }
-        let (name, path) = find_script(&vfs, &wanted, english)?;
+        let (name, path) = find_script(&vfs, &next, english)?;
         log::info!("playing {name} from {path}");
         let script = Script::parse(&name, &vfs.read_path(&path)?)?;
         log::info!(
@@ -276,10 +289,12 @@ fn main() -> Result<()> {
 }
 
 /// Why a loop gave up control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
     /// Start playing the script.
     Play,
+    /// Play one replay scene's script, chosen on the replay screen.
+    Replay(String),
     /// Close the game.
     Quit,
 }
@@ -323,6 +338,52 @@ fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
     }
 }
 
+/// Gathers everything the menus ask the host about.
+///
+/// A scene table that cannot be recovered is not fatal: the replay screen shows
+/// an empty grid and says why, which is the same rule every other missing asset
+/// follows.
+fn build_session(player: &Player, start: &Ini) -> Session {
+    let scenes = match Scenes::recover(&player.dll) {
+        Ok(scenes) => scenes,
+        Err(err) => {
+            log::warn!("no replay scene table: {err}");
+            Scenes::from_scenes(Vec::new())
+        }
+    };
+    Session {
+        save: SaveState::from_flags(&player.flags, start),
+        flags: player.flags.clone(),
+        config: Config::load(&player.game),
+        scenes,
+        // This engine draws its menus at one fixed size, so the two questions
+        // the Def tab asks have one answer. `MENU_RESOLUTION` is widescreen and
+        // the window is not full screen.
+        display: Display {
+            wide: true,
+            full_screen: false,
+        },
+        som: Som::default(),
+    }
+}
+
+/// Pushes the settings' volumes into the mixer.
+///
+/// The original hands a decibel figure per channel to DirectSound; this engine
+/// has one master gain, so until the mixer grows per-channel gain the quietest
+/// of the three is what it can honestly apply. Muting is exact either way.
+fn apply_settings(session: &Session, mixer: &Mixer) {
+    let gain = if session.config.flag(Flag::Mute) {
+        0.0
+    } else {
+        Channel::ALL
+            .iter()
+            .map(|c| session.config.gain(*c))
+            .fold(f32::INFINITY, f32::min)
+    };
+    mixer.set_master_volume(gain);
+}
+
 fn run_menu(
     player: &mut Player,
     canvas: &mut Canvas<Window>,
@@ -330,9 +391,16 @@ fn run_menu(
     events: &mut EventPump,
     start: &Ini,
 ) -> Result<Outcome> {
-    let save = SaveState::from_flags(&player.flags, start);
-    let mut menu = Menu::open(player.vfs, &player.dll, Mode::TITLE, save, MENU_RESOLUTION)
-        .context("opening the title screen")?;
+    let session = build_session(player, start);
+    apply_settings(&session, player.mixer);
+    let mut menu = Menu::open(
+        player.vfs,
+        &player.dll,
+        Mode::TITLE,
+        session,
+        MENU_RESOLUTION,
+    )
+    .context("opening the title screen")?;
 
     let backdrop = load_title_backdrop(player, start);
 
@@ -351,11 +419,19 @@ fn run_menu(
                 Event::KeyDown {
                     keycode: Some(Keycode::Up),
                     ..
-                } => menu.navigate(-1),
+                } => menu.navigate(Dir::Up),
                 Event::KeyDown {
                     keycode: Some(Keycode::Down),
                     ..
-                } => menu.navigate(1),
+                } => menu.navigate(Dir::Down),
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    ..
+                } => menu.navigate(Dir::Left),
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    ..
+                } => menu.navigate(Dir::Right),
                 Event::KeyDown {
                     keycode: Some(Keycode::Return | Keycode::KpEnter | Keycode::Space),
                     ..
@@ -388,7 +464,35 @@ fn run_menu(
 
             match action {
                 Action::Play => return Ok(Outcome::Play),
+                Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
                 Action::Quit => return Ok(Outcome::Quit),
+                // Each change is already in the settings; this is where the
+                // engine picks the new volumes up.
+                Action::SettingsChanged => {
+                    apply_settings(menu.session(), player.mixer);
+                    texture = None;
+                }
+                // The Option screen's close button. The original flushes here
+                // and tells the host to leave the menus with a mode whose
+                // meaning is not recovered, so this returns to the title.
+                Action::SettingsSaved => {
+                    apply_settings(menu.session(), player.mixer);
+                    if menu.session().config.dirty() {
+                        let mut config = menu.session().config.clone();
+                        if let Err(err) = config.save(&player.game) {
+                            log::warn!("could not write the settings: {err}");
+                        }
+                        menu.session_mut().config = config;
+                    }
+                    menu.advance(player.vfs, &player.dll, Mode::TITLE)?;
+                    texture = None;
+                }
+                // The DLL only records the request and this engine draws its
+                // menus at one size, so the request is logged rather than
+                // silently dropped. See `daysengine::options::DisplayRequest`.
+                Action::Display(request) => {
+                    log::info!("the Option screen asked for {request:?}; not applied");
+                }
                 Action::Sound(se) => {
                     player
                         .system_se

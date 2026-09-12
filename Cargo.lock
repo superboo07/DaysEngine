@@ -246,6 +246,7 @@ dependencies = [
  "days-ui",
  "env_logger",
  "log",
+ "miniz_oxide 0.9.1",
  "png",
  "rusty_ffmpeg",
  "sdl3",

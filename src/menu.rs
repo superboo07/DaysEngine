@@ -23,8 +23,14 @@
 //!
 //! Every screen is [`Screen`]: base art, a chip sprite sheet, and a per-pixel
 //! hit map. Pointing at a widget swaps in its chip sprite; clicking runs the
-//! screen's action table. Only the title's table is recovered so far, out of
-//! the DLL's own dispatch — see [`Menu::confirm`].
+//! screen's action table. Each table is the DLL's own dispatch, transcribed
+//! where that screen's behaviour lives: the title's in [`Menu::confirm`], the
+//! Option screen's in [`crate::options`], and the replay grid's and its popup's
+//! in [`crate::replay`]. `SaveLoad` and `Replay_PlayData` have none yet.
+//!
+//! A few screens also draw sprites that are not widget states — the Sound tab's
+//! volume bars and the replay grid's thumbnails — which is what
+//! `Menu::sprites` builds.
 //!
 //! # Whose answer is it
 //!
@@ -34,7 +40,11 @@
 //! where the reasoning is written down, because getting this wrong produced a
 //! title screen the real game never shows.
 
+use crate::config::Config;
 use crate::ini::Ini;
+use crate::options;
+use crate::options::Dir;
+use crate::replay::{self, Scenes};
 use crate::screen::{Error, Resolution, Screen, WidgetState};
 use crate::vfs::Vfs;
 use days_save::FlagStore;
@@ -263,7 +273,7 @@ pub fn end_bg_view(start: &Ini) -> bool {
 }
 
 /// What the engine should do after handing the menu an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Nothing changed that the engine needs to act on.
     Stay,
@@ -276,8 +286,62 @@ pub enum Action {
     Unavailable(Mode),
     /// Leave the menus and play the script.
     Play,
+    /// Play a replay scene's script, named as the DLL's table spells it.
+    PlayReplay(String),
+    /// A setting changed. The engine should re-read the volumes it mixes with.
+    ///
+    /// The DLL writes each setting through to the config object as it happens,
+    /// which is why this is separate from [`Action::SettingsSaved`].
+    SettingsChanged,
+    /// The Option screen was closed: the settings were flushed to disk.
+    ///
+    /// The DLL flushes here and then tells the host to leave the menus, with a
+    /// mode whose meaning is **not recovered** — so this engine returns to the
+    /// title, which is where the screen was opened from.
+    SettingsSaved,
+    /// The Option screen asked for a display mode this engine has to apply.
+    ///
+    /// The DLL only records the request; who acts on it is not recovered. See
+    /// [`crate::options::DisplayRequest`].
+    Display(options::DisplayRequest),
     /// Quit the game.
     Quit,
+}
+
+/// Everything the menus know about the player, carried across screens.
+///
+/// Each menu module in the original is a singleton that keeps its own state
+/// between visits and asks the host for the rest. This is both halves: the
+/// answers the host gives, and the per-screen state that survives a screen
+/// being closed and reopened.
+pub struct Session {
+    /// The three answers the title screen asks for.
+    pub save: SaveState,
+    /// The global flag store, which is what the host really answers from.
+    pub flags: FlagStore,
+    /// The settings file, read and written by the Option screen.
+    pub config: Config,
+    /// The replay scene table, recovered from the player's own menu DLL.
+    pub scenes: Scenes,
+    /// What this engine can say about the display, for the Def tab's two rows.
+    pub display: options::Display,
+    /// What the SOMCON tab knows.
+    pub som: options::Som,
+}
+
+impl Session {
+    /// A session with no save data, no settings and no scene table — enough to
+    /// open the title screen, which is what a broken install leaves.
+    pub fn empty(save: SaveState) -> Session {
+        Session {
+            save,
+            flags: FlagStore::default(),
+            config: Config::default(),
+            scenes: Scenes::from_scenes(Vec::new()),
+            display: options::Display::default(),
+            som: options::Som::default(),
+        }
+    }
 }
 
 /// The menu, as one screen plus the pointer state over it.
@@ -291,10 +355,24 @@ pub struct Menu {
     /// Where the confirm popup returns to on cancel. `SystemInit` records this
     /// for every mode except the popups themselves.
     return_to: Mode,
-    save: SaveState,
     resolution: Resolution,
     states: Vec<WidgetState>,
     dirty: bool,
+    /// The player's state, kept across screens the way the originals' singleton
+    /// modules keep theirs.
+    session: Session,
+    /// Which Option tab is showing: `MENU::ConfigMenu` `+0x184`.
+    tab: options::Tab,
+    /// Which Replay screen is showing: `MENU::SceneView` `+0x2b0`.
+    view: replay::View,
+    /// Which page of the replay grid: `+0x2a4`.
+    page: usize,
+    /// The scene the replay popup is asking about: `+0x2a8`.
+    asked: Option<usize>,
+    /// The replay grid's thumbnail sheet for the current page, with the record
+    /// table that cuts it up. Absent when the page's art will not load, which
+    /// leaves the grid's empty frames showing.
+    thumbnails: Option<(days_ui::Image, replay::Thumbnails)>,
 }
 
 impl Menu {
@@ -303,45 +381,126 @@ impl Menu {
         vfs: &Vfs,
         dll: &[u8],
         mode: Mode,
-        save: SaveState,
+        session: Session,
         resolution: Resolution,
     ) -> Result<Menu, Error> {
-        let variant = if mode == Mode::TITLE {
-            save.title_variant().to_string()
-        } else {
-            mode.default_variant().to_string()
-        };
-        Menu::open_variant(vfs, dll, mode, &variant, save, resolution, Mode::TITLE)
-    }
-
-    fn open_variant(
-        vfs: &Vfs,
-        dll: &[u8],
-        mode: Mode,
-        variant: &str,
-        save: SaveState,
-        resolution: Resolution,
-        return_to: Mode,
-    ) -> Result<Menu, Error> {
-        let stem = mode
-            .stem(variant)
-            .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
-        let base = base_art(mode, return_to);
-        let screen = Screen::load_with_base(vfs, dll, &stem, base, resolution)?;
-        let states = vec![WidgetState::Resting; screen.widget_count()];
+        let tab = options::Tab::DEFAULT;
+        let view = replay::View::DEFAULT;
+        let variant = variant_for(&session, mode, tab, view, None);
+        let screen = load_screen(
+            vfs,
+            dll,
+            mode,
+            &variant,
+            Mode::TITLE,
+            tab,
+            &session,
+            resolution,
+        )?;
         let mut menu = Menu {
             mode,
-            variant: variant.to_string(),
+            variant,
+            states: vec![WidgetState::Resting; screen.widget_count()],
             screen,
             selection: None,
-            return_to,
-            save,
+            return_to: Mode::TITLE,
             resolution,
-            states,
             dirty: true,
+            session,
+            tab,
+            view,
+            page: 0,
+            asked: None,
+            thumbnails: None,
         };
+        menu.load_thumbnails(vfs, dll);
         menu.refresh();
         Ok(menu)
+    }
+
+    /// Loads `mode`'s screen into this menu, keeping the session.
+    fn enter(&mut self, vfs: &Vfs, dll: &[u8], mode: Mode, return_to: Mode) -> Result<(), Error> {
+        let variant = variant_for(&self.session, mode, self.tab, self.view, self.asked);
+        let screen = load_screen(
+            vfs,
+            dll,
+            mode,
+            &variant,
+            return_to,
+            self.tab,
+            &self.session,
+            self.resolution,
+        )?;
+        self.states = vec![WidgetState::Resting; screen.widget_count()];
+        self.screen = screen;
+        self.mode = mode;
+        self.variant = variant;
+        self.return_to = return_to;
+        self.selection = None;
+        self.load_thumbnails(vfs, dll);
+        self.refresh();
+        Ok(())
+    }
+
+    /// Loads the thumbnail sheet for the page the replay grid is showing.
+    ///
+    /// A page whose art or table will not load leaves the frames empty and the
+    /// grid still usable, which is the same rule every other missing asset
+    /// follows.
+    fn load_thumbnails(&mut self, vfs: &Vfs, dll: &[u8]) {
+        self.thumbnails = None;
+        if self.mode != Mode::REPLAY || self.view != replay::View::HScene {
+            return;
+        }
+        let path = replay::thumbnail_sheet(self.page);
+        let sheet = match vfs
+            .read_path(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| days_ui::Image::decode_png(&bytes).map_err(|e| e.to_string()))
+        {
+            Ok(sheet) => sheet,
+            Err(err) => {
+                log::warn!("replay thumbnails {path}: {err}");
+                return;
+            }
+        };
+        let slots: Vec<days_ui::cmap::Rect> = self
+            .screen
+            .atlas()
+            .widgets
+            .iter()
+            .skip(replay::HSCENE_FIRST_THUMBNAIL)
+            .map(|w| w.dst)
+            .collect();
+        match replay::Thumbnails::recover(dll, &slots, (sheet.width, sheet.height)) {
+            Ok(table) => self.thumbnails = Some((sheet, table)),
+            Err(err) => log::warn!("no thumbnail table for {path}: {err}"),
+        }
+    }
+
+    /// The session, for an engine that needs to read the settings.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// The session, for an engine that has just changed the display mode.
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Which Option tab is showing.
+    pub fn tab(&self) -> options::Tab {
+        self.tab
+    }
+
+    /// Which Replay screen is showing, and which page of it.
+    pub fn replay_view(&self) -> (replay::View, usize) {
+        (self.view, self.page)
+    }
+
+    /// The scene the replay popup is asking about, if it is up.
+    pub fn asked(&self) -> Option<usize> {
+        self.asked
     }
 
     pub fn mode(&self) -> Mode {
@@ -364,23 +523,136 @@ impl Menu {
     /// Composites the current frame over an optional backdrop and marks it clean.
     pub fn compose(&mut self, backdrop: Option<&days_ui::Image>) -> days_ui::Image {
         self.dirty = false;
-        self.screen.compose_over(backdrop, &self.states)
+        let sprites = self.sprites();
+        self.screen
+            .compose_over_sprites(backdrop, &self.states, &sprites)
+    }
+
+    /// The sprites this screen draws that are not widget states.
+    ///
+    /// Two screens have them: the Sound tab's three volume bars, cut from the
+    /// chip sheet, and the replay grid's thumbnails, cut from the page's own
+    /// sheet. See [`options::volume_bar`] and [`replay::Thumbnails`].
+    fn sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
+        let mut out = Vec::new();
+        match self.mode {
+            Mode::OPTION if self.tab == options::Tab::Sound => {
+                for row in 0..options::VOLUME_ROW_COUNT {
+                    let Some((channel, first)) = options::volume_row(row) else {
+                        continue;
+                    };
+                    let cells = self
+                        .screen
+                        .atlas()
+                        .widgets
+                        .get(first..first + options::VOLUME_CELLS);
+                    if let Some(bar) = cells
+                        .and_then(|c| options::volume_bar(c, self.session.config.volume(channel)))
+                    {
+                        out.push((self.screen.chip(), bar));
+                    }
+                }
+            }
+            Mode::REPLAY if self.view == replay::View::HScene => {
+                let Some((sheet, table)) = &self.thumbnails else {
+                    return out;
+                };
+                for slot in 0..table.len() {
+                    let widget = replay::HSCENE_FIRST_THUMBNAIL + slot;
+                    if !self.enabled(widget) {
+                        continue;
+                    }
+                    if let Some(sprite) = table.sprite(slot, self.selection == Some(widget)) {
+                        out.push((sheet, sprite));
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Whether a widget can be chosen.
     ///
-    /// Only the title's rule is recovered, from the DLL's own enablement switch:
-    /// everything is selectable except `REPLAY`, which needs a cleared route,
-    /// and the all-clear-only sixth widget. Other screens have no recovered
-    /// table yet and treat every widget as live.
+    /// Each screen has its own rule in the DLL, and each is transcribed where
+    /// that screen's behaviour lives: the title's here, the Option screen's in
+    /// [`options::enabled`] (`FUN_10007ca0`), the replay grid's in
+    /// [`replay::hscene_enabled`] (`FUN_1001dd40`) and the replay popup's in
+    /// [`replay::popup_enabled`] (`FUN_100195d0`). A screen with no recovered
+    /// rule treats every widget as live.
     pub fn enabled(&self, widget: usize) -> bool {
-        if self.mode != Mode::TITLE {
-            return true;
+        if widget >= self.states.len() {
+            return false;
         }
-        match widget {
-            2 => self.save.replay_unlocked(),
-            5 => self.save.all_clear,
-            _ => widget < self.states.len(),
+        match self.mode {
+            Mode::TITLE => match widget {
+                2 => self.session.save.replay_unlocked(),
+                5 => self.session.save.all_clear,
+                _ => true,
+            },
+            Mode::OPTION => {
+                options::enabled(self.tab, widget, self.session.save.trial, self.session.som)
+            }
+            Mode::REPLAY if self.view == replay::View::HScene => {
+                replay::hscene_enabled(&self.session.scenes, self.page, widget, &self.session.flags)
+            }
+            Mode::REPLAY_POPUP => match self.asked.and_then(|s| self.session.scenes.get(s)) {
+                Some(scene) => replay::popup_enabled(scene, widget, &self.session.flags),
+                None => false,
+            },
+            _ => true,
+        }
+    }
+
+    /// The alternate-state sprite a widget draws instead of its hover art, if
+    /// any.
+    ///
+    /// On the Option screens the setting currently in force draws a mark, from
+    /// a run of records that follows the per-widget ones. Which record is a
+    /// per-screen constant the DLL carries in `+0x190` — 27 records in for the
+    /// Def tab, 51 for Sound and 35 for the SOMCON tab — and the per-widget
+    /// run is as long as the hit map has regions, so the index into
+    /// [`Atlas::extras`](days_ui::atlas::Atlas::extras) is that constant minus
+    /// the region count, plus the offset the screen's own switch applies.
+    ///
+    /// The SOMCON tab's selected port is the one case with no sprite at all:
+    /// `FUN_1000a250` reports it as the current value and draws nothing,
+    /// leaving `Option_SomCon_Set.png` to show it.
+    fn extra_for(&self, widget: usize) -> Option<usize> {
+        let regions = self.states.len();
+        match self.mode {
+            Mode::TITLE if widget == 2 && !self.session.save.replay_unlocked() => Some(0),
+            Mode::OPTION => {
+                if !options::shows_current_value(
+                    self.tab,
+                    widget,
+                    &self.session.config,
+                    self.session.display,
+                    self.session.som,
+                ) {
+                    return None;
+                }
+                let (base, slot) = match self.tab {
+                    // `FUN_10009fd0` draws extras[widget - 1] of a run 27 in.
+                    options::Tab::Def => (27usize, widget.checked_sub(1)?),
+                    // `FUN_1000a190`, a run 51 in, indexed from widget 7.
+                    options::Tab::Sound => (51usize, widget.checked_sub(7)?),
+                    // `FUN_1000a250`, a run 35 in, indexed 3..=6 for the four
+                    // widgets that have a mark; the port buttons have none.
+                    options::Tab::SomCon => (
+                        35usize,
+                        match widget {
+                            4 => 3,
+                            5 => 4,
+                            0x10 => 5,
+                            0x11 => 6,
+                            _ => return None,
+                        },
+                    ),
+                };
+                base.checked_sub(regions)?.checked_add(slot)
+            }
+            _ => None,
         }
     }
 
@@ -391,15 +663,14 @@ impl Menu {
     /// that first extra belongs to this screen: the run after it is the next
     /// screen's table, which the atlas cannot see the end of.
     fn refresh(&mut self) {
-        for (i, state) in self.states.iter_mut().enumerate() {
-            *state = if self.mode == Mode::TITLE && i == 2 && !self.save.replay_unlocked() {
-                WidgetState::Extra(0)
-            } else if self.selection == Some(i) {
-                WidgetState::Active
-            } else {
-                WidgetState::Resting
-            };
-        }
+        let states: Vec<WidgetState> = (0..self.states.len())
+            .map(|i| match self.extra_for(i) {
+                Some(extra) => WidgetState::Extra(extra),
+                None if self.selection == Some(i) => WidgetState::Active,
+                None => WidgetState::Resting,
+            })
+            .collect();
+        self.states = states;
         self.dirty = true;
     }
 
@@ -426,23 +697,51 @@ impl Menu {
         }
     }
 
-    /// Keyboard navigation: `delta` is -1 for up and +1 for down.
+    /// Keyboard navigation.
     ///
-    /// The DLL wraps over the five title entries and steps past a disabled
-    /// `REPLAY` in whichever direction it was already moving, so the locked
-    /// entry is never landed on. With nothing selected yet, a first keypress
-    /// lands on the first entry rather than moving from an imaginary one.
-    pub fn navigate(&mut self, delta: i32) -> Action {
-        let count = self.wrapping_count();
-        let Some(index) = step(count, self.selection, delta, |i| self.enabled(i)) else {
+    /// The title is a vertical list and uses `step`; the Option screens are
+    /// not, and each tab has a hand-written transition table in the DLL — see
+    /// [`options::navigate`]. A screen with no transcribed table falls back to
+    /// walking its widgets in order, which is at least reachable.
+    ///
+    /// The replay grid's table is **decompiled but not transcribed**. It is
+    /// `FUN_1001e3a0`, and one of its arms does not yet read consistently with
+    /// a grid four thumbnails across: the horizontal move guards on `c % 4 != 0`
+    /// over widgets 8 to 17, which blocks the second column rather than the
+    /// last, and widgets 7 and 18 fall through every arm. Either the grid is
+    /// not indexed the way the rest of that function implies or the arm does
+    /// something else; until that is settled, the grid gets the fallback rather
+    /// than a transition table that looks recovered and is not.
+    pub fn navigate(&mut self, dir: Dir) -> Action {
+        let next = match self.mode {
+            Mode::OPTION => Some(options::navigate(
+                self.tab,
+                self.selection.unwrap_or(3),
+                dir,
+                self.session.save.trial,
+                self.session.som,
+            )),
+            _ => {
+                let delta = match dir {
+                    Dir::Up | Dir::Left => -1,
+                    Dir::Down | Dir::Right => 1,
+                };
+                step(self.wrapping_count(), self.selection, delta, |i| {
+                    self.enabled(i)
+                })
+            }
+        };
+        let Some(index) = next else {
             return Action::Stay;
         };
+        if self.selection == Some(index) {
+            return Action::Stay;
+        }
         self.selection = Some(index);
         self.refresh();
-        Action::Sound(if delta < 0 {
-            SystemSe::Up
-        } else {
-            SystemSe::Down
+        Action::Sound(match dir {
+            Dir::Up | Dir::Left => SystemSe::Up,
+            Dir::Down | Dir::Right => SystemSe::Down,
         })
     }
 
@@ -461,11 +760,11 @@ impl Menu {
 
     /// Activates the selected widget.
     ///
-    /// The title's widget-to-mode table is the DLL's own dispatch: `START` and
-    /// the all-clear shortcut both begin play, `LOAD`, `OPTION` and `REPLAY`
-    /// each open their screen, and `EXIT` opens the confirm popup. No other
-    /// screen's table is recovered, so elsewhere a click confirms nothing and
-    /// only the cancel path is live.
+    /// Every screen's table is the DLL's own dispatch: the title's here,
+    /// the Option screen's in [`options::action`] (`FUN_10007e80` and the three
+    /// it switches to), the replay grid's in [`replay::hscene_action`]
+    /// (`FUN_1001de10`) and the replay popup's in [`replay::popup_action`]
+    /// (`FUN_10019610`).
     pub fn confirm(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
         let Some(widget) = self.selection else {
             return Ok(Action::Stay);
@@ -485,6 +784,11 @@ impl Menu {
                 };
                 self.advance(vfs, dll, next)
             }
+            Mode::OPTION => self.confirm_option(vfs, dll, widget),
+            Mode::REPLAY if self.view == replay::View::HScene => {
+                self.confirm_replay(vfs, dll, widget)
+            }
+            Mode::REPLAY_POPUP => Ok(self.confirm_replay_popup(widget)),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
@@ -498,6 +802,97 @@ impl Menu {
                 _ => Ok(Action::Stay),
             },
             _ => Ok(Action::Stay),
+        }
+    }
+
+    /// The Option screen's dispatch.
+    ///
+    /// Every setting is written through to the config as it changes, which is
+    /// what the DLL does; only the close button flushes to disk.
+    fn confirm_option(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        let act = options::action(self.tab, widget, self.session.display);
+        match act {
+            options::Act::Tab(next) => {
+                if next == self.tab {
+                    return Ok(Action::Stay);
+                }
+                self.tab = next;
+                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+                Ok(Action::Opened(Mode::OPTION))
+            }
+            options::Act::Close => Ok(Action::SettingsSaved),
+            options::Act::Display(request) => Ok(Action::Display(request)),
+            options::Act::SomDetect | options::Act::SomRelease => {
+                options::apply(&mut self.session.config, act);
+                // Whether a port is really there is the engine's to answer, and
+                // this engine opens none — see `options::SOM_PORTS`. Asking is
+                // all this screen does. The background art changes with the
+                // answer, so the screen reloads.
+                self.session.som.enabled = self.session.config.flag(crate::config::Flag::UseSom);
+                if !self.session.som.enabled {
+                    self.session.som.attached = false;
+                    self.session.som.testing = false;
+                }
+                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+                Ok(Action::SettingsChanged)
+            }
+            options::Act::SomPort(port) => {
+                self.session.som.port = port;
+                self.refresh();
+                Ok(Action::Stay)
+            }
+            options::Act::SomTest(on) => {
+                self.session.som.testing = on;
+                self.refresh();
+                Ok(Action::Stay)
+            }
+            options::Act::None => Ok(Action::Stay),
+            _ => {
+                options::apply(&mut self.session.config, act);
+                self.refresh();
+                Ok(Action::SettingsChanged)
+            }
+        }
+    }
+
+    /// The replay grid's dispatch.
+    fn confirm_replay(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        match replay::hscene_action(&self.session.scenes, self.page, widget) {
+            replay::Act::View(next) => {
+                if next == self.view {
+                    return Ok(Action::Stay);
+                }
+                self.view = next;
+                self.page = 0;
+                self.reopen(vfs, dll, Mode::REPLAY)
+            }
+            replay::Act::Back => self.advance(vfs, dll, Mode::CONFIRM),
+            replay::Act::Page(page) => {
+                if page == self.page {
+                    return Ok(Action::Stay);
+                }
+                self.page = page;
+                self.selection = None;
+                self.refresh();
+                Ok(Action::Sound(SystemSe::Click))
+            }
+            replay::Act::Play { script, .. } => Ok(Action::PlayReplay(script)),
+            replay::Act::Ask { scene } => {
+                self.asked = Some(scene);
+                self.advance(vfs, dll, Mode::REPLAY_POPUP)
+            }
+            replay::Act::None => Ok(Action::Stay),
+        }
+    }
+
+    /// The replay popup's dispatch: pick a version and play it.
+    fn confirm_replay_popup(&mut self, widget: usize) -> Action {
+        let Some(scene) = self.asked.and_then(|s| self.session.scenes.get(s)) else {
+            return Action::Stay;
+        };
+        match replay::popup_action(scene, widget) {
+            Some(script) => Action::PlayReplay(script.to_string()),
+            None => Action::Stay,
         }
     }
 
@@ -552,30 +947,20 @@ impl Menu {
         } else {
             Mode::TITLE
         };
-        let variant = if next == Mode::TITLE {
-            self.save.title_variant().to_string()
-        } else {
-            next.default_variant().to_string()
-        };
-        match Menu::open_variant(
-            vfs,
-            dll,
-            next,
-            &variant,
-            self.save,
-            self.resolution,
-            return_to,
-        ) {
-            Ok(opened) => {
-                *self = opened;
-                Ok(Action::Opened(next))
-            }
+        let was = (self.mode, self.variant.clone());
+        match self.enter(vfs, dll, next, return_to) {
+            Ok(()) => Ok(Action::Opened(next)),
             // Two screens lay their rows out with a runtime loop instead of a
             // table, so the atlas search correctly refuses them and they cannot
             // be drawn yet. Staying put is the right answer: an unbuilt screen
             // should leave the player on a working menu, not end the session.
             Err(err) => {
                 log::warn!("cannot open menu mode {}: {err}", next.0);
+                // Put back whatever the failed load replaced. This cannot fail:
+                // it is the screen that was already up a moment ago.
+                if self.enter(vfs, dll, was.0, self.return_to).is_err() {
+                    log::error!("could not return to menu mode {}", was.0 .0);
+                }
                 Ok(Action::Unavailable(next))
             }
         }
@@ -585,6 +970,55 @@ impl Menu {
     pub fn variant(&self) -> &str {
         &self.variant
     }
+}
+
+/// The variant a mode's screen loads with, given where the session has got to.
+///
+/// Only the title picks from save state. The rest pick from the member each
+/// module keeps between visits — the Option tab, the Replay screen, and how
+/// many versions the scene the popup is asking about has — and a mode with
+/// neither keeps the DLL's own default.
+fn variant_for(
+    session: &Session,
+    mode: Mode,
+    tab: options::Tab,
+    view: replay::View,
+    asked: Option<usize>,
+) -> String {
+    match mode {
+        Mode::TITLE => session.save.title_variant().to_string(),
+        Mode::OPTION => tab.variant().to_string(),
+        Mode::REPLAY => view.variant().to_string(),
+        Mode::REPLAY_POPUP => {
+            let choices = asked
+                .and_then(|scene| session.scenes.get(scene))
+                .map_or(0, |scene| scene.choices.len());
+            replay::popup_variant(choices).to_string()
+        }
+        _ => mode.default_variant().to_string(),
+    }
+}
+
+/// Loads the art for one mode.
+#[allow(clippy::too_many_arguments)]
+fn load_screen(
+    vfs: &Vfs,
+    dll: &[u8],
+    mode: Mode,
+    variant: &str,
+    return_to: Mode,
+    tab: options::Tab,
+    session: &Session,
+    resolution: Resolution,
+) -> Result<Screen, Error> {
+    let stem = mode
+        .stem(variant)
+        .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
+    let base = match mode {
+        Mode::OPTION => options::base_art(tab, session.som),
+        _ => base_art(mode, return_to),
+    };
+    Screen::load_with_base(vfs, dll, &stem, base, resolution)
 }
 
 /// One step of keyboard navigation over `count` entries.
@@ -794,6 +1228,83 @@ mod tests {
     fn navigation_gives_up_rather_than_spinning_when_everything_is_locked() {
         assert_eq!(step(5, Some(0), 1, |_| false), None);
         assert_eq!(step(0, None, 1, |_| true), None);
+    }
+
+    /// Each module remembers where it was between visits, so reopening a mode
+    /// has to come back to the tab or page the player left it on.
+    #[test]
+    fn a_screen_reopens_on_the_variant_the_session_left_it_on() {
+        let session = Session::empty(SaveState {
+            cleared_first: true,
+            ..SaveState::default()
+        });
+        let def = options::Tab::DEFAULT;
+        let hscene = replay::View::DEFAULT;
+
+        assert_eq!(
+            variant_for(&session, Mode::TITLE, def, hscene, None),
+            "Title_Clear",
+            "the title is the one that picks from save state"
+        );
+        assert_eq!(
+            variant_for(&session, Mode::OPTION, def, hscene, None),
+            "Def"
+        );
+        assert_eq!(
+            variant_for(&session, Mode::OPTION, options::Tab::SomCon, hscene, None),
+            "SomCon"
+        );
+        assert_eq!(
+            variant_for(&session, Mode::REPLAY, def, hscene, None),
+            "HScene"
+        );
+        assert_eq!(
+            variant_for(&session, Mode::REPLAY, def, replay::View::PlayData, None),
+            "PlayData"
+        );
+        // A mode with no remembered state keeps the DLL's own default.
+        assert_eq!(
+            variant_for(&session, Mode::ROUTEMAP, def, hscene, None),
+            "01"
+        );
+    }
+
+    /// The popup's art follows how many versions the scene it was raised for
+    /// has, which is what `+0xc8` is set from.
+    #[test]
+    fn the_replay_popup_sizes_itself_to_the_scene_that_raised_it() {
+        let two = replay::Scene {
+            flag: "REP04_C1_A00".to_string(),
+            scripts: Vec::new(),
+            choices: (0..2)
+                .map(|k| replay::Choice {
+                    flag: format!("REP04_C1_A00{}", (b'A' + k) as char),
+                    scripts: vec!["04/04-C1-A00".to_string()],
+                })
+                .collect(),
+        };
+        let mut four = two.clone();
+        four.choices.extend(two.choices.clone());
+
+        let session = Session {
+            scenes: Scenes::from_scenes(vec![two, four]),
+            ..Session::empty(SaveState::default())
+        };
+        let def = options::Tab::DEFAULT;
+        let hscene = replay::View::DEFAULT;
+        assert_eq!(
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(0)),
+            "2"
+        );
+        assert_eq!(
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(1)),
+            "4"
+        );
+        // With nothing asked, the module's own zeroed member picks the small one.
+        assert_eq!(
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, None),
+            "2"
+        );
     }
 
     #[test]
