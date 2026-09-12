@@ -82,6 +82,30 @@ it pass as recovered. There are several honest "not recovered" notes in
 is a task. A gap that is filled with a guess is a bug that looks like a
 feature.
 
+### When a claim turns out to be wrong, delete it
+
+Documentation here is inherited as fact. The next session reads a doc comment
+the way it reads the binary, and by the time a claim is found to be wrong the
+word it introduced has already spread into names, tests and `docs/FORMATS.md`.
+So a wrong claim is **replaced and removed**, never annotated. Do not write
+"previously thought to be X", do not keep the old name with a correction beside
+it, and do not let a fixed paragraph sit next to the one it fixes. Change the
+claim, rename everything it leaked into, delete whatever only existed to support
+it, and then grep for the wrong word and confirm none of it survived.
+
+The failure that motivated this: the Option screen's third tab was written up as
+"gamepad configuration", inferred from the DirectInput-shaped calls around it.
+It is SOMCON, a toy on a COM port — the DLL imports no input API at all, its own
+art says `Port number`, and one look at the import table would have said so. By
+then the wrong word was in a module doc, a struct, three field and variant
+names, nine test names and two sections of `docs/FORMATS.md`. Fixing only the
+sentence that was literally false would have left the whole codebase reading as
+though it drove a gamepad.
+
+This does not apply to limitations. "Not recovered" notes, shipped bugs written
+down as such, and the reasons a screen is unimplemented are all findings, and
+they stay. What gets deleted is the claim that is false.
+
 ### Verify against the real install before claiming it works
 
 The headless tools exist for this: `days menu`, `days ui`, `days save`,
@@ -182,7 +206,8 @@ methods that agree is the standard the rules above ask for.
 
 ```text
 src/              the engine as ordinary modules: vfs, media, screen, compose,
-                  stage, mixer, text, menu, ini, save, ending
+                  stage, mixer, text, menu, options, replay, ini, config,
+                  save, ending
 src/main.rs       `daysengine` — the game (SDL3)
 src/bin/days.rs   `days` — offline inspection tools
 
@@ -238,6 +263,10 @@ Read `docs/DEPENDENCIES.md` before adding anything.
 - **No stray files in the repo.** Scratch output goes to a temp directory.
 - Backticks in `git commit -m` get shell-expanded and silently mangle the
   message. Use `git commit -F <file>`.
+- **Never create a branch.** Commit to whatever branch is checked out. This
+  project works on `master` directly and there is no remote to open a pull
+  request against, so a branch is pure friction — it hides finished work behind
+  a merge nobody asked for. Branch only when explicitly told to.
 - Indented code blocks in `//!` module docs become doctests and fail to
   compile. Use ```` ```text ```` fences.
 - **Never go through the user's personal files.** If something is needed that

@@ -195,19 +195,25 @@ Relevant addresses in the retail DLL (imagebase `0x10000000`):
 The engine does **not** embed those offsets. It searches the user's own DLL for
 the table by content: the first four floats of record *i* are the bounding box
 of region *i + 1* in the screen's native `.CMAP`, so taking the boxes from the
-user's `.CMAP` and looking for a run of records that reproduces them at a
-24-byte stride finds the table and validates it at the same time.
+user's `.CMAP` and looking for records that reproduce them at a 24-byte stride
+finds the table and validates it at the same time.
 
-The match is scored rather than all-or-nothing, and anchored on any region
-rather than the first:
+The search takes the longest run of records it can anchor at region 1, carries
+on from wherever that run stops, and repeats — see *A table is not always one
+run* below for why one run is not enough. Within a run:
 
-- A region's bounding box can legitimately differ from its sprite rect —
-  regions that abut have their boxes clipped by the neighbour. The route map's
+- An anchor is an **exact** box match, so a run can never be started by the
+  looser rule that extends it.
+- A run extends while each next record either matches its region's box exactly
+  or sits inside it. A region's box can legitimately differ from its sprite rect
+  — regions that abut have their boxes clipped by the neighbour. The route map's
   episode tabs do this, hence e.g. 11/15 boxes matching a table that is correct.
-- A screen can have untabled widgets ahead of tabled ones in ID order, so the
-  run does not always start at region 1.
-- Below a threshold (3 exact matches and a majority) the search reports failure
-  rather than drawing sprites from a wrong offset.
+- A region no run reproduces is one laid out at runtime. Its record is taken at
+  the stride from the nearest run instead; the save/load screen's slot rows are
+  why that exists.
+- Below a threshold — 3 exact matches, a majority of regions, and an average of
+  at least 3 regions per segment — the search reports failure rather than
+  drawing sprites from a wrong offset.
 
 ### Screens whose layout is not in a table
 
@@ -217,6 +223,29 @@ those rects exist nowhere in the binary. Those two screens need their layout
 reproduced in code. Every other screen recovers: title (all three variants),
 menubar, all three options pages, both backlogs, the exit popup, the replay
 popups, `REPLAY_HSCENE` and all 15 route maps.
+
+### A table is not always one run
+
+`TITLE` and the three `OPTION` screens keep one record per region, in region
+order, back to back. `REPLAY_HSCENE` does not: its nineteen regions are three
+separate stretches of one larger table — headers and back button, then the four
+page buttons eight records later, then the twelve thumbnails eight records after
+that — because the records in between are those widgets' other states.
+
+Insisting on a single run there does not fail cleanly. It lands on a stretch
+that reproduces fifteen of the nineteen boxes, passes the match threshold, and
+draws every sprite from the wrong offset — a table that fits the bytes and is
+wrong. The search is therefore segmented: longest run anchored at region 1,
+continue from where it stops, repeat. Screens whose table really is one run come
+out as one segment. A screen that needed a segment per region would be matching
+individual records anywhere in the DLL, so that is refused.
+
+Segmentation fixes the anchor, not everything. `REPLAY_HSCENE`'s page buttons
+appear in the table three times over with **identical destination rectangles**
+and different source rows — resting, hovered, current page — so geometry alone
+cannot say which row a widget's hover sprite comes from. Only `FUN_1001a460`
+can, and that is per-screen knowledge rather than something the search can
+derive.
 
 A few screens do not name their base art after the stem, because they share one
 chip sheet and hit map across several backgrounds: `Exit/Popup` uses
@@ -310,6 +339,174 @@ entry is stepped over in both directions and never selected. Widget 5 is
 outside that range: it is reached by pointer, or by entering from outside
 `0..=4`. Selection lives at `+0xb0` and starts unset.
 
+### Option — `MENU::ConfigMenu`, mode 4
+
+One class, three sets of art, chosen by `+0x184` (0 `Def`, 1 `Sound`, 2
+`SomCon`) and reloaded by `FUN_100076c0`. `Option_SomCon` swaps its background
+for `Option_SomCon_Set.png` once a serial port is held. Widgets 0, 1 and 2 are the
+tab headers and widget 3 is the close button on all three; widget 3 flushes the
+settings and then tells the host to leave the menus with mode 0, whose meaning
+is **not recovered**.
+
+Dispatch is `FUN_10007e80`, switching to `FUN_10007ef0` / `FUN_10008260` /
+`FUN_100089a0`. Enablement is `FUN_10007ca0`, which delegates the same way; the
+only widget it can disable outright is header 2, hidden in a trial build.
+
+| Tab | Widgets | What they are |
+|---|---|---|
+| Def | 4,5 | aspect: wide / 4:3 |
+| | 6,7 | window mode: window / full screen |
+| | 8,9 | `Skip` on / off |
+| | 10,11 | `SuperSkip` on / off |
+| | 12,13 | `TextView` on / off |
+| Sound | 4,5 | `BgmVolume` − / + |
+| | 6,7 | `SeVolume` − / + |
+| | 8,9 | `VoiceVolume` − / + |
+| | 10,11 | `MenVoice` on / off |
+| | 12,13 | `Mute` on / off |
+| | 14–23 | `BgmVolume` = widget − 13, so 1 to 10 |
+| | 24–33 | `SeVolume` = widget − 23 |
+| | 34–43 | `VoiceVolume` = widget − 33 |
+| SomCon | 4,5 | find a port / let it go |
+| | 6–15 | `Port number` 1 to 10 |
+| | 16,17 | `SOMCON test` start / stop |
+
+The arrows step by one and clamp at 0 and 10 (`FUN_10007140`), so only they
+reach silence — the cells start at 1. The Sound tab's ten cells have **no chip
+sprite**: its record table declares only 14 per-widget sprites, and the level is
+drawn instead as one record stretched to the width `FUN_100070e0` computes,
+from the first cell's left edge to the right edge of the cell at the current
+level.
+
+The Def tab's two display rows do not change anything. Each checks the host
+(`+0xb8` aspect, `+0xbc` full screen) and, if the mode would really change, sets
+a flag at `+0xb0` or `+0xac`. **Who reads those flags is not recovered.** Two
+decompiler sweeps — over `MENU::ConfigMenu`'s neighbourhood and over the
+`MENU::menuBase` it inherits — found writes and no reads, and a raw opcode scan
+cannot tell a read of this member from a load of the host vtable slot at the
+same displacement, so that null result is reported rather than claimed.
+
+The mark showing which value is in force is a per-tab switch — `FUN_10009fd0`,
+`FUN_1000a190`, `FUN_1000a250` — indexing a run of records that begins 27, 51
+and 35 records into each tab's table respectively (`+0x190`). `FUN_1000a190`
+tests `widget == 10` in **both** of its first two arms, so the mark for
+`MenVoice` is stuck on widget 10 and widget 11 never gets one; that is a bug in
+the shipped DLL and the engine reproduces it. The SOMCON tab's selected port is
+reported as the current value but draws no sprite at all.
+
+Keyboard navigation is a hand-written transition table per tab —
+`FUN_10008da0`, `FUN_100092d0`, `FUN_100098a0` — on `+0x50`/`+0x54`/`+0x58`/
+`+0x5c` for up/down/left/right. The Sound tab's never visits the level cells.
+
+See `daysengine::options`.
+
+### SOMCON — `MENU::SomconSet`
+
+SOMCON is the peripheral toy the game can drive, not a gamepad. The tab's own
+art says `Port number` and `SOMCON test`, and the DLL imports no input API of
+any kind — no DirectInput, nothing. What it imports is `CreateFileA`,
+`GetCommState`, `SetCommState`, `GetCommTimeouts`, `SetCommTimeouts`,
+`SetCommMask`, `WaitCommEvent`, `ClearCommError`, `GetOverlappedResult`,
+`ReadFile` and `WriteFile`. The toy is a **serial device** and a "port number"
+is a COM port.
+
+`FUN_10021070` picks from a table of nine ASCII names — `COM1` to `COM9`, eight
+bytes apart in `.rdata` — and opens it:
+
+```text
+CreateFileA(name, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED|FILE_ATTRIBUTE_NORMAL, NULL)
+DCB:            9600 baud, 8 data bits, no parity, 1 stop bit
+COMMTIMEOUTS:   500 / 10 / 500 / 10 / 500
+SetCommMask:    EV_RXCHAR
+```
+
+Then a two-command ASCII protocol, each followed by a read of up to 256 bytes
+of reply:
+
+| Command | Written by | Meaning |
+|---|---|---|
+| `s%02x` | `FUN_100214d0` | set level, hex. The `SOMCON test` sends `0x96`; taking a port sends `0x00`. |
+| `b` | `FUN_100215d0` | stop |
+
+`FUN_10007850` is the search behind the tab's find button: it tries port
+indices 0 to 8 in turn, opening each and sending `s00`, and keeps the first
+that answers.
+
+**Nothing in this engine drives a toy, and nothing is planned to.** The tab is
+a working screen and `UseSOM` is stored with the rest of the settings, but no
+port is opened and no byte is written. The protocol above is proprietary to one
+discontinued device; if this engine ever moves a toy it should do it through
+[Intiface](https://intiface.com/) rather than reimplement this. It is recorded
+here because recovering it is what established that SOMCON is not an input
+device — not because it is a plan.
+
+One mismatch is the DLL's own: the screen has ten `Port number` buttons and the
+port-name table has nine entries. The tenth button selects index 9, and the
+string that follows `COM9` in `.rdata` is the `s%02x` format itself, so the
+shipped build would ask `CreateFileA` to open a file called `s%02x` and fail.
+This engine refuses the tenth button rather than reproducing an out-of-bounds
+read.
+
+### Replay — `MENU::SceneView`, mode 5, and `MENU::SceneCheck`, mode 8
+
+`+0x2b0` chooses `Replay_HScene` (the thumbnail grid) or `Replay_PlayData`.
+On the grid, widgets 0 and 1 are the tab headers, widget 2 is back, widgets 3
+to 6 are the four page buttons and widgets 7 to 18 are twelve thumbnails —
+`page * 12 + widget - 7` is the scene (`FUN_1001de10`). Forty-one scenes over
+forty-eight slots, so the last page is short.
+
+Three `.data` runs carry the table, none of them at an address this engine
+knows; they are found by content:
+
+- a run of 41 pointers to UTF-16 **save-flag names** like `REP02_2S_W03`. A
+  thumbnail is live exactly when that flag is set: the DLL asks the host's
+  `+0x18`, which is `FUN_00428770`, a lookup in `Save/GlobalFlag.DAT` by name.
+- a run of 41 pointers to per-scene **script lists** like `02/02-2S-W03`. Three
+  of them — scenes 11, 22 and 30 — point into zero-filled `.data` and carry
+  nothing, because those scenes ask a question first.
+- a run of 8 pointers to **version flags**, each a scene's own flag plus a
+  trailing letter (`REP03_KB_N00A`…`D`), and a matching run of 8 script lists.
+
+A scene's flag implies its script path: `REPnn_XX_Ymm` is `nn/nn-XX-Ymm`. That
+rule holds for all forty-one and agrees with all thirty-eight table entries that
+exist, and it is used to *place* the script window, because the scene run and
+the version run are adjacent in `.data` and read as one.
+
+Clicking a thumbnail hands the scene's **first** script to the host (`+0xa4`).
+The rest of a list are the steps after it, fetched by `FUN_1001f0d0`, which
+walks a per-scene branch table (`FUN_1001ee20`, tables from `DAT_1004bc58`
+onwards) by a choice the player makes during playback. **Chained replay
+playback is not implemented**; nothing about those branch tables beyond their
+existence is recovered.
+
+Scenes 11, 22 and 30 raise `Pop_Replay` instead (`FUN_10001830`, which sets
+`+0xc8` and `+0xc4` on the popup singleton). `+0xc8` picks `Pop_Replay_2` or
+`Pop_Replay_4` — two or four versions. A version is pickable only once its own
+flag is set (`FUN_100195d0`), and picking one sets the step index to zero and
+plays element zero of its list (`FUN_1001f270`) — which is the **same script in
+every version**, so the choice cannot change what starts. It selects a branch
+for later.
+
+The thumbnails themselves come from `System/Replay/Replay_Thm%02d.png`, one
+sheet per page, page number plus one (`FUN_1001b3f0`). A second record table
+holds the twelve slot rectangles **twice over** — the first twelve are what a
+selected slot draws, the last twelve what every live slot draws — and that
+doubled shape is what tells it apart from the chip sheet's run, which
+reproduces the same twelve boxes once and then carries on.
+
+The grid's keyboard transition table is `FUN_1001e3a0`. It is decompiled but
+**not transcribed**: one arm guards the horizontal move on `c % 4 != 0` over
+widgets 8 to 17, which blocks the second column rather than the last, and
+widgets 7 and 18 fall through every arm. Until that reads consistently the grid
+gets a plain walk over its widgets rather than a table that looks recovered and
+is not.
+
+`Replay_PlayData` is not implemented: its rows are laid out by a runtime loop,
+so the atlas search correctly refuses the screen.
+
+See `daysengine::replay`.
+
 ### What is not recovered
 
 The seven system sounds `FILMENGINE.INI` names — `SeCancel`, `SeSelect`,
@@ -321,10 +518,14 @@ switch dispatching on the index was found, so which index names which sound is
 still open. `daysengine::menu::SystemSe` therefore carries the game's names and
 INI keys, and the engine picks the bindings itself.
 
-The three questions the title asks the host — all-clear (`+0xe8`), trial build
-(`+0x34`), and route *n* cleared (`+0xec`) — are answered out of
-`Save/GlobalFlag.DAT`; see that section below for which flag answers which, and
-`daysengine::menu::SaveState::from_flags`.
+Of the three questions the title asks the host, only one is answered out of
+`Save/GlobalFlag.DAT`. Route *n* cleared (`+0xec`, `FUN_0042baf0`) reads the
+`EndClear` flag together with object `+0x21c`. All-clear (`+0xe8`) and trial
+build (`+0x34`) are **plain members**, `+0x7a4` and `+0x7a8`, that the only
+constructor anything calls zeroes and nothing else writes — so both are always
+false in the retail build, and `Title_AC` is unreachable. See the Title section
+above and `daysengine::menu::SaveState::from_flags`, where the reasoning is kept
+next to the code that depends on it.
 
 ---
 
@@ -419,8 +620,61 @@ The ones that matter:
 - `FEELINGSCRIPT.INI` / `STANDERDSCRIPT.INI` — per-script affection deltas,
   keyed by script name, feeding the route logic.
 
-`Config.DAT` uses a `DFLT` + zlib container (magic `DFLT` followed by a raw
-zlib stream). The save files do **not** — see below.
+### `Config.DAT` — the player's settings
+
+Next to the executable, and a `DFLT` + zlib container: magic `DFLT` followed by
+a raw zlib stream. The save files do **not** use it. Inflated it is an ordinary
+engine INI with a banner line:
+
+```text
+< Config.dat >
+[Format]="22"
+[WindowWidth]="800"
+[MasterVolume]="-1.000000"
+[BgmVolume]="5"
+[TextView]="-1"
+```
+
+The `Config` class in the executable writes every scalar with `%d` or `%f`
+(`FUN_0046cd30` and its neighbours, reached from `FUN_0046c520`, the one
+function that references the banner). The values it is handed are Windows
+`VARIANT`s, so **a true bool is written as `-1`** and a bool read back is true
+when the stored integer is non-zero — a reader that accepted only `1` could
+never read what this writer produces. `Config`'s own getters are **not
+recovered**; that rule comes from the writer.
+
+The shipped writer appends rather than rewriting in place, so a key can appear
+twice with the live value second, and two lines in the retail file are missing
+their opening bracket (`MenVoice]="1"`). Dropping malformed lines and taking
+the last occurrence leaves each key exactly once.
+
+The ten settings the Option screen loads, with the defaults it passes the
+getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):
+
+| Key | Type | Default | Set by |
+|---|---|---|---|
+| `VoiceVolume` | int `0..=10` | 5 | Sound tab |
+| `BgmVolume` | int `0..=10` | 5 | Sound tab |
+| `SeVolume` | int `0..=10` | 5 | Sound tab |
+| `TextView` | bool | true | Def tab |
+| `MenVoice` | bool | true | Sound tab |
+| `Mute` | bool | false | Sound tab |
+| `Skip` | bool | false | Def tab |
+| `AutoDraw` | bool | true | *(no widget recovered)* |
+| `SuperSkip` | bool | false | Def tab |
+| `UseSOM` | bool | false | SOMCON tab |
+
+`MasterVolume` is a float the same write-back stores; the shipped value is
+`-1.0`. A channel's volume reaches the sound layer as
+`(11 - level) * MasterVolume` (`FUN_10006fd0`), which is an attenuation in
+decibels — level 10 is -1 dB and level 0 is -11 dB — so louder is a *smaller*
+number. Index 3 of that function is a fixed level of 2, used when muted.
+
+`Format`, `WindowWidth`, `WindowHeight`, `DisplayType`, `TypeMiniNote`,
+`WindowMode`, `UseAgate` and `Wheel` are written back untouched by the Option
+screen, which asks the host about the display rather than reading them here.
+
+See `daysengine::config`.
 
 ---
 

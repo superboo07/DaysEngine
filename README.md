@@ -38,9 +38,11 @@ Early. What works today:
 | `FONTDATA.DAT` glyph store | **Decoded** — all 22,420 glyphs render |
 | Video / audio decode | **Done** — matches ffmpeg's own output |
 | Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
-| UI rendering — title, menubar, options, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
-| UI rendering — save/load, replay grid | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover; choosing them leaves the menu where it was |
-| UI input handling / screen state machine | **Works** — the title screen is live: pointer and keyboard, the game's own widget-to-mode table, the confirm popup, and the mode graph out of `SystemInit` |
+| UI rendering — title, menubar, options, replay grid, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
+| UI rendering — save/load, replay play-data list | Not started — their slot rows are laid out by a loop at runtime, so there is no table to recover; choosing them leaves the menu where it was |
+| UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
+| Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
+| Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
 | Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
@@ -108,6 +110,8 @@ days script 00-00-A00                # parse one script's timeline
 days render 00-00-A00 --at 00:39:00 -o /tmp/frames
 days ui System/Title/Title -r full --active 1 -o /tmp/title.png
 days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
+days config                          # the player's settings, as the Option screen reads them
+days replay                          # the replay scene table, and what the save has unlocked
 ```
 
 `days ui` composites a UI screen without a display, the way `days render` does
@@ -115,9 +119,9 @@ for playback, so the UI can be checked as an image diff on a machine with no
 GPU. `--table` prints the widget-to-sprite table recovered from the DLL instead
 of drawing.
 
-`days menu` replays a script of menu events — `down`, `up`, `enter`, `esc`,
-`at:X:Y`, `click:X:Y` — against the real screens and reports where each one
-lands. Every decision the menus make happens there, so the state machine is
+`days menu` replays a script of menu events — `down`, `up`, `left`, `right`,
+`enter`, `esc`, `at:X:Y`, `click:X:Y` — against the real screens and reports
+where each one lands. Every decision the menus make happens there, so the state machine is
 testable on a machine with no GPU even though the SDL player draws through one.
 
 ## Layout
