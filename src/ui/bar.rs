@@ -552,6 +552,27 @@ impl Bar {
         &self.screen
     }
 
+    /// Reloads the strip's art at a new display size, keeping the drop-down and
+    /// the latch where they are.
+    ///
+    /// The Option screen is one of the menus the bar itself opens, so the
+    /// display mode can change underneath a bar that is already on screen.
+    /// `FUN_10013470` picks the art set from the mode, and this screen is no
+    /// exception to it. A size the packs have no art for leaves the strip as it
+    /// was rather than losing the bar mid-script.
+    pub fn set_resolution(
+        &mut self,
+        vfs: &crate::install::vfs::Vfs,
+        dll: &[u8],
+        resolution: Resolution,
+    ) -> Result<(), Error> {
+        if self.screen.resolution == resolution {
+            return Ok(());
+        }
+        self.screen = Screen::load(vfs, dll, PATH, resolution)?;
+        Ok(())
+    }
+
     /// The strip's size in display pixels — an 800x75 band at the top of the
     /// screen, scaled like any other UI art.
     pub fn strip(&self) -> (u32, u32) {

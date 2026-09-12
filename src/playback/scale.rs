@@ -4,11 +4,16 @@
 //!
 //! Everything else in this engine is a recovered behaviour. This is not: it is
 //! a deliberate, documented departure. The original hands its surfaces to
-//! Direct3D and takes whatever the driver's bilinear filter gives, which at
-//! 800x450 stretched onto a modern panel is a soft, slightly aliased picture
-//! that varies with the driver. There is nothing to recover here that would be
-//! worth reproducing, and reproducing a driver's filter faithfully is not
-//! possible anyway.
+//! Direct3D and takes whatever the driver's bilinear filter gives —
+//! `FUN_0044a3d0` sets `D3DSAMP_MAGFILTER` and `D3DSAMP_MINFILTER` to
+//! `D3DTEXF_LINEAR` on all eight sampler stages, with `D3DSAMP_ADDRESSU`/`V`
+//! clamped — which at 800x450 stretched onto a modern panel is a soft, slightly
+//! aliased picture that varies with the driver. There is nothing to recover
+//! here that would be worth reproducing, and reproducing a driver's filter
+//! faithfully is not possible anyway.
+//!
+//! What is recovered is that the picture is *filtered*, and that its edges are
+//! clamped. This module is both of those; only the kernel is ours.
 //!
 //! So this module scales with a **cubic B-spline** instead. Nothing about the
 //! game's timing, layout or art depends on the filter, so the choice changes
@@ -51,7 +56,8 @@
 
 /// One output pixel's taps along one axis.
 struct Taps {
-    /// Index of the first source pixel this output pixel reads.
+    /// Index of the first source pixel this output pixel reads. The whole run
+    /// `start .. start + weights.len()` is inside the source.
     start: usize,
     /// Weights, summing to 1.
     weights: Vec<f32>,
@@ -124,10 +130,12 @@ fn axis(src: usize, dst: usize) -> Vec<Taps> {
                     *w /= total;
                 }
             }
-            Taps {
-                start: start.max(0) as usize,
-                weights,
-            }
+            // The folding above already pulls the footprint inside the
+            // image except in the degenerate one-tap case. Bringing it into
+            // range here means the passes can index the row directly instead
+            // of clamping on every tap.
+            let start = start.clamp(0, (src as i64 - weights.len() as i64).max(0)) as usize;
+            Taps { start, weights }
         })
         .collect()
 }
@@ -178,43 +186,54 @@ impl Scaler {
         self.fit(src, dst);
 
         // Horizontal, into the scratch as f32 so the vertical pass does not
-        // round twice.
-        for y in 0..src.1 {
-            let row = y * src.0 * 4;
-            let out_row = y * dst.0 * 4;
-            for (x, taps) in self.horizontal.iter().enumerate() {
+        // round twice. One output pixel gathers a short run of the source row,
+        // so the row is sliced once and the taps read it in order.
+        for (in_row, out_row) in rgba[..src.0 * src.1 * 4]
+            .chunks_exact(src.0 * 4)
+            .zip(self.scratch.chunks_exact_mut(dst.0 * 4))
+        {
+            for (out, taps) in out_row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&self.horizontal)
+            {
                 let mut acc = [0.0f32; 4];
-                for (i, w) in taps.weights.iter().enumerate() {
-                    let sx = (taps.start + i).min(src.0 - 1);
-                    let px = row + sx * 4;
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += f32::from(rgba[px + c]) * w;
+                let run = &in_row[taps.start * 4..(taps.start + taps.weights.len()) * 4];
+                for (px, w) in run.as_chunks::<4>().0.iter().zip(&taps.weights) {
+                    for (a, s) in acc.iter_mut().zip(px) {
+                        *a += f32::from(*s) * w;
                     }
                 }
-                let at = out_row + x * 4;
-                self.scratch[at..at + 4].copy_from_slice(&acc);
+                out.copy_from_slice(&acc);
             }
         }
 
-        // Vertical, straight out to bytes.
-        let mut out = vec![0u8; dst.0 * dst.1 * 4];
-        for (y, taps) in self.vertical.iter().enumerate() {
-            let out_row = y * dst.0 * 4;
-            for x in 0..dst.0 {
-                let mut acc = [0.0f32; 4];
-                for (i, w) in taps.weights.iter().enumerate() {
-                    let sy = (taps.start + i).min(src.1 - 1);
-                    let at = (sy * dst.0 + x) * 4;
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += self.scratch[at + c] * w;
-                    }
+        // Vertical, straight out to bytes. This one accumulates a whole
+        // output row per tap rather than a pixel at a time: the taps of one
+        // output row are whole scratch rows, so each is a single pass in order
+        // rather than a walk down a column.
+        let stride = dst.0 * 4;
+        let mut out = vec![0u8; stride * dst.1];
+        let mut acc = vec![0.0f32; stride];
+        for (taps, out_row) in self.vertical.iter().zip(out.chunks_exact_mut(stride)) {
+            acc.fill(0.0);
+            let run =
+                &self.scratch[taps.start * stride..(taps.start + taps.weights.len()) * stride];
+            for (row, w) in run.chunks_exact(stride).zip(&taps.weights) {
+                let w = *w;
+                for (a, s) in acc.iter_mut().zip(row) {
+                    *a += *s * w;
                 }
-                let at = out_row + x * 4;
-                for (c, a) in acc.iter().enumerate() {
-                    // The kernel is non-negative so this cannot overshoot, but
-                    // rounding still has to land inside the byte range.
-                    out[at + c] = a.round().clamp(0.0, 255.0) as u8;
-                }
+            }
+            for (o, a) in out_row.iter_mut().zip(&acc) {
+                // Rounded by adding a half rather than by `f32::round`, which
+                // is a libm call on a baseline x86-64 target — once per byte,
+                // it cost more than the filter did. Every value here is
+                // non-negative, so adding a half and truncating is the same
+                // number, and the cast to `u8` saturates, which is the range
+                // clamp the kernel is too well behaved to need.
+                *o = (a + 0.5) as u8;
             }
         }
         Some(out)

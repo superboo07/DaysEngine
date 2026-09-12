@@ -1124,6 +1124,7 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     // litters whatever the caller happened to be standing in, and the summary
     // above is the useful part when you are just checking that a screen loads.
     if let Some(path) = &args.out {
+        let backdrop = backdrop.as_ref().map(|b| screen.to_display(b));
         let image = screen.compose_over(backdrop.as_ref(), &states);
         write_png(path, &image.rgba, image.width, image.height)?;
         println!("wrote {}", path.display());
@@ -1976,6 +1977,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             },
             None => None,
         };
+        let backdrop = backdrop.as_ref().map(|b| menu.screen().to_display(b));
         let image = menu.compose(backdrop.as_ref());
         write_png(out, &image.rgba, image.width, image.height)?;
         println!("wrote {}", out.display());

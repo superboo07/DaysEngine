@@ -1,10 +1,12 @@
-//! A plain RGBA image, PNG decode, and the two operations screens need:
-//! nearest-neighbour scaling and an alpha blit.
+//! A plain RGBA image, PNG decode, and the three blits screens compose with: an
+//! alpha blit, a nearest-neighbour stretch and an averaging downscale.
 //!
-//! Deliberately small. The UI never needs filtering — every scale factor the
-//! game uses (1.0, 1.28, 1.6) is applied to art authored at 800x450, and the
-//! original scales it on the GPU with point sampling — and pulling in an
-//! imaging crate for a blit and a stretch would not pay for itself.
+//! Deliberately small, and deliberately not a filter library. Scaling art from
+//! the native 800x450 layout up to a display size is filtered work — the
+//! original sets `D3DTEXF_LINEAR` on every sampler stage in `FUN_0044a3d0` —
+//! and the engine does it with the resampler in `daysengine::playback::scale`,
+//! which is where a filter belongs. What is left here is placement: putting a
+//! rectangle of one image onto another with the right alpha.
 
 use crate::Error;
 
@@ -66,7 +68,8 @@ impl Image {
         })
     }
 
-    fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+    /// One pixel, or `None` outside the image.
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
         if x >= self.width || y >= self.height {
             return None;
         }
@@ -77,13 +80,12 @@ impl Image {
     /// Alpha-blends a rectangle of `src` onto `self`, averaging over the source
     /// area instead of point sampling it.
     ///
-    /// [`Image::blit_scaled`] is right for the art, which the original scales on
-    /// the GPU with point sampling and never by much. It is wrong for text that
-    /// was rasterised at twice its final size: taking one source pixel in four
-    /// turns a glyph stroke into a row of specks. This averages the source cell
-    /// each destination pixel covers, weighting colour by alpha so a
-    /// half-covered edge does not drag the glyph's colour towards its
-    /// transparent surroundings.
+    /// [`Image::blit_scaled`] takes one source pixel per destination pixel,
+    /// which is wrong for text that was rasterised at twice its final size:
+    /// taking one source pixel in four turns a glyph stroke into a row of
+    /// specks. This averages the source cell each destination pixel covers,
+    /// weighting colour by alpha so a half-covered edge does not drag the
+    /// glyph's colour towards its transparent surroundings.
     pub fn blit_downscaled(
         &mut self,
         src: &Image,
@@ -156,6 +158,10 @@ impl Image {
     /// `src_rect` is `(x, y, width, height)` in `src`; `dst` is the destination
     /// rectangle in `self`. Both are clipped rather than checked, so a screen
     /// with a widget hanging off the edge draws what fits.
+    ///
+    /// The stretch is nearest-neighbour, so callers that are changing an
+    /// image's size resample it first and hand this one a rectangle it can copy
+    /// across — see `daysengine::ui::screen`.
     pub fn blit_scaled(
         &mut self,
         src: &Image,

@@ -798,7 +798,8 @@ impl Menu {
         self.dirty
     }
 
-    /// Composites the current frame over an optional backdrop and marks it clean.
+    /// Composites the current frame over an optional backdrop and marks it
+    /// clean. The backdrop is in display space; see [`Screen::compose_over`].
     pub fn compose(&mut self, backdrop: Option<&days_ui::Image>) -> days_ui::Image {
         self.dirty = false;
         let sprites = self.sprites();
@@ -807,7 +808,7 @@ impl Menu {
             .compose_over_sprites(backdrop, &self.states, &sprites);
         // The save/load rows are not widget sprites: their source is twice the
         // size of their destination, so they are blitted with the averaging
-        // downscale rather than the point-sampled one the art uses.
+        // downscale.
         if let Some(rows) = &self.rows {
             for quad in &rows.quads {
                 out.blit_downscaled(&rows.surface, quad.src, self.screen.place_layout(quad.dst));

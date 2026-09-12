@@ -230,6 +230,30 @@ which gives 75px for 4:3 `TITLE` and 0 for the 800x75 `MENUBAR` strip with no
 special case for either. This also settles the playback geometry: stills are
 800x450, movies are 800x452 (encoder rounding), and 4:3 letterboxes both.
 
+### The art is filtered on the way up, not point-sampled
+
+The maps come in four sizes but the art does not: there is one `NAME.PNG` and
+one `NAME_CHIP.PNG` per screen, authored at 800x450, and a 1024x576 or 1280x720
+screen is that art scaled by 1.28 or 1.6. `FUN_0044a3d0` is what the engine does
+about that. It is the render-state init, and for each of the eight sampler
+stages it calls `SetSamplerState` (`IDirect3DDevice9` vtable `+0x114`) with:
+
+| `D3DSAMPLERSTATETYPE` | value |
+|---|---|
+| `D3DSAMP_ADDRESSU` (1) | `D3DTADDRESS_CLAMP` (3) |
+| `D3DSAMP_ADDRESSV` (2) | `D3DTADDRESS_CLAMP` (3) |
+| `D3DSAMP_ADDRESSW` (3) | `D3DTADDRESS_CLAMP` (3) |
+| `D3DSAMP_MAGFILTER` (5) | `D3DTEXF_LINEAR` (2) |
+| `D3DSAMP_MINFILTER` (6) | `D3DTEXF_LINEAR` (2) |
+
+So every sprite the menus draw is bilinear-filtered by the GPU on its way to the
+screen, with the texture edge clamped rather than wrapped. Scaling the art by
+taking the nearest source pixel instead is not what the game looks like: at 1.6x
+it duplicates every other row and column, which steps the diagonals and hardens
+the text. This engine resamples the art with `daysengine::playback::scale`
+instead — a cubic B-spline rather than the driver's bilinear, and its edge clamp
+is the `ADDRESSU`/`V` above.
+
 ---
 
 ## `_CHIP` sprite sheets — the widget table in `SysMenuSDHQ.dll`

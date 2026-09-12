@@ -32,7 +32,7 @@ use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
 use sdl3::mouse::MouseButton;
 use sdl3::pixels::{Color, PixelFormat};
-use sdl3::render::{BlendMode, Canvas, FRect, Texture, TextureCreator};
+use sdl3::render::{BlendMode, Canvas, FRect, ScaleMode, Texture, TextureCreator};
 use sdl3::video::{Window, WindowContext};
 use sdl3::EventPump;
 use std::collections::HashMap;
@@ -601,6 +601,11 @@ fn run_menu(
     };
 
     let backdrop = load_title_backdrop(player, start);
+    // Resampled into the screen's space once rather than on every composite:
+    // it covers the whole frame, and a hover that relights one label would
+    // otherwise pay for scaling all of it again. Rebuilt when the display mode
+    // changes, which is the only thing that changes the size it goes into.
+    let mut under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
 
     play_menu_bgm(player, start.get("TitleBGM"));
 
@@ -718,6 +723,7 @@ fn run_menu(
                     // showing has to be reloaded at the new size.
                     menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
                     menu.session_mut().display = player.display;
+                    under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
                     texture = None;
                 }
                 Action::Sound(se) => {
@@ -822,10 +828,11 @@ fn run_menu(
         if menu.dirty() || texture.is_none() || at != size {
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
-            let under = (menu.mode() == Mode::TITLE)
-                .then_some(backdrop.as_ref())
-                .flatten();
-            let image = menu.compose(under);
+            let image = menu.compose(
+                (menu.mode() == Mode::TITLE)
+                    .then_some(under.as_ref())
+                    .flatten(),
+            );
             let src = (image.width as usize, image.height as usize);
             let want = (at.0 as usize, at.1 as usize);
             let (w, h, rgba) = match scaler.resample(&image.rgba, src, want) {
@@ -833,11 +840,7 @@ fn run_menu(
                 None => (image.width, image.height, image.rgba),
             };
             size = at;
-            let mut new = creator.create_texture_streaming(
-                PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                w,
-                h,
-            )?;
+            let mut new = new_texture(creator, w, h)?;
             new.update(None, &rgba, w as usize * 4)?;
             texture = Some(new);
         }
@@ -999,11 +1002,7 @@ fn comment_loop(
             );
             image.blit_scaled(&over, (0, 0, w, h), (at.0, at.1, w, h));
             size = (image.width, image.height);
-            let mut new = creator.create_texture_streaming(
-                PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                image.width,
-                image.height,
-            )?;
+            let mut new = new_texture(creator, image.width, image.height)?;
             new.update(None, &image.rgba, image.width as usize * 4)?;
             texture = Some(new);
             dirty = false;
@@ -1122,6 +1121,39 @@ fn apply_display(
     Ok(())
 }
 
+/// Where the control bar's strip lands in the window.
+///
+/// `strip` is the strip's size in the art set the display mode chose — 800x75
+/// windowed, 1280x120 full screen — and it is the full width of the picture in
+/// every one of them. So it scales by its own width. Scaling it by the stage's
+/// instead, as though the two shared a ladder, drew the bar 1.6x oversized off
+/// the right of a full-screen window and put every widget's hit box there too.
+fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
+    let scale = dst.w / strip.0.max(1) as f32;
+    FRect::new(dst.x, dst.y, dst.w, strip.1 as f32 * scale)
+}
+
+/// Creates a streaming RGBA texture, filtered the way the original filters.
+///
+/// `FUN_0044a3d0` sets `D3DSAMP_MAGFILTER` and `D3DSAMP_MINFILTER` to
+/// `D3DTEXF_LINEAR` on all eight sampler stages, so everything the engine draws
+/// is filtered on its way onto the screen. Saying so here rather than leaving
+/// it to SDL's default is the difference between a recovered choice and an
+/// inherited one.
+fn new_texture<'a>(
+    creator: &'a TextureCreator<WindowContext>,
+    width: u32,
+    height: u32,
+) -> Result<Texture<'a>> {
+    let mut texture = creator.create_texture_streaming(
+        PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+        width,
+        height,
+    )?;
+    texture.set_scale_mode(ScaleMode::Linear);
+    Ok(texture)
+}
+
 /// The rectangle a `width` x `height` image is drawn into, centred and scaled
 /// to fit the window without distorting it.
 fn letterbox(canvas: &Canvas<Window>, width: u32, height: u32) -> FRect {
@@ -1160,13 +1192,8 @@ fn run_script(
 ) -> Result<Outcome> {
     player.mixer.stop_all();
 
-    let mut movie_texture = creator
-        .create_texture_streaming(
-            PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-            STAGE_WIDTH,
-            STAGE_HEIGHT,
-        )
-        .context("creating movie texture")?;
+    let mut movie_texture =
+        new_texture(creator, STAGE_WIDTH, STAGE_HEIGHT).context("creating movie texture")?;
     let mut still_texture: Option<(String, (u32, u32), Texture)> = None;
     // The movie frame resampled to the window, and the weights that did it.
     let mut movie_scaled: Option<(u32, u32, Texture)> = None;
@@ -1323,12 +1350,14 @@ fn run_script(
         bar_state.rate = rate;
         if let Some(control) = &mut control {
             let (bw, bh) = control.strip();
-            let strip = FRect::new(dst.x, dst.y, bw as f32 * scale, bh as f32 * scale);
+            let strip = bar_strip(dst, (bw, bh));
+            // The strip's own space, which is where its hit map is indexed.
+            let bar_scale = strip.w / bw as f32;
             // Whether the pointer is inside the strip's own rectangle at all is
             // the question the bar's visibility turns on, so it is asked here
             // and not derived from whether a widget was hit.
-            let sx = (pointer.0 - strip.x) / scale;
-            let sy = (pointer.1 - strip.y) / scale;
+            let sx = (pointer.0 - strip.x) / bar_scale;
+            let sy = (pointer.1 - strip.y) / bar_scale;
             let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
                 .then_some((sx as u32, sy as u32));
             let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
@@ -1447,6 +1476,16 @@ fn run_script(
                             )?;
                             origin = Instant::now();
                             player.mixer.set_rate(bar_state.rate);
+                            // The Option screen can change the display mode,
+                            // and the bar's own art set follows it.
+                            if let Err(err) =
+                                control.set_resolution(player.vfs, &player.dll, player.resolution())
+                            {
+                                log::warn!(
+                                    "no control bar art at {}: {err}",
+                                    player.resolution().name()
+                                );
+                            }
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
                             bar_texture = None;
@@ -1555,11 +1594,7 @@ fn run_script(
                         .as_ref()
                         .is_none_or(|(w, h, _)| (*w, *h) != window_px)
                     {
-                        let texture = creator.create_texture_streaming(
-                            PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                            window_px.0,
-                            window_px.1,
-                        )?;
+                        let texture = new_texture(creator, window_px.0, window_px.1)?;
                         movie_scaled = Some((window_px.0, window_px.1, texture));
                     }
                     if let Some((w, _, texture)) = &mut movie_scaled {
@@ -1596,11 +1631,7 @@ fn run_script(
                     Some(scaled) => (window_px.0, window_px.1, scaled),
                     None => (still.width, still.height, still.rgba.clone()),
                 };
-                let mut texture = creator.create_texture_streaming(
-                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                    w,
-                    h,
-                )?;
+                let mut texture = new_texture(creator, w, h)?;
                 texture.update(None, &rgba, w as usize * 4)?;
                 still_texture = Some((still.path.clone(), window_px, texture));
             }
@@ -1618,11 +1649,7 @@ fn run_script(
                 .as_ref()
                 .is_none_or(|(w, h, _)| (*w, *h) != (mouth.width, mouth.height));
             if stale {
-                let mut texture = creator.create_texture_streaming(
-                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                    mouth.width as u32,
-                    mouth.height as u32,
-                )?;
+                let mut texture = new_texture(creator, mouth.width as u32, mouth.height as u32)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 mouth_texture = Some((mouth.width, mouth.height, texture));
             }
@@ -1667,11 +1694,8 @@ fn run_script(
                 let mut drawn = Vec::new();
                 for one in &lines {
                     let image = text::render_line(player.font, one, [255, 255, 255], english);
-                    let mut texture = creator.create_texture_streaming(
-                        PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                        image.width as u32,
-                        image.height as u32,
-                    )?;
+                    let mut texture =
+                        new_texture(creator, image.width as u32, image.height as u32)?;
                     texture.set_blend_mode(BlendMode::Blend);
                     texture.update(None, &image.rgba, image.width * 4)?;
                     drawn.push(texture);
@@ -1719,11 +1743,8 @@ fn run_script(
                             [255, 255, 255]
                         };
                         let image = text::render_line(player.font, label, colour, english);
-                        let mut texture = creator.create_texture_streaming(
-                            PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                            image.width as u32,
-                            image.height as u32,
-                        )?;
+                        let mut texture =
+                            new_texture(creator, image.width as u32, image.height as u32)?;
                         texture.set_blend_mode(BlendMode::Blend);
                         texture.update(None, &image.rgba, image.width * 4)?;
                         let text_scale = scale * 0.5;
@@ -1760,11 +1781,7 @@ fn run_script(
                 .is_none_or(|(cached, ..)| cached != &records);
             if stale {
                 let image = control.compose(&control.states(hovered, bar_state, elapsed));
-                let mut texture = creator.create_texture_streaming(
-                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-                    image.width,
-                    image.height,
-                )?;
+                let mut texture = new_texture(creator, image.width, image.height)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 texture.update(None, &image.rgba, image.width as usize * 4)?;
                 bar_texture = Some((records, image.width, image.height, texture));
@@ -1776,11 +1793,7 @@ fn run_script(
                 // one ARGB set on every sprite the bar owns.
                 texture.set_alpha_mod(control.fade().alpha());
                 canvas
-                    .copy(
-                        &*texture,
-                        None,
-                        FRect::new(dst.x, dst.y, *w as f32 * scale, *h as f32 * scale),
-                    )
+                    .copy(&*texture, None, bar_strip(dst, (*w, *h)))
                     .map_err(|e| anyhow::anyhow!("drawing the control bar: {e}"))?;
             }
         }
@@ -1843,4 +1856,35 @@ fn discover_game_dir() -> Result<PathBuf> {
         }
     }
     bail!("no School Days HQ install found; put this next to the game or pass --game <dir>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The control bar covers the picture's full width and the same fraction of
+    /// its height whichever art set is loaded, because every set is the same
+    /// 800x75 layout scaled. Getting this from the stage's scale instead —
+    /// 1280 wide art multiplied by a window-over-452 factor — is what drew the
+    /// full-screen bar off the side of the window.
+    #[test]
+    fn the_bar_covers_the_picture_whichever_art_set_is_loaded() {
+        let dst = FRect::new(0.0, -2.0, 1920.0, 1084.0);
+        let windowed = bar_strip(dst, (800, 75));
+        let full = bar_strip(dst, (1280, 120));
+        assert_eq!(windowed.w, dst.w);
+        assert_eq!(full.w, dst.w);
+        assert_eq!(windowed.h, full.h);
+        assert!((full.h - dst.w * 75.0 / 800.0).abs() < 0.01, "{full:?}");
+        assert_eq!((windowed.x, windowed.y), (dst.x, dst.y));
+    }
+
+    /// A screen whose hit map failed to load leaves the strip zero-sized, and
+    /// that must not divide by zero on the way to a rectangle.
+    #[test]
+    fn a_zero_sized_strip_still_gives_a_rectangle() {
+        let dst = bar_strip(FRect::new(4.0, 8.0, 100.0, 50.0), (0, 10));
+        assert_eq!(dst.w, 100.0);
+        assert!(dst.h.is_finite(), "{dst:?}");
+    }
 }
