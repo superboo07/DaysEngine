@@ -392,7 +392,25 @@ match the original pixel for pixel.
 
 ## Configuration
 
-`Ini.GPK` holds eight files. The ones that matter:
+`Ini.GPK` holds eight files, and nothing in the install says which is which:
+the master list is compiled into `SCHOOLDAYS HQ.exe` as a block of INI text of
+exactly the same shape, naming every file the engine reads.
+
+```text
+[Directory]="Packs\"                   [ConfigFile]="/Config.DAT"
+[FileExtend]=".GPK"                    [FILMEngine]="Ini/FILMEngine.ini"
+[DXGraphicBase]="Ini/DX9Graphic.ini"   [StartScript]="Ini/StartScript.ini"
+[DXSoundBase]="Ini/DX8Sound.ini"       [DebugInfo]="Ini/DebugInfo.ini"
+[EndingList]="Ini/EndList.ini"         [Dummy]="Ini/Dummy.ini"
+```
+
+Those names are spelled in mixed case and the packs store them upper-cased, so
+every lookup has to be case-insensitive; `Ini/EndList.ini` is `ENDLIST.INI`.
+
+Seven of the eight are plain ASCII. `STARTSCRIPT.INI` is the odd one out, UTF-8
+with a BOM, so an INI reader has to sniff rather than assume.
+
+The ones that matter:
 
 - `STARTSCRIPT.INI` — entry point (`00/00-00-A00`), title/system BGM, logo.
 - `FILMENGINE.INI` — save paths, system SFX, font, select graphics, fade timings.
@@ -484,19 +502,21 @@ once the number of endings seen reaches `[EndingMax]`.
 
 ### Which endings have been seen, and the title backdrop
 
-**Recovered but not yet implemented.** The picture *behind* the title is not
-fixed: it is the title card of the most recent ending, and a special one once
-every ending is seen. `FUN_0041fee0` is the chooser and picks, in order:
+The picture *behind* the title is not fixed. `Title.png` is transparent around
+the logo, and what goes underneath is the title card of the most recent ending
+the player reached — or a card of its own once every ending is seen.
+`FUN_0041fee0` is the chooser and picks, in order:
 
 1. `AllClear` set — `ENDLIST.INI [AllClear]`, `END-ALL-complete.png`.
-2. `EndClear` clear — `STARTSCRIPT.INI [BaseFile]`, `TitleBase.png`. This is
-   the fresh-install picture, and the only one this engine draws today.
+2. `EndClear` clear — `STARTSCRIPT.INI [BaseFile]`, `TitleBase.png`, the
+   fresh-install picture.
 3. every ending seen — `[AllClear]` again, *and* the flag is set on the way
    past, which is how `AllClear` comes to be stored in the first place.
 4. otherwise — ending number `EndNo`'s own card.
 
-`ENDLIST.INI` supplies the cards, read by `FUN_0041fc40` through the
-`[EndingList]="` key in `FILMENGINE.INI`:
+`FUN_0041fc40` loads the list from the file `[EndingList]=` names — a key that
+is in no shipped INI, only in the master block inside the executable (see
+[Configuration](#configuration)), where it reads `Ini/EndList.ini`:
 
 ```text
 [EndingMax]="22"
@@ -516,8 +536,17 @@ lists them. So `EndNo` is an **index**, not a tally: `EndNo = 20` means the most
 recent ending was slot 20, i.e. `[Ending21]`.
 
 Two of the 22 cards are `.wmv`, not `.png` (`Ending16` and `Ending21`), so the
-title backdrop can be a movie. `STARTSCRIPT.INI [EndBGView]="1"` is the likely
-switch for that and is **not** recovered.
+title backdrop can be a movie. This engine draws their **first frame**. Whether
+the original animates them is **not recovered**: `STARTSCRIPT.INI
+[EndBGView]="1"` is the only plausible switch and nothing was found reading it.
+
+Branch 3 is the one that writes, and this engine does not write save data yet,
+so it recomputes the answer on every launch instead. The picture is the same
+either way; the player's file is left alone.
+
+`days save` reports the whole chain, and `days menu` reports the backdrop
+alongside the widget table, which is how the two halves of "which title" get
+checked together.
 
 **Trial is not recovered.** The retail executable holds no trial string and no
 reachable trial branch, so there is nothing to read; a trial build would be a

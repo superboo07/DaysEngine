@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
+use daysengine::ending;
 use daysengine::media::AudioBuffer;
 use daysengine::menu::{Action, Menu, Mode, SaveState, SystemSe};
 use daysengine::save::FlagStore;
@@ -302,6 +303,26 @@ fn start_script(start: &Ini) -> String {
 /// The menu is a still image that only changes when the selection does, so this
 /// recomposites on demand rather than per frame: a frame is a 800x450 software
 /// composite and there is nothing animating between clicks.
+/// Loads the picture that goes behind the title.
+///
+/// This belongs to the engine, not to the menu module: `Title.png` is
+/// transparent around the logo and the engine picks what goes under it from
+/// save state — see [`daysengine::ending`]. A card that will not load costs the
+/// player the picture and nothing else, as any missing asset does.
+fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
+    let list = ending::load_list(player.vfs);
+    let base = start.get("BaseFile").unwrap_or_default();
+    let chosen = ending::title_backdrop(&list, &player.flags, base);
+    log::info!("title backdrop {} ({:?})", chosen.path, chosen.reason);
+    match ending::load_image(player.vfs, &chosen.path) {
+        Ok(image) => Some(image),
+        Err(err) => {
+            log::warn!("loading title backdrop {}: {err}", chosen.path);
+            None
+        }
+    }
+}
+
 fn run_menu(
     player: &mut Player,
     canvas: &mut Canvas<Window>,
@@ -313,23 +334,7 @@ fn run_menu(
     let mut menu = Menu::open(player.vfs, &player.dll, Mode::TITLE, save, MENU_RESOLUTION)
         .context("opening the title screen")?;
 
-    // The picture behind the title belongs to the engine, not the menu module:
-    // Title.png is transparent around the logo and STARTSCRIPT.INI names what
-    // goes under it.
-    let backdrop = start.get("BaseFile").and_then(|path| {
-        match player
-            .vfs
-            .read_path(path)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Ok(days_ui::Image::decode_png(&bytes)?))
-        {
-            Ok(image) => Some(image),
-            Err(err) => {
-                log::warn!("loading title background {path}: {err}");
-                None
-            }
-        }
-    });
+    let backdrop = load_title_backdrop(player, start);
 
     play_menu_bgm(player, start.get("TitleBGM"));
 

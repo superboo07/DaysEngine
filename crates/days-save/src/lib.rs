@@ -191,6 +191,18 @@ impl FlagStore {
         Ok(Self { entries })
     }
 
+    /// Builds a store from entries already in hand.
+    ///
+    /// The file is a `std::map`, so a store is fully described by its entries;
+    /// this is the constructor for one that did not come off disk — a caller
+    /// synthesising save state, or a test that wants a particular save without
+    /// hand-assembling the encoding.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
+
     /// Looks a value up by its plain (deciphered) name.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.entries.get(name)

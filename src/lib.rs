@@ -12,6 +12,7 @@
 #![deny(unsafe_code)]
 
 pub mod compose;
+pub mod ending;
 pub mod ini;
 #[allow(unsafe_code)]
 pub mod media;
@@ -24,6 +25,7 @@ pub mod text;
 pub mod vfs;
 
 pub use days_save::FlagStore;
+pub use ending::{title_backdrop, Backdrop, EndingList};
 pub use ini::Ini;
 pub use menu::{Action, Menu, Mode, SaveState, SystemSe};
 pub use mixer::Mixer;

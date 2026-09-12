@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use days_gpk::{Archive, Key};
+use daysengine::ending;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -178,7 +179,8 @@ struct MenuArgs {
     /// Force REPLAY unlocked, which is greyed out on a fresh save.
     #[arg(long)]
     replay: bool,
-    /// Image to draw behind the title, normally STARTSCRIPT.INI [BaseFile].
+    /// Image to draw behind the title, overriding the one the save chooses.
+    /// A `.wmv` ending card is accepted and shows its first frame.
     #[arg(long)]
     backdrop: Option<String>,
     /// PNG to write the final frame to.
@@ -874,6 +876,25 @@ fn load_flags(game: &Path, vfs: &daysengine::vfs::Vfs) -> daysengine::save::Flag
     daysengine::save::load_flags(game, &film)
 }
 
+/// The backdrop the title screen would be drawn over.
+///
+/// Shared by `menu` and `save`, and the reason `[BaseFile]` is read here rather
+/// than passed in: the fresh-install picture is one of the four answers.
+fn chosen_backdrop(
+    vfs: &daysengine::vfs::Vfs,
+    list: &ending::EndingList,
+    flags: &daysengine::save::FlagStore,
+) -> ending::Backdrop {
+    let start = match vfs.read_path("Ini/STARTSCRIPT.INI") {
+        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
+        Err(err) => {
+            log::warn!("reading Ini/STARTSCRIPT.INI: {err}");
+            daysengine::Ini::parse("")
+        }
+    };
+    ending::title_backdrop(list, flags, start.get("BaseFile").unwrap_or_default())
+}
+
 /// Prints what the save data says the player has unlocked.
 fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
     use daysengine::save::Value;
@@ -892,12 +913,12 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
         Some(n) => println!("  EndNo             most recent ending is #{n}"),
         None => println!("  EndNo             (not set)"),
     }
-    let seen = (0..)
-        .map(|n| format!("[End{n:02}]=\""))
-        .take_while(|name| flags.get(name).is_some())
-        .filter(|name| flags.flag(name))
-        .count();
-    println!("  [EndNN] flags     {seen} endings seen");
+    let list = ending::load_list(&vfs);
+    println!(
+        "  [EndNN] flags     {} of {} endings seen",
+        list.seen(&flags),
+        list.max()
+    );
     println!();
     println!(
         "so the title screen shows {}, REPLAY {}",
@@ -908,6 +929,11 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
             "locked"
         }
     );
+    let chosen = chosen_backdrop(&vfs, &list, &flags);
+    println!("and draws it over {} ({:?})", chosen.path, chosen.reason);
+    if chosen.sets_all_clear {
+        println!("  (the original would store the AllClear flag here)");
+    }
 
     if all || grep.is_some() {
         println!();
@@ -928,7 +954,6 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
-    use days_ui::Image;
     use daysengine::menu::{Action, Menu, Mode, SaveState};
     use daysengine::screen::Resolution;
 
@@ -938,11 +963,14 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
     // The player's real save decides this; the flags below only force things
     // on, so a fresh install can still be driven through every screen.
-    let mut save = if args.fresh {
-        SaveState::default()
+    // A forced-fresh run reads an empty store, so the backdrop below follows
+    // the same pretence the widget tables do.
+    let flags = if args.fresh {
+        daysengine::save::FlagStore::default()
     } else {
-        SaveState::from_flags(&load_flags(game, &vfs))
+        load_flags(game, &vfs)
     };
+    let mut save = SaveState::from_flags(&flags);
     save.all_clear |= args.all_clear;
     save.cleared_first |= args.cleared;
     save.cleared_replay |= args.replay;
@@ -988,6 +1016,10 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         menu.variant(),
         menu.screen().widget_count()
     );
+    // The title's backdrop comes from the same save data, so report it here:
+    // the widget table and the picture are the two halves of "which title".
+    let chosen = chosen_backdrop(&vfs, &ending::load_list(&vfs), &flags);
+    println!("backdrop {} ({:?})", chosen.path, chosen.reason);
 
     for event in args
         .events
@@ -1045,8 +1077,21 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     }
 
     if let Some(out) = &args.out {
-        let backdrop = match &args.backdrop {
-            Some(path) => Some(Image::decode_png(&vfs.read_path(path)?)?),
+        // With no override, draw what the save says: the same choice the
+        // engine makes, so the PNG shows the title the player would see.
+        let under = match &args.backdrop {
+            Some(path) => Some(path.as_str()),
+            None if menu.mode() == Mode::TITLE => Some(chosen.path.as_str()),
+            None => None,
+        };
+        let backdrop = match under {
+            Some(path) => match ending::load_image(&vfs, path) {
+                Ok(image) => Some(image),
+                Err(err) => {
+                    log::warn!("loading backdrop {path}: {err}");
+                    None
+                }
+            },
             None => None,
         };
         let image = menu.compose(backdrop.as_ref());
