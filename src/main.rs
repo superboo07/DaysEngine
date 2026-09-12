@@ -18,6 +18,7 @@ use daysengine::install::save::FlagStore;
 use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
 use daysengine::ui::bar::{self, Bar};
+use daysengine::ui::comment;
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
 use daysengine::ui::options::{Dir, Display, Som};
@@ -160,6 +161,9 @@ struct Player<'a> {
     game: PathBuf,
     /// `FILMENGINE.INI`, which names the choice box's hit maps among much else.
     film: &'a Ini,
+    /// SDL's text input, which is what carries an IME into the save-comment
+    /// dialog. Off except while that dialog is up.
+    text_input: sdl3::keyboard::TextInputUtil,
 }
 
 fn main() -> Result<()> {
@@ -239,6 +243,9 @@ fn main() -> Result<()> {
 
     let mut player = Player {
         game: game.clone(),
+        // Started only while the save-comment dialog is up, so ordinary key
+        // presses stay key presses everywhere else.
+        text_input: video.text_input(),
         vfs: &vfs,
         font: &font,
         mixer: &mixer,
@@ -329,7 +336,7 @@ fn main() -> Result<()> {
                 // There is nothing to save from the title -- the player has no
                 // position -- so this only happens from playback, where the
                 // save is taken before the menus open.
-                Outcome::SaveSlot(slot) => {
+                Outcome::SaveSlot(slot, _) => {
                     log::info!("slot {slot} cannot be written from the title");
                     continue;
                 }
@@ -393,8 +400,8 @@ enum Outcome {
     Replay(String),
     /// Load a save slot and play what it names.
     LoadSlot(u32),
-    /// Write the player's position to a save slot.
-    SaveSlot(u32),
+    /// Write the player's position to a save slot, under this comment.
+    SaveSlot(u32, String),
     /// Close the game.
     Quit,
 }
@@ -519,6 +526,9 @@ fn run_menu(
     play_menu_bgm(player, start.get("TitleBGM"));
 
     let mut texture: Option<Texture> = None;
+    // The slot the player picked on the save screen, waiting for the
+    // comment dialog to confirm or abandon it.
+    let mut naming: Option<u32> = None;
     let mut size = (0, 0);
     loop {
         for event in events.poll_iter() {
@@ -578,7 +588,12 @@ fn run_menu(
                 Action::Play => return Ok(Outcome::Play),
                 Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
                 Action::Load(slot) => return Ok(Outcome::LoadSlot(slot)),
-                Action::Save(slot) => return Ok(Outcome::SaveSlot(slot)),
+                // Naming the save is what confirms it. The original hands this
+                // to Windows; `run_comment` draws the same dialog out of the
+                // executable's own template. Cancelling calls nothing, so no
+                // save happens -- which is what `FUN_0042e4a0` does by simply
+                // not reaching `_CommentSet@4`.
+                Action::Save(slot) => naming = Some(slot),
                 Action::Quit => return Ok(Outcome::Quit),
                 // Each change is already in the settings; this is where the
                 // engine picks the new volumes up.
@@ -637,6 +652,21 @@ fn run_menu(
             }
         }
 
+        // Outside the event loop: the dialog runs its own, and the borrow of
+        // the pump has to have ended first.
+        if let Some(slot) = naming.take() {
+            let existing = menu
+                .session()
+                .slots
+                .get(slot)
+                .map(|line| line.comment.clone())
+                .unwrap_or_default();
+            match run_comment(player, canvas, creator, events, &mut menu, &existing)? {
+                Some(comment) => return Ok(Outcome::SaveSlot(slot, comment)),
+                None => texture = None,
+            }
+        }
+
         if menu.dirty() || texture.is_none() {
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
@@ -664,6 +694,195 @@ fn run_menu(
         canvas.present();
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
+}
+
+/// Runs the save-comment dialog over the menu.
+///
+/// Returns the comment when the player accepts and `None` when they cancel —
+/// and cancelling means no save at all, because in the original the dialog's OK
+/// is what sets the member the save screen's next tick acts on.
+///
+/// Text arrives through SDL's text input rather than through key codes, which
+/// is what carries an IME: the original is a Windows edit control and the
+/// player is expected to type Japanese into it.
+fn run_comment(
+    player: &mut Player,
+    canvas: &mut Canvas<Window>,
+    creator: &TextureCreator<WindowContext>,
+    events: &mut EventPump,
+    menu: &mut Menu,
+    existing: &str,
+) -> Result<Option<String>> {
+    let english = player.film.get_bool("UseEnglish").unwrap_or(false);
+    let exe = match std::fs::read(player.game.join("SCHOOLDAYS HQ.exe")) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::warn!("cannot read the executable for the comment dialog: {err}");
+            return Ok(Some(existing.to_owned()));
+        }
+    };
+    let mut dialog = match comment::Comment::open(&exe, english, existing) {
+        Ok(dialog) => dialog,
+        Err(err) => {
+            log::warn!("the comment dialog is unavailable: {err}");
+            return Ok(Some(existing.to_owned()));
+        }
+    };
+    let base = comment::base_units(english);
+
+    player.text_input.start(canvas.window());
+    let result = comment_loop(player, canvas, creator, events, menu, &mut dialog, base);
+    player.text_input.stop(canvas.window());
+    result
+}
+
+fn comment_loop(
+    player: &mut Player,
+    canvas: &mut Canvas<Window>,
+    creator: &TextureCreator<WindowContext>,
+    events: &mut EventPump,
+    menu: &mut Menu,
+    dialog: &mut comment::Comment,
+    base: (i32, i32),
+) -> Result<Option<String>> {
+    let mut texture: Option<Texture> = None;
+    let mut size = (0u32, 0u32);
+    let mut dirty = true;
+
+    loop {
+        // Collected first: the handlers below need the pump again for the
+        // modifier state, and cannot hold its iterator while they do.
+        let pending: Vec<Event> = events.poll_iter().collect();
+        for event in pending {
+            let act = match event {
+                Event::Quit { .. } => return Ok(None),
+                Event::TextInput { text, .. } => {
+                    dialog.insert(&text);
+                    dirty = true;
+                    comment::Act::None
+                }
+                Event::TextEditing { text, .. } => {
+                    dialog.compose(&text);
+                    dirty = true;
+                    comment::Act::None
+                }
+                Event::KeyDown {
+                    keycode: Some(key),
+                    keymod,
+                    ..
+                } => {
+                    dirty = true;
+                    match key {
+                        Keycode::Return | Keycode::KpEnter => dialog.enter(),
+                        Keycode::Escape => dialog.escape(),
+                        Keycode::Backspace => {
+                            dialog.backspace();
+                            comment::Act::None
+                        }
+                        Keycode::Delete => {
+                            dialog.delete();
+                            comment::Act::None
+                        }
+                        Keycode::Left => {
+                            dialog.left();
+                            comment::Act::None
+                        }
+                        Keycode::Right => {
+                            dialog.right();
+                            comment::Act::None
+                        }
+                        Keycode::Home => {
+                            dialog.home();
+                            comment::Act::None
+                        }
+                        Keycode::End => {
+                            dialog.end();
+                            comment::Act::None
+                        }
+                        Keycode::Tab => {
+                            dialog.tab(keymod.intersects(
+                                sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                            ));
+                            comment::Act::None
+                        }
+                        _ => comment::Act::None,
+                    }
+                }
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    dirty = true;
+                    match to_dialog(canvas, size, dialog, base, x, y) {
+                        Some(at) => dialog.click(at, base),
+                        None => comment::Act::None,
+                    }
+                }
+                _ => comment::Act::None,
+            };
+            match act {
+                comment::Act::Accept(text) => return Ok(Some(text)),
+                comment::Act::Cancel => return Ok(None),
+                comment::Act::None => {}
+            }
+        }
+
+        if dirty || texture.is_none() {
+            let mut image = menu.compose(None);
+            let over = dialog.compose_image(player.font, base);
+            // `WM_INITDIALOG` centres the dialog on the game window, so this
+            // does too.
+            let (w, h) = (over.width, over.height);
+            let at = (
+                (image.width as i64 - w as i64) / 2,
+                (image.height as i64 - h as i64) / 2,
+            );
+            image.blit_scaled(&over, (0, 0, w, h), (at.0, at.1, w, h));
+            size = (image.width, image.height);
+            let mut new = creator.create_texture_streaming(
+                PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                image.width,
+                image.height,
+            )?;
+            new.update(None, &image.rgba, image.width as usize * 4)?;
+            texture = Some(new);
+            dirty = false;
+        }
+
+        canvas.set_draw_color(Color::BLACK);
+        canvas.clear();
+        if let Some(texture) = &texture {
+            canvas
+                .copy(texture, None, letterbox(canvas, size.0, size.1))
+                .map_err(|e| anyhow::anyhow!("drawing the comment dialog: {e}"))?;
+        }
+        canvas.present();
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+}
+
+/// Maps a window pixel to the dialog's own space, or `None` outside it.
+fn to_dialog(
+    canvas: &Canvas<Window>,
+    size: (u32, u32),
+    dialog: &comment::Comment,
+    base: (i32, i32),
+    x: f32,
+    y: f32,
+) -> Option<(i32, i32)> {
+    if size.0 == 0 || size.1 == 0 {
+        return None;
+    }
+    let dst = letterbox(canvas, size.0, size.1);
+    let sx = (x - dst.x) / dst.w * size.0 as f32;
+    let sy = (y - dst.y) / dst.h * size.1 as f32;
+    let (w, h) = dialog.size(base);
+    let ox = (size.0 as f32 - w as f32) / 2.0;
+    let oy = (size.1 as f32 - h as f32) / 2.0;
+    let (dx, dy) = (sx - ox, sy - oy);
+    (dx >= 0.0 && dy >= 0.0 && dx < w as f32 && dy < h as f32).then_some((dx as i32, dy as i32))
 }
 
 /// Activates the menu's selection, playing the confirm sound when it takes.
@@ -981,10 +1200,16 @@ fn run_script(
                             still_texture = None;
                             text_texture = None;
                             match outcome {
-                                Outcome::SaveSlot(slot) => {
+                                Outcome::SaveSlot(slot, comment) => {
                                     if let Some(p) = progress.as_deref_mut() {
                                         let game = player.game.clone();
-                                        match p.save_to(&game, player.film, slot, english, None) {
+                                        match p.save_to(
+                                            &game,
+                                            player.film,
+                                            slot,
+                                            english,
+                                            Some(&comment),
+                                        ) {
                                             // The global store now holds the
                                             // slot's display line, so the
                                             // menus have to see it.

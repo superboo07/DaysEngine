@@ -10,6 +10,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod dialog;
 pub mod feeling;
 pub mod ini;
 pub mod progress;

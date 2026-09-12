@@ -149,6 +149,22 @@ enum Cmd {
         #[arg(long)]
         unlocked: bool,
     },
+    /// Print a dialog template out of the user's own executable.
+    ///
+    /// The save-comment box is a Win32 dialog from the executable's resources,
+    /// not something the menu DLL draws. This reads the template the engine
+    /// lays out from.
+    Dialog {
+        /// Resource id, default the comment dialog for the install's language.
+        #[arg(long)]
+        id: Option<String>,
+        /// Draw the dialog the way the engine does, to a PNG.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Text to show in the edit field.
+        #[arg(long, default_value = "")]
+        text: String,
+    },
     /// Print the branch graph recovered from the user's RouteProcSDHQ.dll.
     ///
     /// The 55 routes and their script-name tables, and the two affection
@@ -409,6 +425,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Config => cmd_config(&game)?,
+        Cmd::Dialog { id, out, text } => cmd_dialog(&game, id.as_deref(), out.as_deref(), &text)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
         Cmd::Route {
             name,
@@ -1840,6 +1857,63 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             None => None,
         };
         let image = menu.compose(backdrop.as_ref());
+        write_png(out, &image.rgba, image.width, image.height)?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
+}
+
+/// Prints a dialog template out of the player's executable.
+fn cmd_dialog(game: &Path, id: Option<&str>, out: Option<&Path>, text: &str) -> Result<()> {
+    use daysengine::install::dialog::{comment_dialog, Class, Template};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let english = film_ini(&vfs).get_bool("UseEnglish").unwrap_or(false);
+    let id = match id {
+        Some(text) => {
+            let text = text.trim_start_matches("0x");
+            u16::from_str_radix(text, 16).context("--id takes a hexadecimal resource id")?
+        }
+        None => comment_dialog(english),
+    };
+
+    let t = Template::from_game(game, id)?;
+    println!("dialog {:#04x}  {:?}", t.id, t.title);
+    println!(
+        "  {} x {} dialog units{}",
+        t.rect.cx,
+        t.rect.cy,
+        match &t.font {
+            Some((points, face)) => format!(", {points}pt {face}"),
+            None => String::new(),
+        }
+    );
+    for item in &t.items {
+        let class = match &item.class {
+            Class::Named(n) => n.clone(),
+            other => format!("{other:?}"),
+        };
+        println!(
+            "  id {:#06x}  {class:<9} ({:>3},{:>3}) {:>3}x{:<3}  style {:08x}  {:?}",
+            item.id, item.rect.x, item.rect.y, item.rect.cx, item.rect.cy, item.style, item.text
+        );
+    }
+
+    if let Some(out) = out {
+        use daysengine::ui::comment::{base_units, Comment};
+        let exe = std::fs::read(game.join("SCHOOLDAYS HQ.exe"))?;
+        let bytes = vfs
+            .read_path("System/System/FONTDATA_ENG.DAT")
+            .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?;
+        let font = days_font::Font::parse(bytes)?;
+        let mut dialog = Comment::open_id(&exe, t.id, english, text)?;
+        dialog.end();
+        let base = base_units(english);
+        let image = dialog.compose_image(&font, base);
+        println!(
+            "  drawn at {}x{} pixels, base units {:?}",
+            image.width, image.height, base
+        );
         write_png(out, &image.rgba, image.width, image.height)?;
         println!("wrote {}", out.display());
     }

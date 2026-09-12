@@ -121,6 +121,20 @@ pub fn advance(c: char, english: bool) -> i32 {
     pitch(english) + kerning(c, english)
 }
 
+/// The advance the **menus** use, from `FUN_10011dc0` in the menu DLL.
+///
+/// The same kerning table as the dialogue's, over a different pitch: `0x18`
+/// rather than [`pitch`], and a flat `0x2d` for anything outside ASCII whatever
+/// the language. With `[UseEnglish]` clear the function returns `0x18` for
+/// every ASCII character and never reaches the kerning arms at all, which is
+/// the same thing as a zero kerning — so this is one rule, not two.
+pub fn menu_advance(c: char, english: bool) -> i32 {
+    if u32::from(c) >= 0x80 {
+        return 0x2d;
+    }
+    0x18 + kerning(c, english)
+}
+
 /// A laid-out line's width in layout units, from `FUN_0044c740`.
 ///
 /// The twelve is the function's own: it records `local_14 + 0xc` as the line's
@@ -349,6 +363,19 @@ pub struct TextImage {
 /// advances, because the original advances on the character rather than on the
 /// glyph — it never looks the glyph up to decide spacing.
 pub fn render_line(font: &Font, text: &str, colour: [u8; 3], english: bool) -> TextImage {
+    render_line_with(font, text, colour, &|c| advance(c, english))
+}
+
+/// Renders one line with a caller-chosen advance rule.
+///
+/// The menus space text differently from the dialogue box — see
+/// [`menu_advance`] — and the rasterising is otherwise the same.
+pub fn render_line_with(
+    font: &Font,
+    text: &str,
+    colour: [u8; 3],
+    advance: &dyn Fn(char) -> i32,
+) -> TextImage {
     let mut glyphs: Vec<(usize, days_font::Glyph)> = Vec::new();
     let mut pen = 0i32;
 
@@ -362,7 +389,7 @@ pub fn render_line(font: &Font, text: &str, colour: [u8; 3], english: bool) -> T
             }
             Err(err) => log::warn!("glyph for {c:?} failed to decode: {err}"),
         }
-        pen += advance(c, english);
+        pen += advance(c);
     }
 
     // Leave room for the last glyph's full cell, since the outline extends past

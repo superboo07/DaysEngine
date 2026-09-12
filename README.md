@@ -39,7 +39,7 @@ Early. What works today:
 | Video / audio decode | **Done** — matches ffmpeg's own output |
 | Playback / windowing | **Plays a scene** — video, audio, timeline, dialogue |
 | UI rendering — title, menubar, options, replay grid, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
-| UI rendering — save/load | **Works** — the game's own LOAD/SAVE screen, its ten rows, ten page buttons and route-map button, from the player's art; picking a row loads or writes that slot. Its chip table needed the atlas matcher to believe a long exact run rather than a majority of regions, because ten of its rows are one sprite behind two hit regions each. **Where a row's text sits is not recovered** — the DLL renders the three columns into an off-screen surface and blits it — so the rows draw empty; `days menu` prints the lines |
+| UI rendering — save/load | **Works** — the game's own LOAD/SAVE screen, its ten rows, ten page buttons and route-map button, from the player's art; picking a row loads or writes that slot. Its chip table needed the atlas matcher to believe a long exact run rather than a majority of regions, because ten of its rows are one sprite behind two hit regions each. Naming a save works: the original opens a Win32 dialog from the executable's own resources, and this draws that template — caption, prompt, button captions and every rectangle out of the player's exe — with SDL text input behind it so an IME works. **Where a row's text sits is not recovered** — the DLL renders the three columns into an off-screen surface and blits it — so the rows draw empty; `days menu` prints the lines |
 | UI rendering — replay play-data list | Not started — choosing it leaves the menu where it was |
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
@@ -140,6 +140,7 @@ days config                          # the player's settings, as the Option scre
 days replay                          # the replay scene table, and what the save has unlocked
 days save --slot 0                   # decode a save slot: position, story points, choices
 days save --roundtrip                # read every save file, write it back, compare bytes
+days dialog -o /tmp/dlg.png          # the save-comment dialog, from the exe's own template
 days bar --pointer 400,40 -o /tmp/bar.png   # the control bar, widget by widget
 days render 00-00-A00 --at 00:39:00 --bar -o /tmp/frames   # ...over a real frame
 days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test

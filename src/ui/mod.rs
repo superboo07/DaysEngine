@@ -13,6 +13,7 @@
 //! beyond its hit maps.
 
 pub mod bar;
+pub mod comment;
 pub mod ending;
 pub mod menu;
 pub mod options;

@@ -1390,6 +1390,51 @@ consecutive, which is enough to anchor the table and fill the rest in at its
 stride — `days_ui::atlas` now believes a long exact run whatever proportion of
 the screen it covers.
 
+### Naming a save — a Win32 dialog, not game art
+
+The save screen does not draw the box that asks for a comment. It hands the
+current text to host `+0xdc`, which stores it and posts `WM_USER` to the game
+window; the window procedure's `0x400` case opens a **modal dialog from the
+executable's own resources**:
+
+```text
+host +0xdc  ->  SendMessageA(hwnd, WM_USER, 0, 0)
+wnd proc    ->  DialogBoxParamA(hinst, 0x73 | 0x77, hwnd, FUN_0042e4a0, 0)
+                  0x73 Japanese, 0x77 English -- chosen by host +0x5c
+```
+
+Both are `DIALOGEX` templates, 280 x 62 dialog units, `MS Shell Dlg` 8pt, with
+four controls: a prompt (`0x410`), an edit field (`0x40c`), `OK` (`1`) and
+`Cancel` (`2`). The English one is captioned `Enter comment` and prompts
+`Insert comments (120 characters or less)`; the Japanese one is
+`コメント入力` and `コメント入力（６０文字以内）`.
+
+`FUN_0042e4a0` is the procedure, and it is short:
+
+- **`WM_INITDIALOG`** centres the dialog on the game window, or on the screen
+  when the game is full screen.
+- **OK** reads at most `0x79` bytes from the edit field, widens them and calls
+  `_CommentSet@4`, which stores the text on the save screen's module and sets
+  its `+0x98`.
+- **Cancel** ends the dialog and calls nothing.
+
+That `+0x98` is the same member the confirm popup sets, and the save screen's
+next tick is what writes the slot: `if (kind != Load && +0x98) { save the
+chosen row; +0x98 = 0 }`. **So the dialog is the confirmation, not a decoration
+on a save already decided — cancelling means no save happens at all.**
+
+The two prompts disagree about the limit only because the buffer is 120
+**bytes** and `GetWindowTextA` is the ANSI call: 120 ASCII characters, or 60
+Shift-JIS ones.
+
+DaysEngine cannot open a Win32 dialog, so it draws one — but the caption, the
+prompt, the button captions and every rectangle are read out of the player's
+own executable by `install::dialog`, and the dialog units are converted by
+Windows' own rule, `x * base_x / 4` and `y * base_y / 8`, against the base
+units of the font being drawn with. Only the colours are ours: the original
+took the player's Windows theme, so there is nothing there to recover. Typing
+goes through SDL's text input, which is what carries an IME.
+
 Not recovered: **where a row's text sits**. `FUN_10011ec0` renders the three
 columns into an off-screen surface — the object at `+0x110`, its pixels at
 `+0x114`, its pitch at `+0x118` — putting the timestamp at
