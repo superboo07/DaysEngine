@@ -800,6 +800,12 @@ fn run_script(
                             }
                             paused = !paused;
                         }
+                        // Host `+0x8c` sets a member and the bar redraws from
+                        // it, which is what happens here. **It does not yet
+                        // make playback faster**: the clock is wall-clock and
+                        // the decoders run at their own rate, so scaling only
+                        // the timeline would run it ahead of the audio. The
+                        // rate is carried, the fast-forward is not implemented.
                         bar::Act::Speed(index) => bar_state.speed = index,
                         bar::Act::Seek(code) if code == bar::Seek::RESTART => {
                             offset = Frame::ZERO;
