@@ -124,12 +124,25 @@ pub fn advance(english: bool) -> u32 {
 /// of these and hand it to `FUN_0044ca10`, which treats it as **x** in the
 /// sideways layout and as **y** in the stacked one, pinning x at `533.4` there.
 ///
-/// The numbers are recovered; the transform that turns them into pixels is
-/// **not**. `FUN_0044ca10` ends by pushing each line through a divide by
-/// `_PTR_004d6708` and a scale from `_DAT_004d6710`, which is the engine's text
-/// pipeline rather than the choice box's own layout, and nothing here depends on
-/// having chased it: the boxes' real extents are in the shipped `.CMAP`s, which
-/// is what [`Select::bounds`] reports.
+/// `FUN_0044ca10` ends by setting each line's **source** rectangle — sprite slot
+/// `+0x1c`, where in the shared text texture the label was drawn. The
+/// **destination** is `FUN_0044ced0`, slot `+0xc`:
+///
+/// ```text
+/// x = block->0x18[n] * scale + block->0x10
+/// y = n * 48.0 * scale + 568.0 * scale + base
+/// w = scale * (533.4, or 1066.8 in the stacked layout)
+/// h = scale * 48.0
+/// ```
+///
+/// with `base` centring the block vertically on the anchor —
+/// `anchor - lines * 48.0 * scale / 2.0` in the stacked English case — and
+/// `scale` the same 0.75/0.96/1.2 ladder [`crate::playback::text::Geometry`]
+/// carries.
+///
+/// **This engine does not place labels by that formula yet.** It centres each
+/// one in the box the shipped `.CMAP` gives, which is exact data and lines up
+/// with the hit testing, but it is not the original's arithmetic.
 pub const ANCHOR_ONE: f64 = 533.4;
 pub const ANCHOR_TWO: [f64; 2] = [266.7, 800.0];
 pub const ANCHOR_ONE_STACKED: f64 = -268.0;

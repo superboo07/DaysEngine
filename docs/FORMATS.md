@@ -813,9 +813,19 @@ path word-wraps**, breaking at a space when the next word would pass the limit,
 so a single over-long word is never broken. Each label's anchor is the object's
 scale times one of `533.4` (one choice), `266.7`/`800.0` (two) or, stacked,
 `-268.0` and `-418.7`/`-118.0`; the anchor is x in the sideways layout and y in
-the stacked one. **The transform from anchor to pixels is not recovered** — it
-runs through the engine's text pipeline (`_PTR_004d6708`, `_DAT_004d6710`) —
-and nothing depends on it, because the boxes' real extents are the shipped maps.
+the stacked one. `FUN_0044ca10`'s tail sets each line's **source** rectangle,
+where in the shared text texture it was drawn; the **destination** is
+`FUN_0044ced0`:
+
+    x = block->0x18[n] * scale + block->0x10
+    y = n * 48.0 * scale + 568.0 * scale + base
+    w = scale * (533.4, or 1066.8 stacked)
+    h = scale * 48.0
+
+with `base` centring the block on its anchor — `anchor - lines * 48 * scale / 2`
+in the stacked English case. `daysengine::ui::select` records that formula but
+does not use it yet: it centres each label in the box the shipped `.CMAP` gives,
+which is exact data and agrees with the hit testing.
 
 See `daysengine::ui::select`, and `days select` to print the map and metrics a
 resolution really gets.
@@ -874,10 +884,58 @@ tests:
 | everything else | 0 |
 
 The `A`..`Z` gate comes *after* `i`, `j`, `l`, `m` and `w`, so every other
-lowercase letter, every digit and all punctuation get nothing. `daysengine`'s
-`playback::text` carries the table and the wrap; the transform from these units
-to screen pixels is **not recovered**, so where the block sits is this engine's
-choice while the pitch between lines and between characters is the game's.
+lowercase letter, every digit and all punctuation get nothing. ### Dialogue placement — centred, bottom-anchored, and behind one setting
+
+`FUN_0044bf30` is the text layer's draw, and it places each line
+
+    x = (this->0x1dc - width * this->0x1e4) / 2.0 - 0.5
+    y = this->0x1e0 - (this->0x1e8 + 40.0) * this->0x1e4 + this->0x1ec
+    w = this->0x1e4 * width
+    h = this->0x1e4 * 42.0
+
+counting **down** from the last line and lifting by `39.0 * scale` each step, so
+the block grows upwards from the bottom. The divisor in the x is
+`_DAT_004d13c0` = **2.0**, which is what makes it a horizontal centring — each
+line on its own width, not the block on the widest.
+
+Unless `FUN_0044e2e0` answers non-zero, in which case the loop keeps the running
+**minimum** of those x values and gives every line the last one, so the block
+shares the widest line's left edge. That function returns `engine+0x98`, which
+is the member `FILMENGINE.INI`'s `[LeftArrangement]` is read into — shipped as
+`0`, so the retail build centres per line.
+
+`FUN_0044bc90` sets the screen size and scale together:
+
+| mode | `0x1dc` x `0x1e0` | scale `0x1e4` |
+|---|---|---|
+| full screen, `FUN_0040f0d0() == 0` | 1280 x 720 | 1.2 |
+| full screen, otherwise | 1024 x 576 | 0.96 |
+| windowed | 800 x 450 | 0.75 |
+
+which is `0.75 x screen_width / 800` — the same 1.0/1.28/1.6 ladder the rest of
+the UI scales by. `0x1ec` is `-0.5` widescreen and **`+74.5`** otherwise, which
+is the 75-pixel letterbox of the 800x600 mode: in 4:3 the block sits at the
+bottom of the *picture*, not of the window. `0x1e8` is `48.0` full screen and
+outside `[UseEnglish]`, else 0.
+
+The source row is `_DAT_004d2ce8` = 48 units tall and the destination 42, so a
+line is squashed vertically by 42/48 before the scale.
+
+**The whole block is behind one gate.** `FUN_0044bf30` draws it only when
+`_GetDrawMessage@0` answers non-zero, and that export forwards to
+`FUN_10007050(0x1004fb00)` — `+0xa4` of the Option module — whose setter
+`FUN_10007070` persists the same member under the key **`TextView`**. So
+subtitles are that setting, off included.
+
+**The speaker is not drawn.** `[PrintText]` carries a speaker field and it never
+reaches the text layer: `FUN_0043dbe0`'s arm hands only the text field to
+`FUN_0043f600`, and `FUN_00431740`'s tail hands `FUN_0044c740` the line, its
+ruby and the ruby flag. The speaker goes to `FUN_00432cc0`, which wraps it and
+the text into a `0x10`-byte record and pushes it onto the list at `engine+0xac`
+— the backlog. `FUN_0044bf30` draws the lines, the ruby and the choice blocks
+and nothing else, so there is no name box.
+
+`daysengine::playback::text` carries all of this.
 
 ---
 

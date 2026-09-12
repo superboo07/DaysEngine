@@ -29,6 +29,28 @@
 //! `FUN_0044c660` is an eight-case table that returns 0 for everything unless
 //! `[UseEnglish]` is set. See [`kerning`].
 //!
+//! # The speaker is not drawn
+//!
+//! `[PrintText]` carries a speaker field, and it never reaches the text layer.
+//! `FUN_0043dbe0`'s arm hands only the *text* field to `FUN_0043f600` for
+//! wrapping, and `FUN_00431740`'s tail hands `FUN_0044c740` three things: the
+//! line, its ruby, and the ruby flag. The speaker goes somewhere else entirely
+//! — `FUN_00432cc0` wraps speaker and text into a `0x10`-byte record and pushes
+//! it onto the list at `engine+0xac`, which is what the control bar's backlog
+//! button asks for. `FUN_0044bf30` draws the lines, the ruby and the choice
+//! blocks and nothing else, so there is no name box to miss.
+//!
+//! # Where the block sits, and how big
+//!
+//! Centred, along the bottom, and scaled — see [`place`] and [`Geometry`], and
+//! note that none of that is a choice this engine made: the x divisor
+//! `_DAT_004d13c0` is 2.0, which is what makes it a centring.
+//!
+//! The whole block is behind one gate: `FUN_0044bf30` draws it only when
+//! `_GetDrawMessage@0` answers non-zero, and that export reads `+0xa4` of the
+//! settings module — the member whose setter `FUN_10007070` persists under the
+//! key `TextView`. So subtitles are the `TextView` setting, off included.
+//!
 //! # What the box holds
 //!
 //! Two lines. The array `FUN_0043f600` fills is at `this+0x234` with a `0x1c`
@@ -97,6 +119,155 @@ pub fn kerning(c: char, english: bool) -> i32 {
 /// The advance for one character, in the layout's own units.
 pub fn advance(c: char, english: bool) -> i32 {
     pitch(english) + kerning(c, english)
+}
+
+/// A laid-out line's width in layout units, from `FUN_0044c740`.
+///
+/// The twelve is the function's own: it records `local_14 + 0xc` as the line's
+/// width after summing the advances.
+pub fn line_width(text: &str, english: bool) -> i32 {
+    text.chars().map(|c| advance(c, english)).sum::<i32>() + 0xc
+}
+
+/// Destination step between dialogue lines, `_DAT_004d6740`.
+pub const LINE_STEP: f32 = 39.0;
+
+/// Destination height of one dialogue line, `_DAT_004d6770`. The source row is
+/// [`LINE_PITCH`] tall, so a line is squashed vertically by 42/48 before the
+/// resolution scale is applied.
+pub const LINE_HEIGHT: f32 = 42.0;
+
+/// Gap left below the last line before scaling, `_DAT_004d6788`.
+pub const BOTTOM_MARGIN: f32 = 40.0;
+
+/// Where the dialogue block goes, per resolution.
+///
+/// `FUN_0044bc90` sets the four numbers together, so they travel together. The
+/// scales are `0.75`, `0.96` and `1.2` — which is `0.75 * screen_width / 800`,
+/// the same 1.0/1.28/1.6 ladder the rest of the UI scales by, taken off a
+/// design width of 800/0.75.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    /// `this+0x1dc` and `this+0x1e0`: the size the block is placed within.
+    pub screen: (f32, f32),
+    /// `this+0x1e4`: layout units to screen pixels.
+    pub scale: f32,
+    /// `this+0x1ec`: `-0.5` widescreen, `+74.5` in 4:3 — which is the 75-pixel
+    /// letterbox of the 800x600 mode, so the block sits at the bottom of the
+    /// *picture* rather than of the window.
+    pub y_offset: f32,
+    /// `this+0x1e8`: `48.0` when full screen and not `[UseEnglish]`, else 0.
+    pub margin: f32,
+    /// `FUN_0044e2e0`, the member `FILMENGINE.INI`'s `[LeftArrangement]` is
+    /// read into. With it clear — the shipped value — every line is centred on
+    /// its own width. With it set they all take the widest line's left edge,
+    /// so the block is left-aligned as a unit.
+    pub left_arrangement: bool,
+}
+
+impl Geometry {
+    /// The windowed 800x450 case, which is the one this engine presents at.
+    pub fn native(left_arrangement: bool) -> Geometry {
+        Geometry {
+            screen: (800.0, 450.0),
+            scale: 0.75,
+            // Widescreen; the 4:3 mode takes +74.5 instead.
+            y_offset: -0.5,
+            // `FUN_0044bc90` sets the margin to 48 only on the full-screen
+            // path, and only outside `[UseEnglish]`; the windowed path zeroes
+            // it either way.
+            margin: 0.0,
+            left_arrangement,
+        }
+    }
+
+    /// The 4:3 800x600 case: the same 800x450 block pushed down by the
+    /// letterbox.
+    pub fn standard(left_arrangement: bool) -> Geometry {
+        Geometry {
+            y_offset: 74.5,
+            ..Geometry::native(left_arrangement)
+        }
+    }
+
+    /// Full screen. `small` selects 1024x576 over 1280x720, which is what
+    /// `FUN_0040f0d0` answers.
+    pub fn full_screen(small: bool, english: bool, left_arrangement: bool) -> Geometry {
+        let (screen, scale) = if small {
+            ((1024.0, 576.0), 0.96)
+        } else {
+            ((1280.0, 720.0), 1.2)
+        };
+        Geometry {
+            screen,
+            scale,
+            y_offset: -0.5,
+            margin: if english { 0.0 } else { 48.0 },
+            left_arrangement,
+        }
+    }
+}
+
+/// Where one line of dialogue is drawn, in screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Places a block of dialogue lines, from `FUN_0044bf30`.
+///
+/// Each line's x is
+///
+/// ```text
+/// (screen_width - line_width * scale) / 2.0 - 0.5
+/// ```
+///
+/// — a horizontal centring, and it is one because `_DAT_004d13c0`, the divisor,
+/// is 2.0. The y runs up from the bottom: the *last* line sits at
+/// `screen_height - (margin + 40.0) * scale + y_offset` and each earlier line is
+/// `39.0 * scale` above it, because the draw loop counts down from the last line
+/// and lifts as it goes.
+pub fn place(lines: &[String], english: bool, geometry: Geometry) -> Vec<Placement> {
+    let Geometry {
+        screen: (w, h),
+        scale,
+        y_offset,
+        margin,
+        left_arrangement,
+    } = geometry;
+
+    let widths: Vec<f32> = lines
+        .iter()
+        .map(|l| line_width(l, english) as f32)
+        .collect();
+    let centred = |width: f32| (w - width * scale) / 2.0 - 0.5;
+
+    // With `[LeftArrangement]` set the loop keeps the running minimum of those
+    // x values and gives every line the last one, so the block shares the
+    // widest line's left edge.
+    let x_for = |width: f32| {
+        if left_arrangement {
+            widths.iter().copied().map(centred).fold(w, f32::min)
+        } else {
+            centred(width)
+        }
+    };
+
+    let bottom = h - (margin + BOTTOM_MARGIN) * scale + y_offset;
+    let last = lines.len().saturating_sub(1) as f32;
+    widths
+        .iter()
+        .enumerate()
+        .map(|(n, width)| Placement {
+            x: x_for(*width),
+            y: bottom - (last - n as f32) * LINE_STEP * scale,
+            width: width * scale,
+            height: LINE_HEIGHT * scale,
+        })
+        .collect()
 }
 
 /// Breaks a dialogue line the way `FUN_0043f600` breaks it.
@@ -367,6 +538,87 @@ mod tests {
         // Only the two-character escape breaks a line. A genuine newline is an
         // ordinary character to the splitter, and none of the scripts hold one.
         assert_eq!(wrap("one\ntwo", true), vec!["one\ntwo"]);
+    }
+
+    #[test]
+    fn a_line_is_centred_on_its_own_width() {
+        // The x formula's divisor `_DAT_004d13c0` is 2.0, which is the whole
+        // reason this is a centring rather than a margin.
+        let g = Geometry::native(false);
+        let lines = vec!["aa".to_string()];
+        let places = place(&lines, true, g);
+        let width = line_width("aa", true) as f32 * g.scale;
+        assert_eq!(places[0].width, width);
+        assert!((places[0].x - ((800.0 - width) / 2.0 - 0.5)).abs() < 1e-3);
+        // A wider line starts further left, and the midpoints agree.
+        let wide = vec!["aaaaaaaaaa".to_string()];
+        let wider = place(&wide, true, g);
+        assert!(wider[0].x < places[0].x);
+        let mid = |p: &Placement| p.x + p.width / 2.0;
+        assert!((mid(&places[0]) - mid(&wider[0])).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_block_is_anchored_to_the_bottom_and_stacks_upwards() {
+        let g = Geometry::native(false);
+        let one = place(&["a".to_string()], true, g);
+        let three = place(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            true,
+            g,
+        );
+        // The bottom line lands in the same place however many there are: the
+        // draw counts down from the last line and lifts as it goes.
+        assert_eq!(one[0].y, three[2].y);
+        assert_eq!(one[0].y, 450.0 - BOTTOM_MARGIN * g.scale - 0.5);
+        // And each earlier line is one step higher.
+        let step = LINE_STEP * g.scale;
+        assert!((three[1].y - (three[2].y - step)).abs() < 1e-3);
+        assert!((three[0].y - (three[2].y - 2.0 * step)).abs() < 1e-3);
+        // A line is drawn 42 units tall, not the 48 of its source row.
+        assert_eq!(one[0].height, LINE_HEIGHT * g.scale);
+    }
+
+    #[test]
+    fn left_arrangement_gives_every_line_the_widest_lines_edge() {
+        let lines = vec!["a".to_string(), "aaaaaaaaaaaaaaaa".to_string()];
+        let centred = place(&lines, true, Geometry::native(false));
+        let aligned = place(&lines, true, Geometry::native(true));
+        // Centred, the short line starts further right than the long one.
+        assert!(centred[0].x > centred[1].x);
+        // Left-arranged, both take the minimum, which is the long line's x.
+        assert_eq!(aligned[0].x, aligned[1].x);
+        assert!((aligned[0].x - centred[1].x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_scales_are_the_same_ladder_the_rest_of_the_ui_uses() {
+        // 0.75, 0.96, 1.2 is 0.75 x 1.0 / 1.28 / 1.6.
+        assert_eq!(Geometry::native(false).scale, 0.75);
+        assert_eq!(Geometry::full_screen(true, true, false).scale, 0.96);
+        assert_eq!(Geometry::full_screen(false, true, false).scale, 1.2);
+        assert_eq!(
+            Geometry::full_screen(true, true, false).screen,
+            (1024.0, 576.0)
+        );
+        assert_eq!(
+            Geometry::full_screen(false, true, false).screen,
+            (1280.0, 720.0)
+        );
+        // The margin is 48 only full screen and only outside [UseEnglish].
+        assert_eq!(Geometry::full_screen(false, false, false).margin, 48.0);
+        assert_eq!(Geometry::full_screen(false, true, false).margin, 0.0);
+        assert_eq!(Geometry::native(false).margin, 0.0);
+        // 4:3 pushes the block down by the 800x600 letterbox.
+        assert_eq!(Geometry::standard(false).y_offset, 74.5);
+        assert_eq!(Geometry::native(false).y_offset, -0.5);
+    }
+
+    #[test]
+    fn a_line_width_is_the_advances_plus_twelve() {
+        assert_eq!(line_width("", true), 0xc);
+        assert_eq!(line_width("M", true), 0x10 + 11 + 0xc);
+        assert_eq!(line_width("ii", true), 2 * (0x10 - 7) + 0xc);
     }
 
     #[test]

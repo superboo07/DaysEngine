@@ -133,17 +133,14 @@ impl SystemSounds {
     }
 }
 
-/// One wrapped dialogue line, uploaded.
-struct DialogueLine<'r> {
-    width: u32,
-    height: u32,
-    texture: Texture<'r>,
-}
-
 /// The dialogue currently on screen, cached on the lines it was built from.
+///
+/// Each line is uploaded at the layout's own size; where it lands and how far
+/// it is stretched comes from `playback::text::place`, so the texture's own
+/// dimensions are not needed again once it is made.
 struct DialogueBlock<'r> {
     lines: Vec<String>,
-    drawn: Vec<DialogueLine<'r>>,
+    drawn: Vec<Texture<'r>>,
 }
 
 /// Everything the two loops both need.
@@ -664,6 +661,8 @@ fn run_script(
     let config = Config::load(&player.game);
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
+    // `[LeftArrangement]` picks per-line centring or a left-aligned block.
+    let left_arrangement = player.film.get_bool("LeftArrangement").unwrap_or(false);
     // Male voice lines are dropped when the player has turned `MenVoice` off.
     stage.set_men_voice(config.flag(Flag::MenVoice));
 
@@ -974,12 +973,10 @@ fn run_script(
             // stacked at the recovered `0x30` pitch. Cached on the joined
             // lines: laying one out costs a 48x48 glyph decode per character,
             // which is wasteful at 24 fps.
-            let display = if speaker.is_empty() {
-                line.to_string()
-            } else {
-                format!("{speaker}: {line}")
-            };
-            let lines = text::wrap(&display, english);
+            // The speaker field is not drawn: the original never hands it to
+            // the text layer, only to the backlog. See `playback::text`.
+            let _ = speaker;
+            let lines = text::wrap(line, english);
             let stale = text_texture
                 .as_ref()
                 .is_none_or(|cached| cached.lines != lines);
@@ -994,32 +991,26 @@ fn run_script(
                     )?;
                     texture.set_blend_mode(BlendMode::Blend);
                     texture.update(None, &image.rgba, image.width * 4)?;
-                    drawn.push(DialogueLine {
-                        width: image.width as u32,
-                        height: image.height as u32,
-                        texture,
-                    });
+                    drawn.push(texture);
                 }
                 text_texture = Some(DialogueBlock { lines, drawn });
             }
             if let Some(block_lines) = &text_texture {
-                // Dialogue sits along the bottom of the stage. The pitch
-                // between lines is the original's; where the block as a whole
-                // sits is this engine's, because the transform that turns the
-                // layout's units into screen pixels is not recovered.
-                let text_scale = scale * 0.5;
-                let pitch = text::LINE_PITCH as f32 * text_scale;
-                let block = pitch * block_lines.drawn.len() as f32;
-                for (n, line) in block_lines.drawn.iter().enumerate() {
+                // Placed by `FUN_0044bf30`: centred on each line's own width
+                // and anchored to the bottom, at the 800x450 scale of 0.75.
+                // `scale` on top of that is only this window's letterbox.
+                let geometry = text::Geometry::native(left_arrangement);
+                let places = text::place(&block_lines.lines, english, geometry);
+                for (texture, at) in block_lines.drawn.iter().zip(places) {
                     canvas
                         .copy(
-                            &line.texture,
+                            texture,
                             None,
                             FRect::new(
-                                dst.x + 16.0 * scale,
-                                dst.y + dst.h - block - 16.0 * scale + n as f32 * pitch,
-                                line.width as f32 * text_scale,
-                                line.height as f32 * text_scale,
+                                dst.x + at.x * scale,
+                                dst.y + at.y * scale,
+                                at.width * scale,
+                                at.height * scale,
                             ),
                         )
                         .map_err(|e| anyhow::anyhow!("drawing text: {e}"))?;
@@ -1027,10 +1018,10 @@ fn run_script(
             }
         }
 
-        // The choice labels. The original draws these through its own text
-        // pipeline from an anchor whose transform is not recovered; what *is*
-        // recovered is the box each choice occupies, because that is the
-        // shipped hit map. So each label is centred in its own box.
+        // The choice labels. The original places these with `FUN_0044ced0`, and
+        // that formula is written down in `ui::select` but not used here yet:
+        // each label is centred in the box the shipped hit map gives, which is
+        // exact data and agrees with the hit testing.
         if let Some((pending, map)) = &choice {
             if pending.visible(at) {
                 if let Some(((mw, mh), boxes)) = map.map_size().zip(map.bounds()) {

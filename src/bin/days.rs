@@ -666,6 +666,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
     let stacked =
         daysengine::ui::select::Layout::from_ini(&film) == daysengine::ui::select::Layout::Stacked;
     let english = film.get_bool("UseEnglish").unwrap_or(false);
+    let left_arrangement = film.get_bool("LeftArrangement").unwrap_or(false);
 
     // The control bar, with the pointer parked inside the strip and the ramp
     // settled, so `--bar` shows the dropped-down state.
@@ -704,8 +705,15 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
                 .select
                 .map(|w| format!("{:?}/{:?} {}..{}", w.a, w.b, w.start, w.end)),
         );
-        let mut rgba =
-            daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked, english);
+        let mut rgba = daysengine::playback::compose::frame_rgba_with(
+            &visual,
+            &font,
+            W,
+            H,
+            stacked,
+            english,
+            left_arrangement,
+        );
 
         if let Some(strip) = &control {
             // Blended over the frame, which is the check that matters: the

@@ -12,7 +12,7 @@ use days_font::Font;
 
 /// Composites one frame to RGBA at `width` x `height`.
 pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize) -> Vec<u8> {
-    frame_rgba_with(visual, font, width, height, false, false)
+    frame_rgba_with(visual, font, width, height, false, false, false)
 }
 
 /// As [`frame_rgba`], with the two answers only the install can give.
@@ -29,6 +29,7 @@ pub fn frame_rgba_with(
     height: usize,
     stacked: bool,
     english: bool,
+    left_arrangement: bool,
 ) -> Vec<u8> {
     let mut out = vec![0u8; width * height * 4];
     for px in out.as_chunks_mut::<4>().0 {
@@ -92,46 +93,24 @@ pub fn frame_rgba_with(
         }
     }
 
-    // Dialogue, broken into lines the way `FUN_0043f600` breaks them and
-    // stacked at the recovered pitch. A 62-column line comes to 992 units at
-    // the English pitch of 16, so at the half scale everything here is drawn
-    // at it lands inside 500 of the stage's 800 pixels — which is what stops
-    // long lines running off the edge.
-    if let Some((speaker, line)) = visual.text {
-        let display = if speaker.is_empty() {
-            line.to_string()
-        } else {
-            format!("{speaker}: {line}")
-        };
-        let lines = text::wrap(&display, english);
-        let pitch = text::LINE_PITCH / 2;
-        let block = pitch * lines.len();
-        for (n, one) in lines.iter().enumerate() {
+    // Dialogue: broken by `FUN_0043f600`'s rule, placed by `FUN_0044bf30`'s.
+    // The speaker field is deliberately not drawn — the original never hands it
+    // to the text layer, it goes to the backlog instead.
+    if let Some((_speaker, line)) = visual.text {
+        let lines = text::wrap(line, english);
+        let geometry = text::Geometry::native(left_arrangement);
+        for (one, at) in lines.iter().zip(text::place(&lines, english, geometry)) {
             let image = text::render_line(font, one, [255, 255, 255], english);
-            let scaled = downscale_half(&image.rgba, image.width, image.height);
-            let (sw, sh) = (image.width / 2, image.height / 2);
-            let _ = sh;
-            let y = height.saturating_sub(block + 8) + n * pitch;
-            blit(
-                &mut out,
-                width,
-                height,
-                &Surface {
-                    pixels: &scaled,
-                    width: sw,
-                    height: image.height / 2,
-                },
-                8,
-                y,
-            );
+            blit_stretched(&mut out, width, height, &image, at);
         }
     }
 
-    // The choice box, when one is up. Its labels are placed by fractions of
-    // the frame rather than in pixels: the hit maps are shipped only at 1024x576
-    // and 1280x720, so the split -- x for two boxes side by side, y for two
-    // stacked -- is what carries over to any size. Which axis is the install's
-    // own `[SelectType]` and `[UseEnglish]` answer; see `crate::ui::select`.
+    // The choice box, when one is up. Placed by fractions of the frame rather
+    // than by `FUN_0044ced0`'s formula, which `crate::ui::select` records but
+    // nothing uses yet: the hit maps are shipped only at 1024x576 and 1280x720,
+    // so the split -- x for two boxes side by side, y for two stacked -- is what
+    // carries over to any size. Which axis is the install's own `[SelectType]`
+    // and `[UseEnglish]` answer.
     if let Some(window) = &visual.select {
         let labels: Vec<&str> = [Some(window.a), window.b]
             .into_iter()
@@ -165,6 +144,50 @@ pub fn frame_rgba_with(
     }
 
     out
+}
+
+/// Stretches a rendered line into its placement, nearest-sampled.
+///
+/// The original does this on the GPU by handing the text texture a destination
+/// rectangle; the source row is 48 units tall and the destination 42 before the
+/// resolution scale, so a line is slightly squashed vertically, and that falls
+/// out of using the recovered rectangle rather than being applied separately.
+fn blit_stretched(
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+    src: &text::TextImage,
+    at: text::Placement,
+) {
+    let w = at.width.round().max(1.0) as usize;
+    let h = at.height.round().max(1.0) as usize;
+    for row in 0..h {
+        let dy = at.y.round() as i64 + row as i64;
+        if dy < 0 || dy as usize >= dst_h {
+            continue;
+        }
+        let sy = row * src.height / h;
+        for col in 0..w {
+            let dx = at.x.round() as i64 + col as i64;
+            if dx < 0 || dx as usize >= dst_w {
+                continue;
+            }
+            let sx = col * src.width / w;
+            let s = (sy * src.width + sx) * 4;
+            let Some(px) = src.rgba.get(s..s + 4) else {
+                continue;
+            };
+            let a = u32::from(px[3]);
+            if a == 0 {
+                continue;
+            }
+            let d = (dy as usize * dst_w + dx as usize) * 4;
+            for i in 0..3 {
+                let under = u32::from(dst[d + i]);
+                dst[d + i] = ((u32::from(px[i]) * a + under * (255 - a)) / 255) as u8;
+            }
+        }
+    }
 }
 
 /// An RGBA image with its dimensions.
