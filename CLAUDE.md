@@ -114,6 +114,12 @@ The headless tools exist for this: `days menu`, `days ui`, `days save`,
 were correct while the screen it chose was wrong, and only a screenshot of the
 real game caught it.
 
+**Verify with the headless tools, never by launching the game.** Do not run
+`daysengine` unless the user asks for it in so many words. It opens a window on
+their desktop and takes over their machine, and playing the game is the part
+they want to do themselves. Build it — `cargo build --release` — and tell them
+it is ready; the run is theirs.
+
 ### Record the provenance next to the behaviour
 
 Every recovered rule carries the function that established it, in the doc
