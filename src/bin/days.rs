@@ -1699,6 +1699,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         som: Som::default(),
         slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
         english,
+        text_input: film.get_bool("TextInput").unwrap_or(false),
     };
 
     if args.check_all {
@@ -1816,9 +1817,9 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         }
     }
 
-    // The save/load screen's rows carry text, and where that text sits inside
-    // a row is not recovered -- see `ui::saveload`. Print the lines, so what
-    // the screen would show is still checkable against the install.
+    // The save/load screen's rows carry text the composite draws itself rather
+    // than cutting out of art. Print the lines, so what the screen shows is
+    // checkable against the install without reading pixels.
     if menu.mode() == Mode::SAVELOAD {
         let slots = &menu.session().slots;
         println!(
@@ -1836,6 +1837,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 ),
                 None => println!("    slot {slot:>3}  (empty)"),
             }
+        }
+        match menu.rows().and_then(|rows| rows.tooltip.as_ref()) {
+            Some(tip) => {
+                let (x, y, w, h) = tip.panel.dst;
+                println!(
+                    "    expanded comment: panel {w:.0}x{h:.0} at {x:.1},{y:.1}, {} line(s)",
+                    tip.lines.len()
+                );
+            }
+            None => println!("    expanded comment: none"),
         }
     }
 

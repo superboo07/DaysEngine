@@ -1405,7 +1405,28 @@ comment over up to three lines and shows it over the list: the panel sprite at
 `+0x108`, cut from that record, and the lines at `+0x1bc + n * 4` rasterised
 into the same 2048x1024 surface at `(0x400, 0x202 + n * 0x40)`. The panel's
 height grows with the line count, and rows 8 and 9 borrow rows 6 and 7's record
-so three lines cannot run off the bottom. **Not implemented.**
+so the panel opens upwards there and three lines cannot run off the bottom.
+
+The wrapping is by character count and never by pixels: Japanese breaks every
+twenty characters with no regard for what it cuts, English looks ahead at each
+space to the end of the next word and breaks if that word would not finish
+inside forty, and both stop after three lines' worth of input. A break at
+exactly the cap leaves an empty line behind and the shipped loop counts it,
+which matters because that count is what sizes the panel — though the panel
+actually switches on the **character count** divided by the per-line cap, not
+on the wrapped line count, so for English the two can disagree. The shipped
+formula is kept.
+
+The panel's sprite takes the record's full height as its source however short
+it is drawn, so a one-line panel is a 472x97 cut squashed into about 31 pixels.
+`_DAT_1003b0f8` is a `fdivl`, the double 3.0: the record is three rows and the
+panel is that divided by the rows it needs.
+
+One shipped bug here. The panel's y shift and the text's are written only on
+the branches a row past the eighth takes, and zeroed only on the three-line
+branch, so a shallow row with one or two lines reads **two uninitialised
+floats**. DaysEngine uses zero, which is what the branch that does initialise
+them uses and what puts the panel on its own row.
 
 One more departure from `FUN_10014910`: the route map's sprite is drawn behind
 one condition more than the enablement carries, `+0x94 == 0`. On the Save
@@ -1520,20 +1541,33 @@ already there (`FUN_004367d0`). So the surface carries the font's luminance
 plane as colour and its outline plane as alpha, which is what the engine's own
 line rasteriser produces.
 
-**The comment column's gate is uninitialised memory.** The comment sprites are
-built, and the comment rasterised, only when host `+0xd8` answers non-zero.
-That slot is `FUN_0042bad0`, returning the plain member `+0x74` of the
-interface it is called on — and the interface is a secondary base subobject at
-`[object+0x2c]`, which the constructor does literally
-(`movl $0x4d2894,0x2c(%edx)` in `FUN_004217e0`). So the member is object
-`+0xa0`, and **nothing in the executable ever writes it**: a store-pattern scan
-over the disassembly of the whole `.text` finds six writes to `0xa0(reg)`, all
-on other classes, and no method in the host's own code band so much as
-references it. The constructor does not zero it either — it sets five members
-explicitly and bulk-initialises nothing — and the object is a plain
-`malloc(0x7d0)` through `FUN_0047ad7d`. So in the retail build the column
-appears or not according to heap contents. DaysEngine draws it: the layout is
-recovered, and the comment the save dialog writes has no other way to be seen.
+**The comment column's gate is `FILMENGINE.INI [TextInput]`.** The comment
+sprites are built, and the comment rasterised, only when host `+0xd8` answers
+non-zero. That slot is `FUN_0042bad0`, returning member `+0x74` of the
+interface it is called on. The host object carries **two** interfaces, and the
+constructor installs both: `movl $0x4d2894,0x2c(%edx)` and
+`movl $0x4d2864,0x30(%eax)`. The menu DLL is handed the first, so the member is
+object `+0xa0`.
+
+Searching for writes to `0xa0(reg)` finds none that belong to this class, and
+that is not the same as the member never being written — the writer holds the
+**other** interface, so it stores at `0x70(reg)`. It is slot `+0x20` of the
+`+0x30` vtable, `FUN_00422170`, which is the `FILMENGINE.INI` reader:
+
+```text
+[TextInput]   -> this+0x70  ->  object +0xa0  ->  host +0xd8
+[UseEnglish]  -> this+0x74  ->  object +0xa4  ->  host +0x5c
+```
+
+The line below is the check on the line above. Host `+0x5c` is the English
+question, recovered long before from the other side, and it reads the member
+that the key sitting next to `[TextInput]` writes. Two interfaces, two
+different deltas, one member, and the meaning agrees.
+
+This is the trap the two-vtable rule exists for, and scanning one offset is not
+enough to retire a member: a scan at `+0x74` finds dozens of unrelated writes
+and a scan at `+0xa0` finds none, and the answer was at `+0x70` on a third
+pointer. The shipped INI sets `[TextInput]="1"`, and the column shows.
 
 Two more sprites, `+0xf8` and `+0xfc`, are placed from records
 `(page + 0x20) * 0x18` and `(page + 0x2a) * 0x18` — the current page's

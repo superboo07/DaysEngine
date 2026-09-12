@@ -386,6 +386,13 @@ pub struct Session {
     pub som: options::Som,
     /// What the save/load screen shows for each slot.
     pub slots: Slots,
+    /// `FILMENGINE.INI [TextInput]`, which is what host `+0xd8` answers.
+    ///
+    /// It gates the save row's comment column and the expanded comment behind
+    /// it. `FUN_00422170` reads the key into the member host `+0xd8` returns —
+    /// see [`crate::ui::saveload`], where the two-interface arithmetic that
+    /// connects them is written down. The shipped INI sets it.
+    pub text_input: bool,
     /// `FILMENGINE.INI [UseEnglish]`, which is what host `+0x5c` answers.
     ///
     /// The menus ask it constantly — it picks the timestamp format, the
@@ -407,6 +414,7 @@ impl Session {
             som: options::Som::default(),
             slots: Slots::default(),
             english: false,
+            text_input: false,
         }
     }
 }
@@ -494,7 +502,6 @@ impl Menu {
             rows: None,
         };
         menu.load_thumbnails(vfs, dll);
-        menu.load_rows();
         menu.refresh();
         Ok(menu)
     }
@@ -520,7 +527,6 @@ impl Menu {
         self.return_to = return_to;
         self.selection = None;
         self.load_thumbnails(vfs, dll);
-        self.load_rows();
         self.refresh();
         Ok(())
     }
@@ -538,12 +544,22 @@ impl Menu {
             log::warn!("no font, so the save/load rows stay empty");
             return;
         };
+        // The selection is what opens the expanded comment, so this is rebuilt
+        // on every hover -- which is what the shipped screen does: its
+        // `FUN_10012900` re-runs the whole row rasterising before laying the
+        // tooltip out.
+        let hovered = self
+            .selection
+            .filter(|w| (0x16..0x20).contains(w))
+            .map(|w| w - 0x16);
         self.rows = Some(saveload::Rows::render(
             font,
             &self.session.slots,
             self.page,
             self.session.english,
             &self.screen.atlas().widgets,
+            self.session.text_input,
+            hovered,
         ));
         self.dirty = true;
     }
@@ -613,6 +629,12 @@ impl Menu {
         self.mode
     }
 
+    /// The save/load screen's rasterised rows, for a tool that wants to report
+    /// what the composite would draw.
+    pub fn rows(&self) -> Option<&saveload::Rows> {
+        self.rows.as_ref()
+    }
+
     pub fn screen(&self) -> &Screen {
         &self.screen
     }
@@ -639,6 +661,25 @@ impl Menu {
         if let Some(rows) = &self.rows {
             for quad in &rows.quads {
                 out.blit_downscaled(&rows.surface, quad.src, self.screen.place_layout(quad.dst));
+            }
+            // The expanded comment goes over the list, panel first. The panel
+            // is cut from the chip sheet at the record's full height however
+            // short it is drawn, so a one- or two-line panel is that art
+            // squashed -- the shipped sprite's own source rectangle.
+            if let Some(tip) = &rows.tooltip {
+                let panel = &tip.panel;
+                out.blit_downscaled(
+                    self.screen.chip(),
+                    panel.src,
+                    self.screen.place_layout(panel.dst),
+                );
+                for line in &tip.lines {
+                    out.blit_downscaled(
+                        &rows.surface,
+                        line.src,
+                        self.screen.place_layout(line.dst),
+                    );
+                }
             }
         }
         out
@@ -798,6 +839,7 @@ impl Menu {
     /// that first extra belongs to this screen: the run after it is the next
     /// screen's table, which the atlas cannot see the end of.
     fn refresh(&mut self) {
+        self.load_rows();
         let lit = self.lit();
         let states: Vec<WidgetState> = (0..self.states.len())
             .map(|i| match self.extra_for(i) {
@@ -963,7 +1005,6 @@ impl Menu {
                     return Ok(Action::Stay);
                 }
                 self.page = page;
-                self.load_rows();
                 self.refresh();
                 Ok(Action::Stay)
             }

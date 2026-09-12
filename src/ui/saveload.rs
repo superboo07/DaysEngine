@@ -106,28 +106,32 @@
 //! `235.5 - width / 4` clamped at zero, measured on the advance total
 //! `FUN_10011ec0` accumulates. See [`comment_centre`].
 //!
-//! # The comment column's gate is uninitialised memory
+//! # The comment column's gate is `[TextInput]`
 //!
-//! The comment sprites are built, and the comment is rasterised, only when host
-//! `+0xd8` answers non-zero. That slot is `FUN_0042bad0`, which returns the
-//! plain member `+0x74` of the interface it is called on — and the interface is
-//! a **secondary base subobject** installed at `[object+0x2c]`, which
-//! `FUN_004217e0` does literally: `movl $0x4d2894,0x2c(%edx)`. So the member is
-//! object `+0xa0`.
+//! The comment sprites are built, and the comment rasterised, only when host
+//! `+0xd8` answers non-zero. That slot is `FUN_0042bad0`, returning member
+//! `+0x74` of the interface it is called on — and the host object carries
+//! **two** interfaces, one at `+0x2c` (`movl $0x4d2894,0x2c(%edx)` in
+//! `FUN_004217e0`) and one at `+0x30` (`0x4d2864`). The DLL holds the first, so
+//! the member is object `+0xa0`.
 //!
-//! **Nothing in the executable ever writes object `+0xa0`.** A store-pattern
-//! scan over the disassembly of the whole `.text` finds six writes to
-//! `0xa0(reg)`, and every one is on another class — a `timeGetTime` stamp, an
-//! indexed array base, and three in library code. No method in the host's own
-//! code band references the member at all. The constructor does not zero it
-//! either: it sets five members explicitly and bulk-initialises nothing, and
-//! the object is a plain `malloc(0x7d0)` through `FUN_0047ad7d`, which does not
-//! clear what it hands back.
+//! Nothing writes `0xa0(reg)` anywhere in the executable, which is not the same
+//! as nothing writing the member: the writer holds the **second** interface, so
+//! it stores at `0x70(reg)`. It is slot `+0x20` of the `+0x30` vtable,
+//! `FUN_00422170`, and it is the `FILMENGINE.INI` reader:
 //!
-//! So in the retail build whether the comment column appears is decided by
-//! uninitialised heap. This engine draws it, because its layout is recovered
-//! and the comment the save dialog writes has no other way to be seen; a fresh
-//! allocation that happens to read zero is the same screen without it.
+//! ```text
+//! [TextInput]    -> this+0x70  -> object +0xa0 -> host +0xd8
+//! [UseEnglish]   -> this+0x74  -> object +0xa4 -> host +0x5c
+//! ```
+//!
+//! The second line is the check on the first. `+0x5c` is the English question,
+//! already recovered from the other side and used all over this module, and it
+//! lands on the member the key next to `[TextInput]` writes. Two interfaces,
+//! two different deltas, one member, and the meaning agrees.
+//!
+//! So the column is on when the player's `FILMENGINE.INI` says
+//! `[TextInput]="1"`, which the shipped INI does.
 //!
 //! # One sprite between the two bands
 //!
@@ -150,8 +154,9 @@
 //! and rows 8 and 9 borrow rows 6 and 7's record so three lines cannot run off
 //! the bottom of the screen.
 //!
-//! **Not implemented.** The rows show the comment truncated to its column, as
-//! they do in the shipped screen until the tooltip opens.
+//! [`Tooltip`] is that, and [`wrap_comment`] is its wrapping rule: Japanese breaks
+//! every twenty characters and English wraps on whole words at forty, both
+//! measured in characters and both cut at three lines' worth.
 //!
 //! # What else is not implemented
 //!
@@ -447,6 +452,192 @@ pub fn comment_centre(width: i32, english: bool) -> f32 {
     }
 }
 
+/// How many lines the expanded comment can run to, from `FUN_10012900`'s own
+/// clamp.
+pub const TIP_LINES: usize = 3;
+
+/// Where the expanded comment's lines are rasterised, and how they are cut.
+///
+/// `FUN_10012900` starts its pen at `(0x400, 0x202)` and steps down by `0x40`,
+/// and `FUN_100135c0` cuts the sprites at `_DAT_1003b120` (1024.0f),
+/// `_DAT_1003b108` (514.0) + n * `_DAT_1003b100` (64.0), `_DAT_1003b110`
+/// (986.0f) wide and `_DAT_1003b0f4` (64.0f) tall. The two agree, which is the
+/// cross-check.
+const TIP_SURFACE_X: f32 = 1024.0;
+const TIP_SURFACE_Y: f32 = 514.0;
+const TIP_SURFACE_PITCH: f32 = 64.0;
+const TIP_SURFACE_HEIGHT: f32 = 64.0;
+
+/// How far apart the lines are drawn and how tall each is, `_DAT_1003b0e8` —
+/// an `fmull`, so the double 32.0. Half the surface pitch, the same halving the
+/// rows get.
+const TIP_LINE_HEIGHT: f32 = 32.0;
+
+/// How many rows of the list the panel's record spans, `_DAT_1003b0f8` — an
+/// `fdivl`, so the double 3.0. The record is about three rows tall and the
+/// panel is that divided by the lines it needs.
+const PANEL_ROWS: f32 = 3.0;
+
+/// The last row whose panel can open downwards, from `FUN_10012900`'s
+/// `param_1 < 8` test.
+const LAST_ROW_OPENING_DOWN: usize = 7;
+
+/// Splits a comment the way `FUN_10012900` splits it.
+///
+/// Two different rules, chosen by host `+0x5c`. Japanese breaks every twenty
+/// characters with no regard for what it cuts. English looks ahead at each
+/// space to the end of the next word and breaks if that word would not finish
+/// inside forty. Both are counted in characters, never in pixels, and both stop
+/// after three lines' worth of input.
+///
+/// The empty line a break at exactly the cap leaves behind is **kept**: the
+/// shipped loop increments its line count there, and that count is what sizes
+/// the panel.
+pub fn wrap_comment(text: &str, english: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let cap = Column::Comment.cap(english);
+    let total = chars.len().min(cap * TIP_LINES);
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![String::new()];
+    let mut on_line = 0usize;
+    let mut i = 0usize;
+    while i < total {
+        if let Some(line) = lines.last_mut() {
+            line.push(chars[i]);
+        }
+        i += 1;
+        on_line += 1;
+        if !english {
+            if i.is_multiple_of(cap) {
+                lines.push(String::new());
+            }
+        } else if chars[i - 1] == ' ' {
+            // The look-ahead runs over the whole comment, not the capped part,
+            // so a word past the cut still decides the break before it.
+            let word = chars[i..].iter().take_while(|c| **c != ' ').count();
+            if on_line + word >= cap {
+                lines.push(String::new());
+                on_line = 0;
+            }
+        }
+    }
+    lines.truncate(TIP_LINES);
+    lines
+}
+
+/// The expanded comment shown over the list, from `FUN_10012900`.
+#[derive(Debug, Clone)]
+pub struct Tooltip {
+    /// The panel behind the lines. Its `src` is in the screen's `_CHIP` sheet,
+    /// not in [`Rows::surface`], and it is the record's **full** height however
+    /// short the panel is drawn — so a one-line panel is the same art squashed,
+    /// which is what the shipped sprite does.
+    pub panel: Quad,
+    /// The lines, cut from [`Rows::surface`].
+    pub lines: Vec<Quad>,
+}
+
+impl Tooltip {
+    /// Lays out the tooltip for a row, given the lines already wrapped and the
+    /// advance each consumed.
+    ///
+    /// `record` is the row's second-band record — but not always its own: a row
+    /// past [`LAST_ROW_OPENING_DOWN`] borrows the record two rows up and the
+    /// panel grows upwards instead, so three lines cannot run off the bottom of
+    /// the screen. [`Tooltip::record_row`] is that swap.
+    ///
+    /// The panel's height comes from the **character count**, not from the
+    /// wrapped line count: `FUN_10012900` divides the capped length by the
+    /// per-line cap and switches on that. The two agree for Japanese and can
+    /// differ for English, where the wrap is by word; the shipped formula is
+    /// kept rather than the one that would agree.
+    pub fn place(
+        row: usize,
+        record: days_ui::atlas::Widget,
+        widths: &[i32],
+        chars: usize,
+        english: bool,
+    ) -> Tooltip {
+        let cap = Column::Comment.cap(english);
+        let height = record.dst.height as f32;
+        let row_of_panel = height / PANEL_ROWS;
+        let deep = row > LAST_ROW_OPENING_DOWN;
+
+        // `FUN_10012900` writes the panel's shift and the text's only on the
+        // branches a deep row takes, and zeroes them only on the three-line
+        // one. A shallow row with one or two lines therefore reads **two
+        // uninitialised floats** -- a shipped bug. Zero is what the branch that
+        // does initialise them uses, and what puts the panel on its own row.
+        let (panel_shift, text_shift, panel_height) = match chars.min(cap * TIP_LINES) / cap {
+            0 => (
+                if deep { row_of_panel * 2.0 } else { 0.0 },
+                if deep { TIP_SURFACE_HEIGHT } else { 0.0 },
+                row_of_panel - 2.0,
+            ),
+            1 => (
+                if deep { row_of_panel } else { 0.0 },
+                if deep { TIP_LINE_HEIGHT } else { 0.0 },
+                row_of_panel * 2.0,
+            ),
+            _ => (0.0, 0.0, height),
+        };
+
+        let panel = Quad {
+            src: (
+                record.src_x,
+                record.src_y,
+                record.dst.width,
+                record.dst.height,
+            ),
+            // The half-pixel outset is the DLL's, on this sprite as on every
+            // other: origin back by 0.5 and size out by 1.0.
+            dst: (
+                record.dst.x as f32 - 0.5,
+                record.dst.y as f32 - 0.5 + panel_shift,
+                record.dst.width as f32 + 1.0,
+                panel_height + 1.0,
+            ),
+        };
+
+        let lines = widths
+            .iter()
+            .take(TIP_LINES)
+            .enumerate()
+            .map(|(n, width)| Quad {
+                src: (
+                    TIP_SURFACE_X as u32,
+                    (TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH) as u32,
+                    Column::Comment.width() as u32,
+                    TIP_SURFACE_HEIGHT as u32,
+                ),
+                dst: (
+                    record.dst.x as f32
+                        + Column::Comment.dest_x(english)
+                        + comment_centre(*width, english),
+                    record.dst.y as f32 + DEST_Y + n as f32 * TIP_LINE_HEIGHT + text_shift,
+                    Column::Comment.dest_width(),
+                    TIP_LINE_HEIGHT,
+                ),
+            })
+            .collect();
+
+        Tooltip { panel, lines }
+    }
+
+    /// Which row's second-band record places the panel, from
+    /// `FUN_10012900`'s `param_1 < 8 ? param_1 : param_1 - 2`.
+    pub fn record_row(row: usize) -> usize {
+        if row > LAST_ROW_OPENING_DOWN {
+            row - 2
+        } else {
+            row
+        }
+    }
+}
+
 /// The ten rows of a page, rasterised into one surface with the rectangles that
 /// put each column on the screen.
 ///
@@ -459,6 +650,9 @@ pub struct Rows {
     pub surface: days_ui::Image,
     /// One per drawn column, in row order.
     pub quads: Vec<Quad>,
+    /// The expanded comment, when the pointer is in the second band and the
+    /// row it names has one.
+    pub tooltip: Option<Tooltip>,
 }
 
 /// One column's sprite: what it cuts out of the surface and where it lands.
@@ -477,12 +671,16 @@ impl Rows {
     /// shipped loop does: it only draws when the host's slot query answers 1.
     /// `records` is the screen's widget table, and a row whose record is missing
     /// is skipped rather than placed somewhere this engine chose.
+    /// `hovered` is the row the pointer is expanding, if any — the selection's
+    /// `widget - 0x16`, which is the only thing that opens the tooltip.
     pub fn render(
         font: &days_font::Font,
         slots: &Slots,
         page: usize,
         english: bool,
         records: &[days_ui::atlas::Widget],
+        comments: bool,
+        hovered: Option<usize>,
     ) -> Rows {
         let (width, height) = SURFACE;
         let mut surface = days_ui::Image::empty(width, height);
@@ -493,6 +691,9 @@ impl Rows {
                 continue;
             };
             for column in Column::ALL {
+                if column == Column::Comment && !comments {
+                    continue;
+                }
                 let text: String = match column {
                     Column::When => &line.when,
                     Column::Chapter => &line.chapter,
@@ -521,7 +722,56 @@ impl Rows {
             }
         }
 
-        Rows { surface, quads }
+        let tooltip = hovered
+            .filter(|_| comments)
+            .and_then(|row| Rows::expand(&mut surface, font, slots, page, row, english, records));
+        Rows {
+            surface,
+            quads,
+            tooltip,
+        }
+    }
+
+    /// Rasterises the expanded comment and lays it out, from `FUN_10012900`.
+    ///
+    /// Draws into the same surface the rows use, at the same place the shipped
+    /// code draws it: `(0x400, 0x202 + n * 0x40)`, which is clear of all three
+    /// columns — they end at x 986 above y 514 and at x 1024 below it.
+    fn expand(
+        surface: &mut days_ui::Image,
+        font: &days_font::Font,
+        slots: &Slots,
+        page: usize,
+        row: usize,
+        english: bool,
+        records: &[days_ui::atlas::Widget],
+    ) -> Option<Tooltip> {
+        let comment = &slots.get(slot_of(page, row))?.comment;
+        let lines = wrap_comment(comment, english);
+        if lines.is_empty() {
+            return None;
+        }
+        let record = *records.get(Column::Comment.record_of(Tooltip::record_row(row)))?;
+
+        let widths = lines
+            .iter()
+            .enumerate()
+            .map(|(n, line)| {
+                let pen = (
+                    TIP_SURFACE_X as i32,
+                    (TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH) as i32,
+                );
+                draw_line(surface, font, line, pen, english)
+            })
+            .collect::<Vec<i32>>();
+
+        Some(Tooltip::place(
+            row,
+            record,
+            &widths,
+            comment.chars().count(),
+            english,
+        ))
     }
 }
 
@@ -837,6 +1087,180 @@ mod tests {
         assert_eq!(highlight(Kind::Load, 0x99), None);
     }
 
+    /// Twenty characters to a line and no regard for what it cuts.
+    #[test]
+    fn a_japanese_comment_breaks_on_the_count_alone() {
+        let text: String = std::iter::repeat_n('あ', 25).collect();
+        let lines = wrap_comment(&text, false);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), 20);
+        assert_eq!(lines[1].chars().count(), 5);
+    }
+
+    /// A break at exactly the cap leaves an empty line behind, and the shipped
+    /// loop counts it -- which is what sizes the panel, so it is kept.
+    #[test]
+    fn a_break_at_the_cap_leaves_the_empty_line_it_makes() {
+        let text: String = std::iter::repeat_n('あ', 20).collect();
+        let lines = wrap_comment(&text, false);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "");
+    }
+
+    /// English breaks before a word that would not finish inside forty.
+    #[test]
+    fn an_english_comment_breaks_on_whole_words() {
+        let lines = wrap_comment("the quick brown fox jumps over the lazy dog again", true);
+        assert!(lines.len() >= 2);
+        assert!(lines[0].chars().count() <= 40);
+        // No word is cut in half.
+        for line in &lines {
+            assert!(!line.trim_end().ends_with(char::is_alphabetic) || line.len() <= 40);
+        }
+        assert_eq!(
+            lines.concat(),
+            "the quick brown fox jumps over the lazy dog again"
+        );
+    }
+
+    /// Three lines' worth of input and no more, whichever language.
+    #[test]
+    fn a_comment_is_cut_at_three_lines_of_input() {
+        let long: String = std::iter::repeat_n('あ', 200).collect();
+        assert_eq!(wrap_comment(&long, false).len(), TIP_LINES);
+        let words = "alpha ".repeat(60);
+        assert_eq!(wrap_comment(&words, true).len(), TIP_LINES);
+    }
+
+    #[test]
+    fn an_empty_comment_has_no_tooltip() {
+        assert!(wrap_comment("", false).is_empty());
+        assert!(wrap_comment("", true).is_empty());
+    }
+
+    fn panel_record() -> days_ui::atlas::Widget {
+        days_ui::atlas::Widget {
+            dst: days_ui::cmap::Rect {
+                x: 328,
+                y: 96,
+                width: 472,
+                height: 97,
+            },
+            src_x: 1,
+            src_y: 442,
+        }
+    }
+
+    /// One line takes a third of the record, two take two thirds and three
+    /// take all of it.
+    #[test]
+    fn the_panel_grows_with_the_comment() {
+        let one = Tooltip::place(0, panel_record(), &[0], 10, false);
+        let two = Tooltip::place(0, panel_record(), &[0, 0], 25, false);
+        let three = Tooltip::place(0, panel_record(), &[0, 0, 0], 50, false);
+        assert!((one.panel.dst.3 - (97.0 / 3.0 - 2.0 + 1.0)).abs() < 0.01);
+        assert!((two.panel.dst.3 - (97.0 * 2.0 / 3.0 + 1.0)).abs() < 0.01);
+        assert!((three.panel.dst.3 - 98.0).abs() < 0.01);
+    }
+
+    /// The panel is always the record's full height in the chip sheet however
+    /// short it is drawn, so a one-line panel is that art squashed.
+    #[test]
+    fn the_panel_cuts_the_whole_record_however_short_it_is_drawn() {
+        let tip = Tooltip::place(0, panel_record(), &[0], 10, false);
+        assert_eq!(tip.panel.src, (1, 442, 472, 97));
+        assert!(tip.panel.dst.3 < 97.0);
+    }
+
+    /// Rows past the eighth borrow the record two rows up, so three lines
+    /// cannot run off the bottom of the screen.
+    #[test]
+    fn the_last_two_rows_open_upwards() {
+        for row in 0..=LAST_ROW_OPENING_DOWN {
+            assert_eq!(Tooltip::record_row(row), row);
+        }
+        assert_eq!(Tooltip::record_row(8), 6);
+        assert_eq!(Tooltip::record_row(9), 7);
+    }
+
+    /// Having borrowed it, a short panel is pushed back down so it still lands
+    /// on the row the pointer is on, and the text with it.
+    #[test]
+    fn a_borrowed_record_is_pushed_back_down() {
+        let deep = Tooltip::place(8, panel_record(), &[0], 10, false);
+        let shallow = Tooltip::place(0, panel_record(), &[0], 10, false);
+        assert!((deep.panel.dst.1 - shallow.panel.dst.1 - 97.0 * 2.0 / 3.0).abs() < 0.01);
+        assert!((deep.lines[0].dst.1 - shallow.lines[0].dst.1 - 64.0).abs() < 0.01);
+
+        let deep = Tooltip::place(9, panel_record(), &[0, 0], 25, false);
+        let shallow = Tooltip::place(1, panel_record(), &[0, 0], 25, false);
+        assert!((deep.panel.dst.1 - shallow.panel.dst.1 - 97.0 / 3.0).abs() < 0.01);
+        assert!((deep.lines[0].dst.1 - shallow.lines[0].dst.1 - 32.0).abs() < 0.01);
+    }
+
+    /// Three lines fill the record, so there is nothing to push down.
+    #[test]
+    fn a_full_panel_is_not_shifted_at_all() {
+        let deep = Tooltip::place(9, panel_record(), &[0, 0, 0], 60, false);
+        let shallow = Tooltip::place(1, panel_record(), &[0, 0, 0], 60, false);
+        assert_eq!(deep.panel.dst.1, shallow.panel.dst.1);
+        assert_eq!(deep.lines[0].dst.1, shallow.lines[0].dst.1);
+    }
+
+    /// The lines step down by half the surface pitch and cut the surface where
+    /// `FUN_10012900` writes them.
+    #[test]
+    fn the_lines_cut_where_they_were_written() {
+        let tip = Tooltip::place(0, panel_record(), &[0, 0, 0], 60, false);
+        for (n, line) in tip.lines.iter().enumerate() {
+            assert_eq!(line.src, (1024, 514 + n as u32 * 64, 986, 64));
+            assert!((line.dst.1 - (96.0 + DEST_Y + n as f32 * 32.0)).abs() < 0.01);
+            assert_eq!(line.dst.2, Column::Comment.dest_width());
+        }
+    }
+
+    /// The tooltip is rasterised clear of all three columns: they stop at x 986
+    /// above y 514 and the tooltip starts at x 1024.
+    #[test]
+    fn the_tooltip_does_not_overwrite_the_rows() {
+        for n in 0..TIP_LINES {
+            let y = TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH;
+            assert!(TIP_SURFACE_X >= Column::Comment.width());
+            assert!(y + TIP_SURFACE_HEIGHT <= SURFACE.1 as f32);
+            // Clear of the chapter column, which stops at y 482.
+            assert!(y >= source_rect(Column::Chapter, PER_PAGE - 1).1 + SURFACE_ROW_HEIGHT);
+        }
+    }
+
+    /// Pointing at a row with a comment opens it; pointing at nothing does not,
+    /// and neither does a screen with `[TextInput]` off.
+    #[test]
+    fn the_tooltip_opens_only_on_a_hovered_row() {
+        let slots = filled(3);
+        let open = Rows::render(&font(), &slots, 0, false, &records(), true, Some(3));
+        assert!(open.tooltip.is_some());
+        assert!(
+            Rows::render(&font(), &slots, 0, false, &records(), true, None)
+                .tooltip
+                .is_none()
+        );
+        // A row with no file has nothing to expand.
+        assert!(
+            Rows::render(&font(), &slots, 0, false, &records(), true, Some(4))
+                .tooltip
+                .is_none()
+        );
+    }
+
+    /// `[TextInput]` off takes the comment column and the tooltip together,
+    /// which is what the one host answer gates.
+    #[test]
+    fn text_input_off_takes_the_comment_and_its_tooltip() {
+        let rows = Rows::render(&font(), &filled(3), 0, false, &records(), false, Some(3));
+        assert!(rows.tooltip.is_none());
+        assert_eq!(rows.quads.len(), 2);
+    }
+
     fn rect(x: u32, y: u32) -> days_ui::cmap::Rect {
         days_ui::cmap::Rect {
             x,
@@ -1020,7 +1444,7 @@ mod tests {
     }
 
     fn saveload_rows(slots: &Slots, page: usize) -> Rows {
-        Rows::render(&font(), slots, page, false, &records())
+        Rows::render(&font(), slots, page, false, &records(), true, None)
     }
 
     /// The surface is the size the `FrameBuffer` is created at, and every quad
@@ -1041,7 +1465,7 @@ mod tests {
     #[test]
     fn a_row_with_no_record_is_left_undrawn() {
         let short: Vec<days_ui::atlas::Widget> = records().into_iter().take(10).collect();
-        let rows = Rows::render(&font(), &filled(0), 0, false, &short);
+        let rows = Rows::render(&font(), &filled(0), 0, false, &short, true, None);
         // The comment's record is in the second band, which this table stops
         // short of, so only the stored line's two columns are placed.
         assert_eq!(rows.quads.len(), 2);

@@ -472,6 +472,7 @@ fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
         },
         som: Som::default(),
         english,
+        text_input: player.film.get_bool("TextInput").unwrap_or(false),
         // The screen reports a slot as present when its file opens, and takes
         // the line it shows from the global store.
         slots: Slots::read(&player.game, player.film, &player.flags, english),
