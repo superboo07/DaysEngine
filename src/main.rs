@@ -310,7 +310,7 @@ fn start_script(start: &Ini) -> String {
 /// save state — see [`daysengine::ending`]. A card that will not load costs the
 /// player the picture and nothing else, as any missing asset does.
 fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
-    let list = ending::load_list(player.vfs);
+    let list = ending::load_list(player.vfs, start);
     let base = start.get("BaseFile").unwrap_or_default();
     let chosen = ending::title_backdrop(&list, &player.flags, base);
     log::info!("title backdrop {} ({:?})", chosen.path, chosen.reason);
@@ -330,7 +330,7 @@ fn run_menu(
     events: &mut EventPump,
     start: &Ini,
 ) -> Result<Outcome> {
-    let save = SaveState::from_flags(&player.flags);
+    let save = SaveState::from_flags(&player.flags, start);
     let mut menu = Menu::open(player.vfs, &player.dll, Mode::TITLE, save, MENU_RESOLUTION)
         .context("opening the title screen")?;
 

@@ -484,21 +484,65 @@ the value tag.
 
 ### What the title screen reads
 
-The DLL asks the host three questions; the executable answers out of this file:
+The DLL decides nothing itself: it asks the host three questions through a
+vtable and picks its art from the replies. Only one of the three turns out to
+be save data.
 
-| Question | Host vtable slot | Answer |
-|---|---|---|
-| all-clear | `+0xe8` | flag `AllClear` |
-| route *n* cleared | `+0xec` | flag `EndClear`, for **either** route |
-| trial build | `+0x34` | not recovered |
+The host interface the DLL is handed is a **secondary base subobject** — the
+vtable `0x004d2894` is installed at `[object+0x2c]`, so every member offset the
+executable uses is `0x2c` above the offset the DLL sees. Missing that is what
+makes a scan for writes come back empty and look like a discovery.
 
-One route, one flag: `FUN_0042baf0` answers route 0 and route 1 from the same
-`EndClear`, so clearing the game once both switches the title to `Title_Clear`
-and unlocks `REPLAY`. Route 0 carries one further condition — a member at
-`+0x1f0` that the exe sets — which is **not recovered**.
+| Question | Slot | Getter | Object member | Answer |
+|---|---|---|---|---|
+| all-clear | `+0xe8` | `FUN_0042c2f0` | `+0x7a4` | **always false** |
+| trial | `+0x34` | `FUN_0042c120` | `+0x7a8` | **always false** |
+| route *n* cleared | `+0xec` | `FUN_0042baf0` | `+0x21c` + flag | see below |
 
-`AllClear` is a stored flag, not something to recompute: `FUN_0041fee0` sets it
-once the number of endings seen reaches `[EndingMax]`.
+**All-clear and trial are not flags.** Exactly two functions write either, and
+both are constructors:
+
+```text
+FUN_004217e0    +0x7a0 = 0   +0x7a4 = 0                    +0x7a8 = 0
+FUN_00421b30    +0x7a0 = 0   +0x7a4 = <query "CrossDays">  +0x7a8 = 1
+```
+
+`FUN_004217e0` is the one the executable runs, from `FUN_0041e3a0`.
+`FUN_00421b30` — the one that would answer all-clear from a `L"CrossDays"`
+query and declare itself a trial — **has no callers at all**, confirmed by
+Ghidra's reference index and by a raw scan of `.text` for its address. It is
+the sibling-title build, dead code here.
+
+So in the retail executable all-clear is always false, and **`Title_AC` is a
+screen the game cannot reach** — along with the sixth widget painted into it,
+the audio-commentary entry, whose action is `+0xe0(1)` where `START` is
+`+0xe0(0)`. Trial is always false too. This is confirmed against the real game:
+a save with all 22 endings seen still shows `Title_Clear`.
+
+`Title_AC` is nonetheless still implemented, because this is a reimplementation
+of the DLL's test and not of its reachable subset.
+
+The `AllClear` **save flag** is real and is read — but by `FUN_0041fee0`, to
+choose the backdrop, not the title art. Two different questions with almost the
+same name; see the next section.
+
+Route 0 and route 1 both come from the one `EndClear` flag, so clearing the
+game once changes the title art and unlocks `REPLAY`. Route 0 carries one
+further condition, `+0x21c`, and it is now recovered: `FUN_0041f600` sets it
+from `STARTSCRIPT.INI [EndBGView]`, through the setter `FUN_00420150`.
+
+```c
+uVar5 = *(undefined4 *)(param_1 + 0x26c);     /* [EndBGView] */
+pvVar3 = FUN_00440730(&DAT_0050c428);
+FUN_00420150(pvVar3, uVar5);                  /* host +0x21c */
+if (*(int *)(param_1 + 0x26c) != 0) {
+  FUN_0041fc40(param_1);                      /* load ENDLIST.INI */
+}
+```
+
+One key therefore does two things: it is the extra condition on route 0, and it
+gates loading the ending list at all. Clearing it leaves the plain `Title` and
+no ending backdrops however far the player has got. The shipped value is `"1"`.
 
 ### Which endings have been seen, and the title backdrop
 
@@ -535,10 +579,15 @@ how many are set and compares against `[EndingMax]`; `days save --grep "[End"`
 lists them. So `EndNo` is an **index**, not a tally: `EndNo = 20` means the most
 recent ending was slot 20, i.e. `[Ending21]`.
 
+`STARTSCRIPT.INI [EndBGView]` gates the whole feature: `FUN_0041f600` only
+calls the loader above when that key is set. It is the same key that carries
+the extra condition on route 0 — see the previous section.
+
 Two of the 22 cards are `.wmv`, not `.png` (`Ending16` and `Ending21`), so the
 title backdrop can be a movie. This engine draws their **first frame**. Whether
-the original animates them is **not recovered**: `STARTSCRIPT.INI
-[EndBGView]="1"` is the only plausible switch and nothing was found reading it.
+the original animates them is **not recovered**; `[EndBGView]` is not that
+switch — it is read once, as a plain on/off, and `[MovieView]` next to it
+selects `.png` or `.wmv` for the *logo*, not for the ending cards.
 
 Branch 3 is the one that writes, and this engine does not write save data yet,
 so it recomputes the answer on every launch instead. The picture is the same

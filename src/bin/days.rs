@@ -885,14 +885,19 @@ fn chosen_backdrop(
     list: &ending::EndingList,
     flags: &daysengine::save::FlagStore,
 ) -> ending::Backdrop {
-    let start = match vfs.read_path("Ini/STARTSCRIPT.INI") {
+    let start = start_script_ini(vfs);
+    ending::title_backdrop(list, flags, start.get("BaseFile").unwrap_or_default())
+}
+
+/// `STARTSCRIPT.INI`, which both the title art and the backdrop are read from.
+fn start_script_ini(vfs: &daysengine::vfs::Vfs) -> daysengine::Ini {
+    match vfs.read_path("Ini/STARTSCRIPT.INI") {
         Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
         Err(err) => {
             log::warn!("reading Ini/STARTSCRIPT.INI: {err}");
             daysengine::Ini::parse("")
         }
-    };
-    ending::title_backdrop(list, flags, start.get("BaseFile").unwrap_or_default())
+    }
 }
 
 /// Prints what the save data says the player has unlocked.
@@ -902,7 +907,8 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
     let vfs = daysengine::vfs::Vfs::mount(game)?;
     let flags = load_flags(game, &vfs);
-    let save = SaveState::from_flags(&flags);
+    let start = start_script_ini(&vfs);
+    let save = SaveState::from_flags(&flags, &start);
 
     println!("{} flags", flags.len());
     println!();
@@ -913,7 +919,7 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
         Some(n) => println!("  EndNo             most recent ending is #{n}"),
         None => println!("  EndNo             (not set)"),
     }
-    let list = ending::load_list(&vfs);
+    let list = ending::load_list(&vfs, &start);
     println!(
         "  [EndNN] flags     {} of {} endings seen",
         list.seen(&flags),
@@ -970,7 +976,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     } else {
         load_flags(game, &vfs)
     };
-    let mut save = SaveState::from_flags(&flags);
+    let mut save = SaveState::from_flags(&flags, &start_script_ini(&vfs));
     save.all_clear |= args.all_clear;
     save.cleared_first |= args.cleared;
     save.cleared_replay |= args.replay;
@@ -1018,7 +1024,11 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     );
     // The title's backdrop comes from the same save data, so report it here:
     // the widget table and the picture are the two halves of "which title".
-    let chosen = chosen_backdrop(&vfs, &ending::load_list(&vfs), &flags);
+    let chosen = chosen_backdrop(
+        &vfs,
+        &ending::load_list(&vfs, &start_script_ini(&vfs)),
+        &flags,
+    );
     println!("backdrop {} ({:?})", chosen.path, chosen.reason);
 
     for event in args

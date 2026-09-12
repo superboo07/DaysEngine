@@ -241,12 +241,21 @@ pub enum Error {
     EmptyClip,
 }
 
-/// Reads the ending list out of the packs.
+/// Reads the ending list out of the packs, if `[EndBGView]` asks for it.
 ///
-/// A list that will not load is an empty list, not an error: it costs the
-/// player the ending backdrops and leaves them the fresh-install picture,
-/// which is the same bargain every other missing asset gets.
-pub fn load_list(vfs: &Vfs) -> EndingList {
+/// `FUN_0041f600` only calls the loader when that key is set, so a clear key
+/// means the game holds no cards at all and the title keeps the fresh-install
+/// picture however far the player has got. The same key is the extra condition
+/// on route 0 — see [`crate::menu::end_bg_view`].
+///
+/// A list that will not load is likewise an empty list rather than an error:
+/// it costs the player the ending backdrops and nothing else, which is the
+/// bargain every other missing asset gets.
+pub fn load_list(vfs: &Vfs, start: &Ini) -> EndingList {
+    if !crate::menu::end_bg_view(start) {
+        log::info!("[EndBGView] is clear: no ending backdrops");
+        return EndingList::default();
+    }
     match vfs.read_path(EndingList::PATH) {
         Ok(bytes) => EndingList::parse(&Ini::parse_bytes(&bytes)),
         Err(err) => {

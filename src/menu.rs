@@ -25,6 +25,14 @@
 //! hit map. Pointing at a widget swaps in its chip sprite; clicking runs the
 //! screen's action table. Only the title's table is recovered so far, out of
 //! the DLL's own dispatch — see [`Menu::confirm`].
+//!
+//! # Whose answer is it
+//!
+//! The DLL decides nothing about the player: it asks the host, through a
+//! vtable, and picks art from the replies. Two of the three replies turn out
+//! not to be save data at all — see [`SaveState::from_flags`], which is also
+//! where the reasoning is written down, because getting this wrong produced a
+//! title screen the real game never shows.
 
 use crate::ini::Ini;
 use crate::screen::{Error, Resolution, Screen, WidgetState};
@@ -155,63 +163,75 @@ impl SystemSe {
 
 /// What the player has unlocked.
 ///
-/// The title screen asks the host three questions — all-clear, trial build, and
-/// whether a given route is cleared — and picks its art and its enabled widgets
-/// from the answers. The host answers out of `Save/GlobalFlag.DAT`; see
-/// [`SaveState::from_flags`] for which flag answers which question, and
-/// [`crate::save`] for reading the file. The default is a fresh install: plain
-/// `Title`, replay locked.
+/// The title screen asks the host three questions — all-clear, trial build,
+/// and whether a given route is cleared — and picks its art and its enabled
+/// widgets from the answers. See [`SaveState::from_flags`] for where each
+/// answer really comes from, because only one of the three is a save flag.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SaveState {
-    /// Every ending seen. Switches the title to `Title_AC` and adds its sixth
-    /// widget.
+    /// The host's all-clear answer. **Always false in the retail executable**
+    /// — see [`SaveState::from_flags`]. It is not the `AllClear` save flag.
     pub all_clear: bool,
-    /// Trial build. Forces the plain title and locks replay.
+    /// The host's trial answer. Always false in the retail executable.
     pub trial: bool,
-    /// Route 0 cleared: switches the title to `Title_Clear`.
+    /// Route 0 cleared: switches the title to `Title_Clear`. Needs both the
+    /// `EndClear` flag and `STARTSCRIPT.INI [EndBGView]`.
     pub cleared_first: bool,
-    /// Route 1 cleared: unlocks `REPLAY`.
+    /// Route 1 cleared: unlocks `REPLAY`. The `EndClear` flag alone.
     pub cleared_replay: bool,
 }
 
 impl SaveState {
-    /// Answers the title screen's three questions out of the flag store.
+    /// Answers the title screen's three questions the way the host does.
     ///
-    /// The DLL only asks; the executable answers, and these are the answers it
-    /// gives:
+    /// The DLL only asks; the executable answers. The host interface it is
+    /// handed is a **secondary base subobject**, installed at `[object+0x2c]`,
+    /// so each slot's member sits `0x2c` above the offset the DLL sees:
     ///
-    /// | Question | Host slot | Answer |
-    /// |---|---|---|
-    /// | all-clear | `+0xe8` | flag `AllClear` |
-    /// | route *n* cleared | `+0xec` | flag `EndClear`, for **either** route |
-    /// | trial build | `+0x34` | not recovered; see below |
+    /// | Question | Slot | Reads | Object member |
+    /// |---|---|---|---|
+    /// | all-clear | `+0xe8` | `FUN_0042c2f0` | `+0x7a4` |
+    /// | trial | `+0x34` | `FUN_0042c120` | `+0x7a8` |
+    /// | route *n* cleared | `+0xec` | `FUN_0042baf0` | `+0x21c` and a flag |
     ///
-    /// One route, one flag: `FUN_0042baf0` answers route 0 and route 1 from the
-    /// same `EndClear` flag, so clearing the game once both changes the title
-    /// art and unlocks `REPLAY`. Route 0 carries one extra condition — a member
-    /// the exe must have set — that is **not recovered**, so `cleared_first`
-    /// here is `EndClear` alone and may be true slightly earlier than the
-    /// original would say.
+    /// **Neither all-clear nor trial is a save flag.** Both are plain members,
+    /// and only two functions in the whole executable write either. The live
+    /// constructor `FUN_004217e0` — the only one anything calls — zeroes both.
+    /// The other, `FUN_00421b30`, sets trial to 1 and all-clear to the result
+    /// of asking for `L"CrossDays"`, and **has no callers at all**: it is the
+    /// sibling-title build, dead code here.
     ///
-    /// `trial` stays false: the retail executable contains no trial string and
-    /// no reachable trial branch, so there is nothing to read. A trial build
-    /// would be a different executable, not a different save.
+    /// So in the retail executable all-clear is always false, which makes
+    /// `Title_AC` — and the audio-commentary entry painted into it — a screen
+    /// the game can never reach. Trial is always false too. This engine
+    /// answers both the way the shipped code does rather than inventing a
+    /// condition for them, and [`SaveState::from_flags`] therefore ignores the
+    /// `AllClear` flag entirely. That flag is real and is read, but by
+    /// `FUN_0041fee0` in the executable, to choose the *backdrop* — a
+    /// different question with a confusingly similar name. See
+    /// [`crate::ending`].
     ///
-    /// The exe sets `AllClear` itself, in `FUN_0041fee0`, once the number of
-    /// per-ending flags that are set reaches `[EndingMax]` — so it is a stored
-    /// flag and not something to recompute here. `EndNo` is *not* that count:
-    /// it is the index of the most recent ending. See [`crate::save`].
-    pub fn from_flags(flags: &FlagStore) -> Self {
+    /// Route 0 and route 1 both come from the one `EndClear` flag
+    /// (`FUN_0042baf0`), so clearing the game once changes the title art and
+    /// unlocks `REPLAY`. Route 0 carries one further condition, object
+    /// `+0x21c`, which `FUN_0041f600` sets from `STARTSCRIPT.INI
+    /// [EndBGView]` — the same key that gates loading the ending list at all.
+    pub fn from_flags(flags: &FlagStore, start: &Ini) -> Self {
         let cleared = flags.flag("EndClear");
         SaveState {
-            all_clear: flags.flag("AllClear"),
+            all_clear: false,
             trial: false,
-            cleared_first: cleared,
+            cleared_first: cleared && end_bg_view(start),
             cleared_replay: cleared,
         }
     }
 
     /// The title art variant, following the DLL's own three-way test.
+    ///
+    /// `Title_AC` is kept because the test is the DLL's and this is a
+    /// reimplementation of it, not of its reachable subset — but nothing in
+    /// the retail executable can set [`SaveState::all_clear`], so the live
+    /// answers are only `Title_Clear` and `Title`.
     pub fn title_variant(self) -> &'static str {
         if self.all_clear {
             "Title_AC"
@@ -228,6 +248,18 @@ impl SaveState {
     pub fn replay_unlocked(self) -> bool {
         !self.trial && self.cleared_replay
     }
+}
+
+/// `STARTSCRIPT.INI [EndBGView]`, the ending-backdrop switch.
+///
+/// `FUN_0041f600` reads this key into the startup config and does two things
+/// with it: it hands it to the host as the extra condition on route 0, and it
+/// skips loading the ending list entirely when the key is clear. So one key
+/// turns off both the ending backdrops and the cleared title art. The shipped
+/// value is `"1"`; a key that is absent altogether reads as off, which is what
+/// the executable's zero-initialised member does.
+pub fn end_bg_view(start: &Ini) -> bool {
+    start.get_bool("EndBGView").unwrap_or(false)
 }
 
 /// What the engine should do after handing the menu an event.
@@ -637,6 +669,8 @@ mod tests {
         }
     }
 
+    /// The DLL's three-way test, exercised on its own terms — including the
+    /// branch the retail executable can never take.
     #[test]
     fn the_title_variant_follows_the_dlls_three_way_test() {
         let fresh = SaveState::default();
@@ -656,8 +690,6 @@ mod tests {
         };
         assert_eq!(all.title_variant(), "Title_AC");
 
-        // A trial build is forced back to the plain title and keeps replay shut
-        // even once a route is cleared.
         let trial = SaveState {
             trial: true,
             cleared_first: true,
@@ -666,6 +698,61 @@ mod tests {
         };
         assert_eq!(trial.title_variant(), "Title");
         assert!(!trial.replay_unlocked());
+    }
+
+    fn started(end_bg_view: &str) -> Ini {
+        Ini::parse(&format!("[EndBGView]=\"{end_bg_view}\""))
+    }
+
+    fn cleared_save() -> FlagStore {
+        FlagStore::from_entries([("EndClear".to_string(), days_save::Value::Bool(true))])
+    }
+
+    /// A finished save gets `Title_Clear`, and **not** `Title_AC`: the host
+    /// member behind the all-clear question is zeroed by the one constructor
+    /// anything calls and never written again. Confirmed against the real
+    /// game, which shows `Title_Clear` on a save with every ending seen.
+    #[test]
+    fn a_finished_save_gets_the_cleared_title_and_never_the_all_clear_one() {
+        let save = SaveState::from_flags(&cleared_save(), &started("1"));
+        assert_eq!(save.title_variant(), "Title_Clear");
+        assert!(save.replay_unlocked());
+        assert!(!save.all_clear, "no executable path sets this");
+        assert!(!save.trial, "nor this");
+    }
+
+    /// The `AllClear` save flag is real, but it chooses the backdrop, not the
+    /// title art. Setting it must not move the title screen.
+    #[test]
+    fn the_all_clear_save_flag_does_not_reach_the_title_art() {
+        let flags = FlagStore::from_entries([
+            ("EndClear".to_string(), days_save::Value::Bool(true)),
+            ("AllClear".to_string(), days_save::Value::Bool(true)),
+        ]);
+        let save = SaveState::from_flags(&flags, &started("1"));
+        assert!(!save.all_clear);
+        assert_eq!(save.title_variant(), "Title_Clear");
+    }
+
+    /// `[EndBGView]` is the extra condition on route 0, so clearing it leaves
+    /// the plain title however far the player has got — while `REPLAY`, which
+    /// asks about route 1, stays unlocked.
+    #[test]
+    fn end_bg_view_gates_the_cleared_title_but_not_replay() {
+        let save = SaveState::from_flags(&cleared_save(), &started("0"));
+        assert_eq!(save.title_variant(), "Title");
+        assert!(save.replay_unlocked());
+
+        // An absent key reads as clear, matching the zeroed member.
+        let save = SaveState::from_flags(&cleared_save(), &Ini::parse(""));
+        assert_eq!(save.title_variant(), "Title");
+    }
+
+    #[test]
+    fn a_fresh_save_gets_the_plain_title() {
+        let save = SaveState::from_flags(&FlagStore::default(), &started("1"));
+        assert_eq!(save.title_variant(), "Title");
+        assert!(!save.replay_unlocked());
     }
 
     #[test]
