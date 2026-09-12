@@ -12,6 +12,20 @@ use days_font::Font;
 
 /// Composites one frame to RGBA at `width` x `height`.
 pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize) -> Vec<u8> {
+    frame_rgba_with(visual, font, width, height, false)
+}
+
+/// As [`frame_rgba`], with the choice box's axis given.
+///
+/// `stacked` is the install's own layout answer, which `frame_rgba` cannot read
+/// for itself because it is handed no INI — see [`crate::ui::select::Layout`].
+pub fn frame_rgba_with(
+    visual: &Visual<'_>,
+    font: &Font,
+    width: usize,
+    height: usize,
+    stacked: bool,
+) -> Vec<u8> {
     let mut out = vec![0u8; width * height * 4];
     for px in out.as_chunks_mut::<4>().0 {
         *px = [0, 0, 0, 255];
@@ -97,6 +111,43 @@ pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize)
             8,
             y,
         );
+    }
+
+    // The choice box, when one is up. Its labels are placed by fractions of
+    // the frame rather than in pixels: the hit maps are shipped only at 1024x576
+    // and 1280x720, so the split -- x for two boxes side by side, y for two
+    // stacked -- is what carries over to any size. Which axis is the install's
+    // own `[SelectType]` and `[UseEnglish]` answer; see `crate::ui::select`.
+    if let Some(window) = &visual.select {
+        let labels: Vec<&str> = [Some(window.a), window.b]
+            .into_iter()
+            .flatten()
+            .filter(|l| !l.eq_ignore_ascii_case("null"))
+            .collect();
+        for (index, label) in labels.iter().enumerate() {
+            let (cx, cy) = match (labels.len(), stacked) {
+                (1, _) => (0.5, 0.5),
+                (_, true) => (0.5, 0.25 + 0.5 * index as f32),
+                (_, false) => (0.25 + 0.5 * index as f32, 0.5),
+            };
+            let image = text::render_line(font, label, [255, 255, 255]);
+            let scaled = downscale_half(&image.rgba, image.width, image.height);
+            let (sw, sh) = (image.width / 2, image.height / 2);
+            let x = ((width as f32 * cx) as usize).saturating_sub(sw / 2);
+            let y = ((height as f32 * cy) as usize).saturating_sub(sh / 2);
+            blit(
+                &mut out,
+                width,
+                height,
+                &Surface {
+                    pixels: &scaled,
+                    width: sw,
+                    height: sh,
+                },
+                x,
+                y,
+            );
+        }
     }
 
     out

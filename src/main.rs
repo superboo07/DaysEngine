@@ -16,11 +16,13 @@ use daysengine::install::config::{Channel, Config, Flag};
 use daysengine::install::save::FlagStore;
 use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
+use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
 use daysengine::ui::options::{Dir, Display, Som};
 use daysengine::ui::replay::Scenes;
 use daysengine::ui::screen::Resolution;
+use daysengine::ui::select::{self, Choice, Input, Select};
 use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
@@ -144,6 +146,8 @@ struct Player<'a> {
     flags: FlagStore,
     /// The install root, which is where `Config.DAT` is written back.
     game: PathBuf,
+    /// `FILMENGINE.INI`, which names the choice box's hit maps among much else.
+    film: &'a Ini,
 }
 
 fn main() -> Result<()> {
@@ -227,6 +231,7 @@ fn main() -> Result<()> {
         font: &font,
         mixer: &mixer,
         sounds: Sounds::default(),
+        film: &film,
         system_se: SystemSounds::from_ini(&film),
         flags: daysengine::install::save::load_flags(&game, &film),
         // The widget tables are only needed for menus. A missing DLL is not
@@ -642,14 +647,36 @@ fn run_script(
     let mut mouth_texture: Option<(usize, usize, Texture)> = None;
 
     let mut stage = Stage::new(script);
+    let config = Config::load(&player.game);
     // Male voice lines are dropped when the player has turned `MenVoice` off.
-    stage.set_men_voice(Config::load(&player.game).flag(Flag::MenVoice));
+    stage.set_men_voice(config.flag(Flag::MenVoice));
+
+    // The control bar and the choice box both come out of the install, and a
+    // missing one has to leave playback alone: this is the UI over a movie, not
+    // the movie. So both are loaded with a warning and the loop checks for them.
+    let mut control = match Bar::load(player.vfs, &player.dll, MENU_RESOLUTION) {
+        Ok(bar) => Some(bar),
+        Err(err) => {
+            log::warn!("the control bar is unavailable: {err}");
+            None
+        }
+    };
+    let mut bar_state = bar::State::from_config(&config);
+    // The bar's own fade, and the frame the auto flag was last set on.
+    let mut auto_since = Instant::now();
+    let mut hovered: Option<usize> = None;
+    // Cached on the record list, so the strip is only recomposited when it
+    // actually changes — which is on a hover, a state change or an auto frame.
+    let mut bar_texture: Option<(Vec<usize>, u32, u32, Texture)> = None;
+    let mut choice: Option<(Choice, Select)> = None;
 
     // The clock is wall-clock based with an offset, so pausing and seeking are
     // both just adjustments to the offset rather than separate state machines.
     let mut origin = Instant::now();
     let mut offset = Frame::ZERO;
     let mut paused = false;
+    let mut pointer = (0.0f32, 0.0f32);
+    let mut buttons = (false, false);
 
     loop {
         for event in events.poll_iter() {
@@ -690,6 +717,22 @@ fn run_script(
                     offset = Frame::ZERO;
                     origin = Instant::now();
                 }
+                Event::MouseMotion { x, y, .. } => pointer = (x, y),
+                Event::MouseButtonDown {
+                    mouse_btn, x, y, ..
+                } => {
+                    pointer = (x, y);
+                    match mouse_btn {
+                        MouseButton::Left => buttons.0 = true,
+                        MouseButton::Right => buttons.1 = true,
+                        _ => {}
+                    }
+                }
+                Event::MouseButtonUp { mouse_btn, .. } => match mouse_btn {
+                    MouseButton::Left => buttons.0 = false,
+                    MouseButton::Right => buttons.1 = false,
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -712,6 +755,119 @@ fn run_script(
 
         let dst = letterbox(canvas, STAGE_WIDTH, STAGE_HEIGHT);
         let scale = dst.h / STAGE_HEIGHT as f32;
+
+        // The control bar's own space is 800x75 with its origin at the strip's
+        // top-left corner; the engine places that strip, and the DLL's
+        // `FUN_10021c20` gives the base sprite the same half-pixel inset every
+        // other sprite gets, so the origin is the only placement there is.
+        bar_state.paused = paused;
+        bar_state.rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
+        if let Some(control) = &mut control {
+            let (bw, bh) = control.screen().size();
+            let strip = FRect::new(dst.x, dst.y, bw as f32 * scale, bh as f32 * scale);
+            let over = |p: (f32, f32)| {
+                let sx = (p.0 - strip.x) / scale;
+                let sy = (p.1 - strip.y) / scale;
+                (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
+                    .then_some((sx as u32, sy as u32))
+            };
+            hovered = over(pointer).and_then(|(x, y)| control.hit(x, y));
+
+            if buttons.0 {
+                if let Some(widget) = hovered {
+                    // Consume the press, so holding the button does not
+                    // re-dispatch every frame.
+                    buttons.0 = false;
+                    let act = control.press(widget, bar_state, at.0);
+                    if act != bar::Act::None {
+                        player.system_se.play(
+                            SystemSe::Click,
+                            player.vfs,
+                            &mut player.sounds,
+                            player.mixer,
+                        );
+                    }
+                    match act {
+                        bar::Act::ToggleAuto => {
+                            bar_state.auto = !bar_state.auto;
+                            auto_since = Instant::now();
+                        }
+                        bar::Act::TogglePause => {
+                            if paused {
+                                origin = Instant::now();
+                            } else {
+                                offset = clock(origin, offset);
+                            }
+                            paused = !paused;
+                        }
+                        bar::Act::Speed(index) => bar_state.speed = index,
+                        bar::Act::Seek(code) if code == bar::Seek::RESTART => {
+                            offset = Frame::ZERO;
+                            origin = Instant::now();
+                        }
+                        // Everything past a restart lands in the executable's
+                        // state 4, which chains to the next script — the route
+                        // system, which this engine does not have. Leaving
+                        // playback is the closest honest answer, and the two
+                        // menu requests have no screen to open over playback
+                        // yet, so they are logged rather than half-done.
+                        bar::Act::Seek(_) | bar::Act::Leave => return Ok(Outcome::Play),
+                        bar::Act::Menu(request) => {
+                            log::info!("the bar asked for menu {} over playback", request.0)
+                        }
+                        bar::Act::Step(step) => {
+                            log::info!("the bar asked for step {step}")
+                        }
+                        bar::Act::None => {}
+                    }
+                }
+            }
+            control.expire_latch(at.0);
+        }
+
+        // The choice box. It is raised and decided by the script clock, not by
+        // the player: an ignored choice still resolves when its window runs out.
+        match (&visual.select, &mut choice) {
+            (Some(window), None) => {
+                let pending = Choice::new(window.a, window.b, window.start, window.end);
+                match Select::load(player.vfs, player.film, pending.count(), MENU_RESOLUTION) {
+                    Ok(map) => choice = Some((pending, map)),
+                    Err(err) => log::warn!("the choice box is unavailable: {err}"),
+                }
+            }
+            (None, Some(_)) => choice = None,
+            _ => {}
+        }
+        if let Some((pending, map)) = &mut choice {
+            let input = Input {
+                pointer: (
+                    f64::from((pointer.0 - dst.x) / dst.w),
+                    f64::from((pointer.1 - dst.y) / dst.h),
+                ),
+                pick: buttons.0,
+                dismiss: buttons.1,
+                ..Input::default()
+            };
+            let event = pending.tick(at, map, input, bar_state.auto, &mut |n| {
+                // The original seeds from `GetTickCount` and draws once; any
+                // source of the same range does the same job.
+                (Instant::now().elapsed().subsec_nanos() as usize ^ at.0 as usize) % n.max(1)
+            });
+            match event {
+                select::Event::Raised(se) | select::Event::Decided(_, se) => {
+                    player
+                        .system_se
+                        .play(se, player.vfs, &mut player.sounds, player.mixer);
+                    if let select::Event::Decided(index, _) = event {
+                        log::info!("choice decided: {index}");
+                    }
+                }
+                select::Event::Nothing => {}
+            }
+            if event != select::Event::Nothing {
+                buttons.0 = false;
+            }
+        }
 
         if let Some(frame) = visual.movie {
             movie_texture
@@ -821,6 +977,84 @@ fn run_script(
                         ),
                     )
                     .map_err(|e| anyhow::anyhow!("drawing text: {e}"))?;
+            }
+        }
+
+        // The choice labels. The original draws these through its own text
+        // pipeline from an anchor whose transform is not recovered; what *is*
+        // recovered is the box each choice occupies, because that is the
+        // shipped hit map. So each label is centred in its own box.
+        if let Some((pending, map)) = &choice {
+            if pending.visible(at) {
+                if let Some(((mw, mh), boxes)) = map.map_size().zip(map.bounds()) {
+                    for (index, label) in pending.labels.iter().enumerate() {
+                        let Some(region) = boxes.get(index) else {
+                            continue;
+                        };
+                        let lit = pending.highlight == Some(index);
+                        let colour = if lit {
+                            [255, 236, 160]
+                        } else {
+                            [255, 255, 255]
+                        };
+                        let image = text::render_line(player.font, label, colour);
+                        let mut texture = creator.create_texture_streaming(
+                            PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                            image.width as u32,
+                            image.height as u32,
+                        )?;
+                        texture.set_blend_mode(BlendMode::Blend);
+                        texture.update(None, &image.rgba, image.width * 4)?;
+                        let text_scale = scale * 0.5;
+                        let tw = image.width as f32 * text_scale;
+                        let th = image.height as f32 * text_scale;
+                        let cx =
+                            (f32::from(region.x as u16) + region.width as f32 / 2.0) / mw as f32;
+                        let cy =
+                            (f32::from(region.y as u16) + region.height as f32 / 2.0) / mh as f32;
+                        canvas
+                            .copy(
+                                &texture,
+                                None,
+                                FRect::new(
+                                    dst.x + dst.w * cx - tw / 2.0,
+                                    dst.y + dst.h * cy - th / 2.0,
+                                    tw,
+                                    th,
+                                ),
+                            )
+                            .map_err(|e| anyhow::anyhow!("drawing a choice label: {e}"))?;
+                    }
+                }
+            }
+        }
+
+        // The control bar last, over everything, as its own layer.
+        if let Some(control) = &control {
+            let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            let records = control.records(hovered, bar_state, elapsed);
+            let stale = bar_texture
+                .as_ref()
+                .is_none_or(|(cached, ..)| cached != &records);
+            if stale {
+                let image = control.compose(None, &control.states(hovered, bar_state, elapsed));
+                let mut texture = creator.create_texture_streaming(
+                    PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
+                    image.width,
+                    image.height,
+                )?;
+                texture.set_blend_mode(BlendMode::Blend);
+                texture.update(None, &image.rgba, image.width as usize * 4)?;
+                bar_texture = Some((records, image.width, image.height, texture));
+            }
+            if let Some((_, w, h, texture)) = &bar_texture {
+                canvas
+                    .copy(
+                        texture,
+                        None,
+                        FRect::new(dst.x, dst.y, *w as f32 * scale, *h as f32 * scale),
+                    )
+                    .map_err(|e| anyhow::anyhow!("drawing the control bar: {e}"))?;
             }
         }
 

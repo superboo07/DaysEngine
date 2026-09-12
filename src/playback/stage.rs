@@ -48,14 +48,28 @@ pub struct Visual<'a> {
     pub still: Option<&'a Still>,
     /// Speaker and line of the active `[PrintText]`.
     pub text: Option<(&'a str, &'a str)>,
-    /// Choice labels of the active `[SetSELECT]`.
-    pub choices: Option<(&'a str, Option<&'a str>)>,
+    /// The active `[SetSELECT]`, with the window it owns.
+    ///
+    /// The window is part of it because the choice box is driven by it: the
+    /// original raises the box at `start` and decides for the player once
+    /// `frame + 1` reaches `end`, so a caller given only the labels could not
+    /// reproduce the timeout. See [`crate::ui::select`].
+    pub select: Option<SelectWindow<'a>>,
     /// Fade overlay: colour and opacity in `0.0..=1.0`.
     pub fade: Option<([u8; 3], f32)>,
     /// Mouth patches to draw over the still, each with the index of the image
     /// showing this frame. Empty unless a tagged voice line is speaking over a
     /// background that ships overlays for it.
     pub mouths: Vec<(&'a Mouth, usize)>,
+}
+
+/// The active `[SetSELECT]`: its labels and the frames it runs between.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectWindow<'a> {
+    pub a: &'a str,
+    pub b: Option<&'a str>,
+    pub start: Frame,
+    pub end: Frame,
 }
 
 /// Tracks a fade in progress.
@@ -412,7 +426,14 @@ impl Stage {
                 Command::PrintText { speaker, text } => {
                     visual.text = Some((speaker.as_str(), text.as_str()))
                 }
-                Command::SetSelect { a, b } => visual.choices = Some((a.as_str(), b.as_deref())),
+                Command::SetSelect { a, b } => {
+                    visual.select = Some(SelectWindow {
+                        a: a.as_str(),
+                        b: b.as_deref(),
+                        start: event.start,
+                        end: event.end,
+                    })
+                }
                 _ => {}
             }
         }

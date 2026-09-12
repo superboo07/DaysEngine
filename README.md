@@ -43,6 +43,8 @@ Early. What works today:
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
 | Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
+| In-game control bar | **Works** — all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the five playback rates, the auto flag and restart act. The buttons that chain to the next script are blocked on the route graph, and which menu each one opens is not recovered. `days bar` prints the table |
+| Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Text box, word wrap, backlog | Not started |
 | Route / branch graph | **Blocked on reverse engineering** — see below |
 | Save file compatibility | Not started |
@@ -112,12 +114,20 @@ days ui System/Title/Title -r full --active 1 -o /tmp/title.png
 days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 days config                          # the player's settings, as the Option screen reads them
 days replay                          # the replay scene table, and what the save has unlocked
+days bar --hover 12 -o /tmp/bar.png  # the in-game control bar, widget by widget
+days select "I'm happy" "This is bad" --at 0.5,0.75   # a choice box's map and hit test
 ```
 
 `days ui` composites a UI screen without a display, the way `days render` does
 for playback, so the UI can be checked as an image diff on a machine with no
 GPU. `--table` prints the widget-to-sprite table recovered from the DLL instead
 of drawing.
+
+`days bar` prints every control-bar widget with its box, whether the engine's
+own rules make it live, its caption and what it asks the host for, and renders
+the strip as the engine composites it. `days select` reports which of the six
+shipped hit maps a resolution really gets, the boxes in it, the label wrap
+limits, and where a normalised point lands.
 
 `days menu` replays a script of menu events — `down`, `up`, `left`, `right`,
 `enter`, `esc`, `at:X:Y`, `click:X:Y` — against the real screens and reports

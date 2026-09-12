@@ -593,16 +593,33 @@ so the atlas search correctly refuses the screen.
 
 See `daysengine::replay`.
 
-### What is not recovered
+### The system sounds, and the index they are asked for by
 
-The seven system sounds `FILMENGINE.INI` names — `SeCancel`, `SeSelect`,
-`SeClick`, `SeUp`, `SeDown`, `SeView`, `SeOpen` — are stored by the executable
-as seven separate `std::wstring` members on a `0x1c` stride from `+0x5a0`, in
-that order. The menu modules ask the host to play one **by index** (host vtable
-slot `0x50`, argument 2 on confirm), but no code computing that stride and no
-switch dispatching on the index was found, so which index names which sound is
-still open. `daysengine::menu::SystemSe` therefore carries the game's names and
-INI keys, and the engine picks the bindings itself.
+The seven sounds `FILMENGINE.INI` names are stored by the executable as seven
+separate `std::wstring` members on a `0x1c` stride, written by `FUN_00422170`
+at `base + 0x5a0 + 0x1c * n` in the INI's own declaration order:
+
+| index | key | index | key |
+|---|---|---|---|
+| 0 | `SeCancel` | 4 | `SeDown` |
+| 1 | `SeSelect` | 5 | `SeView` |
+| 2 | `SeClick` | 6 | `SeOpen` |
+| 3 | `SeUp` | | |
+
+Host vtable slot `0x50` — `FUN_00429c80` — is how the menu modules and the
+in-game UI ask for one, and it is a seven-arm switch reading
+`this + 0x5a4 + 0x1c * index`: the same run, at the same stride, in the same
+order. The four-byte difference is the host subobject offset: `base` is the
+host plus four, which falls out twice, once from the member run lining up and
+once because `FUN_00422170` hands `base + 0x304` to the choice box that
+`FUN_00431740` reaches as `engine + 0x334` with the host installed at
+`engine + 0x2c`. The switch has no default arm, so an eighth index would play
+whatever the path pointer last held.
+
+Three call sites agree with the names: the control bar plays index 2 on any
+live click, and the choice box plays 1 when a choice is taken and 0 when it is
+declined or times out. Which index each menu *screen* plays is per-screen and
+still open; what `daysengine::ui::menu` plays where is this engine's choice.
 
 Of the three questions the title asks the host, only one is answered out of
 `Save/GlobalFlag.DAT`. Route *n* cleared (`+0xec`, `FUN_0042baf0`) reads the
@@ -612,6 +629,143 @@ constructor anything calls zeroes and nothing else writes — so both are always
 false in the retail build, and `Title_AC` is unreachable. See the Title section
 above and `daysengine::menu::SaveState::from_flags`, where the reasoning is kept
 next to the code that depends on it.
+
+---
+
+## The in-game UI — the control bar and the choice box
+
+Neither of these is one of `SystemInit`'s modes. They are the UI the engine puts
+*over* playback, and they are owned differently from the menus and from each
+other.
+
+### `System/MenuBar` — the control bar
+
+The art and the 25-region widget table are in `SysMenuSDHQ.dll` like any other
+screen, but the module is not in the mode switch. `_SetMenuBar@4` is a one-line
+export — `*param = &DAT_10050790` — so the executable is handed a pointer to a
+static `FILM::MenuBar` (constructor `FUN_100216e0`, which writes the vtable at
+`0x1003d804`) and drives it through that object's own slots:
+
+| slot | role |
+|---|---|
+| `+0x08` | release textures |
+| `+0x0c` | load the cmap and chip sheet, lay the sprites out |
+| `+0x10` | re-place on a resolution change |
+| `+0x14` | draw — `FUN_10024ca0` |
+| `+0x1c` | take the renderer and host pointers |
+| `+0x20` | update: hit test, fade, dispatch — `FUN_10024100` |
+| `+0x2c` | re-place the play/pause widget — `FUN_100258f0` |
+| `+0x30` | widget 2's action — `FUN_10025b90` |
+| `+0x34` | widget 0's action — `FUN_10025cf0` |
+
+Widget index `n` is region `n + 1` and table record `n`. `FUN_10024100`'s
+dispatch, `FUN_10023fb0`'s enabled test and `FUN_100262e0`'s caption switch all
+bracket the 25 into the same twelve groups:
+
+| widgets | asks the host for | live when |
+|---|---|---|
+| 0 | `+0x120`, flip the auto flag and save the settings | always |
+| 1 | `+0xf4`, toggle pause | always |
+| 2 | `+0xfc(1)`, then `+0xfc(2)` on a second press | always |
+| 3 | `+0xfc(2)` | always |
+| 4 | `+0x12c(1)` then `+0xfc(5)` | `!+0x104 && !+0x110 && SuperSkip` |
+| 5..9 | `+0x8c(0..4)`, the playback rate | `!+0x110 && +0x88` |
+| 10..12 | `+0xf8(4)`, `+0xf8(5)`, `+0xf8(3)` | `!+0x104` |
+| 13 | `+0xf8(2)` | always |
+| 14 | `+0x100(1)` | always |
+| 15..24 | `FUN_10026ed0`, ten steps of one setting | `+0x98` |
+
+A press on a widget that is not live is swallowed *and silent*: the dispatch
+asks the enabled test before playing SE index 2.
+
+**The rate table is `1, 2, 4, 12, 24`** — `DAT_004f99f0`, indexed by host slot
+`+0x8c` in `FUN_00424f90`. The English chip sheet labels the last two buttons
+`▶×16` and `▶×32`; the art is not the authority.
+
+Where the host slots land is the executable's own state machine. `FUN_00427300`
+switches on `engine + 0x220`, which is host `+0x1f4` — an independent
+confirmation that the host interface sits at `engine + 0x2c`. State 1 plays,
+state 3 opens a menu (`FUN_00425550`, with the number `_SetReMenu@4` was given),
+state 4 moves the timeline (`FUN_00425bf0`, where code 1 restarts the script in
+place and codes 2 and 5 chain to whatever `_GetNextScriptFile@12` names) and
+state 5 leaves. **Which menu each `+0xf8` number selects is not recovered**, and
+the chaining codes are route-system territory.
+
+`MENUBAR.PNG` holds two buttons and nothing else, so the bar cannot be
+composited from hover states: `FUN_10024ca0` draws about fifteen sprites from
+the chip sheet every frame and `FUN_10021c20` is where each is given a record.
+Records 48..52 are the five menu buttons' resting art, 47/66 the rate row live
+and dead, 46/65 widget 4's, 44/45 widget 1's, 42 widget 0's, 69/70 the strip
+above the ten steps, 67 the gauge bed, and 53..64 the twelve captions
+(`0x1004d318`, which is record 53). Records at chip row `y = 127` are the live
+variant and those at `y = 290` the dead one — established twice over, because
+each pair is picked by the same question that makes its widget pressable.
+
+Widget 0 animates through records 29..41 while its flag is set, at
+`((now - started) / (1000 / (rate_index + 1))) % 13`, so it runs faster the
+faster playback is. The bar fades in over 300ms and out over 1000ms
+(`FUN_100255c0`). Widget 1's hover art is inverted on purpose — it offers
+`pause` while playing — and `FUN_10024100` and `FUN_100258f0` pick the same pair
+independently.
+
+See `daysengine::ui::bar`, and `days bar` to print the whole table against a
+real install.
+
+### `System/Select` — the choice box
+
+`[SetSELECT]` is an ordinary timeline statement and **nothing about it pauses
+the script**. `FUN_00431740`, the per-frame playback tick, raises the box the
+first frame at or past the start, polls it while `frame + 1 < end`, and once the
+window is spent decides without the player. Parsing is in `FUN_00438de0`: the
+second label being the literal `NULL` or `null` is what makes a one-choice box.
+
+The box has **no base art and no chip sheet**. `System/Select/` ships six
+`.CMAP`s and nothing else, and only at 1024x576 and 1280x720 — there is no
+choice map at either 800-wide size. `FILMENGINE.INI`'s `[Select1]` and
+`[Select2]` name the `_Full` ones; `FUN_0040f0d0` swaps in `_Note`, and the
+two-choice loader appends `_H` when `[SelectType]` and `[UseEnglish]` are both
+non-zero, which is what the shipped English install has.
+
+`FUN_0044d450` hit-tests in **normalised** coordinates — host slot `+0x144`
+hands back a pair of floats, and the bounds are the doubles `0.0`, `0.5` and
+`1.0` at `0x004d13d8`, `0x004d4fb0` and `0x004d13d0`. It uses the `.CMAP` only
+when `FUN_0040e830()` and `FUN_0040ea90()` both return 1, and otherwise splits
+the screen itself: **on x by default, on y for the `_H` layout**. The shipped
+maps agree exactly — `Select_2_Full.cmap` is two 640x720 halves and
+`Select_2_Full_H.cmap` two 1280x360 ones — so the `_H` is a stacked layout, not
+a horizontal one.
+
+`FUN_0044de50` is the input, through host slot `+0x148`'s eight buttons: 0 picks
+what the pointer is on, 1 cancels with 0 up, 4 and 5 walk the highlight with
+wrapping, 6 confirms it and 7 cancels. It returns the choice, `-1` for declined
+or `-2` for undecided, and `-2` is what the tick gates on.
+
+Three things can answer instead of the player:
+
+- with the auto flag (host `+0x134`) set, a spent window is **drawn at random**:
+  `srand(GetTickCount()); rand() % (count + 1) - 1`, over a range that includes
+  `-1`, so skipping can still decline;
+- in a replay (host `+0x104`), `FUN_0043f3b0` overrides the pick with what was
+  recorded, and falls back to a random pick among the choices
+  `_GetSelectRead@4` says have been seen;
+- host `+0x98` replaces the answer outright with `FUN_00428a80`.
+
+A decided choice plays SE index 1, a declined one index 0, and the box going up
+plays index 5.
+
+`FUN_0044ca10` lays the labels out. The line limit is 11 characters by default
+and, with `[UseEnglish]`, 33 when `[SelectType]` is zero on a two-choice box or
+66 otherwise; the per-character budget is 36 or 16 to match. **Only the English
+path word-wraps**, breaking at a space when the next word would pass the limit,
+so a single over-long word is never broken. Each label's anchor is the object's
+scale times one of `533.4` (one choice), `266.7`/`800.0` (two) or, stacked,
+`-268.0` and `-418.7`/`-118.0`; the anchor is x in the sideways layout and y in
+the stacked one. **The transform from anchor to pixels is not recovered** — it
+runs through the engine's text pipeline (`_PTR_004d6708`, `_DAT_004d6710`) —
+and nothing depends on it, because the boxes' real extents are the shipped maps.
+
+See `daysengine::ui::select`, and `days select` to print the map and metrics a
+resolution really gets.
 
 ---
 

@@ -124,12 +124,23 @@ impl Mode {
 
 /// The seven system sounds `FILMENGINE.INI` names.
 ///
-/// The menu modules ask the host to play one of these by a small integer index.
-/// Which index is which is **not recovered**: the executable stores the seven
-/// paths as separate members rather than an array, so there is no stride to
-/// read off, and no dispatch on the index was found in the menu-host code. The
-/// bindings [`Menu`] uses are therefore this engine's choice, not the game's —
-/// the names and the INI keys are the game's.
+/// The menu modules ask the host to play one of these by a small integer index,
+/// through host vtable slot `+0x50`, and the index is the key's position in
+/// `FILMENGINE.INI`'s own order — the order the variants are declared in below.
+///
+/// `FUN_00429c80` is slot `+0x50`: a seven-arm switch reading the member at
+/// `this + 0x5a4 + 0x1c * index`. `FUN_00422170` writes the seven INI values to
+/// `base + 0x5a0 + 0x1c * n` in declaration order, and `base` is the host
+/// subobject plus four — twice over, because the run of members lines up and
+/// because the same function hands `base + 0x304` to the choice box that
+/// `FUN_00431740` reaches as `engine + 0x334`, with the host subobject at
+/// `engine + 0x2c`. So the two runs are the same seven strings in the same
+/// order.
+///
+/// Three uses agree with the names: the control bar plays index 2 on a click,
+/// and the choice box index 1 when a choice is taken and index 0 when it is
+/// declined. Which index each *menu screen* plays is a separate question and
+/// still a per-screen one; what [`Menu`] plays where is this engine's choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemSe {
     Cancel,
@@ -168,6 +179,21 @@ impl SystemSe {
     /// Resolves the sound's asset path out of `FILMENGINE.INI`.
     pub fn path(self, film: &Ini) -> Option<&str> {
         film.get(self.key())
+    }
+
+    /// The index host slot `+0x50` takes for this sound.
+    pub fn index(self) -> usize {
+        SystemSe::ALL
+            .iter()
+            .position(|se| *se == self)
+            .expect("ALL lists every variant")
+    }
+
+    /// The sound host slot `+0x50` plays for an index, or `None` past the
+    /// seventh — the switch has no default arm, so an index it does not know
+    /// leaves the path pointer uninitialised and plays whatever was last there.
+    pub fn from_index(index: usize) -> Option<SystemSe> {
+        SystemSe::ALL.get(index).copied()
     }
 }
 
@@ -1078,6 +1104,35 @@ mod tests {
     fn play_is_the_mode_with_no_screen() {
         assert_eq!(Mode::PLAY.stem(""), None);
         assert!(Mode::TITLE.stem("Title").is_some());
+    }
+
+    /// Host slot `+0x50`'s switch reads `this + 0x5a4 + 0x1c * index`, and
+    /// `FUN_00422170` writes the INI's keys to the same run in declaration
+    /// order — so the index is the key's position in `FILMENGINE.INI`.
+    #[test]
+    fn the_system_sound_index_is_the_ini_order() {
+        let keys: Vec<&str> = (0..7)
+            .map(|i| SystemSe::from_index(i).expect("seven arms").key())
+            .collect();
+        assert_eq!(
+            keys,
+            ["SeCancel", "SeSelect", "SeClick", "SeUp", "SeDown", "SeView", "SeOpen"]
+        );
+        for se in SystemSe::ALL {
+            assert_eq!(SystemSe::from_index(se.index()), Some(se));
+        }
+        // The switch has no default arm, so there is no eighth sound.
+        assert_eq!(SystemSe::from_index(7), None);
+    }
+
+    /// The three uses recovered from call sites, as a guard on the numbering:
+    /// the control bar plays 2 on a live click and the choice box 1 on a pick
+    /// and 0 on a decline.
+    #[test]
+    fn the_recovered_call_sites_line_up_with_the_names() {
+        assert_eq!(SystemSe::Cancel.index(), 0);
+        assert_eq!(SystemSe::Select.index(), 1);
+        assert_eq!(SystemSe::Click.index(), 2);
     }
 
     /// Every mode's default has to name art that actually ships, so a stem is

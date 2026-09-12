@@ -144,6 +144,69 @@ enum Cmd {
         /// Script name, e.g. "00-00-A00".
         name: String,
     },
+    /// Report the in-game control bar: what each widget is and what it does.
+    ///
+    /// The bar's geometry comes from the user's own DLL like any other screen,
+    /// but its behaviour is a dispatch rather than a table, so this prints the
+    /// decision for every widget under whatever engine state is asked for.
+    Bar(BarArgs),
+    /// Report a choice box: which hit map it uses and where a click lands.
+    ///
+    /// `System/Select` ships hit maps and nothing else, and only for two of the
+    /// four UI sizes, so this is the way to see which map a resolution really
+    /// gets and what the engine falls back to when there is none.
+    Select(SelectArgs),
+}
+
+#[derive(clap::Args)]
+struct BarArgs {
+    /// Resolution: standard, wide, note or full.
+    #[arg(long, short = 'r', default_value = "wide")]
+    resolution: String,
+    /// Widget to treat as hovered, 0-based, as the dispatch numbers them.
+    #[arg(long)]
+    hover: Option<usize>,
+    /// The auto flag widget 0 toggles is set.
+    #[arg(long)]
+    auto: bool,
+    /// Playback is paused.
+    #[arg(long)]
+    paused: bool,
+    /// Playback was started from the replay menu.
+    #[arg(long)]
+    replay: bool,
+    /// The host's message flag is set.
+    #[arg(long)]
+    message: bool,
+    /// Clear the Skip setting the speed row needs, overriding Config.DAT.
+    #[arg(long)]
+    no_skip: bool,
+    /// Set the host member the ten step widgets need.
+    #[arg(long)]
+    stepping: bool,
+    /// Playback rate index, 0 to 4.
+    #[arg(long, default_value_t = 0)]
+    speed: usize,
+    /// Milliseconds since the auto flag was set, for its animation frame.
+    #[arg(long, default_value_t = 0)]
+    elapsed: u32,
+    /// PNG to write the composited bar to.
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct SelectArgs {
+    /// First choice label.
+    label: String,
+    /// Second choice label. Omit, or pass `null`, for a one-choice box.
+    label2: Option<String>,
+    /// Resolution: standard, wide, note or full.
+    #[arg(long, short = 'r', default_value = "full")]
+    resolution: String,
+    /// Hit-test a normalised point, as `X,Y` in 0.0..1.0.
+    #[arg(long = "at")]
+    at: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -285,6 +348,8 @@ fn main() -> Result<()> {
         Cmd::Save { all, grep } => cmd_save(&game, all, grep.as_deref())?,
         Cmd::Config => cmd_config(&game)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
+        Cmd::Bar(args) => cmd_bar(&game, &args)?,
+        Cmd::Select(args) => cmd_select(&game, &args)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -557,6 +622,10 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
     let mut stage = daysengine::Stage::new(script);
     std::fs::create_dir_all(out)?;
 
+    // The choice box's axis is the install's, not ours.
+    let stacked = daysengine::ui::select::Layout::from_ini(&film_ini(&vfs))
+        == daysengine::ui::select::Layout::Stacked;
+
     const W: usize = 800;
     const H: usize = 452;
 
@@ -564,13 +633,16 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
         stage.seek_to(target, &vfs, &mixer)?;
         let visual = stage.visual_at(target);
         let described = format!(
-            "movie={} still={} text={:?} fade={:?}",
+            "movie={} still={} text={:?} fade={:?} select={:?}",
             visual.movie.is_some(),
             visual.still.map(|s| s.path.as_str()).unwrap_or("-"),
             visual.text.map(|(s, t)| format!("{s}: {t}")),
             visual.fade,
+            visual
+                .select
+                .map(|w| format!("{:?}/{:?} {}..{}", w.a, w.b, w.start, w.end)),
         );
-        let rgba = daysengine::playback::compose::frame_rgba(&visual, &font, W, H);
+        let rgba = daysengine::playback::compose::frame_rgba_with(&visual, &font, W, H, stacked);
 
         let path = out.join(format!(
             "{wanted}-{}.png",
@@ -594,6 +666,164 @@ fn system_menu_dll(game: &Path) -> Result<Vec<u8>> {
             path.display()
         )
     })
+}
+
+/// Reads `FILMENGINE.INI` out of the packs, or an empty one with a warning.
+fn film_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
+    match vfs.read_path("Ini/FILMENGINE.INI") {
+        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
+        Err(err) => {
+            log::warn!("reading Ini/FILMENGINE.INI: {err}");
+            daysengine::Ini::parse("")
+        }
+    }
+}
+
+fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
+    use daysengine::ui::bar::{self, Act, Bar, State};
+    use daysengine::ui::screen::Resolution;
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let resolution = Resolution::from_name(&args.resolution)
+        .with_context(|| format!("unknown resolution {}", args.resolution))?;
+    let bar = Bar::load(&vfs, &dll, resolution)?;
+
+    let config = daysengine::install::config::Config::load(game);
+    let state = State {
+        auto: args.auto,
+        paused: args.paused,
+        replay: args.replay,
+        message: args.message,
+        skippable: !args.no_skip && State::from_config(&config).skippable,
+        stepping: args.stepping,
+        speed: args.speed.min(bar::SPEEDS.len() - 1),
+        ..State::default()
+    };
+
+    let (w, h) = bar.screen().size();
+    println!(
+        "{} at {} — {w}x{h}, scale {:.2}, {} widgets ({}/{} boxes matched the table)",
+        bar::PATH,
+        resolution.name(),
+        bar.screen().scale(),
+        bar::WIDGETS,
+        bar.screen().atlas().matched,
+        bar::WIDGETS,
+    );
+    println!(
+        "state: auto {} paused {} replay {} message {} skippable {} stepping {} speed x{}",
+        state.auto,
+        state.paused,
+        state.replay,
+        state.message,
+        state.skippable,
+        state.stepping,
+        bar::SPEEDS[state.speed],
+    );
+    println!("fade in {}ms, out {}ms", bar::FADE_IN_MS, bar::FADE_OUT_MS);
+
+    println!("  wgt  region  dst                live   caption  action");
+    for widget in 0..bar::WIDGETS {
+        let rect = bar.screen().atlas().widgets[widget].dst;
+        let act = bar::action(widget, state, false);
+        let shown = match act {
+            Act::None => "-".to_string(),
+            Act::ToggleAuto => "toggle the auto flag".to_string(),
+            Act::TogglePause => "toggle pause".to_string(),
+            Act::Seek(code) => format!("seek code {}", code.0),
+            Act::Speed(i) => format!("speed x{}", bar::SPEEDS[i]),
+            Act::Menu(m) => format!("open menu {}", m.0),
+            Act::Leave => "leave playback".to_string(),
+            Act::Step(n) => format!("step {n}"),
+        };
+        println!(
+            "  {widget:3}  {:6}  ({:4},{:3}) {:3}x{:<3}  {:5}  {:>7}  {shown}",
+            widget + 1,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            bar::enabled(widget, state),
+            bar::caption(widget)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+    if state.auto {
+        println!(
+            "widget 0 is on animation record {} after {}ms",
+            bar::auto_frame(args.elapsed, state.speed),
+            args.elapsed
+        );
+    }
+    if let Some(widget) = args.hover {
+        println!("hovering widget {widget}");
+    }
+
+    if let Some(out) = &args.out {
+        let states = bar.states(args.hover, state, args.elapsed);
+        let image = bar.compose(None, &states);
+        write_png(out, &image.rgba, image.width, image.height)?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
+    use days_script::Frame;
+    use daysengine::ui::screen::Resolution;
+    use daysengine::ui::select::{Choice, Metrics, Select};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let film = film_ini(&vfs);
+    let resolution = Resolution::from_name(&args.resolution)
+        .with_context(|| format!("unknown resolution {}", args.resolution))?;
+
+    let choice = Choice::new(&args.label, args.label2.as_deref(), Frame(0), Frame(1));
+    let select = Select::load(&vfs, &film, choice.count(), resolution)?;
+    let metrics = Metrics::from_ini(&film, choice.count());
+
+    println!(
+        "{} choice(s) at {} — {:?} layout, map {}",
+        choice.count(),
+        resolution.name(),
+        select.layout,
+        match select.map_size() {
+            Some((w, h)) => format!("{} ({w}x{h})", select.path),
+            None => format!("{} is absent; splitting the screen", select.path),
+        }
+    );
+    if let Some(bounds) = select.bounds() {
+        for (i, r) in bounds.iter().enumerate() {
+            println!(
+                "  box {i}  ({:4},{:4}) {:4}x{:<4}",
+                r.x, r.y, r.width, r.height
+            );
+        }
+    }
+    println!(
+        "labels wrap at {} characters, advance {}, word wrap {}",
+        metrics.wrap, metrics.advance, metrics.word_wrap
+    );
+    for (i, label) in choice.labels.iter().enumerate() {
+        for line in metrics.lines(label) {
+            println!("  label {i}: {line:?}");
+        }
+    }
+
+    for point in &args.at {
+        let (x, y) = point
+            .split_once(',')
+            .with_context(|| format!("--at wants X,Y, got {point}"))?;
+        let x: f64 = x.trim().parse().context("bad X")?;
+        let y: f64 = y.trim().parse().context("bad Y")?;
+        match select.hit(x, y) {
+            Some(index) => println!("({x}, {y}) hits box {index}: {}", choice.labels[index]),
+            None => println!("({x}, {y}) hits nothing"),
+        }
+    }
+    Ok(())
 }
 
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
