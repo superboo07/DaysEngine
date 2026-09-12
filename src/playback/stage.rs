@@ -8,9 +8,9 @@
 //! can reference a hundred movies and thirty minutes of voice, and the game only
 //! ever needs the next few seconds.
 
-use crate::lipsync::{self, Envelope, Mouth};
+use crate::install::vfs::Vfs;
 use crate::media::{AudioBuffer, VideoDecoder, VideoFrame};
-use crate::vfs::Vfs;
+use crate::playback::lipsync::{self, Envelope, Mouth};
 use anyhow::{Context, Result};
 use days_script::{Command, Fade, Frame, Script};
 use std::collections::{BTreeMap, HashMap};
@@ -347,7 +347,11 @@ impl Stage {
         self.mouths.insert(tag.to_string(), mouth);
     }
 
-    fn audio(&mut self, vfs: &Vfs, handle: crate::vfs::Handle) -> Result<Arc<AudioBuffer>> {
+    fn audio(
+        &mut self,
+        vfs: &Vfs,
+        handle: crate::install::vfs::Handle,
+    ) -> Result<Arc<AudioBuffer>> {
         let key = vfs.entry(handle).name.clone();
         if let Some(cached) = self.audio_cache.get(&key) {
             return Ok(cached.clone());

@@ -27,7 +27,7 @@
 //! menubar, whose map is a 800x75 strip, it yields the same scales and no
 //! offset, with no special case for either.
 
-use crate::vfs::Vfs;
+use crate::install::vfs::Vfs;
 use days_ui::atlas::{self, Atlas, Widget};
 use days_ui::cmap::Cmap;
 use days_ui::Image;

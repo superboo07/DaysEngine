@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use days_gpk::{Archive, Key};
-use daysengine::ending;
+use daysengine::ui::ending;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -316,7 +316,7 @@ fn main() -> Result<()> {
 /// Pack paths look like `english/00/00-00-A00.ENG.ORS`; the route layer knows
 /// the script as `00-00-A00`, so strip the language directory and the `.ENG`
 /// infix.
-fn script_paths(vfs: &daysengine::vfs::Vfs) -> Vec<(String, String)> {
+fn script_paths(vfs: &daysengine::install::vfs::Vfs) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vfs
         .paths()
         .filter(|p| p.starts_with("script/") && p.ends_with(".ors"))
@@ -335,7 +335,7 @@ fn script_paths(vfs: &daysengine::vfs::Vfs) -> Vec<(String, String)> {
 }
 
 fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let mut histogram: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let (mut ok, mut failed) = (0usize, 0usize);
 
@@ -370,7 +370,7 @@ fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
 }
 
 fn cmd_script(game: &Path, name: &str) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, path) = script_paths(&vfs)
         .into_iter()
@@ -386,7 +386,7 @@ fn cmd_script(game: &Path, name: &str) -> Result<()> {
 }
 
 fn cmd_assets(game: &Path) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let mut missing: std::collections::BTreeMap<String, usize> = Default::default();
     let mut checked = 0usize;
 
@@ -421,7 +421,7 @@ fn cmd_assets(game: &Path) -> Result<()> {
 }
 
 fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     println!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
     let handle = vfs
@@ -491,7 +491,7 @@ fn write_ppm(path: &Path, frame: &daysengine::media::VideoFrame) -> Result<()> {
 /// expected to cut a movie short, and we would rather find out here than by
 /// watching playback drift.
 fn cmd_timing(game: &Path, name: &str) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -533,7 +533,7 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
 fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> {
     use days_script::Frame;
 
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -570,7 +570,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path) -> Result<()> 
             visual.text.map(|(s, t)| format!("{s}: {t}")),
             visual.fade,
         );
-        let rgba = daysengine::compose::frame_rgba(&visual, &font, W, H);
+        let rgba = daysengine::playback::compose::frame_rgba(&visual, &font, W, H);
 
         let path = out.join(format!(
             "{wanted}-{}.png",
@@ -597,9 +597,9 @@ fn system_menu_dll(game: &Path) -> Result<Vec<u8>> {
 }
 
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
-    use daysengine::screen::{Resolution, Screen, WidgetState};
+    use daysengine::ui::screen::{Resolution, Screen, WidgetState};
 
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -693,7 +693,7 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
 }
 
 fn cmd_font(game: &Path, text: Option<&str>, alpha: bool, verify: bool) -> Result<()> {
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     // The English build ships both; FONTDATA_ENG is the one the localised
     // executable selects.
     let bytes = vfs
@@ -885,7 +885,10 @@ fn select_packs(dir: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
 ///
 /// Shared by `menu` and `save` so both see the install the same way. A missing
 /// or unreadable file reads as a fresh install, which is what it means.
-fn load_flags(game: &Path, vfs: &daysengine::vfs::Vfs) -> daysengine::save::FlagStore {
+fn load_flags(
+    game: &Path,
+    vfs: &daysengine::install::vfs::Vfs,
+) -> daysengine::install::save::FlagStore {
     let film = match vfs.read_path("Ini/FILMENGINE.INI") {
         Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
         Err(err) => {
@@ -893,7 +896,7 @@ fn load_flags(game: &Path, vfs: &daysengine::vfs::Vfs) -> daysengine::save::Flag
             daysengine::Ini::parse("")
         }
     };
-    daysengine::save::load_flags(game, &film)
+    daysengine::install::save::load_flags(game, &film)
 }
 
 /// The backdrop the title screen would be drawn over.
@@ -901,16 +904,16 @@ fn load_flags(game: &Path, vfs: &daysengine::vfs::Vfs) -> daysengine::save::Flag
 /// Shared by `menu` and `save`, and the reason `[BaseFile]` is read here rather
 /// than passed in: the fresh-install picture is one of the four answers.
 fn chosen_backdrop(
-    vfs: &daysengine::vfs::Vfs,
+    vfs: &daysengine::install::vfs::Vfs,
     list: &ending::EndingList,
-    flags: &daysengine::save::FlagStore,
+    flags: &daysengine::install::save::FlagStore,
 ) -> ending::Backdrop {
     let start = start_script_ini(vfs);
     ending::title_backdrop(list, flags, start.get("BaseFile").unwrap_or_default())
 }
 
 /// `STARTSCRIPT.INI`, which both the title art and the backdrop are read from.
-fn start_script_ini(vfs: &daysengine::vfs::Vfs) -> daysengine::Ini {
+fn start_script_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
     match vfs.read_path("Ini/STARTSCRIPT.INI") {
         Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
         Err(err) => {
@@ -922,10 +925,10 @@ fn start_script_ini(vfs: &daysengine::vfs::Vfs) -> daysengine::Ini {
 
 /// Prints what the save data says the player has unlocked.
 fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
-    use daysengine::save::Value;
+    use daysengine::install::save::Value;
     use daysengine::SaveState;
 
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let flags = load_flags(game, &vfs);
     let start = start_script_ini(&vfs);
     let save = SaveState::from_flags(&flags, &start);
@@ -980,7 +983,7 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
 /// Prints the player's settings the way the Option screen reads them.
 fn cmd_config(game: &Path) -> Result<()> {
-    use daysengine::config::{Channel, Config, Flag};
+    use daysengine::install::config::{Channel, Config, Flag};
 
     let path = Config::path(game);
     let config = Config::load(game);
@@ -1007,9 +1010,9 @@ fn cmd_config(game: &Path) -> Result<()> {
 
 /// Prints the replay scene table recovered from the user's own menu DLL.
 fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
-    use daysengine::replay::{Scenes, HSCENE_PER_PAGE};
+    use daysengine::ui::replay::{Scenes, HSCENE_PER_PAGE};
 
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let flags = load_flags(game, &vfs);
     let scenes = Scenes::recover(&dll)?;
@@ -1057,13 +1060,13 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
 
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
-    use daysengine::config::Config;
-    use daysengine::menu::{Action, Menu, Mode, SaveState, Session};
-    use daysengine::options::{Dir, Display, Som};
-    use daysengine::replay::Scenes;
-    use daysengine::screen::Resolution;
+    use daysengine::install::config::Config;
+    use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session};
+    use daysengine::ui::options::{Dir, Display, Som};
+    use daysengine::ui::replay::Scenes;
+    use daysengine::ui::screen::Resolution;
 
-    let vfs = daysengine::vfs::Vfs::mount(game)?;
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -1072,7 +1075,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // A forced-fresh run reads an empty store, so the backdrop below follows
     // the same pretence the widget tables do.
     let flags = if args.fresh {
-        daysengine::save::FlagStore::default()
+        daysengine::install::save::FlagStore::default()
     } else {
         load_flags(game, &vfs)
     };

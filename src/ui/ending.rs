@@ -42,8 +42,8 @@
 //! branch: reaching the last ending is what *creates* the stored `AllClear`
 //! flag, which is why the first branch can rely on it.
 
-use crate::ini::Ini;
-use crate::vfs::Vfs;
+use crate::install::ini::Ini;
+use crate::install::vfs::Vfs;
 use days_save::{FlagStore, Value};
 
 /// `Ini/EndList.ini`, parsed: the per-ending title cards.
@@ -232,7 +232,7 @@ pub fn title_backdrop(list: &EndingList, flags: &FlagStore, base_file: &str) -> 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Vfs(#[from] crate::vfs::Error),
+    Vfs(#[from] crate::install::vfs::Error),
     #[error(transparent)]
     Image(#[from] days_ui::Error),
     #[error(transparent)]
@@ -246,13 +246,13 @@ pub enum Error {
 /// `FUN_0041f600` only calls the loader when that key is set, so a clear key
 /// means the game holds no cards at all and the title keeps the fresh-install
 /// picture however far the player has got. The same key is the extra condition
-/// on route 0 — see [`crate::menu::end_bg_view`].
+/// on route 0 — see [`crate::ui::menu::end_bg_view`].
 ///
 /// A list that will not load is likewise an empty list rather than an error:
 /// it costs the player the ending backdrops and nothing else, which is the
 /// bargain every other missing asset gets.
 pub fn load_list(vfs: &Vfs, start: &Ini) -> EndingList {
-    if !crate::menu::end_bg_view(start) {
+    if !crate::ui::menu::end_bg_view(start) {
         log::info!("[EndBGView] is clear: no ending backdrops");
         return EndingList::default();
     }

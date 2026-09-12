@@ -25,8 +25,8 @@
 //! hit map. Pointing at a widget swaps in its chip sprite; clicking runs the
 //! screen's action table. Each table is the DLL's own dispatch, transcribed
 //! where that screen's behaviour lives: the title's in [`Menu::confirm`], the
-//! Option screen's in [`crate::options`], and the replay grid's and its popup's
-//! in [`crate::replay`]. `SaveLoad` and `Replay_PlayData` have none yet.
+//! Option screen's in [`crate::ui::options`], and the replay grid's and its popup's
+//! in [`crate::ui::replay`]. `SaveLoad` and `Replay_PlayData` have none yet.
 //!
 //! A few screens also draw sprites that are not widget states — the Sound tab's
 //! volume bars and the replay grid's thumbnails — which is what
@@ -40,13 +40,13 @@
 //! where the reasoning is written down, because getting this wrong produced a
 //! title screen the real game never shows.
 
-use crate::config::Config;
-use crate::ini::Ini;
-use crate::options;
-use crate::options::Dir;
-use crate::replay::{self, Scenes};
-use crate::screen::{Error, Resolution, Screen, WidgetState};
-use crate::vfs::Vfs;
+use crate::install::config::Config;
+use crate::install::ini::Ini;
+use crate::install::vfs::Vfs;
+use crate::ui::options;
+use crate::ui::options::Dir;
+use crate::ui::replay::{self, Scenes};
+use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
 use days_save::FlagStore;
 
 /// A menu screen id, as the game itself numbers them.
@@ -219,7 +219,7 @@ impl SaveState {
     /// `AllClear` flag entirely. That flag is real and is read, but by
     /// `FUN_0041fee0` in the executable, to choose the *backdrop* — a
     /// different question with a confusingly similar name. See
-    /// [`crate::ending`].
+    /// [`crate::ui::ending`].
     ///
     /// Route 0 and route 1 both come from the one `EndClear` flag
     /// (`FUN_0042baf0`), so clearing the game once changes the title art and
@@ -302,7 +302,7 @@ pub enum Action {
     /// The Option screen asked for a display mode this engine has to apply.
     ///
     /// The DLL only records the request; who acts on it is not recovered. See
-    /// [`crate::options::DisplayRequest`].
+    /// [`crate::ui::options::DisplayRequest`].
     Display(options::DisplayRequest),
     /// Quit the game.
     Quit,
@@ -828,7 +828,10 @@ impl Menu {
                 // this engine opens none — see `options::SOM_PORTS`. Asking is
                 // all this screen does. The background art changes with the
                 // answer, so the screen reloads.
-                self.session.som.enabled = self.session.config.flag(crate::config::Flag::UseSom);
+                self.session.som.enabled = self
+                    .session
+                    .config
+                    .flag(crate::install::config::Flag::UseSom);
                 if !self.session.som.enabled {
                     self.session.som.attached = false;
                     self.session.som.testing = false;

@@ -78,7 +78,7 @@ Ghidra's reference index *and* a raw byte scan of `.text`.
 If something is not recovered, the code and the docs say **"not recovered"**.
 Do not pick a plausible constant, a likely index, or a sensible default and let
 it pass as recovered. There are several honest "not recovered" notes in
-`src/menu.rs` and `docs/FORMATS.md`; match that style. A gap that is labelled
+`src/ui/menu.rs` and `docs/FORMATS.md`; match that style. A gap that is labelled
 is a task. A gap that is filled with a guess is a bug that looks like a
 feature.
 
@@ -205,9 +205,10 @@ methods that agree is the standard the rules above ask for.
 ## The code
 
 ```text
-src/              the engine as ordinary modules: vfs, media, screen, compose,
-                  stage, mixer, text, menu, options, replay, ini, config,
-                  save, ending
+src/install/      the player's install: vfs, ini, config, save
+src/media/        audio + video decode through system ffmpeg
+src/playback/     stage, mixer, lipsync, text, compose
+src/ui/           menu, screen, options, replay, ending
 src/main.rs       `daysengine` — the game (SDL3)
 src/bin/days.rs   `days` — offline inspection tools
 
@@ -219,8 +220,9 @@ crates/days-ui      CMAP hit maps + _CHIP atlas recovery
 ```
 
 **This is one ordinary crate, not a pile of them.** New engine functionality is
-a module in `src/`. Only add a crate for a standalone reader of a format the
-game ships, and say why in the commit.
+a module in one of those four `src/` groups — find the group it belongs to
+rather than dropping another file at the top level. Only add a crate for a
+standalone reader of a format the game ships, and say why in the commit.
 
 Design decisions already made and not up for re-litigation:
 

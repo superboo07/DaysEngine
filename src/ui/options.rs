@@ -20,7 +20,7 @@
 //! # Where the settings go
 //!
 //! Every change is written straight through to `Config.DAT` — see
-//! [`crate::config`] — and the close button flushes it. The DLL does exactly
+//! [`crate::install::config`] — and the close button flushes it. The DLL does exactly
 //! that: each dispatch arm calls the config object's setter with the key name
 //! before it touches anything else, and widget 3 calls the flush.
 //!
@@ -39,7 +39,7 @@
 //! the ten level cells at all, which is why those cells have no sprite of their
 //! own. [`navigate`] is those three tables.
 
-use crate::config::{Channel, Config, Flag};
+use crate::install::config::{Channel, Config, Flag};
 
 /// Which set of art the Option module is showing, as the member it switches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +230,7 @@ pub enum Act {
 /// except the SOMCON header, which the trial build hides — the DLL asks the
 /// host's `+0x34` trial question, and that member is zeroed by the only
 /// constructor anything calls, so in the retail build the header is always
-/// live. See [`crate::menu::SaveState::from_flags`] for the same question on
+/// live. See [`crate::ui::menu::SaveState::from_flags`] for the same question on
 /// the title screen.
 pub fn enabled(tab: Tab, widget: usize, trial: bool, som: Som) -> bool {
     match widget {

@@ -12,16 +12,16 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
-use daysengine::config::{Channel, Config, Flag};
-use daysengine::ending;
+use daysengine::install::config::{Channel, Config, Flag};
+use daysengine::install::save::FlagStore;
+use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
-use daysengine::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
-use daysengine::options::{Dir, Display, Som};
-use daysengine::replay::Scenes;
-use daysengine::save::FlagStore;
-use daysengine::screen::Resolution;
-use daysengine::vfs::Vfs;
-use daysengine::{ini::Ini, text, Mixer, Stage};
+use daysengine::ui::ending;
+use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
+use daysengine::ui::options::{Dir, Display, Som};
+use daysengine::ui::replay::Scenes;
+use daysengine::ui::screen::Resolution;
+use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
         mixer: &mixer,
         sounds: Sounds::default(),
         system_se: SystemSounds::from_ini(&film),
-        flags: daysengine::save::load_flags(&game, &film),
+        flags: daysengine::install::save::load_flags(&game, &film),
         // The widget tables are only needed for menus. A missing DLL is not
         // fatal to playing a script, so this is reported and left empty.
         dll: match std::fs::read(game.join("SysMenuSDHQ.dll")) {
@@ -322,7 +322,7 @@ fn start_script(start: &Ini) -> String {
 ///
 /// This belongs to the engine, not to the menu module: `Title.png` is
 /// transparent around the logo and the engine picks what goes under it from
-/// save state — see [`daysengine::ending`]. A card that will not load costs the
+/// save state — see [`daysengine::ui::ending`]. A card that will not load costs the
 /// player the picture and nothing else, as any missing asset does.
 fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
     let list = ending::load_list(player.vfs, start);
@@ -489,7 +489,7 @@ fn run_menu(
                 }
                 // The DLL only records the request and this engine draws its
                 // menus at one size, so the request is logged rather than
-                // silently dropped. See `daysengine::options::DisplayRequest`.
+                // silently dropped. See `daysengine::ui::options::DisplayRequest`.
                 Action::Display(request) => {
                     log::info!("the Option screen asked for {request:?}; not applied");
                 }

@@ -6,8 +6,8 @@
 //! regression in timing, fades or text layout shows up as an image diff rather
 //! than as "it looked wrong when I ran it".
 
-use crate::stage::Visual;
-use crate::text;
+use crate::playback::stage::Visual;
+use crate::playback::text;
 use days_font::Font;
 
 /// Composites one frame to RGBA at `width` x `height`.

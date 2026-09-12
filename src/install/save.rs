@@ -2,7 +2,7 @@
 //!
 //! Save data is the one thing that does *not* live in the packs: it sits in
 //! plain files next to the executable, at paths `Ini/FILMENGINE.INI` names.
-//! So these take a game directory rather than a [`Vfs`](crate::vfs::Vfs).
+//! So these take a game directory rather than a [`Vfs`](crate::install::vfs::Vfs).
 //!
 //! The format itself is [`days_save`]; this module is only where to find it.
 
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use days_save::{FlagStore, Value};
 
-use crate::ini::Ini;
+use crate::install::ini::Ini;
 
 /// Where `FILMENGINE.INI` says the global flag store lives.
 ///

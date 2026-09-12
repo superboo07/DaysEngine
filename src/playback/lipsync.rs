@@ -41,8 +41,8 @@
 //! retail install contains a single `.A`/`.B`/`.C` overlay, so nothing can
 //! drive it.
 
+use crate::install::vfs::Vfs;
 use crate::media::AudioBuffer;
-use crate::vfs::Vfs;
 use anyhow::{Context, Result};
 use days_script::Frame;
 

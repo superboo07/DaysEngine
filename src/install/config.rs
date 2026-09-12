@@ -34,7 +34,7 @@
 //! themselves are **not recovered**, so `1` is accepted as true as well, which
 //! costs nothing and matches the one shipped file that contains both spellings.
 //!
-//! This is why the settings do not go through [`crate::ini::Ini`], whose
+//! This is why the settings do not go through [`crate::install::ini::Ini`], whose
 //! `get_bool` is `value == "1"` because that is right for the packs' own INIs.
 //!
 //! # Keys, defaults and ranges
@@ -292,7 +292,7 @@ impl Config {
     ///
     /// The last occurrence wins. The shipped writer appends rather than
     /// rewriting in place, so a key really can appear twice with the live value
-    /// second — the opposite of [`crate::ini::Ini`], where the packs' INIs list
+    /// second — the opposite of [`crate::install::ini::Ini`], where the packs' INIs list
     /// alternatives first-best.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries

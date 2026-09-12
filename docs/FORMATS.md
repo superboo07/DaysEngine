@@ -173,7 +173,7 @@ constructed at `FUN_00443900`), and the rules are:
 indexes relative to the decoder's current packet
 (`packet_bytes * n / 23 - consumed_samples`), so the answer depends on how the
 shipped Ogg reader chunks the stream; the same expression also advances the tick
-counter at 23 Hz while labelling the entries at 24. `src/lipsync.rs` samples at
+counter at 23 Hz while labelling the entries at 24. `src/playback/lipsync.rs` samples at
 the frame's own position and keeps the threshold.
 
 `FILMOBJ::MovieChar` carries the same ten slots at `+0xe4` (`FUN_0044a2c0`), but

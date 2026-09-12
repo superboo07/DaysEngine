@@ -131,8 +131,10 @@ formats are split out, because those are the parts another project could use on
 their own — a modding tool wanting the archives has no business pulling in SDL
 and ffmpeg to get them.
 
-    src/              the engine: vfs, media, screen compositing, mixer,
-                      timeline stage, text layout, menus, INI, save lookup
+    src/install/      the player's install: packs, INI, settings, save lookup
+    src/media/        audio and video decoding through system ffmpeg
+    src/playback/     timeline stage, mixer, lip sync, text layout, compositor
+    src/ui/           the game's menus: title, save/load, option, replay
     src/main.rs       `daysengine` — the game
     src/bin/days.rs   `days` — offline inspection tools
 
