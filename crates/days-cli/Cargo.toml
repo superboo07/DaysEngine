@@ -13,6 +13,7 @@ path = "src/main.rs"
 days-gpk = { path = "../days-gpk", version = "=0.1.0" }
 days-vfs = { path = "../days-vfs", version = "=0.1.0" }
 days-script = { path = "../days-script", version = "=0.1.0" }
+days-media = { path = "../days-media", version = "=0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 log.workspace = true

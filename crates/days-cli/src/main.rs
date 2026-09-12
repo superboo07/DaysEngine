@@ -63,6 +63,20 @@ enum Cmd {
     },
     /// Check that every asset path referenced by every script resolves.
     Assets,
+    /// Decode one media asset and report what came out.
+    Media {
+        /// Logical path, e.g. "Movie00/00-00/00-00-A00/00-00-A00-000".
+        path: String,
+        /// Write the first decoded video frame here as a PPM.
+        #[arg(long)]
+        dump_frame: Option<PathBuf>,
+    },
+    /// Decode every movie referenced by a script, checking frame counts against
+    /// the timeline the script declares.
+    Timing {
+        /// Script name, e.g. "00-00-A00".
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -128,6 +142,8 @@ fn main() -> Result<()> {
         Cmd::Scripts { stats } => cmd_scripts(&game, stats)?,
         Cmd::Script { name } => cmd_script(&game, &name)?,
         Cmd::Assets => cmd_assets(&game)?,
+        Cmd::Media { path, dump_frame } => cmd_media(&game, &path, dump_frame.as_deref())?,
+        Cmd::Timing { name } => cmd_timing(&game, &name)?,
         Cmd::Verify { pack } => {
             let packs = select_packs(&game, pack.as_deref())?;
             let (mut ok, mut bad) = (0usize, 0usize);
@@ -260,6 +276,116 @@ fn cmd_assets(game: &Path) -> Result<()> {
         "{checked} references checked, {} distinct missing",
         missing.len()
     );
+    Ok(())
+}
+
+fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    println!("ffmpeg {}", days_media::ffmpeg_version());
+
+    let handle = vfs
+        .resolve(path)
+        .with_context(|| format!("no asset at {path}"))?;
+    let entry = vfs.entry(handle);
+    let name = entry.name.clone();
+    let bytes = vfs.read(handle)?;
+    println!("{} ({} bytes)", name, bytes.len());
+
+    if name.to_ascii_lowercase().ends_with(".wmv") {
+        let mut decoder = days_media::VideoDecoder::open(bytes)?;
+        println!("video {}x{}", decoder.width(), decoder.height());
+        let mut frames = 0usize;
+        let mut last = 0.0;
+        let mut first: Option<days_media::VideoFrame> = None;
+        while let Some(frame) = decoder.next_frame()? {
+            last = frame.timestamp;
+            if first.is_none() {
+                first = Some(frame);
+            }
+            frames += 1;
+        }
+        println!(
+            "{frames} frames, last pts {last:.3}s ({:.2} fps average)",
+            if last > 0.0 {
+                (frames - 1) as f64 / last
+            } else {
+                0.0
+            }
+        );
+        if let (Some(path), Some(frame)) = (dump_frame, first) {
+            write_ppm(path, &frame)?;
+            println!("wrote first frame to {}", path.display());
+        }
+    } else {
+        let audio = days_media::decode_audio(bytes)?;
+        println!(
+            "audio {} frames, {:.3}s, peak {:.3}",
+            audio.frames(),
+            audio.duration_seconds(),
+            audio.samples.iter().fold(0f32, |m, s| m.max(s.abs()))
+        );
+    }
+    Ok(())
+}
+
+/// Writes an RGBA frame as a binary PPM, dropping alpha. Enough to eyeball a
+/// decode without pulling in an image encoder.
+fn write_ppm(path: &Path, frame: &days_media::VideoFrame) -> Result<()> {
+    let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
+    out.extend(
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]]),
+    );
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+/// Cross-checks decoded movie lengths against the durations the script declares.
+///
+/// A mismatch means either the timecode interpretation is wrong or the engine is
+/// expected to cut a movie short, and we would rather find out here than by
+/// watching playback drift.
+fn cmd_timing(game: &Path, name: &str) -> Result<()> {
+    let vfs = days_vfs::Vfs::mount(game)?;
+    let wanted = name.to_uppercase();
+    let (_, script_path) = script_paths(&vfs)
+        .into_iter()
+        .find(|(n, _)| *n == wanted)
+        .with_context(|| format!("no script named {name}"))?;
+    let script = days_script::Script::parse(&wanted, &vfs.read_path(&script_path)?)?;
+
+    println!(
+        "{:<46} {:>9} {:>9} {:>8}",
+        "movie", "script", "decoded", "delta"
+    );
+    let mut worst = 0.0f64;
+    for event in &script.events {
+        let days_script::Command::PlayMovie { path, .. } = &event.command else {
+            continue;
+        };
+        let Some(handle) = vfs.resolve_as(path, "wmv") else {
+            println!("{path:<46} MISSING");
+            continue;
+        };
+        let mut decoder = days_media::VideoDecoder::open(vfs.read(handle)?)?;
+        let mut frames = 0usize;
+        while decoder.next_frame()?.is_some() {
+            frames += 1;
+        }
+        let decoded = frames as f64 / f64::from(days_script::FPS);
+        let declared = event.duration().as_seconds();
+        let delta = decoded - declared;
+        worst = worst.max(delta.abs());
+        println!(
+            "{:<46} {declared:>8.3}s {decoded:>8.3}s {delta:>+7.3}s",
+            path.rsplit('/').next().unwrap_or(path)
+        );
+    }
+    println!("worst absolute difference: {worst:.3}s");
     Ok(())
 }
 

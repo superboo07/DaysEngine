@@ -1,0 +1,11 @@
+[package]
+name = "days-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video and audio decoding for DaysEngine, over the system ffmpeg."
+
+[dependencies]
+rusty_ffmpeg = { workspace = true, features = ["link_system_ffmpeg"] }
+thiserror.workspace = true
+log.workspace = true
