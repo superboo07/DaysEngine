@@ -777,6 +777,20 @@ impl Menu {
         }
     }
 
+    /// Which widget's sprite the current selection lights.
+    ///
+    /// Usually the selected widget itself, but a screen is free to draw
+    /// something else: the save/load screen's rows have two hit bands and one
+    /// sprite between them, so pointing at either half lights the whole row.
+    /// See [`saveload::highlight`] (`FUN_10011600`).
+    fn lit(&self) -> Option<usize> {
+        let selection = self.selection?;
+        match self.mode {
+            Mode::SAVELOAD => saveload::highlight(self.kind, selection),
+            _ => Some(selection),
+        }
+    }
+
     /// Recomputes every widget's sprite from the current selection.
     ///
     /// A disabled `REPLAY` draws the one alternate record that follows the
@@ -784,10 +798,11 @@ impl Menu {
     /// that first extra belongs to this screen: the run after it is the next
     /// screen's table, which the atlas cannot see the end of.
     fn refresh(&mut self) {
+        let lit = self.lit();
         let states: Vec<WidgetState> = (0..self.states.len())
             .map(|i| match self.extra_for(i) {
                 Some(extra) => WidgetState::Extra(extra),
-                None if self.selection == Some(i) => WidgetState::Active,
+                None if lit == Some(i) => WidgetState::Active,
                 None => WidgetState::Resting,
             })
             .collect();

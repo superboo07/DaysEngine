@@ -129,14 +129,41 @@
 //! and the comment the save dialog writes has no other way to be seen; a fresh
 //! allocation that happens to read zero is the same screen without it.
 //!
-//! # What is not implemented
+//! # One sprite between the two bands
+//!
+//! Only the first band of ten has hover art. `FUN_10011600` draws it in a loop
+//! over the rows that lights `+0xa8 + row * 4` when
+//! `row == selection || row + 0x16 == selection`, so pointing anywhere in a row
+//! highlights the row entire, from the first band's full-width record.
+//! [`highlight`] is that mapping, and the second band's own records are not
+//! hover art at all — see below.
+//!
+//! # The expanded comment, which is what the tall records are for
+//!
+//! The second band's records are about three rows tall, and that is not an
+//! error in the table: they size the panel of a tooltip. When the selection is
+//! in that band, `FUN_10011600` calls `FUN_10012900`, which re-wraps the
+//! slot's whole comment over up to three lines and shows it over the list —
+//! the panel sprite at `+0x108` cut from that record, and the lines at
+//! `+0x1bc + n * 4` rasterised into the same surface at
+//! `(0x400, 0x202 + n * 0x40)`. The panel's height grows with the line count,
+//! and rows 8 and 9 borrow rows 6 and 7's record so three lines cannot run off
+//! the bottom of the screen.
+//!
+//! **Not implemented.** The rows show the comment truncated to its column, as
+//! they do in the shipped screen until the tooltip opens.
+//!
+//! # What else is not implemented
 //!
 //! The popup that asks the player to confirm overwriting a slot, and the
 //! comment editor behind host `+0xdc`, which is a text field with an IME
 //! attached. Saving here writes the timestamp line and keeps whatever comment
 //! the slot already had. Keyboard navigation through the list
 //! (`FUN_10014c90`) is a transition table that is **not recovered**; the
-//! pointer works, and the arrow keys fall back to the generic order.
+//! pointer works, and the arrow keys fall back to the generic order. The two
+//! sprites at `+0xf8` and `+0xfc`, placed from records `(page + 0x20) * 0x18`
+//! and `(page + 0x2a) * 0x18`, are the current page's indicator and sit past
+//! the thirty-two records the atlas recovers for this screen.
 
 use crate::install::clock::Civil;
 use crate::install::ini::Ini;
@@ -196,6 +223,28 @@ pub fn action(kind: Kind, widget: usize) -> Act {
         0x15 if kind == Kind::Load => Act::RouteMap,
         0x16..0x20 => Act::Row(widget - 0x16),
         _ => Act::None,
+    }
+}
+
+/// Which widget's sprite a selection lights, from `FUN_10011600`.
+///
+/// Not the selected widget. The draw loop runs over the ten rows and tests
+/// `row == selection || row + 0x16 == selection`, lighting `+0xa8 + row * 4`
+/// either way — the sprite built from the **first** band's record, which spans
+/// the whole row. The second band has no sprite of its own at all, so pointing
+/// anywhere in a row highlights the row entire.
+///
+/// The route map is the other departure: its sprite is drawn behind one
+/// condition more than [`enabled`] carries, `+0x94 == 0`, so on the Save screen
+/// the widget is still pointable and still does nothing, and now also lights
+/// nothing. Anything past the table lights nothing either.
+pub fn highlight(kind: Kind, widget: usize) -> Option<usize> {
+    match widget {
+        0..PER_PAGE => Some(widget),
+        0x0a..0x15 => Some(widget),
+        0x15 => (kind == Kind::Load).then_some(0x15),
+        0x16..0x20 => Some(widget - 0x16),
+        _ => None,
     }
 }
 
@@ -753,6 +802,39 @@ mod tests {
             let joined = format!("{head}{tail}");
             assert_eq!(split_line(&joined, english), (head, tail));
         }
+    }
+
+    /// The draw loop lights the row's own sprite for either band, so pointing
+    /// at a comment highlights the whole row rather than the three rows the
+    /// second band's record covers.
+    #[test]
+    fn both_bands_light_the_rows_own_sprite() {
+        for row in 0..PER_PAGE {
+            assert_eq!(highlight(Kind::Load, row), Some(row));
+            assert_eq!(highlight(Kind::Load, row + 0x16), Some(row));
+        }
+    }
+
+    #[test]
+    fn the_page_buttons_and_leave_light_themselves() {
+        for widget in 0x0a..=0x14 {
+            assert_eq!(highlight(Kind::Save, widget), Some(widget));
+        }
+    }
+
+    /// One condition further than `enabled`: the widget is live on both
+    /// screens, but only the Load screen draws its sprite.
+    #[test]
+    fn the_route_map_lights_on_the_load_screen_alone() {
+        assert_eq!(highlight(Kind::Load, 0x15), Some(0x15));
+        assert_eq!(highlight(Kind::Save, 0x15), None);
+        assert!(enabled(false, 0x15));
+    }
+
+    #[test]
+    fn a_widget_past_the_table_lights_nothing() {
+        assert_eq!(highlight(Kind::Load, 0x20), None);
+        assert_eq!(highlight(Kind::Load, 0x99), None);
     }
 
     fn rect(x: u32, y: u32) -> days_ui::cmap::Rect {

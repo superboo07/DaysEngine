@@ -1385,11 +1385,32 @@ nothing.
 
 **This screen's chip table does not match its hit map the way every other
 screen's does.** Ten of its thirty-two regions are half of a row the sprite
-covers whole, and ten more are comment panels taller than the rows they sit on,
-so only twelve regions can ever reproduce a record. The twelve that do are
-consecutive, which is enough to anchor the table and fill the rest in at its
-stride — `days_ui::atlas` now believes a long exact run whatever proportion of
-the screen it covers.
+covers whole, and ten more are about three rows tall, so only twelve regions
+can ever reproduce a record. The twelve that do are consecutive, which is
+enough to anchor the table and fill the rest in at its stride —
+`days_ui::atlas` now believes a long exact run whatever proportion of the
+screen it covers.
+
+Neither mismatch is an error in the table, and `FUN_10011600` says why. Its
+hover loop runs over the ten rows and lights `+0xa8 + row * 4` when
+`row == selection || row + 0x16 == selection`, so **the two bands share one
+sprite**: the first band's, which spans the whole row. The second band has no
+hover art, and pointing at either half highlights the row entire. Drawing each
+band's own record instead lights three rows at once, which is what it looks
+like when you get this wrong.
+
+The tall records are the panel of a tooltip. With the selection in the second
+band, `FUN_10011600` calls `FUN_10012900`, which re-wraps the slot's whole
+comment over up to three lines and shows it over the list: the panel sprite at
+`+0x108`, cut from that record, and the lines at `+0x1bc + n * 4` rasterised
+into the same 2048x1024 surface at `(0x400, 0x202 + n * 0x40)`. The panel's
+height grows with the line count, and rows 8 and 9 borrow rows 6 and 7's record
+so three lines cannot run off the bottom. **Not implemented.**
+
+One more departure from `FUN_10014910`: the route map's sprite is drawn behind
+one condition more than the enablement carries, `+0x94 == 0`. On the Save
+screen the widget is still pointable and still does nothing, and lights
+nothing.
 
 ### Naming a save — a Win32 dialog, not game art
 
@@ -1517,7 +1538,9 @@ recovered, and the comment the save dialog writes has no other way to be seen.
 Two more sprites, `+0xf8` and `+0xfc`, are placed from records
 `(page + 0x20) * 0x18` and `(page + 0x2a) * 0x18` — the current page's
 indicator. Those indices run past the thirty-two the atlas recovers for this
-screen, and they are **not implemented**.
+screen, and they are **not implemented**. The same surface also carries the
+expanded comment's three lines, at `(0x400, 0x202 + n * 0x40)`, for the tooltip
+described above.
 
 ---
 
