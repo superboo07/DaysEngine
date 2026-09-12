@@ -1371,6 +1371,33 @@ impl Menu {
         }
     }
 
+    /// Reloads the screen that is showing at a different art set.
+    ///
+    /// Every screen's loader picks its `.cmap` from the display mode —
+    /// `FUN_10013470` is the save/load screen's copy of the rule — so changing
+    /// the mode means reloading whatever is on screen at the new size. A
+    /// refusal leaves the old screen up, since a menu that cannot be drawn is
+    /// worse than one at the wrong size.
+    pub fn set_resolution(
+        &mut self,
+        vfs: &Vfs,
+        dll: &[u8],
+        resolution: Resolution,
+    ) -> Result<(), Error> {
+        if self.resolution == resolution {
+            return Ok(());
+        }
+        let was = self.resolution;
+        self.resolution = resolution;
+        let (mode, back) = (self.mode, self.return_to);
+        if let Err(err) = self.enter(vfs, dll, mode, back) {
+            log::warn!("cannot draw the menus at {}: {err}", resolution.name());
+            self.resolution = was;
+            self.enter(vfs, dll, mode, back)?;
+        }
+        Ok(())
+    }
+
     /// Which driver is running. See [`Entry`].
     pub fn entry(&self) -> Entry {
         self.entry

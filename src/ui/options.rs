@@ -181,14 +181,26 @@ pub enum Step {
 /// The display change a Def-tab row asks for.
 ///
 /// The DLL does **not** change the mode itself. Each of these four widgets
-/// checks that the mode really would change and then sets a flag at `+0xb0` or
-/// `+0xac` — and **who reads those flags is not recovered**: two decompiler
-/// sweeps, over `MENU::ConfigMenu`'s own neighbourhood and over the
-/// `MENU::menuBase` it inherits, found writes and no reads, and a raw opcode
-/// scan cannot separate a read of this member from a load of the host vtable
-/// slot at the same displacement. So the request is reported here and the
-/// engine decides what to do with it, rather than this module inventing a
-/// mechanism the original might not have.
+/// checks that the mode really would change and then sets a flag: `+0xac` for
+/// full screen and `+0xb0` for wide.
+///
+/// The executable reads them back through the module's **exports**, which is
+/// why a sweep of the DLL's own code finds writes and no reads. `_GetFullFlag@0`
+/// returns `+0xac` and `_GetWideFlag@0` returns `+0xb0`; `_SetFullFlag@4` and
+/// `_SetWideFlag@4` write them. Each has exactly one reader in the executable
+/// and it is a one-shot applier polled from the main loop:
+///
+/// ```text
+/// FUN_004279e0:  if (_GetFullFlag@0()) { tear down, toggle the window with
+///                FUN_0040e860(!FUN_0040e830()), rebuild, _SetFullFlag@4(0) }
+/// FUN_00427a90:  if (_GetWideFlag@0()) { FUN_0040ed10(), rebuild,
+///                _SetWideFlag@4(0) }
+/// ```
+///
+/// So the flag is a **request**, not a setting: the engine acts on it once and
+/// clears it. Both appliers toggle rather than assign, which is safe because
+/// the widgets only fire when the mode would really change — see
+/// [`def_action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayRequest {
     Wide,

@@ -21,7 +21,7 @@ use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::comment;
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
-use daysengine::ui::options::{Dir, Display, Som};
+use daysengine::ui::options::{self, Dir, Display, Som};
 use daysengine::ui::replay::Scenes;
 use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
@@ -45,12 +45,6 @@ use std::time::Instant;
 /// the window, so the two never disagree about aspect.
 const STAGE_WIDTH: u32 = 800;
 const STAGE_HEIGHT: u32 = 452;
-
-/// The UI is authored at 800x450 and the shipped `.CMAP`s carry that same
-/// layout pre-scaled to each of the four sizes. Presenting at the native one
-/// keeps the menu in the same box as the stage and leaves the scaling to the
-/// one letterbox both share.
-const MENU_RESOLUTION: Resolution = Resolution::Wide;
 
 /// Pulls mixed audio for SDL.
 struct MixerSource {
@@ -164,6 +158,21 @@ struct Player<'a> {
     /// SDL's text input, which is what carries an IME into the save-comment
     /// dialog. Off except while that dialog is up.
     text_input: sdl3::keyboard::TextInputUtil,
+    /// The display mode in force, which the Option screen's Def tab both shows
+    /// and changes. The original keeps the same pair on the engine object and
+    /// answers them through host `+0xb8` and `+0xbc`.
+    display: Display,
+    /// `Config.DAT`'s `TypeMiniNote`, which picks the 1024x576 art over the
+    /// 1280x720 art when full screen. Host `+0xc8`, via `DAT_0050b314`.
+    mini_note: bool,
+}
+
+impl Player<'_> {
+    /// The art set to load for the mode in force. See
+    /// [`Resolution::for_display`].
+    fn resolution(&self) -> Resolution {
+        Resolution::for_display(self.display.wide, self.display.full_screen, self.mini_note)
+    }
 }
 
 fn main() -> Result<()> {
@@ -241,8 +250,24 @@ fn main() -> Result<()> {
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
 
+    // The display mode the player left the game in. `Config.DAT` carries all
+    // three keys the original reads: `DisplayType` is the aspect, `WindowMode`
+    // is windowed versus full screen, and `TypeMiniNote` picks the 1024x576 art
+    // over the 1280x720 art. The engine starts windowed whatever `WindowMode`
+    // says, because a window is the safe thing to open on somebody else's
+    // desktop; the Option screen is one click away.
+    let boot_config = Config::load(&game);
     let mut player = Player {
         game: game.clone(),
+        display: Display {
+            wide: boot_config
+                .get("DisplayType")
+                .is_none_or(|v| v.trim() != "0"),
+            full_screen: false,
+        },
+        mini_note: boot_config
+            .get("TypeMiniNote")
+            .is_some_and(|v| v.trim() != "0"),
         // Started only while the save-comment dialog is up, so ordinary key
         // presses stay key presses everywhere else.
         text_input: video.text_input(),
@@ -472,13 +497,11 @@ fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
         flags: player.flags.clone(),
         config: Config::load(&player.game),
         scenes,
-        // This engine draws its menus at one fixed size, so the two questions
-        // the Def tab asks have one answer. `MENU_RESOLUTION` is widescreen and
-        // the window is not full screen.
-        display: Display {
-            wide: true,
-            full_screen: false,
-        },
+        // The Def tab shows which value is in force and greys the other, so
+        // this has to be the engine's real mode rather than a fixed answer.
+        // The original asks the same two questions through host `+0xb8` and
+        // `+0xbc`.
+        display: player.display,
         som: Som::default(),
         english,
         text_input: player.film.get_bool("TextInput").unwrap_or(false),
@@ -528,7 +551,7 @@ fn run_menu(
             &player.dll,
             Mode::TITLE,
             session,
-            MENU_RESOLUTION,
+            player.resolution(),
         )
         .context("opening the title screen")?,
         MenuEntry::OverPlayback(mode, kind) => Menu::open_over_playback(
@@ -537,7 +560,7 @@ fn run_menu(
             mode,
             kind,
             session,
-            MENU_RESOLUTION,
+            player.resolution(),
         )
         .with_context(|| format!("opening menu mode {} over playback", mode.0))?,
     };
@@ -650,8 +673,17 @@ fn run_menu(
                 // engine's to decide, and right now it decides nothing. Logged
                 // so the gap is visible rather than silent. See
                 // `daysengine::ui::options::DisplayRequest`.
+                // `FUN_004279e0` and `FUN_00427a90` are the original's two
+                // appliers: each polls the flag the Def tab raised, changes the
+                // mode once and clears it. This does the same on arrival, which
+                // from the player's side is the same thing.
                 Action::Display(request) => {
-                    log::info!("the Option screen asked for {request:?}; not applied");
+                    apply_display(player, canvas, request)?;
+                    // Every screen's art is chosen by the mode, so whatever is
+                    // showing has to be reloaded at the new size.
+                    menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
+                    menu.session_mut().display = player.display;
+                    texture = None;
                 }
                 Action::Sound(se) => {
                     player
@@ -1015,6 +1047,46 @@ fn play_menu_bgm(player: &mut Player, path: Option<&str>) {
     player.mixer.play_bgm(intro, looped);
 }
 
+/// Applies a display change the Option screen asked for.
+///
+/// Full screen goes to the **desktop's own resolution** rather than to one of
+/// the two sizes `DX9GRAPHIC.INI` names. The original had to pick a mode the
+/// adapter could set in 2005; there is no such constraint here, and the frame
+/// is resampled to whatever it lands on by [`daysengine::playback::scale`], so
+/// borrowing the desktop mode gives a sharper picture than stretching 1280x720
+/// across a panel that is not 1280x720. Which art set is loaded still follows
+/// the recovered rule in [`Resolution::for_display`] — that is about layout,
+/// not about the size of the window it ends up in.
+fn apply_display(
+    player: &mut Player,
+    canvas: &mut Canvas<Window>,
+    request: options::DisplayRequest,
+) -> Result<()> {
+    match request {
+        options::DisplayRequest::Wide => player.display.wide = true,
+        options::DisplayRequest::Normal => player.display.wide = false,
+        options::DisplayRequest::FullScreen | options::DisplayRequest::Windowed => {
+            let want = request == options::DisplayRequest::FullScreen;
+            canvas
+                .window_mut()
+                .set_fullscreen(want)
+                .map_err(|e| anyhow::anyhow!("setting full screen: {e}"))?;
+            player.display.full_screen = want;
+        }
+    }
+    log::info!(
+        "display is now {} and {}, art {}",
+        if player.display.wide { "wide" } else { "4:3" },
+        if player.display.full_screen {
+            "full screen at the desktop's resolution"
+        } else {
+            "windowed"
+        },
+        player.resolution().name()
+    );
+    Ok(())
+}
+
 /// The rectangle a `width` x `height` image is drawn into, centred and scaled
 /// to fit the window without distorting it.
 fn letterbox(canvas: &Canvas<Window>, width: u32, height: u32) -> FRect {
@@ -1083,7 +1155,7 @@ fn run_script(
     // The control bar and the choice box both come out of the install, and a
     // missing one has to leave playback alone: this is the UI over a movie, not
     // the movie. So both are loaded with a warning and the loop checks for them.
-    let mut control = match Bar::load(player.vfs, &player.dll, MENU_RESOLUTION) {
+    let mut control = match Bar::load(player.vfs, &player.dll, player.resolution()) {
         Ok(bar) => Some(bar),
         Err(err) => {
             log::warn!("the control bar is unavailable: {err}");
@@ -1380,7 +1452,12 @@ fn run_script(
         match (&visual.select, &mut choice) {
             (Some(window), None) => {
                 let pending = Choice::new(window.a, window.b, window.start, window.end);
-                match Select::load(player.vfs, player.film, pending.count(), MENU_RESOLUTION) {
+                match Select::load(
+                    player.vfs,
+                    player.film,
+                    pending.count(),
+                    player.resolution(),
+                ) {
                     Ok(map) => choice = Some((pending, map)),
                     Err(err) => log::warn!("the choice box is unavailable: {err}"),
                 }

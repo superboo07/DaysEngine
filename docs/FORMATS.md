@@ -469,13 +469,38 @@ drawn instead as one record stretched to the width `FUN_100070e0` computes,
 from the first cell's left edge to the right edge of the cell at the current
 level.
 
-The Def tab's two display rows do not change anything. Each checks the host
-(`+0xb8` aspect, `+0xbc` full screen) and, if the mode would really change, sets
-a flag at `+0xb0` or `+0xac`. **Who reads those flags is not recovered.** Two
-decompiler sweeps — over `MENU::ConfigMenu`'s neighbourhood and over the
-`MENU::menuBase` it inherits — found writes and no reads, and a raw opcode scan
-cannot tell a read of this member from a load of the host vtable slot at the
-same displacement, so that null result is reported rather than claimed.
+The Def tab's two display rows do not change anything themselves. Each checks
+the host (`+0xb8` aspect, `+0xbc` full screen) and, if the mode would really
+change, sets a flag: `+0xac` for full screen and `+0xb0` for wide.
+
+The executable reads them back through the module's **exports**, which is why a
+sweep of the DLL's own code finds writes and no reads. `_GetFullFlag@0` returns
+`+0xac` and `_GetWideFlag@0` returns `+0xb0`, and `_SetFullFlag@4` /
+`_SetWideFlag@4` write them. Each getter has exactly one caller in the
+executable, and both are one-shot appliers polled from the main loop:
+
+    FUN_004279e0   if (_GetFullFlag@0()) {
+                       FUN_00429b10 / FUN_0042a030      release the surfaces
+                       FUN_0040e860(!FUN_0040e830())    toggle the window
+                       if (engine+0x220) FUN_0042c520   re-place the screen
+                       _SetVistaDisplay@4(0 or 1)
+                       _SetFullFlag@4(0)                clear the request
+                       FUN_00429b40 / FUN_0042a080      rebuild
+                   }
+
+    FUN_00427a90   if (_GetWideFlag@0()) {
+                       FUN_0040ed10()                   apply the layout
+                       if (engine+0x220) FUN_0042c520
+                       _SetWideFlag@4(0)
+                   }
+
+So each flag is a **request**, not a setting: the engine acts on it once and
+clears it. Both appliers toggle rather than assign, which is safe only because
+the widgets fire nothing when the value is already in force.
+
+`_GetResFlag@0` is **not** part of this, despite the name. It returns the popup
+module's `+0xa0`, which `FUN_1000a8f0` sets to 1 on the popup's YES and 0 on its
+NO — it is the confirm popup's answer.
 
 The mark showing which value is in force is a per-tab switch — `FUN_10009fd0`,
 `FUN_1000a190`, `FUN_1000a250` — indexing a run of records that begins 27, 51

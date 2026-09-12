@@ -81,6 +81,34 @@ impl Resolution {
         Resolution::Full,
     ];
 
+    /// The art set the game would load for a given display mode.
+    ///
+    /// `FUN_10013470` is the rule, and every screen's loader repeats it:
+    ///
+    /// ```text
+    /// if (host->+0xb8() == 1)                  // wide
+    ///     if (host->+0xbc() == 1)              // full screen
+    ///         host->+0xc8() ? "_Wide_Note" : "_Wide_Full"
+    ///     else "_Wide"
+    /// else ""
+    /// ```
+    ///
+    /// `+0xb8` is the engine's aspect, `+0xbc` is `FUN_0040e830`'s full-screen
+    /// member, and `+0xc8` returns `DAT_0050b314`, which `FUN_0040cbb0` reads
+    /// out of the player's own `Config.DAT` key **`TypeMiniNote`**. The two
+    /// full-screen sizes are `DX9GRAPHIC.INI`'s `[FullWideWidth]`/`[Height]`
+    /// (1280x720) and `[FullNoteWidth]`/`[Height]` (1024x576), and the 4:3 one
+    /// is `[DisplayWidthSize]`/`[Height]` (800x600), which is where these four
+    /// sizes come from.
+    pub fn for_display(wide: bool, full_screen: bool, mini_note: bool) -> Resolution {
+        match (wide, full_screen, mini_note) {
+            (false, _, _) => Resolution::Standard,
+            (true, false, _) => Resolution::Wide,
+            (true, true, true) => Resolution::Note,
+            (true, true, false) => Resolution::Full,
+        }
+    }
+
     /// Parses a resolution from a CLI-friendly name.
     pub fn from_name(name: &str) -> Option<Resolution> {
         match name.to_ascii_lowercase().as_str() {
@@ -394,6 +422,44 @@ impl Screen {
 
 #[cfg(test)]
 mod tests {
+
+    /// `FUN_10013470`'s three-way test, which every screen's loader repeats.
+    /// 4:3 has one art set whatever else is true; widescreen splits by window
+    /// versus full screen, and full screen splits again on `TypeMiniNote`.
+    #[test]
+    fn the_art_set_follows_the_display_mode() {
+        for mini in [false, true] {
+            assert_eq!(
+                Resolution::for_display(false, false, mini),
+                Resolution::Standard
+            );
+            assert_eq!(
+                Resolution::for_display(false, true, mini),
+                Resolution::Standard,
+                "4:3 has no full-screen art of its own"
+            );
+            assert_eq!(Resolution::for_display(true, false, mini), Resolution::Wide);
+        }
+        assert_eq!(
+            Resolution::for_display(true, true, false),
+            Resolution::Full,
+            "1280x720 without TypeMiniNote"
+        );
+        assert_eq!(
+            Resolution::for_display(true, true, true),
+            Resolution::Note,
+            "1024x576 with it"
+        );
+    }
+
+    /// And each of those really does name a `.cmap` suffix the game ships.
+    #[test]
+    fn every_art_set_has_the_suffix_the_dll_spells() {
+        assert_eq!(Resolution::Standard.suffix(), "");
+        assert_eq!(Resolution::Wide.suffix(), "_Wide");
+        assert_eq!(Resolution::Note.suffix(), "_Wide_Note");
+        assert_eq!(Resolution::Full.suffix(), "_Wide_Full");
+    }
     use super::*;
 
     #[test]

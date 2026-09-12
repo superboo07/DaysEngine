@@ -170,6 +170,17 @@
 //! * key clear: raise `+0x98` on the spot, with no dialog at all. The comment
 //!   `FUN_10011c30` then writes is `L""`.
 //!
+//! **Overwriting is silent and unconditional.** Nothing anywhere on that path
+//! asks, and three separate places say so: `FUN_10014990`'s save arm branches
+//! only on `+0xd8` and never tests whether the row is occupied; `FUN_10014910`
+//! gates the row on nothing but the popup state, where the *load* arm goes
+//! through `FUN_10011d50` and refuses a row whose `+0x11c` entry is zero; and
+//! the host's own writer `FUN_0042aea0` builds the path out of
+//! `[SaveFileName]`, hands it to `FUN_00457240` with mode 1 — "Open
+//! WritableFile", create and truncate — and writes, with no existence test and
+//! no backup. So the asymmetry is the whole rule: loading refuses an empty
+//! slot, saving accepts any slot and overwrites it without asking.
+//!
 //! `+0x98` is the save waiting to be written. While it is up `FUN_10014910`
 //! answers false for every widget, so the screen is inert, and the next tick
 //! of `FUN_10014c90` takes the other arm: `FUN_10011c30` asks the host to write
@@ -1005,6 +1016,33 @@ impl Slots {
 
 #[cfg(test)]
 mod tests {
+
+    /// Loading refuses an empty slot and saving accepts any slot. The save
+    /// screen never asks before overwriting — `FUN_0042aea0` opens the file
+    /// create-and-truncate and writes, and nothing on the way there tests
+    /// whether the slot was occupied.
+    #[test]
+    fn saving_overwrites_without_asking_and_loading_refuses_an_empty_slot() {
+        // Row 2 of page 0 is the only filled one.
+        let mut slots = Slots::default();
+        slots.insert(
+            2,
+            Line {
+                when: "9/12/2026(Sat)15:17".to_string(),
+                chapter: "01".to_string(),
+                comment: String::new(),
+            },
+        );
+        for row in 0..PER_PAGE {
+            let slot = slot_of(0, row);
+            let widget = 0x16 + row;
+            // Both jobs dispatch the row; what differs is what the engine does
+            // with it, which is why both are `Act::Row` here.
+            assert_eq!(action(Kind::Save, widget), Act::Row(row));
+            assert_eq!(action(Kind::Load, widget), Act::Row(row));
+            assert_eq!(slots.filled(slot), slot == 2);
+        }
+    }
 
     /// A slot just written is put back without re-reading the install, which
     /// is what lets the page re-rasterise in place after `FUN_10011c30`.
