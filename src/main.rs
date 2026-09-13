@@ -780,7 +780,16 @@ fn run_menu(
     // changes, which is the only thing that changes the size it goes into.
     let mut under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
 
-    play_menu_bgm(player, start.get("TitleBGM"));
+    // Only the title shell has music of its own. `[TitleBGM]` is read in one
+    // place in the executable — `FUN_0041f600`, the same function that reads
+    // `[StartScript]`, with one caller — and a screen the control bar opens is
+    // the other driver entirely: host `+0xf8` (`FUN_0042a430`) puts the
+    // playback object into its menu layer and touches no audio at all. So the
+    // scene's own BGM plays on underneath, and there is nothing to put back on
+    // the way out.
+    if entry == MenuEntry::Title {
+        play_menu_bgm(player, start.get("TitleBGM"));
+    }
 
     let mut texture: Option<Texture> = None;
     // The slot the player picked on the save screen, waiting for the
@@ -1643,6 +1652,9 @@ fn run_script(
     // actually changes — which is on a hover, a state change or an auto frame.
     let mut bar_texture: Option<(Vec<usize>, u32, u32, Texture)> = None;
     let mut choice: Option<(Choice, Select)> = None;
+    // The playback rate the player had when a choice went up, to put back when
+    // they answer it. See the `Raised`/`Decided` arm below.
+    let mut speed_before_choice: Option<usize> = None;
 
     // The clock is wall-clock based with an offset, so pausing and seeking are
     // both just adjustments to the offset rather than separate state machines.
@@ -1999,6 +2011,34 @@ fn run_script(
                     player
                         .system_se
                         .play(se, player.vfs, &mut player.sounds, player.mixer);
+                    // A choice is decided at 1x, whatever the player was
+                    // fast-forwarding at, and the speed they had comes back
+                    // when they answer. `FUN_00431740` calls
+                    // `FUN_004250b0(engine, 0)` as the box goes up — which
+                    // saves the live index into `+0x534` before overwriting
+                    // `+0x530` — and `FUN_004316b0` calls `FUN_004251d0`,
+                    // which puts `+0x534` back. Both are skipped while the
+                    // auto flag (host `+0x134`) is set, because that is the
+                    // mode that answers the box for you.
+                    //
+                    // Re-basing the clock is part of it: the position is
+                    // `base + elapsed * 24 * rate` (`FUN_00422f70`), so
+                    // changing the rate without moving the base would move the
+                    // frame as well as the speed.
+                    if !bar_state.auto {
+                        let want = match event {
+                            select::Event::Raised(_) => {
+                                speed_before_choice = Some(bar_state.speed);
+                                0
+                            }
+                            _ => speed_before_choice.take().unwrap_or(bar_state.speed),
+                        };
+                        if bar_state.set_speed(want) {
+                            offset = clock(origin, now, offset, rate);
+                            origin = now;
+                            player.mixer.set_rate(bar_state.rate);
+                        }
+                    }
                     if let select::Event::Decided(index, _) = event {
                         // The engine credits the choice's deltas the moment
                         // the box settles, before the script has ended --
