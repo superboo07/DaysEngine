@@ -17,7 +17,7 @@
 //!
 //! | Name | Drawn | Read by |
 //! |---|---|---|
-//! | `001`, `002` | **both gauge bars** | the branch test below, at 25 routes; thresholds at 10 scripts |
+//! | `001` (Sekai), `002` (Kotonoha) | **both gauge bars** | the branch test below, at 25 routes; thresholds at 10 scripts |
 //! | `004` | no | thresholds at 3 scripts, and nothing else |
 //! | `000` | no | nothing: it is the filler, see below |
 //! | `003` | no | nothing |
@@ -99,11 +99,12 @@
 
 use days_save::FlagStore;
 
-/// The counter the left gauge bar draws, and the left side of the branch test.
+/// Sekai's counter: the right-hand, orange half of the gauge, and the left side
+/// of the branch test.
 pub const FIRST: &str = "001";
 
-/// The counter the right gauge bar draws, and the right side of the branch
-/// test.
+/// Kotonoha's counter: the left-hand, green half of the gauge, and the right
+/// side of the branch test.
 pub const SECOND: &str = "002";
 
 /// Characters the readers drop from the front of a script path before building

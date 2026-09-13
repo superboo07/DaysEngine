@@ -68,7 +68,7 @@
 //! territory rather than menu territory — see [`Act::Seek`].
 
 use crate::install::config::{Config, Flag};
-use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
+use crate::ui::screen::{Cut, Error, Resolution, Screen, WidgetState};
 use days_ui::Image;
 
 /// The screen's path stem, as the DLL spells it.
@@ -135,12 +135,23 @@ pub struct Fade {
     started: Option<u32>,
     /// `this+0xbc`.
     up: bool,
+    /// The alpha the gauge bed and the gauge's three pieces carry, which is not
+    /// always the bar's own.
+    ///
+    /// `FUN_10025690` sets one ARGB on every sprite the bar owns **except**
+    /// `this+0x80` and `this+0x98..0xa0` — the bed and the three pieces — which
+    /// it skips whenever host `+0x154` answers non-zero. Skipping is not the
+    /// same as setting them opaque: they keep whatever they last held. So a
+    /// gauge raised while the bar is up stays on screen at full alpha after the
+    /// bar has faded away, and one raised while the bar is already gone is
+    /// pinned at nothing and does not appear at all.
+    gauge_alpha: u8,
 }
 
 impl Fade {
     /// One frame of the fade, given the clock and whether the pointer is over
     /// the strip at all.
-    pub fn update(&mut self, now_ms: u32, over_strip: bool) {
+    pub fn update(&mut self, now_ms: u32, over_strip: bool, gauge_raised: bool) {
         if over_strip {
             self.up = true;
             if self.alpha != 0xff {
@@ -150,6 +161,12 @@ impl Fade {
             self.up = false;
         } else {
             self.ramp(now_ms, false, FADE_OUT_MS);
+        }
+        // The one place `FUN_10025690`'s exception lands: while the gauge is
+        // raised it is not called for the bed or the pieces at all, so their
+        // alpha stops following the bar's.
+        if !gauge_raised {
+            self.gauge_alpha = self.alpha;
         }
     }
 
@@ -171,9 +188,15 @@ impl Fade {
         self.up
     }
 
-    /// The alpha every one of the bar's sprites is modulated by.
+    /// The alpha every one of the bar's sprites is modulated by, bar the
+    /// gauge's — see [`Fade::gauge_alpha`].
     pub fn alpha(&self) -> u8 {
         self.alpha
+    }
+
+    /// The alpha the gauge bed and the gauge's three pieces are modulated by.
+    pub fn gauge_alpha(&self) -> u8 {
+        self.gauge_alpha
     }
 
     /// Puts the bar straight into its hidden state, for a fresh script.
@@ -590,8 +613,13 @@ impl Bar {
     /// which is the `-2` case that fades the bar out. A pointer inside the strip
     /// but on no widget keeps it up, so this takes the position rather than the
     /// hovered widget.
-    pub fn point_at(&mut self, over: Option<(u32, u32)>, now_ms: u32) -> Option<usize> {
-        self.fade.update(now_ms, over.is_some());
+    pub fn point_at(
+        &mut self,
+        over: Option<(u32, u32)>,
+        now_ms: u32,
+        gauge_raised: bool,
+    ) -> Option<usize> {
+        self.fade.update(now_ms, over.is_some(), gauge_raised);
         over.and_then(|(x, y)| self.hit(x, y))
     }
 
@@ -734,15 +762,44 @@ impl Bar {
         state: State,
         elapsed_ms: u32,
     ) -> Vec<WidgetState> {
+        self.states_of(&self.records(hovered, state, elapsed_ms))
+    }
+
+    /// As [`Bar::states`], for a record list already in hand.
+    fn states_of(&self, records: &[usize]) -> Vec<WidgetState> {
         let mut states = vec![WidgetState::Resting; WIDGETS];
-        for record in self.records(hovered, state, elapsed_ms) {
-            if record < WIDGETS {
-                states[record] = WidgetState::Active;
+        for record in records {
+            if *record < WIDGETS {
+                states[*record] = WidgetState::Active;
             } else {
-                states.push(self.extra(record));
+                states.push(self.extra(*record));
             }
         }
         states
+    }
+
+    /// This frame's records split by whether the fade reaches them.
+    ///
+    /// The second list is empty unless the gauge is raised, which is the only
+    /// thing that takes a sprite out of `FUN_10025690`'s reach — and when it is
+    /// raised the bed goes with the gauge, since the original skips that too.
+    fn split(
+        &self,
+        hovered: Option<usize>,
+        state: State,
+        elapsed_ms: u32,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let mut records = self.records(hovered, state, elapsed_ms);
+        if !state.gauge_raised {
+            return (records, Vec::new());
+        }
+        let pinned = records
+            .iter()
+            .copied()
+            .filter(|r| *r == record::GAUGE_BED)
+            .collect();
+        records.retain(|r| *r != record::GAUGE_BED);
+        (records, pinned)
     }
 
     /// Turns a record index into a widget state, warning rather than drawing
@@ -769,8 +826,36 @@ impl Bar {
     /// animation while `_GetAutoDraw@0` is non-zero, so that one stays at full
     /// alpha. **What that export returns is not recovered**, so the exception is
     /// not reproduced and the whole strip fades together.
-    pub fn compose(&self, states: &[WidgetState]) -> Image {
-        self.screen.compose_layer(states)
+    pub fn compose(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
+        let records = self.records(hovered, state, elapsed_ms);
+        self.screen
+            .compose_layer_cuts(&self.states_of(&records), &self.gauge_cuts(state))
+    }
+
+    /// The affection gauge's pieces, as cuts of the chip sheet.
+    ///
+    /// Not part of [`Bar::records`], because they are not chip records:
+    /// `FUN_10026540` sizes them itself from the two counters, and
+    /// `FUN_10024ca0` draws whichever are up straight after the bed record
+    /// they sit in — under the same two tests the bed itself is under, which is
+    /// why this asks [`Bar::records`] for the bed rather than repeating them.
+    ///
+    /// Empty while the counters are unknown: the pieces' visibility flags are
+    /// only ever set by `FUN_10026540`, which nothing has run.
+    pub fn gauge_cuts(&self, state: State) -> Vec<Cut> {
+        let Some((first, second)) = state.gauge else {
+            return Vec::new();
+        };
+        if !self.records(None, state, 0).contains(&record::GAUGE_BED) {
+            return Vec::new();
+        }
+        gauge::pieces(first, second)
+            .drawn()
+            .map(|piece| Cut {
+                src: (piece.src.x, piece.src.y, piece.src.w, piece.src.h),
+                dst: (piece.dst.x, piece.dst.y, piece.dst.w, piece.dst.h),
+            })
+            .collect()
     }
 
     /// As [`Bar::compose`], with the fade already multiplied in.
@@ -779,15 +864,33 @@ impl Bar {
     /// and modulates the texture's alpha instead, so a ramp does not
     /// recomposite the strip every frame. This is for the headless path, where
     /// there is one image and no texture to modulate.
-    pub fn compose_faded(&self, states: &[WidgetState]) -> Image {
-        let mut layer = self.compose(states);
-        let alpha = u32::from(self.fade.alpha());
-        if alpha < 255 {
-            for px in layer.rgba.as_chunks_mut::<4>().0 {
-                px[3] = (u32::from(px[3]) * alpha / 255) as u8;
-            }
+    pub fn compose_faded(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
+        let (records, pinned) = self.split(hovered, state, elapsed_ms);
+        let cuts = self.gauge_cuts(state);
+        let mut layer = self.screen.compose_layer_cuts(
+            &self.states_of(&records),
+            if pinned.is_empty() { &cuts } else { &[] },
+        );
+        modulate(&mut layer, self.fade.alpha());
+        if !pinned.is_empty() {
+            let mut over = self.screen.compose_sprites(&self.states_of(&pinned), &cuts);
+            modulate(&mut over, self.fade.gauge_alpha());
+            let (w, h) = (over.width, over.height);
+            layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }
         layer
+    }
+}
+
+/// Multiplies a layer's alpha through, for the headless path that has no
+/// texture to modulate.
+fn modulate(layer: &mut Image, alpha: u8) {
+    if alpha == 255 {
+        return;
+    }
+    let alpha = u32::from(alpha);
+    for px in layer.rgba.as_chunks_mut::<4>().0 {
+        px[3] = (u32::from(px[3]) * alpha / 255) as u8;
     }
 }
 
@@ -864,40 +967,64 @@ mod tests {
         assert_eq!(fade.alpha(), 0);
 
         // Off the strip it stays away however long it is left.
-        fade.update(0, false);
-        fade.update(10_000, false);
+        fade.update(0, false, false);
+        fade.update(10_000, false, false);
         assert!(!fade.drawn());
 
         // The pointer arriving makes it draw at once, at alpha 0, and it ramps.
-        fade.update(0, true);
+        fade.update(0, true, false);
         assert!(fade.drawn());
         assert_eq!(fade.alpha(), 0);
-        fade.update(FADE_IN_MS / 2, true);
+        fade.update(FADE_IN_MS / 2, true, false);
         assert_eq!(fade.alpha(), 127);
-        fade.update(FADE_IN_MS, true);
+        fade.update(FADE_IN_MS, true, false);
         assert_eq!(fade.alpha(), 255);
+    }
+
+    /// `FUN_10025690` skips the gauge while it is raised, which is not the
+    /// same as holding it up: what it keeps is the alpha it had when the raise
+    /// happened, so a gauge raised over a bar that is already gone stays gone.
+    #[test]
+    fn a_raised_gauge_holds_the_alpha_it_was_raised_at() {
+        let mut fade = Fade::default();
+        fade.update(0, true, false);
+        fade.update(FADE_IN_MS, true, false);
+        assert_eq!(fade.gauge_alpha(), 255);
+
+        // Raised with the bar up, the gauge survives the whole ramp out.
+        fade.update(1_000, false, true);
+        fade.update(1_000 + FADE_OUT_MS, false, true);
+        assert_eq!(fade.alpha(), 0);
+        assert_eq!(fade.gauge_alpha(), 255);
+
+        // Lowering lets it catch up, and raising it again from there pins it at
+        // nothing.
+        fade.update(3_000, false, false);
+        assert_eq!(fade.gauge_alpha(), 0);
+        fade.update(4_000, false, true);
+        assert_eq!(fade.gauge_alpha(), 0);
     }
 
     #[test]
     fn the_pointer_leaving_ramps_out_and_then_takes_the_bar_away() {
         let mut fade = Fade::default();
-        fade.update(0, true);
-        fade.update(FADE_IN_MS, true);
+        fade.update(0, true, false);
+        fade.update(FADE_IN_MS, true, false);
         assert_eq!(fade.alpha(), 255);
 
         // The ramp out is over the longer of the two windows, and the bar keeps
         // drawing all the way through it.
-        fade.update(1_000, false);
+        fade.update(1_000, false, false);
         assert!(fade.drawn());
-        fade.update(1_000 + FADE_OUT_MS / 2, false);
+        fade.update(1_000 + FADE_OUT_MS / 2, false, false);
         assert_eq!(fade.alpha(), 128);
         assert!(fade.drawn());
-        fade.update(1_000 + FADE_OUT_MS, false);
+        fade.update(1_000 + FADE_OUT_MS, false, false);
         assert_eq!(fade.alpha(), 0);
         // It is still "up" on the frame the alpha hits zero; the next frame is
         // the one that takes it away, which is the order `FUN_10024100` does it
         // in — the test comes before the assignment.
-        fade.update(3_000, false);
+        fade.update(3_000, false, false);
         assert!(!fade.drawn());
     }
 
@@ -907,12 +1034,12 @@ mod tests {
         // flipping direction part way through keeps the old start and the alpha
         // jumps. Shipped behaviour, reproduced rather than smoothed over.
         let mut fade = Fade::default();
-        fade.update(0, true);
-        fade.update(FADE_IN_MS / 2, true);
+        fade.update(0, true, false);
+        fade.update(FADE_IN_MS / 2, true, false);
         assert_eq!(fade.alpha(), 127);
         // Now leave. The out ramp measures from tick 0, not from now, so half
         // of FADE_IN_MS into a 1000ms out ramp is barely any fall at all.
-        fade.update(FADE_IN_MS / 2, false);
+        fade.update(FADE_IN_MS / 2, false, false);
         assert_eq!(
             fade.alpha(),
             255 - (FADE_IN_MS / 2 * 255 / FADE_OUT_MS) as u8
@@ -924,8 +1051,8 @@ mod tests {
         // -1 from the hit map, not -2: the bar stays. This is the distinction
         // the whole drop-down turns on.
         let mut fade = Fade::default();
-        fade.update(0, true);
-        fade.update(FADE_IN_MS, true);
+        fade.update(0, true, false);
+        fade.update(FADE_IN_MS, true, false);
         assert!(fade.drawn());
         assert_eq!(fade.alpha(), 255);
     }
@@ -1122,11 +1249,38 @@ mod tests {
 /// drawn instead — so in ordinary play, where the two counters run within a
 /// few points of each other, the level piece is the one on screen.
 ///
-/// The destination rectangles below are `FUN_10026540`'s, exactly. The
-/// **source** rectangles are not: the original builds them through four
-/// chained calls on the object at `this+0x1c` whose vtable this module has not
-/// identified, so which of those four values is x, y, width and height is
-/// **not recovered**, and the pieces are therefore not composed yet.
+/// # Where the art comes from
+///
+/// All three pieces cut `MenuBar_Chip.png`, which is the texture the bar keeps
+/// at `this+0x1c` — `FUN_10023d50` loads `System/MenuBar/MenuBar.png` into
+/// `+0x20` and `System/MenuBar/MenuBar_Chip.png` into `+0x24`, and
+/// `FUN_10023aa0` renders those two into the textures at `+0x18` and `+0x1c`
+/// in that order. The sheet carries one 9-pixel-tall strip per piece: the
+/// first counter's bar at y 57 and the second's at y 369, each 485 long and
+/// each a flat colour — orange for the first, green for the second — and at
+/// y 399 the level strip, 798 long, green until x 370 and orange from x 420
+/// with the blend between them centred on 395.
+///
+/// So the level piece is not a neutral bar. It is a **window** 417 wide onto
+/// that strip, and its origin slides by [`SCALE`] pixels for every point of
+/// lead, which walks the green-to-orange edge across the gauge: at a tie the
+/// edge sits one and a half pixels left of centre, and by the time either side
+/// is far enough ahead for its own piece to take over the edge has reached the
+/// end. That slide is what the gauge shows in ordinary play.
+///
+/// # Reading the rectangles out
+///
+/// `FUN_10026540` sets each piece's destination through `DX9Sprite2D` slot
+/// `+0xc` and its source through slot `+0x1c`, and the source goes in as four
+/// separate calls on the texture — `DX9Texture` slot `+8` is `x / width` and
+/// slot `+0xc` is `y / height`. Ghidra renders those four as a chain of
+/// `float10` results, in which the order is lost; the disassembly's push order
+/// is what gives it, and it is self-checking, since the two `/ width` values
+/// have to pair with each other and the two `/ height` values with each other.
+///
+/// The source rectangles are a pixel smaller than their destinations in each
+/// axis, and the destinations start half a pixel back, which is the half-texel
+/// offset every other sprite the bar draws gets as well.
 pub mod gauge {
     /// `_DAT_1003d858`, a double: points of lead to pixels.
     pub const SCALE: f32 = 2.5;
@@ -1145,8 +1299,31 @@ pub mod gauge {
     pub const TOP: f32 = 9.0;
     /// `DAT_1004d0b4` / `DAT_1004d0cc`, their height before the `+1`.
     pub const HEIGHT: f32 = 9.0;
-    /// `_DAT_1003d860`, a double: the level piece's fixed width.
+    /// `_DAT_1003d860`, a double: the level piece's fixed width on screen.
     pub const LEVEL_WIDTH: f32 = 418.0;
+    /// `DAT_1004d0bc`, the second side's strip in the sheet.
+    pub const SECOND_SRC_Y: f32 = 369.0;
+    /// `DAT_1004d0b8`, added to the second side's source origin. Its bar is
+    /// cut from the **far** end of the strip, so the origin walks right as the
+    /// length shrinks and the art's own right edge stays put.
+    pub const SECOND_SRC_END: f32 = 1.0;
+    /// `DAT_1004d0d0` / `DAT_1004d0d4`, the first side's strip in the sheet.
+    /// This one is cut from its left edge, so the origin is fixed.
+    pub const FIRST_SRC_X: f32 = 1.0;
+    pub const FIRST_SRC_Y: f32 = 57.0;
+    /// `DAT_1004d4f4`, the level strip in the sheet.
+    pub const LEVEL_SRC_Y: f32 = 399.0;
+    /// `_DAT_1003d868`, a float here and not a double: how much of the level
+    /// strip the window shows, one pixel under [`LEVEL_WIDTH`].
+    pub const LEVEL_SRC_WIDTH: f32 = 417.0;
+    /// `DAT_1004d4e0` and `DAT_1004d4f0`, which the level piece's source origin
+    /// is [`LEFT`] less the first and plus the second, before the lead slides
+    /// it.
+    pub const LEVEL_SRC_BACK: f32 = 1.0;
+    pub const LEVEL_SRC_FORWARD: f32 = 1.0;
+    /// `DAT_1004d0b4` / `DAT_1004d0cc` / `DAT_1004d4ec`: every piece cuts nine
+    /// rows, which is [`HEIGHT`] before the `+1` its destination gets.
+    pub const SRC_HEIGHT: f32 = HEIGHT;
     /// `_DAT_10039738`, a double: taken off both origins.
     const HALF: f32 = 0.5;
     /// `_DAT_10039798`, a double: added to both extents.
@@ -1161,16 +1338,35 @@ pub mod gauge {
         pub h: f32,
     }
 
+    /// One piece: where its art is cut from, and where it goes.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Piece {
+        /// In `MenuBar_Chip.png`'s own pixels.
+        pub src: Rect,
+        /// In the strip's 800x75 space, before the display scale.
+        pub dst: Rect,
+    }
+
     /// Which of the three pieces is up, and where each goes.
+    ///
+    /// `FUN_10024ca0` draws them in this order, which is the order the fields
+    /// are in: the flags it walks are `this+0xc4`, `+0xc8` and `+0xcc`.
     #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct Pieces {
         /// `this+0x98`, up under `this+0xc4`: the second counter is far ahead.
-        pub second: Option<Rect>,
+        pub second: Option<Piece>,
         /// `this+0x9c`, up under `this+0xc8`: the first counter is far ahead.
-        pub first: Option<Rect>,
+        pub first: Option<Piece>,
         /// `this+0xa0`, up under `this+0xcc`: neither is, which is the usual
         /// case.
-        pub level: Option<Rect>,
+        pub level: Option<Piece>,
+    }
+
+    impl Pieces {
+        /// The pieces that are up, in the order the original draws them.
+        pub fn drawn(&self) -> impl Iterator<Item = Piece> {
+            [self.second, self.first, self.level].into_iter().flatten()
+        }
     }
 
     /// The lead each side has, scaled: `(first, second)`.
@@ -1183,12 +1379,21 @@ pub mod gauge {
     pub fn pieces(first: i32, second: i32) -> Pieces {
         let (lead_first, lead_second) = leads(first, second);
 
-        // `this+0x98`: driven by the second side's lead, anchored at LEFT.
-        let second_piece = bar(lead_second).map(|len| Rect {
-            x: LEFT - HALF,
-            y: TOP - HALF,
-            w: len + ONE,
-            h: HEIGHT + ONE,
+        // `this+0x98`: driven by the second side's lead, anchored at LEFT, and
+        // cut from the far end of its strip.
+        let second_piece = bar(lead_second).map(|len| Piece {
+            src: Rect {
+                x: (MAX_LEN - len) + SECOND_SRC_END,
+                y: SECOND_SRC_Y,
+                w: len,
+                h: SRC_HEIGHT,
+            },
+            dst: Rect {
+                x: LEFT - HALF,
+                y: TOP - HALF,
+                w: len + ONE,
+                h: HEIGHT + ONE,
+            },
         });
 
         // `this+0x9c`: the original computes the remaining width *before*
@@ -1196,20 +1401,38 @@ pub mod gauge {
         // negative rather than pinning it. That ordering is reproduced.
         let first_piece = bar(lead_first).map(|len| {
             let remaining = MAX_LEN - (lead_first + BIAS);
-            Rect {
-                x: remaining + RIGHT_OFFSET - HALF,
-                y: TOP - HALF,
-                w: len + ONE,
-                h: HEIGHT + ONE,
+            Piece {
+                src: Rect {
+                    x: FIRST_SRC_X,
+                    y: FIRST_SRC_Y,
+                    w: len,
+                    h: SRC_HEIGHT,
+                },
+                dst: Rect {
+                    x: remaining + RIGHT_OFFSET - HALF,
+                    y: TOP - HALF,
+                    w: len + ONE,
+                    h: HEIGHT + ONE,
+                },
             }
         });
 
-        // `this+0xa0`: up only while *neither* side's piece is.
-        let level = (second_piece.is_none() && first_piece.is_none()).then_some(Rect {
-            x: LEFT - HALF,
-            y: TOP - HALF,
-            w: LEVEL_WIDTH,
-            h: HEIGHT + ONE,
+        // `this+0xa0`: up only while *neither* side's piece is. Its window into
+        // the level strip slides against the second side's lead, so the art's
+        // green-to-orange edge moves towards whichever counter is ahead.
+        let level = (second_piece.is_none() && first_piece.is_none()).then_some(Piece {
+            src: Rect {
+                x: (LEFT - LEVEL_SRC_BACK) + LEVEL_SRC_FORWARD - lead_second,
+                y: LEVEL_SRC_Y,
+                w: LEVEL_SRC_WIDTH,
+                h: SRC_HEIGHT,
+            },
+            dst: Rect {
+                x: LEFT - HALF,
+                y: TOP - HALF,
+                w: LEVEL_WIDTH,
+                h: HEIGHT + ONE,
+            },
         });
 
         Pieces {
@@ -1254,15 +1477,31 @@ mod gauge_tests {
         let p = pieces(69, 62);
         assert!(p.first.is_none());
         assert!(p.second.is_none());
-        assert_eq!(
-            p.level,
-            Some(Rect {
-                x: 187.5,
-                y: 8.5,
-                w: 418.0,
-                h: 10.0
-            })
-        );
+        assert!(p.level.is_some());
+    }
+
+    /// What the gauge actually shows in ordinary play: the window onto the
+    /// level strip slides towards whichever counter is ahead, carrying the
+    /// art's green-to-orange edge with it, and sits still at a tie.
+    #[test]
+    fn the_level_window_slides_towards_the_leading_counter() {
+        let at = |a, b| pieces(a, b).level.unwrap().src.x;
+        let tie = at(60, 60);
+        assert_eq!(tie, LEFT);
+        assert_eq!(at(70, 60), tie + 25.0, "the first counter ahead by ten");
+        assert_eq!(at(60, 70), tie - 25.0, "the second counter ahead by ten");
+    }
+
+    /// The second side's bar is cut from the far end of its strip, so growing
+    /// it extends leftwards in the sheet while its right edge stays put. The
+    /// first side's is cut from a fixed origin instead.
+    #[test]
+    fn the_two_sides_are_cut_from_opposite_ends() {
+        for counter in [90, 150, 400] {
+            let second = pieces(0, counter).second.unwrap().src;
+            assert_eq!(second.x + second.w, MAX_LEN + SECOND_SRC_END);
+            assert_eq!(pieces(counter, 0).first.unwrap().src.x, FIRST_SRC_X);
+        }
     }
 
     /// A lead has to clear `(FLOOR - BIAS) / SCALE` before its side's piece
@@ -1288,7 +1527,8 @@ mod gauge_tests {
     #[test]
     fn a_runaway_lead_is_clamped_to_the_bar_length() {
         let p = pieces(0, 10_000).second.unwrap();
-        assert_eq!(p.w, MAX_LEN + 1.0);
+        assert_eq!(p.dst.w, MAX_LEN + 1.0);
+        assert_eq!(p.src.w, MAX_LEN);
     }
 
     /// The `<=` in the visibility test means exactly FLOOR is still hidden.

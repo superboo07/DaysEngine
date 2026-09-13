@@ -2198,7 +2198,7 @@ What each counter is worth is very uneven:
 
 | Name | Drawn | Read by |
 |---|---|---|
-| `001`, `002` | both gauge bars | the relative test below, at 25 routes; thresholds at 10 scripts |
+| `001` (Sekai), `002` (Kotonoha) | both gauge bars | the relative test below, at 25 routes; thresholds at 10 scripts |
 | `004` | no | thresholds at 3 scripts |
 | `000` | no | nothing — it is the filler |
 | `003` | no | nothing |
@@ -2241,20 +2241,74 @@ lead_second = (second - first ) * 2.5       this+0x4c
 ```
 
 A side's piece is up only while `lead + 208.5 > 417.0`, which needs a lead of
-over 83 points; below that neither is up and a third, fixed-width piece is
-drawn instead, which is what is on screen in ordinary play. Lengths clamp to
-485.0.
+over 83 points; below that neither is up and a third, level piece is drawn
+instead, which is what is on screen in ordinary play. Lengths clamp to 485.0.
 
 The scale, bias and floor are **doubles** narrowed at the use site. Ghidra
 prints them as `(float)_DAT_...`, and read as floats their bytes give `0.0` —
 self-consistent, and wrong. The `.data` constants beside them (188.0, 9.0,
-485.0, 118.0, 418.0) really are floats.
+485.0, 118.0, 418.0) really are floats. `_DAT_1003d868`, the level piece's
+417.0, is loaded with `flds` and so is a float; the 418.0 next to it at
+`_DAT_1003d860` is a double. Both are in the same expression.
 
-The pieces' **source** rectangles are **not recovered**: the original builds
-them through four chained calls on an object at `this+0x1c` whose vtable has
-not been identified, so which value is x, y, width and height is unknown and
-the pieces are not composed yet. The destination rectangles are in
-`src/ui/bar.rs`.
+All three pieces cut `MenuBar_Chip.png`. `FUN_10023d50` loads
+`System/MenuBar/MenuBar.png` into `+0x20` and `System/MenuBar/MenuBar_Chip.png`
+into `+0x24`, and `FUN_10023aa0` renders those into the textures at `+0x18` and
+`+0x1c` in that order, so the `this+0x1c` the gauge's source rectangles go
+through is the chip sheet. In the shipped 799x408 sheet:
+
+```text
+y  57, x 1..485    the first counter's bar, flat orange
+y 369, x 1..485    the second counter's bar, flat green
+y 399, x 1..798    the level strip: green to x 370, orange from x 420
+```
+
+The bed sprite above it — record 67, `this+0x80` — carries `KOTONOHA` at the
+left end and `SEKAI` at the right, which is what says which counter is whose:
+`002` is the green one and fills from the left, `001` the orange one from the
+right.
+
+Each source goes in through `DX9Sprite2D` slot `+0x1c` as four separate calls
+on the texture, `DX9Texture` slot `+8` being `x / width` and `+0xc` being
+`y / height`. Ghidra chains those four into one `float10` expression and loses
+their order; the disassembly's push order gives it, and it checks itself, since
+the two `/ width` values have to pair with each other and the two `/ height`
+values with each other. With `len` the clamped bar length:
+
+```text
+piece   source                                    destination
++0x98   (485 - len) + 1, 369,  len, 9             187.5,           8.5, len + 1, 10
++0x9c   1,               57,   len, 9             (485 - lead_first - 208.5) + 117.5, 8.5, len + 1, 10
++0xa0   188 - lead_second, 399, 417, 9            187.5,           8.5, 418,      10
+```
+
+So the level piece is a window onto the level strip whose origin slides 2.5
+pixels per point of lead, walking the art's green-to-orange edge towards
+whichever counter is ahead. At a tie the edge sits a pixel and a half left of
+centre; at the extremes the window runs some 20 pixels off each end of the
+sheet, where `D3DSAMP_ADDRESSU` clamps.
+
+The destinations are a pixel larger than their sources in each axis and start
+half a pixel back, which is the half-texel offset every other sprite on the bar
+gets.
+
+### When the gauge is up
+
+`FUN_10024ca0` draws the bed and then whichever pieces are up, in the order
+`+0x98`, `+0x9c`, `+0xa0`, twice over: once inside the "bar is up" test and
+once outside it under host `+0x154`.
+
+`FUN_10025690`, the fade, sets one ARGB on every sprite the bar owns **except**
+those four, which it skips while `+0x154` is set. Skipping is not holding them
+opaque — they keep whatever they last held. So a gauge raised while the bar is
+up stays on screen at full alpha after the bar has faded away, and one raised
+while the bar is already gone is pinned at nothing and never appears.
+
+`+0x154` is raised by a delta to `001` or `002` and lowered by MenuBar vtable
+`+0x38` (`FUN_10026050`), which the engine calls at the end of a script —
+`FUN_00424020`, on the object at `engine + 0x330` — and again from
+`FUN_00423a70` when playback starts. `_SetFeeling@8` is called from the choice
+handler, so the window is from the player's answer to the end of that script.
 
 ### Exports
 

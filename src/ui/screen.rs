@@ -152,6 +152,27 @@ pub enum WidgetState {
     Extra(usize),
 }
 
+/// A sprite whose source rectangle is not the same size, or even the same
+/// shape, as where it lands.
+///
+/// A widget record carries one rectangle and uses it for both ends, so a
+/// sprite that stretches, or that slides a window across its art, cannot be a
+/// [`Widget`]. The control bar's affection gauge is both: `FUN_10026540` gives
+/// the level piece a 417-wide cut and a 418-wide destination, and slides the
+/// cut's origin by the lead one counter has over the other.
+///
+/// Coordinates are floats because the original's are: the source goes into
+/// `DX9Texture` slot `+8` / `+0xc` as `x / width`, so a cut can start at a
+/// fraction of a pixel and can run past the sheet's edge, where the sampler's
+/// `D3DTEXADDRESS_CLAMP` holds the last texel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cut {
+    /// `(x, y, width, height)` in the `_CHIP` sheet's own pixels.
+    pub src: (f32, f32, f32, f32),
+    /// `(x, y, width, height)` in the screen's layout space.
+    pub dst: (f32, f32, f32, f32),
+}
+
 /// A loaded screen at one resolution.
 pub struct Screen {
     /// Logical path stem, e.g. `System/Title/Title`.
@@ -467,6 +488,13 @@ impl Screen {
         }
     }
 
+    /// Draws a [`Cut`], resampling its source onto its destination.
+    fn blit_cut(&self, out: &mut Image, sheet: &Image, cut: &Cut) {
+        let dst = self.place_layout(cut.dst);
+        let sampled = sampled(sheet, cut.src, (dst.2, dst.3));
+        out.blit_scaled(&sampled, (0, 0, dst.2, dst.3), dst);
+    }
+
     /// Composites the screen. `states` is indexed by widget; a shorter slice
     /// leaves the rest resting.
     pub fn compose(&self, states: &[WidgetState]) -> Image {
@@ -482,10 +510,38 @@ impl Screen {
     /// it onto black first would fill the transparent part of the strip with a
     /// black bar, which is not what the original shows.
     pub fn compose_layer(&self, states: &[WidgetState]) -> Image {
+        self.compose_layer_cuts(states, &[])
+    }
+
+    /// Composites the screen as a transparent layer, with extra cuts on top.
+    ///
+    /// `cuts` are drawn after the widget sprites, from the `_CHIP` sheet, in
+    /// the order given. That is where the original draws the ones this exists
+    /// for: `FUN_10024ca0` walks the gauge's three pieces immediately after the
+    /// bed record they sit in.
+    pub fn compose_layer_cuts(&self, states: &[WidgetState], cuts: &[Cut]) -> Image {
         let (w, h) = self.size();
         let mut out = Image::empty(w, h);
         self.blit_display(&mut out, &self.base);
         self.draw_states(&mut out, states);
+        for cut in cuts {
+            self.blit_cut(&mut out, &self.chip, cut);
+        }
+        out
+    }
+
+    /// The sprites alone, on transparency, with no base art under them.
+    ///
+    /// For a screen that holds part of itself out of something the rest of it
+    /// gets: the control bar's gauge keeps its own alpha while the strip fades,
+    /// so it is composited separately and laid over the faded strip.
+    pub fn compose_sprites(&self, states: &[WidgetState], cuts: &[Cut]) -> Image {
+        let (w, h) = self.size();
+        let mut out = Image::empty(w, h);
+        self.draw_states(&mut out, states);
+        for cut in cuts {
+            self.blit_cut(&mut out, &self.chip, cut);
+        }
         out
     }
 
@@ -616,6 +672,75 @@ fn resampled(src: &Image, rect: (u32, u32, u32, u32), size: (u32, u32)) -> Optio
         height: size.1,
         rgba,
     })
+}
+
+/// Samples `rect` of `src` into an image of `size`, the way the GPU samples a
+/// textured quad.
+///
+/// [`resampled`] cannot do this: its source is a whole number of pixels and has
+/// to lie inside the sheet. A [`Cut`]'s does neither — the gauge's level piece
+/// slides its origin by 2.5 pixels per point of lead and runs off both ends of
+/// the sheet at the extremes — so this samples bilinearly at the texel the
+/// destination pixel's centre maps to, clamping at the edges as
+/// `D3DSAMP_ADDRESSU`/`V` do.
+///
+/// Premultiplied, for the reason [`resampled`] is: the sheet's transparent
+/// pixels carry arbitrary colour, and blending them unpremultiplied would drag
+/// it into the edge of the cut.
+fn sampled(src: &Image, rect: (f32, f32, f32, f32), size: (u32, u32)) -> Image {
+    let (sx, sy, sw, sh) = rect;
+    let (dw, dh) = size;
+    let mut out = Image::empty(dw, dh);
+    if dw == 0 || dh == 0 {
+        return out;
+    }
+    for (row, line) in out.rgba.chunks_exact_mut(dw as usize * 4).enumerate() {
+        let v = sy + (row as f32 + 0.5) * sh / dh as f32 - 0.5;
+        for (col, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let u = sx + (col as f32 + 0.5) * sw / dw as f32 - 0.5;
+            *px = bilinear(src, u, v);
+        }
+    }
+    out
+}
+
+/// One bilinear sample of `src` at `(u, v)` in texel space, edges clamped.
+fn bilinear(src: &Image, u: f32, v: f32) -> [u8; 4] {
+    let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max.saturating_sub(1));
+    let (x0, y0) = (clamp(u.floor(), src.width), clamp(v.floor(), src.height));
+    let (x1, y1) = (
+        clamp(u.floor() + 1.0, src.width),
+        clamp(v.floor() + 1.0, src.height),
+    );
+    let fx = (u - u.floor()).clamp(0.0, 1.0);
+    let fy = (v - v.floor()).clamp(0.0, 1.0);
+    let mut acc = [0.0f32; 4];
+    for (x, y, w) in [
+        (x0, y0, (1.0 - fx) * (1.0 - fy)),
+        (x1, y0, fx * (1.0 - fy)),
+        (x0, y1, (1.0 - fx) * fy),
+        (x1, y1, fx * fy),
+    ] {
+        let Some(p) = src.pixel(x, y) else { continue };
+        let a = f32::from(p[3]) / 255.0;
+        for (slot, c) in acc.iter_mut().zip([
+            f32::from(p[0]) * a,
+            f32::from(p[1]) * a,
+            f32::from(p[2]) * a,
+            f32::from(p[3]),
+        ]) {
+            *slot += c * w;
+        }
+    }
+    let a = acc[3];
+    let mut px = [0u8; 4];
+    px[3] = a.round().clamp(0.0, 255.0) as u8;
+    if a > 0.0 {
+        for (o, c) in px[..3].iter_mut().zip(acc) {
+            *o = (c * 255.0 / a).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    px
 }
 
 #[cfg(test)]

@@ -274,6 +274,14 @@ struct BarArgs {
     /// be seen part way through. Defaults to long enough to have settled.
     #[arg(long)]
     after: Option<u32>,
+    /// The two affection counters the gauge draws, as `001,002`. Defaults to
+    /// whatever the player's own save holds.
+    #[arg(long)]
+    feeling: Option<String>,
+    /// Raise the gauge, which a delta to either counter does: it then draws
+    /// over a bar that is otherwise faded away.
+    #[arg(long)]
+    gauge: bool,
     /// PNG to write the composited bar to. It has an alpha channel: the strip
     /// is a layer the engine draws over the frame, not a picture with a black
     /// bar in it.
@@ -880,8 +888,8 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
         let dll = system_menu_dll(game)?;
         match daysengine::ui::bar::Bar::load(&vfs, &dll, daysengine::ui::screen::Resolution::Wide) {
             Ok(mut strip) => {
-                strip.point_at(Some((0, 0)), 0);
-                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1);
+                strip.point_at(Some((0, 0)), 0, false);
+                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1, false);
                 Some(strip)
             }
             Err(err) => {
@@ -892,8 +900,13 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
     } else {
         None
     };
-    let bar_state =
-        daysengine::ui::bar::State::from_config(&daysengine::install::config::Config::load(game));
+    // The gauge reads the player's own save, as playback does: a bar drawn with
+    // no counters has nothing to put in the channel.
+    let bar_state = daysengine::ui::bar::State {
+        gauge: slot_feeling(game)
+            .map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store)),
+        ..daysengine::ui::bar::State::from_config(&daysengine::install::config::Config::load(game))
+    };
 
     const W: usize = 800;
     const H: usize = 452;
@@ -928,8 +941,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
             // strip is RGBA and the engine draws it over the picture. Had the
             // layer been flattened onto black first, this is where a black band
             // would show up.
-            let states = strip.states(None, bar_state, 0);
-            let layer = strip.compose_faded(&states);
+            let layer = strip.compose_faded(None, bar_state, 0);
             blend_over(&mut rgba, W, H, &layer);
         }
 
@@ -979,8 +991,21 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     let bar = Bar::load(&vfs, &dll, resolution)?;
 
     let config = daysengine::install::config::Config::load(game);
+    let feeling = match &args.feeling {
+        Some(pair) => {
+            let (a, b) = pair
+                .split_once(',')
+                .with_context(|| format!("--feeling wants 001,002, got {pair}"))?;
+            Some((a.trim().parse()?, b.trim().parse()?))
+        }
+        None => {
+            slot_feeling(game).map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store))
+        }
+    };
     let state = State {
         auto: args.auto,
+        gauge: feeling,
+        gauge_raised: args.gauge,
         paused: args.paused,
         replay: args.replay,
         message: args.message,
@@ -1024,6 +1049,37 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         }
     );
     println!("fade in {}ms, out {}ms", bar::FADE_IN_MS, bar::FADE_OUT_MS);
+
+    // The gauge is the one thing on the strip that is not a chip record: its
+    // three pieces are cut from the sheet at sizes worked out from the two
+    // counters, so print the cut rather than a record number.
+    match state.gauge {
+        None => println!("gauge: no save to read the counters from"),
+        Some((first, second)) => {
+            let (lead, _) = bar::gauge::leads(first, second);
+            println!(
+                "gauge: {} {first}, {} {second} — lead {lead:+}px to the {}, {}",
+                daysengine::install::feeling::FIRST,
+                daysengine::install::feeling::SECOND,
+                if lead >= 0.0 { "first" } else { "second" },
+                if state.gauge_raised {
+                    "raised, so it draws even with the bar faded out"
+                } else {
+                    "drawn with the bar"
+                },
+            );
+            let p = bar::gauge::pieces(first, second);
+            for (name, piece) in [("second", p.second), ("first", p.first), ("level", p.level)] {
+                match piece {
+                    None => println!("  {name:6} down"),
+                    Some(c) => println!(
+                        "  {name:6} sheet ({:.1},{:.1}) {:.0}x{:.0} -> strip ({:.1},{:.1}) {:.0}x{:.0}",
+                        c.src.x, c.src.y, c.src.w, c.src.h, c.dst.x, c.dst.y, c.dst.w, c.dst.h,
+                    ),
+                }
+            }
+        }
+    }
 
     println!("  wgt  region  dst                live   caption  action");
     for widget in 0..bar::WIDGETS {
@@ -1082,8 +1138,8 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     let settled = args
         .after
         .unwrap_or(bar::FADE_IN_MS.max(bar::FADE_OUT_MS) + 1);
-    bar.point_at(at, 0);
-    let hovered = bar.point_at(at, settled);
+    bar.point_at(at, 0, state.gauge_raised);
+    let hovered = bar.point_at(at, settled, state.gauge_raised);
     println!(
         "pointer {} — the bar {}, alpha {}",
         match at {
@@ -1104,8 +1160,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     }
 
     if let Some(out) = &args.out {
-        let states = bar.states(hovered, state, args.elapsed);
-        let image = bar.compose_faded(&states);
+        let image = bar.compose_faded(hovered, state, args.elapsed);
         write_png(out, &image.rgba, image.width, image.height)?;
         println!("wrote {}", out.display());
     }

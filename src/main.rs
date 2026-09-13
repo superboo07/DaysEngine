@@ -595,6 +595,15 @@ fn main() -> Result<()> {
         // Cleared here and set only on a chain step below, so a chase that
         // runs out of route cannot leak into whatever is played next.
         chasing_choice = false;
+        // The end of a script is where the original re-reads the two affection
+        // counters and puts the gauge down again: `FUN_00424020` calls MenuBar
+        // vtable `+0x38` — `FUN_10026050`, which sizes the pieces from the
+        // counters and then clears the flag through host `+0x30`.
+        if outcome == Outcome::Finished {
+            if let Some(p) = progress.as_mut() {
+                p.lower_gauge();
+            }
+        }
         if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
             // A replay walks the scene's own list, by its branch table where it
             // has one and straight down the list where it does not —
@@ -1539,6 +1548,14 @@ fn snap(elapsed: Duration, interval: Duration) -> Duration {
 /// every one of them. So it scales by its own width. Scaling it by the stage's
 /// instead, as though the two shared a ladder, drew the bar 1.6x oversized off
 /// the right of a full-screen window and put every widget's hit box there too.
+/// What the cached control-bar layer was composited from.
+///
+/// The record list is most of it, but not all: the gauge's three pieces are
+/// sized from the two affection counters rather than from any record, so those
+/// belong in the key too, and so do the two alphas for the one case where the
+/// fade has to be composited in rather than modulated.
+type BarLayer = (Vec<usize>, Option<(i32, i32)>, Option<(u8, u8)>);
+
 fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
     let scale = dst.w / strip.0.max(1) as f32;
     FRect::new(dst.x, dst.y, dst.w, strip.1 as f32 * scale)
@@ -1699,7 +1716,7 @@ fn run_script(
     let mut hovered: Option<usize> = None;
     // Cached on the record list, so the strip is only recomposited when it
     // actually changes — which is on a hover, a state change or an auto frame.
-    let mut bar_texture: Option<(Vec<usize>, u32, u32, Texture)> = None;
+    let mut bar_texture: Option<(BarLayer, u32, u32, Texture)> = None;
     let mut choice: Option<(Choice, Select)> = None;
     // The playback rate the player had when a choice went up, to put back when
     // they answer it. See the `Raised`/`Decided` arm below.
@@ -1839,7 +1856,7 @@ fn run_script(
             let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
                 .then_some((sx as u32, sy as u32));
             let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-            hovered = control.point_at(over, now_ms);
+            hovered = control.point_at(over, now_ms, bar_state.gauge_raised);
 
             // A click only reaches the bar while the bar is actually on screen.
             if buttons.0 && !control.fade().drawn() {
@@ -2384,14 +2401,36 @@ fn run_script(
 
         // The control bar last, over everything, as its own layer — and only
         // while it is dropped down.
-        if let Some(control) = control.as_ref().filter(|c| c.fade().drawn()) {
+        // A raised gauge keeps its own alpha while the rest of the strip fades,
+        // so the bar can have something to draw after it is otherwise gone.
+        if let Some(control) = control
+            .as_ref()
+            .filter(|c| c.fade().drawn() || (bar_state.gauge_raised && c.fade().gauge_alpha() > 0))
+        {
             let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-            let records = control.records(hovered, bar_state, elapsed);
+            // The cache key carries the gauge's counters as well as the
+            // record list: the gauge's three pieces are sized from those and
+            // not from any record, so a layer keyed on records alone would keep
+            // showing the lead the player had before the last delta.
+            // Two sprites out of the strip carry an alpha of their own once the
+            // gauge is raised, and one texture cannot be modulated twice — so
+            // that case composites the fade in and is keyed on both alphas.
+            let pinned = bar_state.gauge_raised;
+            let alphas = pinned.then(|| (control.fade().alpha(), control.fade().gauge_alpha()));
+            let records = (
+                control.records(hovered, bar_state, elapsed),
+                bar_state.gauge,
+                alphas,
+            );
             let stale = bar_texture
                 .as_ref()
                 .is_none_or(|(cached, ..)| cached != &records);
             if stale {
-                let image = control.compose(&control.states(hovered, bar_state, elapsed));
+                let image = if pinned {
+                    control.compose_faded(hovered, bar_state, elapsed)
+                } else {
+                    control.compose(hovered, bar_state, elapsed)
+                };
                 let mut texture = new_texture(creator, image.width, image.height, art)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 texture.update(None, &image.rgba, image.width as usize * 4)?;
@@ -2402,7 +2441,7 @@ fn run_script(
                 // as an alpha modulation, so ramping does not recomposite it
                 // 60 times a second. This is also how the original fades it:
                 // one ARGB set on every sprite the bar owns.
-                texture.set_alpha_mod(control.fade().alpha());
+                texture.set_alpha_mod(if pinned { 255 } else { control.fade().alpha() });
                 canvas
                     .copy(&*texture, None, bar_strip(dst, (*w, *h)))
                     .map_err(|e| anyhow::anyhow!("drawing the control bar: {e}"))?;
