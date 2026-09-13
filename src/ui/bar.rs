@@ -40,7 +40,7 @@
 //! 10..12    open a menu: save, load, backlog           host +0xf8(4/5/3)
 //! 13        open the settings menu                     host +0xf8(2)
 //! 14        leave playback                             host +0x100(1)
-//! 15..24    ten steps of one setting                   FUN_10026ed0
+//! 15..24    the replay indicator's transparency        FUN_10026ed0
 //! ```
 //!
 //! Note widgets 3 and 2's second press make the *same* host call. That is the
@@ -275,10 +275,14 @@ pub enum Act {
     Menu(MenuRequest),
     /// Leave playback. Host `+0x100(1)`.
     Leave,
-    /// One of ten steps of a setting, `0..=9`, from `FUN_10026ed0`. **Which
-    /// setting is not recovered**: the ten widgets are live only while host
-    /// `+0x98` is set, and nothing in the menu DLL says what that member means.
-    Step(usize),
+    /// Set the replay-mode indicator's transparency, to the level the pressed
+    /// cell stands for. See [`indicator`].
+    ///
+    /// Nothing is asked of the host: `FUN_10026ed0` keeps the level in the bar
+    /// and applies it to the bar's own sprites, so [`Bar::press`] has already
+    /// done it by the time this comes back. It is an [`Act`] so the caller
+    /// still plays the click the original plays for any enabled widget.
+    Transparency(usize),
 }
 
 /// What the engine has to tell the bar about itself for it to draw and dispatch.
@@ -321,8 +325,19 @@ pub struct State {
     /// setting is only a short circuit ahead of the lookup, not a gate on the
     /// speed row.
     pub skippable: bool,
-    /// Host `+0x98`: the member host `+0x94` sets. Required by widgets 15..24.
-    pub stepping: bool,
+    /// Host `+0x98`: playback is following a save's recorded answers.
+    ///
+    /// `FUN_0042bef0` returns the film object's `+0x1e0` and `FUN_0042bf10`
+    /// (host `+0x94`) is the only thing that writes it — nothing in the
+    /// executable names that member otherwise. Its two callers are both in the
+    /// menu DLL: `FUN_1001dfe0`, a row of the replay screen's play-data list,
+    /// passes 1, and `FUN_1001d380`, an ordinary load, passes 0. It is the same
+    /// member an unanswered choice box consults to take the slot's own answer.
+    ///
+    /// On the bar it is what the whole right-hand box is for: it lights the
+    /// slider, makes its ten cells pressable, and puts the `REPLAYMODE`
+    /// indicator on screen.
+    pub following_record: bool,
     /// Host `+0x11c`: the rate index currently in force, an index into
     /// [`SPEEDS`].
     pub speed: usize,
@@ -419,7 +434,7 @@ pub fn enabled(widget: usize, state: State) -> bool {
         4 => !state.replay && !state.message && state.skippable,
         5..=9 => !state.message && state.skippable,
         10..=12 => !state.replay,
-        0xf..=0x18 => state.stepping,
+        0xf..=0x18 => state.following_record,
         _ => false,
     }
 }
@@ -440,7 +455,7 @@ pub fn action(widget: usize, state: State, latched: bool) -> Act {
         // replay menu is driving playback or the host's `+0x98` member is set,
         // so in those cases the button restarts every time.
         2 => {
-            if latched && !state.replay && !state.stepping {
+            if latched && !state.replay && !state.following_record {
                 Act::Seek(Seek::END_OF_SCRIPT)
             } else {
                 Act::Seek(Seek::RESTART)
@@ -454,7 +469,7 @@ pub fn action(widget: usize, state: State, latched: bool) -> Act {
         12 => Act::Menu(MenuRequest(3)),
         13 => Act::Menu(MenuRequest(2)),
         14 => Act::Leave,
-        0xf..=0x18 => Act::Step(widget - 0xf),
+        0xf..=0x18 => indicator::level_for(widget).map_or(Act::None, Act::Transparency),
         _ => Act::None,
     }
 }
@@ -462,10 +477,11 @@ pub fn action(widget: usize, state: State, latched: bool) -> Act {
 /// How widget 2's latch moves when it is pressed or time passes.
 ///
 /// `FUN_10025b90` sets the latch on the first press but only when playback is
-/// neither a replay nor stepping, and clears it on the second; `FUN_10024100`
+/// neither a replay nor a followed recording, and clears it on the second;
+/// `FUN_10024100`
 /// clears it once its frame argument passes [`RESTART_LATCH_FRAMES`].
 pub fn restart_latch(latched: bool, state: State) -> bool {
-    !latched && !state.replay && !state.stepping
+    !latched && !state.replay && !state.following_record
 }
 
 /// The caption strip shown for the hovered widget, as an index into the
@@ -518,16 +534,18 @@ mod record {
     /// `this+0x64`, widget 0's resting art, drawn only while the auto flag is
     /// clear — with it set, the animation takes over.
     pub const AUTO_RESTING: usize = 42;
-    /// `this+0x8c`, the strip above the ten step widgets, picked by host
-    /// `+0x98` — the same question that makes them pressable.
-    pub const STEPS_DEAD: usize = 69;
-    pub const STEPS_LIVE: usize = 70;
+    /// `this+0x8c`, the trough the ten transparency cells sit in, picked by
+    /// host `+0x98` — the same question that makes them pressable. The dead
+    /// one is grey and the live one a white-to-cyan gradient.
+    pub const SLIDER_DEAD: usize = 69;
+    pub const SLIDER_LIVE: usize = 70;
     /// `this+0x80`, a 538-wide strip drawn alongside the gauge.
     pub const GAUGE_BED: usize = 67;
-    /// `this+0x94`, drawn while host `+0x98` is set. Its destination is at
-    /// y = 80, **below the 800x75 hit map**, so composing at the map's size
-    /// clips it away; that is the shipped geometry, not a placement mistake.
-    pub const STEPS_OVERFLOW: usize = 68;
+    /// `this+0x94`, the `REPLAYMODE` indicator, drawn while host `+0x98` is
+    /// set. Its destination is at y = 80, **below the 800x75 strip**, so it
+    /// lands on the picture rather than on the bar and is not part of the
+    /// strip's layer — [`Bar::indicator`] is where it comes out.
+    pub const REPLAY_MODE: usize = 68;
     /// `this+0x60` while widget 0 is hovered, from `FUN_10024100`'s special
     /// case for index 0: its own record with the flag clear, record 25 with it
     /// set.
@@ -555,12 +573,26 @@ pub fn auto_frame(elapsed_ms: u32, speed: usize) -> usize {
     AUTO_FIRST_RECORD + (step as usize % AUTO_FRAMES)
 }
 
+/// The `REPLAYMODE` indicator, ready to draw. See [`Bar::indicator`].
+pub struct Indicator {
+    /// The art at display scale.
+    pub art: Image,
+    /// `(x, y, width, height)` in the same display space [`Bar::strip`] is in,
+    /// whose origin is the picture's top-left corner. `y` is below the strip.
+    pub dst: (i64, i64, u32, u32),
+    /// What the ten cells set: `round(level * 25.0)`.
+    pub alpha: u8,
+}
+
 /// The bar, loaded and ready to hit-test and draw.
 pub struct Bar {
     screen: Screen,
     /// Widget 2's latch, and the frame it was set on.
     latch: Option<u32>,
     fade: Fade,
+    /// `this+0xec`: how solid the replay-mode indicator is drawn, 0 to 10.
+    /// See [`indicator`].
+    transparency: usize,
 }
 
 impl Bar {
@@ -573,6 +605,7 @@ impl Bar {
             screen: Screen::load(vfs, dll, PATH, resolution)?,
             latch: None,
             fade: Fade::default(),
+            transparency: indicator::INITIAL_LEVEL,
         })
     }
 
@@ -656,7 +689,28 @@ impl Bar {
                 None
             };
         }
+        // `FUN_10026ed0` stores the level in the bar itself and applies it to
+        // the bar's own sprites, so this is the whole of what the press does.
+        if let Act::Transparency(level) = act {
+            self.transparency = level;
+        }
         act
+    }
+
+    /// How solid the replay-mode indicator is drawn, 0 to 10.
+    pub fn transparency(&self) -> usize {
+        self.transparency
+    }
+
+    /// Whether anything the strip draws keeps an alpha of its own this frame.
+    ///
+    /// `FUN_10025690` names every sprite the bar owns but two: the rate
+    /// readout, which it never touches, and the gauge bed with its three
+    /// pieces, which it skips while the gauge is raised. While either is
+    /// showing the strip cannot be drawn by modulating one texture — the fade
+    /// has to be composited in, which is what [`Bar::compose_faded`] does.
+    pub fn pinned(&self, state: State) -> bool {
+        state.gauge_raised || self.rate_readout(state).is_some()
     }
 
     /// Drops widget 2's latch once its window has passed.
@@ -702,10 +756,10 @@ impl Bar {
                 } else {
                     record::SKIP_DEAD
                 });
-                out.push(if state.stepping {
-                    record::STEPS_LIVE
+                out.push(if state.following_record {
+                    record::SLIDER_LIVE
                 } else {
-                    record::STEPS_DEAD
+                    record::SLIDER_DEAD
                 });
             }
             out.push(if state.paused {
@@ -727,9 +781,6 @@ impl Bar {
         // The rate readout appears only once the rate is at least 2.0.
         if state.rate >= 2.0 && state.speed < SPEEDS.len() {
             out.push(state.speed + 5);
-        }
-        if state.stepping {
-            out.push(record::STEPS_OVERFLOW);
         }
         if state.auto {
             out.push(auto_frame(elapsed_ms, state.speed));
@@ -789,17 +840,48 @@ impl Bar {
         state: State,
         elapsed_ms: u32,
     ) -> (Vec<usize>, Vec<usize>) {
-        let mut records = self.records(hovered, state, elapsed_ms);
-        if !state.gauge_raised {
-            return (records, Vec::new());
+        let mut faded = self.records(hovered, state, elapsed_ms);
+        let mut pinned = Vec::new();
+        if state.gauge_raised {
+            faded.retain(|r| *r != record::GAUGE_BED);
+            pinned.push(record::GAUGE_BED);
         }
-        let pinned = records
-            .iter()
-            .copied()
-            .filter(|r| *r == record::GAUGE_BED)
-            .collect();
-        records.retain(|r| *r != record::GAUGE_BED);
-        (records, pinned)
+        if let Some(readout) = self.rate_readout(state) {
+            // Only the one `records` pushed for the readout: the same number
+            // comes back as the hover sprite when that rate's widget is under
+            // the pointer, and that one does fade.
+            if let Some(at) = faded.iter().position(|r| *r == readout) {
+                faded.remove(at);
+            }
+            pinned.push(readout);
+        }
+        (faded, pinned)
+    }
+
+    /// The record the rate readout draws from, while it is showing.
+    fn rate_readout(&self, state: State) -> Option<usize> {
+        (state.rate >= 2.0 && state.speed < SPEEDS.len()).then_some(state.speed + 5)
+    }
+
+    /// The sprites the bar sizes itself instead of taking whole from a record,
+    /// split the way [`Bar::split`] splits the records: the gauge's three
+    /// pieces, which stop fading once the gauge is raised, and the transparency
+    /// knob, which does not.
+    fn cuts(&self, state: State) -> (Vec<Cut>, Vec<Cut>) {
+        let mut faded = self.gauge_cuts(state);
+        let pinned = if state.gauge_raised {
+            std::mem::take(&mut faded)
+        } else {
+            Vec::new()
+        };
+        // `this+0x90`. `FUN_10024ca0` draws it last of all, under the same
+        // three tests the trough is under plus the bar being up.
+        if !state.hidden && !state.message && state.following_record {
+            if let Some((src, dst)) = indicator::knob(self.transparency) {
+                faded.push(cut(src, dst));
+            }
+        }
+        (faded, pinned)
     }
 
     /// Turns a record index into a widget state, warning rather than drawing
@@ -828,8 +910,10 @@ impl Bar {
     /// not reproduced and the whole strip fades together.
     pub fn compose(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
         let records = self.records(hovered, state, elapsed_ms);
+        let (faded, pinned) = self.cuts(state);
+        let cuts: Vec<Cut> = pinned.into_iter().chain(faded).collect();
         self.screen
-            .compose_layer_cuts(&self.states_of(&records), &self.gauge_cuts(state))
+            .compose_layer_cuts(&self.states_of(&records), &cuts)
     }
 
     /// The affection gauge's pieces, as cuts of the chip sheet.
@@ -851,11 +935,33 @@ impl Bar {
         }
         gauge::pieces(first, second)
             .drawn()
-            .map(|piece| Cut {
-                src: (piece.src.x, piece.src.y, piece.src.w, piece.src.h),
-                dst: (piece.dst.x, piece.dst.y, piece.dst.w, piece.dst.h),
-            })
+            .map(|piece| cut(piece.src, piece.dst))
             .collect()
+    }
+
+    /// The `REPLAYMODE` indicator, which is not part of the strip's layer.
+    ///
+    /// `this+0x94` goes at `(697, 80) 97x19` in the strip's own space — below
+    /// the 800x75 strip, so it lands on the picture. `FUN_10024ca0` draws it
+    /// outside the test that gates every widget, and it is not in
+    /// `FUN_10025690`'s list, so it neither waits for the bar to drop down nor
+    /// fades with it. The one thing it carries is the transparency the ten
+    /// cells set.
+    ///
+    /// Returns the art at display scale, where it goes in the same display
+    /// space [`Bar::strip`] is in, and the alpha to draw it at.
+    pub fn indicator(&self, state: State) -> Option<Indicator> {
+        if !state.following_record {
+            return None;
+        }
+        let n = record::REPLAY_MODE.checked_sub(WIDGETS)?;
+        let widget = self.screen.atlas().extras.get(n)?;
+        let (art, dst) = self.screen.cut_widget(widget);
+        Some(Indicator {
+            art,
+            dst,
+            alpha: indicator::alpha(self.transparency),
+        })
     }
 
     /// As [`Bar::compose`], with the fade already multiplied in.
@@ -866,19 +972,38 @@ impl Bar {
     /// there is one image and no texture to modulate.
     pub fn compose_faded(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
         let (records, pinned) = self.split(hovered, state, elapsed_ms);
-        let cuts = self.gauge_cuts(state);
-        let mut layer = self.screen.compose_layer_cuts(
-            &self.states_of(&records),
-            if pinned.is_empty() { &cuts } else { &[] },
-        );
+        let (faded_cuts, pinned_cuts) = self.cuts(state);
+        let mut layer = self
+            .screen
+            .compose_layer_cuts(&self.states_of(&records), &faded_cuts);
         modulate(&mut layer, self.fade.alpha());
-        if !pinned.is_empty() {
-            let mut over = self.screen.compose_sprites(&self.states_of(&pinned), &cuts);
-            modulate(&mut over, self.fade.gauge_alpha());
+        if !pinned.is_empty() || !pinned_cuts.is_empty() {
+            let mut over = self
+                .screen
+                .compose_sprites(&self.states_of(&pinned), &pinned_cuts);
+            // The gauge is the only part whose alpha the raise pins; the rate
+            // readout is simply never in `FUN_10025690`'s list, so it keeps the
+            // opaque colour `FUN_10022650` gave it.
+            modulate(
+                &mut over,
+                if state.gauge_raised {
+                    self.fade.gauge_alpha()
+                } else {
+                    255
+                },
+            );
             let (w, h) = (over.width, over.height);
             layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }
         layer
+    }
+}
+
+/// A [`Cut`] from a source and destination rectangle in the bar's own units.
+fn cut(src: gauge::Rect, dst: gauge::Rect) -> Cut {
+    Cut {
+        src: (src.x, src.y, src.w, src.h),
+        dst: (dst.x, dst.y, dst.w, dst.h),
     }
 }
 
@@ -953,7 +1078,7 @@ mod tests {
     fn live() -> State {
         State {
             skippable: true,
-            stepping: true,
+            following_record: true,
             super_skip: true,
             rate: SPEEDS[0],
             ..State::default()
@@ -1101,17 +1226,17 @@ mod tests {
     }
 
     #[test]
-    fn the_ten_steps_need_the_hosts_own_member() {
+    fn the_transparency_cells_need_a_recording_to_be_following() {
         let idle = State {
-            stepping: false,
+            following_record: false,
             ..live()
         };
         for widget in 0xf..=0x18 {
             assert!(!enabled(widget, idle));
             assert!(enabled(widget, live()));
         }
-        assert_eq!(action(0xf, live(), false), Act::Step(0));
-        assert_eq!(action(0x18, live(), false), Act::Step(9));
+        assert_eq!(action(0xf, live(), false), Act::Transparency(0));
+        assert_eq!(action(0x18, live(), false), Act::Transparency(10));
     }
 
     #[test]
@@ -1131,9 +1256,9 @@ mod tests {
     fn widget_two_restarts_then_steps_back() {
         // `FUN_10025b90` takes the second press only while neither the replay
         // menu nor the host's `+0x98` member is driving playback, so the state
-        // here has `stepping` clear.
+        // here is not following a recording.
         let plain = State {
-            stepping: false,
+            following_record: false,
             ..live()
         };
         assert_eq!(action(2, plain, false), Act::Seek(Seek::RESTART));
@@ -1149,14 +1274,14 @@ mod tests {
             ..live()
         };
         assert!(!restart_latch(false, replay));
-        // ...so the second press restarts again rather than stepping back.
+        // ...so the second press restarts again rather than jumping to the end.
         assert_eq!(action(2, replay, true), Act::Seek(Seek::RESTART));
     }
 
     #[test]
     fn widget_three_asks_for_the_same_code_as_a_second_press_of_widget_two() {
         let plain = State {
-            stepping: false,
+            following_record: false,
             ..live()
         };
         assert_eq!(action(3, plain, false), action(2, plain, true));
@@ -1210,6 +1335,113 @@ mod tests {
         assert_eq!(auto_frame(200, 4), AUTO_FIRST_RECORD + 1);
         // And it wraps after thirteen.
         assert_eq!(auto_frame(13_000, 0), AUTO_FIRST_RECORD);
+    }
+}
+
+/// The replay-mode indicator, and the ten-cell slider that sets how solid it is.
+///
+/// # What the box on the right is
+///
+/// Widgets 15 to 24 are ten 12x17 cells in a row at x 676..796, sitting inside
+/// a 124x19 trough at `this+0x8c`. The trough has two sprites and host `+0x98`
+/// picks between them: grey while nothing is following a recording, a
+/// white-to-cyan gradient while something is. The game's own caption for all
+/// ten cells — record 64, the twelfth caption strip — reads
+/// `Change transparency of replay mode indicator`.
+///
+/// The indicator itself is the `REPLAYMODE` sprite at `this+0x94`, drawn while
+/// the same `+0x98` is set. Its destination is `(697, 80) 97x19`, **below** the
+/// 800x75 strip, so it sits on the picture and stays there whether or not the
+/// bar is dropped down — `FUN_10024ca0` draws it outside the `this+0xbc` test
+/// that gates every widget, and `FUN_10025690` never touches its colour, so it
+/// does not fade with the bar either. What it does carry is this setting.
+///
+/// # The level
+///
+/// `FUN_10026ed0` is the whole of it. A press on cell `c` stores a level in
+/// `this+0xec`, sets the indicator's alpha to `round(level * 25.0)`, and calls
+/// `FUN_10027030` to re-place the knob at `this+0x90`:
+///
+/// ```text
+/// widget   15  16  17  18  19  20  21  22  23  24
+/// level     0   2   3   4   5   6   7   8   9  10
+/// ```
+///
+/// **Level 1 is not reachable**, and that is not a transcription slip: cell 0
+/// stores 0 and cell 1 stores 2, and `FUN_10027030`'s switch has no case 1
+/// either — it leaves its local uninitialised, which is what a level of 1 would
+/// place the knob from. `FUN_10023d50` starts the bar at 10, so the indicator
+/// is opaque until the player moves it.
+///
+/// Nothing saves the level. It is a member of the bar, gone with the bar.
+pub mod indicator {
+    use super::gauge::Rect;
+
+    /// `DAT_1004d4c8`, where the knob sits at level 8 — the middle of the run.
+    pub const BASE_X: f32 = 760.0;
+    /// `DAT_1004d4cc` / `DAT_1004d4d0` / `DAT_1004d4d4`: the knob's top edge
+    /// and its size, one cell.
+    pub const TOP: f32 = 5.0;
+    pub const WIDTH: f32 = 12.0;
+    pub const HEIGHT: f32 = 17.0;
+    /// `DAT_1004d4d8` / `DAT_1004d4dc`, the knob's art in `MenuBar_Chip.png`.
+    /// `FUN_10022650` sets that source once and nothing moves it: the knob is
+    /// one sprite that slides, not a record.
+    pub const SRC_X: f32 = 1.0;
+    pub const SRC_Y: f32 = 379.0;
+    /// `_DAT_1003d880`, a float and not a double — `flds`: the alpha one level
+    /// is worth. Ten levels reach 250, not 255, which is the shipped ceiling.
+    pub const ALPHA_STEP: f32 = 25.0;
+    /// `FUN_10023d50`'s `*(this+0xec) = 10`.
+    pub const INITIAL_LEVEL: usize = 10;
+    /// The first of the ten cells.
+    pub const FIRST_WIDGET: usize = 0xf;
+    pub const CELLS: usize = 10;
+    /// `_DAT_10039738` and `_DAT_10039798`, the half-pixel inset and the `+1`
+    /// every sprite on the bar gets.
+    const HALF: f32 = 0.5;
+    const ONE: f32 = 1.0;
+
+    /// The level a press on `widget` stores, or `None` for a widget that is not
+    /// one of the ten cells.
+    pub fn level_for(widget: usize) -> Option<usize> {
+        let cell = widget.checked_sub(FIRST_WIDGET).filter(|c| *c < CELLS)?;
+        // Cell 0 stores 0 and cell 1 stores 2, so the run skips 1.
+        Some(if cell == 0 { 0 } else { cell + 1 })
+    }
+
+    /// The indicator's alpha at `level`, as `FUN_10026ed0` computes it.
+    pub fn alpha(level: usize) -> u8 {
+        (level as f32 * ALPHA_STEP).round().clamp(0.0, 255.0) as u8
+    }
+
+    /// Where the knob goes at `level`, cut from the sheet.
+    ///
+    /// `None` for the unreachable level 1, whose case `FUN_10027030` does not
+    /// have: the original would place the sprite from an uninitialised local,
+    /// so there is no rectangle to transcribe.
+    pub fn knob(level: usize) -> Option<(Rect, Rect)> {
+        if level == 1 || level > 10 {
+            return None;
+        }
+        // Cases 2..10 are `BASE_X - WIDTH * n` with n counting down from 6 to
+        // -2, which is `BASE_X + (level - 8) * WIDTH`; case 0's multiplier is
+        // the double 7.0, one short of the 8.0 that pattern would give it,
+        // because the run has no level 1 to occupy the step in between.
+        let steps = if level == 0 { -7.0 } else { level as f32 - 8.0 };
+        let src = Rect {
+            x: SRC_X,
+            y: SRC_Y,
+            w: WIDTH,
+            h: HEIGHT,
+        };
+        let dst = Rect {
+            x: BASE_X + steps * WIDTH - HALF,
+            y: TOP - HALF,
+            w: WIDTH + ONE,
+            h: HEIGHT + ONE,
+        };
+        Some((src, dst))
     }
 }
 
@@ -1454,6 +1686,44 @@ pub mod gauge {
             return None;
         }
         Some(len.clamp(0.0, MAX_LEN))
+    }
+}
+
+#[cfg(test)]
+mod indicator_tests {
+    use super::indicator::*;
+
+    /// The run of levels skips 1: cell 0 stores 0 and cell 1 stores 2, so no
+    /// press can reach the case `FUN_10027030` does not have.
+    #[test]
+    fn no_cell_can_ask_for_the_level_that_has_no_case() {
+        let levels: Vec<usize> = (FIRST_WIDGET..).take(CELLS).filter_map(level_for).collect();
+        assert_eq!(levels, vec![0, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(knob(1).is_none());
+        assert!(levels.iter().all(|l| knob(*l).is_some()));
+    }
+
+    /// The knob lands on its own cell, which is the check that the switch's
+    /// odd multipliers were read right: cell 0's is 7 where the pattern would
+    /// give 8, and that is what makes the two ends line up.
+    #[test]
+    fn the_knob_lands_on_the_cell_that_was_pressed() {
+        for cell in 0..CELLS {
+            let widget = FIRST_WIDGET + cell;
+            let level = level_for(widget).unwrap();
+            let (_, dst) = knob(level).unwrap();
+            // Widget 15 is at x 676 and they step by 12; the sprite sits half a
+            // pixel back, as every sprite on the bar does.
+            assert_eq!(dst.x, 676.0 + cell as f32 * WIDTH - 0.5, "cell {cell}");
+        }
+    }
+
+    /// Ten levels of 25 reach 250, not 255. The constant is a float, and the
+    /// ceiling is the shipped one.
+    #[test]
+    fn full_is_two_hundred_and_fifty() {
+        assert_eq!(alpha(0), 0);
+        assert_eq!(alpha(INITIAL_LEVEL), 250);
     }
 }
 

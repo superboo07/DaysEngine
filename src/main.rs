@@ -1541,13 +1541,6 @@ fn snap(elapsed: Duration, interval: Duration) -> Duration {
     interval.mul_f64(ticks.max(0.0))
 }
 
-/// Where the control bar's strip lands in the window.
-///
-/// `strip` is the strip's size in the art set the display mode chose — 800x75
-/// windowed, 1280x120 full screen — and it is the full width of the picture in
-/// every one of them. So it scales by its own width. Scaling it by the stage's
-/// instead, as though the two shared a ladder, drew the bar 1.6x oversized off
-/// the right of a full-screen window and put every widget's hit box there too.
 /// What the cached control-bar layer was composited from.
 ///
 /// The record list is most of it, but not all: the gauge's three pieces are
@@ -1556,6 +1549,13 @@ fn snap(elapsed: Duration, interval: Duration) -> Duration {
 /// fade has to be composited in rather than modulated.
 type BarLayer = (Vec<usize>, Option<(i32, i32)>, Option<(u8, u8)>);
 
+/// Where the control bar's strip lands in the window.
+///
+/// `strip` is the strip's size in the art set the display mode chose — 800x75
+/// windowed, 1280x120 full screen — and it is the full width of the picture in
+/// every one of them. So it scales by its own width. Scaling it by the stage's
+/// instead, as though the two shared a ladder, drew the bar 1.6x oversized off
+/// the right of a full-screen window and put every widget's hit box there too.
 fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
     let scale = dst.w / strip.0.max(1) as f32;
     FRect::new(dst.x, dst.y, dst.w, strip.1 as f32 * scale)
@@ -1717,6 +1717,7 @@ fn run_script(
     // Cached on the record list, so the strip is only recomposited when it
     // actually changes — which is on a hover, a state change or an auto frame.
     let mut bar_texture: Option<(BarLayer, u32, u32, Texture)> = None;
+    let mut indicator_texture: Option<(u32, u32, Texture)> = None;
     let mut choice: Option<(Choice, Select)> = None;
     // The playback rate the player had when a choice went up, to put back when
     // they answer it. See the `Raised`/`Decided` arm below.
@@ -1840,6 +1841,10 @@ fn run_script(
             bar_state.gauge = Some(values);
             bar_state.gauge_raised = raised;
         }
+        // Host `+0x98`, which is what the bar's right-hand box is about: the
+        // slider lights up, its ten cells become pressable, and the REPLAYMODE
+        // indicator goes on the picture.
+        bar_state.following_record = player.following_record;
         // `set_speed` keeps these two in step; this is the resting case, for
         // a session that has not touched a speed widget yet.
         bar_state.rate = rate;
@@ -2029,8 +2034,10 @@ fn run_script(
                                 other => return Ok(other),
                             }
                         }
-                        bar::Act::Step(step) => {
-                            log::info!("the bar asked for step {step}")
+                        // Applied inside the bar, as `FUN_10026ed0` applies
+                        // it: nothing out here has to act on it.
+                        bar::Act::Transparency(level) => {
+                            log::info!("the replay indicator is now at {level} of 10")
                         }
                         bar::Act::None => {}
                     }
@@ -2399,13 +2406,50 @@ fn run_script(
             }
         }
 
+        // The REPLAYMODE indicator is not part of the strip: it sits below it,
+        // on the picture, and neither waits for the bar to drop down nor fades
+        // with it. Drawn before the strip so a bar on its way in goes over it.
+        if let Some(control) = control.as_ref() {
+            if let Some(sign) = control.indicator(bar_state) {
+                let (art_w, art_h) = (sign.art.width, sign.art.height);
+                let (bw, bh) = control.strip();
+                let strip = bar_strip(dst, (bw, bh));
+                let scale = strip.w / bw.max(1) as f32;
+                if indicator_texture
+                    .as_ref()
+                    .is_none_or(|(w, h, _)| (*w, *h) != (art_w, art_h))
+                {
+                    let mut texture = new_texture(creator, art_w, art_h, art)?;
+                    texture.set_blend_mode(BlendMode::Blend);
+                    texture.update(None, &sign.art.rgba, art_w as usize * 4)?;
+                    indicator_texture = Some((art_w, art_h, texture));
+                }
+                if let Some((w, h, texture)) = &mut indicator_texture {
+                    texture.set_alpha_mod(sign.alpha);
+                    canvas
+                        .copy(
+                            &*texture,
+                            None,
+                            FRect::new(
+                                strip.x + sign.dst.0 as f32 * scale,
+                                strip.y + sign.dst.1 as f32 * scale,
+                                *w as f32 * scale,
+                                *h as f32 * scale,
+                            ),
+                        )
+                        .map_err(|e| anyhow::anyhow!("drawing the replay indicator: {e}"))?;
+                }
+            }
+        }
+
         // The control bar last, over everything, as its own layer — and only
         // while it is dropped down.
         // A raised gauge keeps its own alpha while the rest of the strip fades,
-        // so the bar can have something to draw after it is otherwise gone.
+        // and the rate readout never had the bar's alpha at all, so the bar can
+        // have something to draw after it is otherwise gone.
         if let Some(control) = control
             .as_ref()
-            .filter(|c| c.fade().drawn() || (bar_state.gauge_raised && c.fade().gauge_alpha() > 0))
+            .filter(|c| c.fade().drawn() || c.pinned(bar_state))
         {
             let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
             // The cache key carries the gauge's counters as well as the
@@ -2415,7 +2459,7 @@ fn run_script(
             // Two sprites out of the strip carry an alpha of their own once the
             // gauge is raised, and one texture cannot be modulated twice — so
             // that case composites the fade in and is keyed on both alphas.
-            let pinned = bar_state.gauge_raised;
+            let pinned = control.pinned(bar_state);
             let alphas = pinned.then(|| (control.fade().alpha(), control.fade().gauge_alpha()));
             let records = (
                 control.records(hovered, bar_state, elapsed),

@@ -475,6 +475,21 @@ impl Screen {
     /// Draws one widget's chip sprite, resampled to the size the display map
     /// gives it.
     fn blit_sprite(&self, out: &mut Image, sheet: &Image, widget: &Widget) {
+        let (art, dst) = self.cut_from(sheet, widget);
+        out.blit_scaled(&art, (0, 0, dst.2, dst.3), dst);
+    }
+
+    /// One widget's chip sprite alone, at display scale, with where it goes.
+    ///
+    /// For a sprite that does not land inside the screen's own rectangle and so
+    /// cannot go in its layer: `FUN_10021c20` puts the control bar's
+    /// `REPLAYMODE` indicator at y = 80, below the 800x75 strip, so it is drawn
+    /// on the picture instead.
+    pub fn cut_widget(&self, widget: &Widget) -> (Image, (i64, i64, u32, u32)) {
+        self.cut_from(&self.chip, widget)
+    }
+
+    fn cut_from(&self, sheet: &Image, widget: &Widget) -> (Image, (i64, i64, u32, u32)) {
         let src = (
             widget.src_x,
             widget.src_y,
@@ -482,10 +497,15 @@ impl Screen {
             widget.dst.height,
         );
         let dst = self.place(widget);
-        match resampled(sheet, src, (dst.2, dst.3)) {
-            Some(scaled) => out.blit_scaled(&scaled, (0, 0, dst.2, dst.3), dst),
-            None => out.blit_scaled(sheet, src, dst),
-        }
+        let art = match resampled(sheet, src, (dst.2, dst.3)) {
+            Some(scaled) => scaled,
+            None => {
+                let mut cut = Image::empty(dst.2, dst.3);
+                cut.blit_scaled(sheet, src, (0, 0, dst.2, dst.3));
+                cut
+            }
+        };
+        (art, dst)
     }
 
     /// Draws a [`Cut`], resampling its source onto its destination.

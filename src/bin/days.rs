@@ -95,6 +95,10 @@ enum Cmd {
         /// engine shows while the pointer is anywhere else.
         #[arg(long)]
         bar: bool,
+        /// Answer host `+0x98` true, so the REPLAYMODE indicator is on the
+        /// picture — what a row of the replay screen's play-data list starts.
+        #[arg(long)]
+        following_record: bool,
     },
     /// Composite a UI screen to PNG, without a display.
     ///
@@ -256,9 +260,16 @@ struct BarArgs {
     /// default here.
     #[arg(long)]
     no_script: bool,
-    /// Set the host member the ten step widgets need.
+    /// Answer host `+0x98` true: playback is following a save's recorded
+    /// answers, which is what the replay screen's play-data list starts. It is
+    /// what lights the transparency slider on the right of the strip, makes its
+    /// ten cells pressable, and puts the REPLAYMODE indicator on the picture.
     #[arg(long)]
-    stepping: bool,
+    following_record: bool,
+    /// How solid the REPLAYMODE indicator is drawn, 0 to 10. The bar starts at
+    /// 10 and the ten cells set it; level 1 is unreachable.
+    #[arg(long)]
+    transparency: Option<usize>,
     /// Playback rate index, 0 to 4.
     #[arg(long, default_value_t = 0)]
     speed: usize,
@@ -477,7 +488,13 @@ fn main() -> Result<()> {
             alpha,
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
-        Cmd::Render { name, at, out, bar } => cmd_render(&game, &name, &at, &out, bar)?,
+        Cmd::Render {
+            name,
+            at,
+            out,
+            bar,
+            following_record,
+        } => cmd_render(&game, &name, &at, &out, bar, following_record)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
         Cmd::Save {
@@ -830,11 +847,39 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
 /// The layer may be shorter than the frame — the control bar is an 800x75 strip
 /// over an 800x452 picture — in which case the rest of the frame is untouched.
 fn blend_over(frame: &mut [u8], width: usize, height: usize, layer: &days_ui::Image) {
-    for y in 0..(layer.height as usize).min(height) {
-        for x in 0..(layer.width as usize).min(width) {
+    blend_at(frame, width, height, layer, (0, 0), 255);
+}
+
+/// As [`blend_over`], at an offset and through an alpha of its own.
+///
+/// The control bar's REPLAYMODE indicator needs both: it goes at y = 80, below
+/// the strip, and it carries the transparency the bar's ten cells set rather
+/// than the bar's fade.
+fn blend_at(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    layer: &days_ui::Image,
+    at: (i64, i64),
+    alpha: u8,
+) {
+    for y in 0..layer.height as usize {
+        let Ok(dy) = usize::try_from(at.1 + y as i64) else {
+            continue;
+        };
+        if dy >= height {
+            continue;
+        }
+        for x in 0..layer.width as usize {
+            let Ok(dx) = usize::try_from(at.0 + x as i64) else {
+                continue;
+            };
+            if dx >= width {
+                continue;
+            }
             let s = (y * layer.width as usize + x) * 4;
-            let d = (y * width + x) * 4;
-            let a = u32::from(layer.rgba[s + 3]);
+            let d = (dy * width + dx) * 4;
+            let a = u32::from(layer.rgba[s + 3]) * u32::from(alpha) / 255;
             if a == 0 {
                 continue;
             }
@@ -847,7 +892,14 @@ fn blend_over(frame: &mut [u8], width: usize, height: usize, layer: &days_ui::Im
     }
 }
 
-fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> Result<()> {
+fn cmd_render(
+    game: &Path,
+    name: &str,
+    at: &[String],
+    out: &Path,
+    bar: bool,
+    following_record: bool,
+) -> Result<()> {
     use days_script::Frame;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -903,6 +955,7 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
     // The gauge reads the player's own save, as playback does: a bar drawn with
     // no counters has nothing to put in the channel.
     let bar_state = daysengine::ui::bar::State {
+        following_record,
         gauge: slot_feeling(game)
             .map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store)),
         ..daysengine::ui::bar::State::from_config(&daysengine::install::config::Config::load(game))
@@ -943,6 +996,17 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
             // would show up.
             let layer = strip.compose_faded(None, bar_state, 0);
             blend_over(&mut rgba, W, H, &layer);
+            // Not part of the strip: it sits below it, on the picture.
+            if let Some(sign) = strip.indicator(bar_state) {
+                blend_at(
+                    &mut rgba,
+                    W,
+                    H,
+                    &sign.art,
+                    (sign.dst.0, sign.dst.1),
+                    sign.alpha,
+                );
+            }
         }
 
         let path = out.join(format!(
@@ -1010,10 +1074,33 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         replay: args.replay,
         message: args.message,
         skippable: !args.no_script && State::from_config(&config).skippable,
-        stepping: args.stepping,
-        speed: args.speed.min(bar::SPEEDS.len() - 1),
+        following_record: args.following_record,
         ..State::default()
     };
+    // The two move together in the engine, and the rate is what decides whether
+    // the readout is drawn, so a `--speed` that left it behind would hide it.
+    let mut state = state;
+    state.set_speed(args.speed.min(bar::SPEEDS.len() - 1));
+
+    // The level is the bar's own, and the only thing that moves it is a press
+    // on one of the ten cells -- so that is how it is set here too.
+    let mut bar = bar;
+    if let Some(want) = args.transparency {
+        match (bar::indicator::FIRST_WIDGET..)
+            .take(bar::indicator::CELLS)
+            .find(|w| bar::indicator::level_for(*w) == Some(want))
+        {
+            Some(widget) => {
+                if bar.press(widget, state, 0) == Act::None {
+                    anyhow::bail!(
+                        "the cells are dead without --following-record, so the press \
+                         that sets the transparency is swallowed"
+                    );
+                }
+            }
+            None => anyhow::bail!("no cell sets a transparency of {want}; level 1 is unreachable"),
+        }
+    }
 
     let (w, h) = bar.screen().size();
     println!(
@@ -1026,13 +1113,14 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         bar::WIDGETS,
     );
     println!(
-        "state: auto {} paused {} replay {} message {} skippable {} stepping {} speed x{}",
+        "state: auto {} paused {} replay {} message {} skippable {} \
+         following-record {} speed x{}",
         state.auto,
         state.paused,
         state.replay,
         state.message,
         state.skippable,
-        state.stepping,
+        state.following_record,
         bar::SPEEDS[state.speed],
     );
     // The rate retimes the audio as well as the picture, and past the
@@ -1049,6 +1137,29 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         }
     );
     println!("fade in {}ms, out {}ms", bar::FADE_IN_MS, bar::FADE_OUT_MS);
+
+    // The right-hand box: a ten-cell slider whose knob is the other sprite the
+    // bar sizes itself, and the indicator it sets the transparency of, which is
+    // not on the strip at all.
+    {
+        let level = bar.transparency();
+        println!(
+            "replay indicator: {}, transparency {level} of 10 (alpha {})",
+            if state.following_record {
+                "on the picture, slider live"
+            } else {
+                "off, slider dead"
+            },
+            bar::indicator::alpha(level),
+        );
+        match bar::indicator::knob(level) {
+            Some((src, dst)) => println!(
+                "  knob   sheet ({:.0},{:.0}) {:.0}x{:.0} -> strip ({:.1},{:.1}) {:.0}x{:.0}",
+                src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h,
+            ),
+            None => println!("  knob   level {level} has no case in FUN_10027030"),
+        }
+    }
 
     // The gauge is the one thing on the strip that is not a chip record: its
     // three pieces are cut from the sheet at sizes worked out from the two
@@ -1098,7 +1209,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             Act::Speed(i) => format!("speed x{}", bar::SPEEDS[i]),
             Act::Menu(m) => format!("open menu {}", m.0),
             Act::Leave => "leave playback".to_string(),
-            Act::Step(n) => format!("step {n}"),
+            Act::Transparency(n) => format!("set the replay indicator to {n} of 10"),
         };
         println!(
             "  {widget:3}  {:6}  ({:4},{:3}) {:3}x{:<3}  {:5}  {:>7}  {shown}",
@@ -1123,7 +1234,6 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     // The bar is a drop-down: it is on screen only while the pointer is inside
     // the strip, and it ramps in over 300ms and out over 1000ms. Drive that
     // here so what gets drawn is what the engine would draw.
-    let mut bar = bar;
     let at = if args.pointer.eq_ignore_ascii_case("off") {
         None
     } else {
@@ -1160,7 +1270,30 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     }
 
     if let Some(out) = &args.out {
-        let image = bar.compose_faded(hovered, state, args.elapsed);
+        let mut image = bar.compose_faded(hovered, state, args.elapsed);
+        // The REPLAYMODE indicator is below the strip, so the PNG grows to hold
+        // it rather than clipping the thing the slider controls.
+        if let Some(sign) = bar.indicator(state) {
+            let height = (sign.dst.1.max(0) as u32 + sign.dst.3).max(image.height);
+            let mut taller = days_ui::Image::empty(image.width, height);
+            taller.blit_scaled(
+                &image,
+                (0, 0, image.width, image.height),
+                (0, 0, image.width, image.height),
+            );
+            // Through the indicator's own alpha, onto transparency, so the PNG
+            // stays a layer rather than gaining a black band under the strip.
+            let mut art = sign.art;
+            for px in art.rgba.as_chunks_mut::<4>().0 {
+                px[3] = (u32::from(px[3]) * u32::from(sign.alpha) / 255) as u8;
+            }
+            taller.blit_scaled(
+                &art,
+                (0, 0, art.width, art.height),
+                (sign.dst.0, sign.dst.1, sign.dst.2, sign.dst.3),
+            );
+            image = taller;
+        }
         write_png(out, &image.rgba, image.width, image.height)?;
         println!("wrote {}", out.display());
     }

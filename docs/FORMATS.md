@@ -834,7 +834,7 @@ bracket the 25 into the same twelve groups:
 | 10..12 | `+0xf8(4)`, `+0xf8(5)`, `+0xf8(3)` | `!+0x104` |
 | 13 | `+0xf8(2)` | always |
 | 14 | `+0x100(1)` | always |
-| 15..24 | `FUN_10026ed0`, ten steps of one setting | `+0x98` |
+| 15..24 | `FUN_10026ed0`, the replay indicator's transparency | `+0x98` |
 
 A press on a widget that is not live is swallowed *and silent*: the dispatch
 asks the enabled test before playing SE index 2.
@@ -1066,8 +1066,9 @@ as a layer and blended over the picture rather than drawn onto black.
 composited from hover states: `FUN_10024ca0` draws about fifteen sprites from
 the chip sheet every frame and `FUN_10021c20` is where each is given a record.
 Records 48..52 are the five menu buttons' resting art, 47/66 the rate row live
-and dead, 46/65 widget 4's, 44/45 widget 1's, 42 widget 0's, 69/70 the strip
-above the ten steps, 67 the gauge bed, and 53..64 the twelve captions
+and dead, 46/65 widget 4's, 44/45 widget 1's, 42 widget 0's, 69/70 the
+transparency slider's trough live and dead, 68 the `REPLAYMODE` indicator,
+67 the gauge bed, and 53..64 the twelve captions
 (`0x1004d318`, which is record 53). Records at chip row `y = 127` are the live
 variant and those at `y = 290` the dead one — established twice over, because
 each pair is picked by the same question that makes its widget pressable.
@@ -2292,6 +2293,56 @@ The destinations are a pixel larger than their sources in each axis and start
 half a pixel back, which is the half-texel offset every other sprite on the bar
 gets.
 
+### The replay-mode indicator, and the box on the right
+
+Widgets 15 to 24 are ten 12x17 cells in a row at x 676..796, inside a 124x19
+trough at `this+0x8c`. Host `+0x98` picks the trough's sprite and makes the
+cells pressable: record 69 is grey, record 70 a white-to-cyan gradient. The
+caption all ten share — record 64, the twelfth strip — is the game's own words
+for what they do: `Change transparency of replay mode indicator`.
+
+The indicator is record 68, `this+0x94`, the word `REPLAYMODE`, and it goes at
+`(697, 80) 97x19` in the strip's own space — **below** the 800x75 strip, so it
+lands on the picture. `FUN_10024ca0` draws it outside the `this+0xbc` test that
+gates every widget, and `FUN_10025690` never names it, so it neither waits for
+the bar to drop down nor fades with it.
+
+`FUN_10026ed0` is the whole of the slider. A press stores a level in
+`this+0xec`, sets the indicator's colour to `round(level * 25.0) << 24 |
+0xffffff`, and calls `FUN_10027030` to re-place the knob at `this+0x90`:
+
+```text
+widget   15  16  17  18  19  20  21  22  23  24
+level     0   2   3   4   5   6   7   8   9  10
+knob x   676 688 700 712 724 736 748 760 772 784
+```
+
+**Level 1 is unreachable**, and both halves agree on it: cell 0 stores 0 and
+cell 1 stores 2, and `FUN_10027030`'s switch has no case 1 either — it would
+place the knob from an uninitialised local. Its cases are
+`760 + (level - 8) * 12` for 2..10 and `760 - 7 * 12` for 0, the 7 being a
+double like the rest of the multipliers, one short of the 8 the pattern would
+give because there is no level 1 to take the step between.
+
+Ten levels reach an alpha of 250, not 255: `_DAT_1003d880` is `25.0`, and a
+float — `flds`, not `fmull`. `FUN_10023d50` starts the bar at level 10, and
+nothing saves the level; it lives and dies with the bar.
+
+The knob's source rectangle is `(1, 379) 12x17`, set once in `FUN_10022650` and
+never moved — it is one sprite that slides, which is why `FUN_10021c20` gives
+`this+0x90` no record.
+
+### What host `+0x98` is
+
+`FUN_0042bef0` returns the film object's `+0x1e0` and `FUN_0042bf10` (host
+`+0x94`) is the only thing that writes it: nothing in the executable names that
+member otherwise, on either the object's offset or the interface's `+0x1b4`.
+Both of the setter's callers are in the menu DLL — `FUN_1001dfe0`, a row of the
+replay screen's play-data list, passes 1, and `FUN_1001d380`, an ordinary load,
+passes 0. It is the same member `FUN_00431740` consults at every choice box to
+take the slot's recorded answer. So `+0x98` is **playback is following a save's
+recorded answers**, and the whole right-hand box is about that mode.
+
 ### When the gauge is up
 
 `FUN_10024ca0` draws the bed and then whichever pieces are up, in the order
@@ -2299,7 +2350,11 @@ gets.
 once outside it under host `+0x154`.
 
 `FUN_10025690`, the fade, sets one ARGB on every sprite the bar owns **except**
-those four, which it skips while `+0x154` is set. Skipping is not holding them
+those four, which it skips while `+0x154` is set. Two more are never in its list
+at all: the rate readout at `this+0x88` and the `REPLAYMODE` indicator at
+`this+0x94`, both of which `FUN_10024ca0` also draws outside the `this+0xbc`
+test. They keep the opaque colour `FUN_10022650` gave them, so a rate of 2.0 or
+more stays legible on the picture after the bar has gone. Skipping is not holding them
 opaque — they keep whatever they last held. So a gauge raised while the bar is
 up stays on screen at full alpha after the bar has faded away, and one raised
 while the bar is already gone is pinned at nothing and never appears.
