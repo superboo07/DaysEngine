@@ -10,12 +10,24 @@
 //!
 //! ```text
 //! +0x08 release textures   +0x20 update: hit test and dispatch  (FUN_10024100)
-//! +0x0c load and lay out   +0x24/+0x28 -
-//! +0x10 re-place on resize +0x2c draw the play/pause widget      (FUN_100258f0)
-//! +0x14 draw               +0x30 widget 2's action               (FUN_10025b90)
-//! +0x18 -                  +0x34 widget 0's action               (FUN_10025cf0)
-//! +0x1c set host pointers  +0x38/+0x3c/+0x40/+0x44 lifetime
+//! +0x0c load and lay out   +0x24 dirty the rate readout (FUN_10027210)
+//! +0x10 re-place on resize +0x28 set widget 2's latch    (FUN_10027230)
+//! +0x14 draw               +0x2c draw the play/pause widget      (FUN_100258f0)
+//! +0x18 -                  +0x30 widget 2's action               (FUN_10025b90)
+//! +0x1c set host pointers  +0x34 widget 0's action               (FUN_10025cf0)
+//!                          +0x38/+0x3c/+0x40/+0x44 lifetime
 //! ```
+//!
+//! The engine's own pointer is `engine + 0x330`, and the eleven slots it calls
+//! on it — `+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`, `+0x28`,
+//! `+0x2c`, `+0x30`, `+0x34`, `+0x38` — all land inside this vtable, which is
+//! what confirms the member. **`+0x14`, the draw, is not among them**, and no
+//! call site for it was found: `FUN_10024ca0` is referenced only from the
+//! vtable slot, and a raw scan of `.text` finds no `CALL [reg+0x14]` outside
+//! the CRT. So what invokes the draw is **not recovered**. That it runs
+//! whether or not the bar is dropped down is read from the function itself,
+//! which tests `this+0xbc` and host `+0x140` internally and draws two sprites
+//! past both — see [`Bar::compose_faded`].
 //!
 //! So the widget geometry is in the DLL — the `MENUBAR` table the atlas search
 //! finds, 25 records plus a long trailing run of alternates — while every

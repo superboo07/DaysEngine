@@ -2350,11 +2350,25 @@ recorded answers**, and the whole right-hand box is about that mode.
 once outside it under host `+0x154`.
 
 `FUN_10025690`, the fade, sets one ARGB on every sprite the bar owns **except**
-those four, which it skips while `+0x154` is set. Two more are never in its list
-at all: the rate readout at `this+0x88` and the `REPLAYMODE` indicator at
-`this+0x94`, both of which `FUN_10024ca0` also draws outside the `this+0xbc`
-test. They keep the opaque colour `FUN_10022650` gave them, so a rate of 2.0 or
-more stays legible on the picture after the bar has gone. Skipping is not holding them
+those four, which it skips while `+0x154` is set.
+
+Two more are never in its list at all: the rate readout at `this+0x88` and the
+`REPLAYMODE` indicator at `this+0x94`. Nothing else sets their colour either —
+only `FUN_10022650` does, once, opaque — and that null result was taken twice,
+from the decompile and from a raw instruction scan of `0x10021000..0x10028000`.
+`FUN_10024ca0` also draws both past the `this+0xbc` and host `+0x140` tests:
+the hidden branch at `0x10024f4f` is `JNZ 0x10025205`, and `0x10025205` is the
+instruction that begins the readout's own test, so this is the branch target
+and not the decompiler's indentation. The consequence is that a rate of 2.0 or
+more leaves one rate button on the picture after the bar has faded away.
+
+**What calls the draw is not recovered**, and that weakens the consequence
+rather than the reading. The engine calls eleven slots on its MenuBar pointer
+at `engine + 0x330` and `+0x14` is not one of them; `FUN_10024ca0` is
+referenced only from the vtable, and `.text` holds no `CALL [reg+0x14]` outside
+the CRT. That the draw runs while the bar is down is inferred from the function
+testing `this+0xbc` and `+0x140` itself, which would be dead code otherwise —
+not from a call site anyone has seen. Skipping is not holding them
 opaque — they keep whatever they last held. So a gauge raised while the bar is
 up stays on screen at full alpha after the bar has faded away, and one raised
 while the bar is already gone is pinned at nothing and never appears.
