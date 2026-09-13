@@ -21,13 +21,35 @@
 //! The engine's own pointer is `engine + 0x330`, and the eleven slots it calls
 //! on it — `+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`, `+0x28`,
 //! `+0x2c`, `+0x30`, `+0x34`, `+0x38` — all land inside this vtable, which is
-//! what confirms the member. **`+0x14`, the draw, is not among them**, and no
-//! call site for it was found: `FUN_10024ca0` is referenced only from the
-//! vtable slot, and a raw scan of `.text` finds no `CALL [reg+0x14]` outside
-//! the CRT. So what invokes the draw is **not recovered**. That it runs
-//! whether or not the bar is dropped down is read from the function itself,
-//! which tests `this+0xbc` and host `+0x140` internally and draws two sprites
-//! past both — see [`Bar::compose_faded`].
+//! what confirms the member.
+//!
+//! # Nothing calls the draw by name
+//!
+//! `+0x14` is **not** one of those eleven, and there is no call site for it
+//! anywhere: `FUN_10024ca0` is reached only through the vtable slot, and the
+//! exe's `.text` holds no `CALL dword ptr [reg+0x14]` at all. The bar is not
+//! drawn by being asked to. It is **registered as a graphics module**, and the
+//! renderer walks the list:
+//!
+//! ```text
+//! FUN_004253f0   the frame step
+//!   FUN_004252e0   MenuBar +0x20, the update
+//!   FUN_0040e540   Clear, BeginScene
+//!     FUN_004144c0   DXGraphicModuleList slot +0x14
+//!       for each module:  module -> slot +0x14      <- FUN_10024ca0
+//!     EndScene, Present
+//! ```
+//!
+//! `FUN_004230b0` puts it there — `MenuBar->+0x0c(device)` and then
+//! `FUN_0040e940(engine+0x330)`, the global register — and `FUN_00423650`,
+//! slot `+0x08`, takes it out again. `DXGraphicModuleList` is an RTTI name, and
+//! `FUN_004144c0` walks its modules and calls each one's `+0x14` **with no test
+//! of any kind**.
+//!
+//! So the draw runs every frame for as long as playback is loaded, whatever the
+//! bar is doing, and the two sprites it draws past its own `this+0xbc` and host
+//! `+0x140` tests really are on the picture with the bar gone — see
+//! [`Bar::compose_faded`].
 //!
 //! So the widget geometry is in the DLL — the `MENUBAR` table the atlas search
 //! finds, 25 records plus a long trailing run of alternates — while every
@@ -716,15 +738,13 @@ impl Bar {
 
     /// Whether anything the strip draws keeps an alpha of its own this frame.
     ///
-    /// Only the raised gauge, which the fade skips. While it is showing, the
-    /// strip cannot be drawn by modulating one texture — the fade has to be
-    /// composited in, which is what [`Bar::compose_faded`] does.
-    ///
-    /// The rate readout at `this+0x88` is **not** here, though `FUN_10025690`
-    /// does not name it either. See [`Bar::compose_faded`] for why it is left
-    /// fading with the rest.
+    /// `FUN_10025690` names every sprite the bar owns but two: the rate
+    /// readout, which it never touches, and the gauge bed with its three
+    /// pieces, which it skips while the gauge is raised. While either is
+    /// showing the strip cannot be drawn by modulating one texture — the fade
+    /// has to be composited in, which is what [`Bar::compose_faded`] does.
     pub fn pinned(&self, state: State) -> bool {
-        state.gauge_raised
+        state.gauge_raised || self.rate_readout(state).is_some()
     }
 
     /// Drops widget 2's latch once its window has passed.
@@ -860,7 +880,21 @@ impl Bar {
             faded.retain(|r| *r != record::GAUGE_BED);
             pinned.push(record::GAUGE_BED);
         }
+        if let Some(readout) = self.rate_readout(state) {
+            // Only the one `records` pushed for the readout: the same number
+            // comes back as the hover sprite when that rate's widget is under
+            // the pointer, and that one does fade.
+            if let Some(at) = faded.iter().position(|r| *r == readout) {
+                faded.remove(at);
+            }
+            pinned.push(readout);
+        }
         (faded, pinned)
+    }
+
+    /// The record the rate readout draws from, while it is showing.
+    fn rate_readout(&self, state: State) -> Option<usize> {
+        (state.rate >= 2.0 && state.speed < SPEEDS.len()).then_some(state.speed + 5)
     }
 
     /// The sprites the bar sizes itself instead of taking whole from a record,
@@ -912,19 +946,15 @@ impl Bar {
     /// Two more are absent from `FUN_10025690`'s list altogether — the rate
     /// readout at `this+0x88` and the `REPLAYMODE` indicator at `this+0x94` —
     /// and `FUN_10024ca0` draws both past the `this+0xbc` and host `+0x140`
-    /// tests, which is a branch target and not a reading of indentation. Taken
-    /// at face value that would leave one rate button on the picture for as
-    /// long as the rate is 2.0 or more.
+    /// tests. That is a branch target, not a reading of indentation: the
+    /// hidden branch at `0x10024f4f` is `JNZ 0x10025205`, and `0x10025205`
+    /// begins the readout's own test. So a rate of 2.0 or more leaves that
+    /// rate's button on the picture at full alpha, and the indicator stays on
+    /// it whether or not the bar is down. Both are reproduced.
     ///
-    /// **The readout is faded with the rest here anyway.** The step that would
-    /// make the consequence follow — that `FUN_10024ca0` runs at all while the
-    /// bar is down — is **not recovered**: nothing found calls the draw, so
-    /// whether it is reached in that state is an inference from the function
-    /// testing `this+0xbc` itself. Against that inference stands the game as
-    /// played, where no such button is on screen. The indicator is the one
-    /// exception, and only because the ten-cell slider that sets its
-    /// transparency is evidence in its own right that it is meant to be seen
-    /// without the bar — there would be nothing to adjust otherwise.
+    /// The step that makes the consequence follow is that `FUN_10024ca0` runs
+    /// every frame regardless of the bar — see the module docs for the chain,
+    /// which ends at `DXGraphicModuleList`.
     pub fn compose(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
         let records = self.records(hovered, state, elapsed_ms);
         let (faded, pinned) = self.cuts(state);
@@ -1001,7 +1031,17 @@ impl Bar {
             // The gauge is the only part whose alpha the raise pins; the rate
             // readout is simply never in `FUN_10025690`'s list, so it keeps the
             // opaque colour `FUN_10022650` gave it.
-            modulate(&mut over, self.fade.gauge_alpha());
+            // The gauge is the only part whose alpha the raise pins; the rate
+            // readout is simply never in `FUN_10025690`'s list, so it keeps the
+            // opaque colour `FUN_10022650` gave it.
+            modulate(
+                &mut over,
+                if state.gauge_raised {
+                    self.fade.gauge_alpha()
+                } else {
+                    255
+                },
+            );
             let (w, h) = (over.width, over.height);
             layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }

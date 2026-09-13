@@ -2362,27 +2362,39 @@ instruction that begins the readout's own test, so this is the branch target
 and not the decompiler's indentation. The consequence is that a rate of 2.0 or
 more leaves one rate button on the picture after the bar has faded away.
 
-**What calls the draw is not recovered**, and that is what the consequence
-needed. The engine calls eleven slots on its MenuBar pointer at
-`engine + 0x330` — `+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`,
-`+0x28`, `+0x2c`, `+0x30`, `+0x34`, `+0x38`, all of them landing inside the
-vtable, which is what confirms the member — and `+0x14` is not among them.
-`FUN_10024ca0` is referenced only from the vtable slot; the exe's own `.text`
-holds no `CALL dword ptr [reg+0x14]` at all (the eleven that match the byte
-pattern are `[EBP+0x14]` stack arguments in the CRT); the static
-`FILM::MenuBar` at `0x10050790` is referenced only by `_SetMenuBar@4` and the
-CRT's static-init pair; and the frame step `FUN_004253f0` reaches the bar's
-*update* through `FUN_004252e0` without drawing it. So that the draw runs while
-the bar is down is an inference from the function testing `this+0xbc` and
-`+0x140` itself, not a call site anyone has seen.
+### Nothing calls the bar's draw
 
-`DaysEngine` therefore **fades the rate readout with the rest of the strip**,
-against the reading, because the reading's missing step is the one that decides
-it and the game as played shows no such button. The `REPLAYMODE` indicator is
-the single exception, and not on the strength of the same inference: the
-ten-cell slider that sets its transparency is evidence in its own right that it
-is meant to be seen without the bar, since there would be nothing to adjust
-otherwise. Skipping is not holding them
+The engine calls eleven slots on its MenuBar pointer at `engine + 0x330` —
+`+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`, `+0x28`, `+0x2c`,
+`+0x30`, `+0x34`, `+0x38`, all of them landing inside the vtable, which is what
+confirms the member — and `+0x14`, the draw, is not among them. Nor is it
+called anywhere else: `FUN_10024ca0` is reached only through the vtable slot,
+and the exe's `.text` holds no `CALL dword ptr [reg+0x14]` at all (the eleven
+that match the byte pattern are `[EBP+0x14]` stack arguments in the CRT).
+
+The bar is not drawn by being asked to. It is **registered as a graphics
+module**, and the renderer walks the list:
+
+```text
+FUN_004253f0   the frame step
+  FUN_004252e0   MenuBar +0x20, the update
+  FUN_0040e540   Clear, BeginScene
+    FUN_004144c0   DXGraphicModuleList slot +0x14
+      for each module:  module -> slot +0x14      <- FUN_10024ca0
+    EndScene, Present
+```
+
+`FUN_004230b0` is what puts it in: `MenuBar->+0x0c(device)` to load it, then
+`FUN_0040e940(engine + 0x330)`, the global register, which forwards to
+`FUN_00413f60` on the list at `DAT_0050b328`. `FUN_00423650` — slot `+0x08`,
+the release — takes it back out through `FUN_0040e960`. `DXGraphicModuleList`
+is an RTTI name off its vftable at `0x004d0fd0`, not an inference, and its
+`FUN_004144c0` walks its modules calling each one's `+0x14` **with no test of
+any kind**, ANDing the results.
+
+So the draw runs every frame for as long as playback is loaded, whatever the
+bar is doing, and the two sprites drawn past `this+0xbc` and host `+0x140`
+really are on the picture with the bar gone. `DaysEngine` reproduces both. Skipping is not holding them
 opaque — they keep whatever they last held. So a gauge raised while the bar is
 up stays on screen at full alpha after the bar has faded away, and one raised
 while the bar is already gone is pinned at nothing and never appears.
