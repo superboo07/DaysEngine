@@ -13,6 +13,13 @@
 //! start timecode and the last is always the end timecode, except for
 //! [`Command::SkipFrame`] and [`Command::Next`], which carry a single timecode.
 //!
+//! Those two are the script's two boundaries and they are not the same one.
+//! `[Next]` is where the script ends; `[SkipFRAME]` is where the control bar's
+//! skip button jumps to, which is the frame the choice is raised at when the
+//! script has one. They coincide in the 1,570 retail scripts with no choice
+//! and differ in the 287 that have one, where `[SkipFRAME]` is exactly the
+//! `[SetSELECT]` start. See [`Script::length`] and [`Script::skip_to`].
+//!
 //! Timecodes are `MM:SS:FF` at **24 fps** — the frames field runs 0..=23 across
 //! all 1,857 retail scripts, and the movies are 24 fps.
 
@@ -190,9 +197,11 @@ pub enum Command {
     MoveSom {
         intensity: i32,
     },
-    /// Total script length. Always the first statement.
+    /// Where the "skip" control jumps to: the frame the choice is raised at,
+    /// or the end of the script when there is no choice. Always the first
+    /// statement. See [`Script::skip_to`].
     SkipFrame,
-    /// End of script. Always the last statement.
+    /// End of script. Always the last statement. See [`Script::length`].
     Next,
 }
 
@@ -220,8 +229,19 @@ impl Event {
 pub struct Script {
     /// Script name as the route layer knows it, e.g. `"00-00-A00"`.
     pub name: String,
-    /// Total length, from `[SkipFRAME]`.
+    /// Total length, from `[Next]` — or `[Exit]`, which the executable treats
+    /// as the same statement. `FUN_0043b640` parses either into the timeline
+    /// object's `+0x21c`, which `FUN_004315a0` reads back as the end.
     pub length: Frame,
+    /// Where the control bar's skip button jumps to, from `[SkipFRAME]`:
+    /// `FUN_0043b640` parses it into the timeline object's `+0x22c` and
+    /// `FUN_004315c0` reads it back.
+    ///
+    /// In the 287 retail scripts that raise a choice this is exactly the
+    /// `[SetSELECT]` start; in the other 1,570 it equals [`Script::length`],
+    /// which is how the engine tells "no choice ahead" from "a choice at
+    /// frame *n*" — see `FUN_00425bf0`'s case 6.
+    pub skip_to: Frame,
     pub events: Vec<Event>,
 }
 
@@ -238,6 +258,7 @@ impl Script {
     pub fn parse_str(name: &str, text: &str) -> Result<Script, Error> {
         let mut events = Vec::new();
         let mut length = Frame::ZERO;
+        let mut skip_to = Frame::ZERO;
 
         for (line, raw) in statements(text) {
             let Some((command, body)) = split_statement(raw) else {
@@ -245,8 +266,10 @@ impl Script {
             };
             let args: Vec<&str> = split_fields(body);
             let event = parse_command(line, command, &args)?;
-            if let Command::SkipFrame = event.command {
-                length = event.end;
+            match event.command {
+                Command::Next => length = event.start,
+                Command::SkipFrame => skip_to = event.start,
+                _ => {}
             }
             events.push(event);
         }
@@ -257,12 +280,19 @@ impl Script {
 
         if length == Frame::ZERO {
             length = events.iter().map(|e| e.end).max().unwrap_or(Frame::ZERO);
-            log::warn!("{name} has no [SkipFRAME]; inferred length {length}");
+            log::warn!("{name} has no [Next]; inferred length {length}");
+        }
+        // No `[SkipFRAME]` means nothing to skip to, which the engine spells as
+        // a target equal to the end: `FUN_00425bf0`'s case 6 compares the two
+        // and finishes the script when they match.
+        if skip_to == Frame::ZERO {
+            skip_to = length;
         }
 
         Ok(Script {
             name: name.to_string(),
             length,
+            skip_to,
             events,
         })
     }
@@ -366,21 +396,18 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
             return Err(arity("1"));
         }
         let at = Frame::parse(args[0])?;
-        // `SkipFRAME` declares the script's total length, so it spans the whole
-        // timeline. `Next` is an end marker, so it sits at a point — giving it a
-        // zero start would sort it to the front of the event list.
-        return Ok(if command == "SkipFRAME" {
-            Event {
-                start: Frame::ZERO,
-                end: at,
-                command: Command::SkipFrame,
-            }
-        } else {
-            Event {
-                start: at,
-                end: at,
-                command: Command::Next,
-            }
+        // Both are markers rather than things that happen over a window, and
+        // both sit at a point: giving either a zero start would sort it to the
+        // front of the event list and make it look like a statement that runs
+        // from the beginning.
+        return Ok(Event {
+            start: at,
+            end: at,
+            command: if command == "SkipFRAME" {
+                Command::SkipFrame
+            } else {
+                Command::Next
+            },
         });
     }
 
@@ -753,6 +780,60 @@ mod tests {
                 text: "Hi.".into()
             }
         );
+    }
+
+    /// The two boundaries are different statements. `[Next]` ends the script;
+    /// `[SkipFRAME]` is where the skip button jumps to, which in a script with
+    /// a choice is the frame the choice is raised at. Reading the length off
+    /// `[SkipFRAME]` cut every such script short at its own choice.
+    #[test]
+    fn a_choice_puts_the_skip_target_before_the_end() {
+        let s = Script::parse_str(
+            "00-00-A03",
+            "[SkipFRAME]=01:02:09;\n\
+             [PrintText]=00:00:00\tMakoto\tWell.\t00:02:00;\n\
+             [SetSELECT]=01:02:09\t'So what?'\t'No'\t01:08:00;\n\
+             [Next]=01:09:00;\n",
+        )
+        .unwrap();
+        assert_eq!(s.length, Frame::parse("01:09:00").unwrap());
+        assert_eq!(s.skip_to, Frame::parse("01:02:09").unwrap());
+        assert!(s.skip_to < s.length);
+    }
+
+    /// Without a choice the two coincide, which is how the engine spells
+    /// "nothing to skip to": `FUN_00425bf0`'s case 6 compares them and finishes
+    /// the script when they are equal.
+    #[test]
+    fn no_choice_puts_the_skip_target_at_the_end() {
+        let s = Script::parse_str(
+            "00-00-A02",
+            "[SkipFRAME]=01:35:06;\n\
+             [PrintText]=00:00:00\tMakoto\tWell.\t00:02:00;\n\
+             [Next]=01:35:06;\n",
+        )
+        .unwrap();
+        assert_eq!(s.length, Frame::parse("01:35:06").unwrap());
+        assert_eq!(s.skip_to, s.length);
+    }
+
+    /// Neither marker is a statement that runs over a window, so neither may
+    /// sort to the front of the event list and look like one.
+    #[test]
+    fn the_markers_sit_at_a_point() {
+        let s = Script::parse_str("x", "[SkipFRAME]=00:10:00;\n[Next]=00:20:00;\n").unwrap();
+        for event in &s.events {
+            assert_eq!(event.start, event.end, "{:?}", event.command);
+        }
+    }
+
+    /// A script with no `[SkipFRAME]` has nothing to skip to, which is the same
+    /// thing as a target at the end.
+    #[test]
+    fn a_missing_skip_marker_falls_back_to_the_end() {
+        let s = Script::parse_str("x", "[Next]=00:30:00;\n").unwrap();
+        assert_eq!(s.length, Frame::parse("00:30:00").unwrap());
+        assert_eq!(s.skip_to, s.length);
     }
 
     /// `05-KI-OP1` is written with `, ` separators instead of tabs, and has a

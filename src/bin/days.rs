@@ -595,7 +595,19 @@ fn cmd_script(game: &Path, name: &str) -> Result<()> {
         .with_context(|| format!("no script named {name}"))?;
     let script = days_script::Script::parse(&wanted, &vfs.read_path(&path)?)?;
 
-    println!("{} — length {}", script.name, script.length);
+    // The two boundaries are different frames whenever the script raises a
+    // choice: `length` is `[Next]`, `skip_to` is `[SkipFRAME]`, which is where
+    // the control bar's skip button jumps to.
+    print!("{} — length {}", script.name, script.length);
+    if script.skip_to < script.length {
+        let landing = days_script::Frame(script.skip_to.0.saturating_sub(days_script::FPS));
+        println!(
+            ", skip to {} (landing one second earlier at {landing})",
+            script.skip_to
+        );
+    } else {
+        println!(" — no choice to skip to");
+    }
     for e in &script.events {
         println!("  {} -> {}  {:?}", e.start, e.end, e.command);
     }
@@ -1021,7 +1033,12 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             Act::None => "-".to_string(),
             Act::ToggleAuto => "toggle the auto flag".to_string(),
             Act::TogglePause => "toggle pause".to_string(),
-            Act::Seek(code) => format!("seek code {}", code.0),
+            Act::Seek(code) => match code {
+                bar::Seek::RESTART => "seek: restart this script".to_string(),
+                bar::Seek::END_OF_SCRIPT => "seek: end of script".to_string(),
+                bar::Seek::SKIP => "seek: to this script's choice, else its end".to_string(),
+                other => format!("seek code {}", other.0),
+            },
             Act::Speed(i) => format!("speed x{}", bar::SPEEDS[i]),
             Act::Menu(m) => format!("open menu {}", m.0),
             Act::Leave => "leave playback".to_string(),

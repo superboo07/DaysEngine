@@ -1667,6 +1667,9 @@ fn run_script(
             log::info!("script finished");
             return Ok(Outcome::Finished);
         }
+        // Worked out here because the bar is handled while `visual` holds the
+        // stage, and this has to be read off the script before that.
+        let skip_target = stage.skip_target(at);
 
         // Where the picture lands, worked out before the frame is asked for:
         // the decoder scales to it, so it has to know first.
@@ -1775,6 +1778,21 @@ fn run_script(
                             offset = Frame::ZERO;
                             origin = now;
                         }
+                        // Skip jumps to the choice this script raises, if it
+                        // still has one ahead. `FUN_00425bf0`'s case 6 is the
+                        // state `+0xfc(5)` selects, and it is the only seek
+                        // that is not "this script is over" — see
+                        // `Stage::skip_target` for the rule and the landing
+                        // frame. With nothing to skip to it falls through to
+                        // the same end-of-script path as the rest.
+                        bar::Act::Seek(code) if code == bar::Seek::SKIP => match skip_target {
+                            Some(to) => {
+                                log::info!("skipping from {at} to the choice at {to}");
+                                offset = to;
+                                origin = now;
+                            }
+                            None => return Ok(Outcome::Finished),
+                        },
                         // Everything past a restart lands in the executable's
                         // state 4, which is the "this script is finished" path:
                         // it asks `_GetNextScriptFile@12` what follows and

@@ -229,6 +229,31 @@ impl Stage {
         self.script.length
     }
 
+    /// Where the control bar's skip button lands from `at`, or `None` when
+    /// there is nothing ahead to skip to.
+    ///
+    /// `FUN_00425bf0`'s case 6, which is the state the bar's `+0xfc(5)` request
+    /// selects. It compares the script's skip target (`FUN_004315c0`, the
+    /// `[SkipFRAME]` frame) against its end (`FUN_004315a0`, the `[Next]`
+    /// frame): equal means the script has no choice to skip to, and a target
+    /// already behind the clock means the choice has been passed. Either way
+    /// the engine takes the other branch, seeks to the end and loads the next
+    /// script.
+    ///
+    /// Otherwise it seeks to the target **less one second** — `iVar6 -
+    /// DAT_0050c468`, and `DAT_0050c468` is `0x18`, set at `0x0044a623` — so
+    /// the run-up to the choice plays rather than the box appearing out of a
+    /// cut. That is also why this returns a frame to seek to rather than just
+    /// the choice's: landing on the choice exactly would skip the line that
+    /// sets it up.
+    pub fn skip_target(&self, at: Frame) -> Option<Frame> {
+        let to = self.script.skip_to;
+        if to >= self.script.length || to < at {
+            return None;
+        }
+        Some(Frame(to.0.saturating_sub(days_script::FPS)))
+    }
+
     /// True once the clock has passed the end of the script.
     pub fn finished(&self, at: Frame) -> bool {
         at >= self.script.length
@@ -594,6 +619,69 @@ mod tests {
         assert_eq!(f.opacity(Frame(0)), 0.0);
         assert_eq!(f.opacity(Frame(10)), 1.0);
         assert_eq!(f.opacity(Frame(50)), 1.0);
+    }
+
+    /// Builds a stage over a script with the two boundaries set.
+    fn staged(skip_to: &str, length: &str) -> Stage {
+        Stage::new(Script {
+            skip_to: Frame::parse(skip_to).unwrap(),
+            length: Frame::parse(length).unwrap(),
+            ..Default::default()
+        })
+    }
+
+    /// Skip lands one second before the choice, not on it: `FUN_00425bf0`'s
+    /// case 6 seeks to the `[SkipFRAME]` frame less `DAT_0050c468`, which is
+    /// `0x18`. Landing on the choice exactly would cut the line that sets it up.
+    #[test]
+    fn skip_lands_a_second_before_the_choice() {
+        let stage = staged("01:02:09", "01:09:00");
+        assert_eq!(
+            stage.skip_target(Frame::parse("00:10:00").unwrap()),
+            Some(Frame::parse("01:01:09").unwrap())
+        );
+    }
+
+    /// A script with no choice spells that as a target equal to the end, and
+    /// then there is nothing to skip to — the bar's press finishes the script
+    /// instead, which is case 6's other branch.
+    #[test]
+    fn a_script_without_a_choice_has_nothing_to_skip_to() {
+        let stage = staged("01:35:06", "01:35:06");
+        assert_eq!(stage.skip_target(Frame::parse("00:10:00").unwrap()), None);
+    }
+
+    /// A choice already behind the clock is not skipped backwards to.
+    #[test]
+    fn a_passed_choice_is_not_skipped_back_to() {
+        let stage = staged("01:02:09", "01:09:00");
+        assert_eq!(stage.skip_target(Frame::parse("01:05:00").unwrap()), None);
+        // Standing exactly on it still counts as ahead, as `to < at` does.
+        assert!(stage
+            .skip_target(Frame::parse("01:02:09").unwrap())
+            .is_some());
+    }
+
+    /// The script runs past its choice. Taking the length from `[SkipFRAME]`
+    /// ended it on the exact frame the choice was raised, so the player loop —
+    /// which checks [`Stage::finished`] before it looks at the choice at all —
+    /// left for the next script instead of ever showing the box.
+    #[test]
+    fn a_script_is_not_finished_while_its_choice_is_up() {
+        // 00-00-A03: choice at 01:02:09 running to 01:08:00, script ends
+        // 01:09:00.
+        let stage = staged("01:02:09", "01:09:00");
+        let raised = Frame::parse("01:02:09").unwrap();
+        assert!(!stage.finished(raised), "the frame the choice is raised on");
+        assert!(!stage.finished(Frame::parse("01:07:23").unwrap()));
+        assert!(stage.finished(Frame::parse("01:09:00").unwrap()));
+    }
+
+    /// A choice inside the first second does not wrap past zero.
+    #[test]
+    fn a_choice_in_the_first_second_clamps_to_the_start() {
+        let stage = staged("00:00:10", "00:30:00");
+        assert_eq!(stage.skip_target(Frame::ZERO), Some(Frame::ZERO));
     }
 
     /// The mouth overlays belong to the background object, so losing the

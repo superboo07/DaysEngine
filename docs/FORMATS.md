@@ -44,7 +44,7 @@ Plain text, one statement per line, blank-line separated:
     [Command]=<start>\t<arg>\t...\t<end>;
 
 Timecodes are `MM:SS:FF` at **24 fps** — confirmed against the movies, which are
-24 fps, and against `[SkipFRAME]` totals. Files are UTF-8 (English) or UTF-16LE
+24 fps, and against `[Next]` totals. Files are UTF-8 (English) or UTF-16LE
 with a BOM (Japanese); `FILMENGINE.INI [UnicodeFile]` selects this.
 
 Exactly 14 commands exist across all 1,857 scripts:
@@ -56,8 +56,8 @@ Exactly 14 commands exist across all 1,857 scripts:
 | `CreateBG` | `BGS`, image path | 13,024 |
 | `PlaySe` | slot (1-5), path | 3,552 |
 | `PlayMovie` | path, loop flag | 2,042 |
-| `SkipFRAME` | *(end timecode only)* — total script length | 1,857 |
-| `Next` | *(end timecode only)* — end of script | 1,857 |
+| `SkipFRAME` | *(one timecode)* — where the skip control jumps to | 1,857 |
+| `Next` | *(one timecode)* — end of script | 1,857 |
 | `PlayBgm` | path | 1,488 |
 | `BlackFade` | `IN` / `OUT` | 847 |
 | `SetSELECT` | choice 1 label, choice 2 label (or `null`) | 287 |
@@ -741,6 +741,38 @@ bracket the 25 into the same twelve groups:
 
 A press on a widget that is not live is swallowed *and silent*: the dispatch
 asks the enabled test before playing SE index 2.
+
+### What widget 4 actually skips to
+
+`+0xfc` (`FUN_0042a4a0`) does not move the timeline itself. It queues a request:
+state 4 with the code in `+0x2a8`, which the engine's state machine
+`FUN_00425bf0` picks up. Its case 2 routes code 5 — and only code 5 — to
+**case 6**; codes 1 and 2 go to case 3, and everything else ends the script.
+
+Case 6 compares two members of the timeline object:
+
+| Member | Getter | Written by | Meaning |
+|---|---|---|---|
+| `+0x22c` | `FUN_004315c0` | `[SkipFRAME]` in `FUN_0043b640` | the skip target |
+| `+0x21c` | `FUN_004315a0` | `[Exit]` / `[Next]` in `FUN_0043b640` | the end of the script |
+
+If the target equals the end, or is already behind the clock (`+0x208`), there
+is nothing to skip to: it seeks to the end and falls through to state 7, which
+asks `_GetNextScriptFile@12` for what follows. Otherwise it seeks to
+**`+0x22c` less `DAT_0050c468`** — `0x18`, 24, set at `0x0044a623` — clears the
+skip flag with `+0x12c(0)` and carries on playing. So the button lands one
+second *before* the target, and the run-up plays rather than the box appearing
+out of a cut.
+
+The target is the choice. Across all 1,857 retail scripts, `[SkipFRAME]` equals
+`[Next]` in the 1,570 that raise no choice, and in all 287 that do it is exactly
+the `[SetSELECT]` start — no exceptions either way. So `[SkipFRAME]` is **not**
+the script's length, which is `[Next]`; the two coincide only when there is
+nothing to skip to.
+
+`+0x12c` (`FUN_0042c000`) sets the skip flag at the engine's `+0x5c9`, which
+`FUN_004401c0` reads back. `FUN_0043b640` only records `[SkipFRAME]` into
+`+0x22c` while that flag is set.
 
 **`+0x88` is not the `Skip` setting**, though it starts with it.
 `FUN_00427490` is

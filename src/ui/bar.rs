@@ -224,6 +224,10 @@ impl Seek {
     /// Leave the current script. Widget 3, and widget 2's second press.
     pub const END_OF_SCRIPT: Seek = Seek(2);
     /// Widget 4's code, reached only after host `+0x12c(1)`.
+    ///
+    /// The only code that is not "this script is over": `FUN_00425bf0`'s case 2
+    /// routes it to case 6, which jumps to the choice this script raises. See
+    /// [`crate::playback::stage::Stage::skip_target`].
     pub const SKIP: Seek = Seek(5);
 }
 
