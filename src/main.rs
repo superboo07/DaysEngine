@@ -155,7 +155,9 @@ struct DialogueBlock<'r> {
 /// hundreds of times a second, for a box that changes when the pointer moves.
 struct ChoiceLabels<'r> {
     labels: Vec<String>,
-    highlight: Option<usize>,
+    /// The colour each label was rendered in, without its alpha: the alpha is
+    /// a modulation on the texture, so a fade is not a re-render.
+    colours: Vec<Option<[u8; 3]>>,
     drawn: Vec<(u32, u32, Texture<'r>)>,
 }
 
@@ -1868,14 +1870,16 @@ fn run_script(
             let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
             hovered = control.point_at(over, now_ms, bar_state.gauge_raised);
 
-            // A click only reaches the bar while the bar is actually on screen.
-            if buttons.0 && !control.fade().drawn() {
-                buttons.0 = false;
-            }
-            if buttons.0 {
+            // A click only reaches the bar while the bar is actually on
+            // screen, and only the widget it lands on takes it. A press the
+            // bar has no use for is left alone: the choice box reads the same
+            // button from the same place this frame, through host slot
+            // `+0x148`, and swallowing it here is why a choice could not be
+            // clicked at all.
+            if buttons.0 && control.fade().drawn() {
                 if let Some(widget) = hovered {
-                    // Consume the press, so holding the button does not
-                    // re-dispatch every frame.
+                    // Consume the press, so a bar widget and a choice box
+                    // under it do not both answer to one click.
                     buttons.0 = false;
                     let act = control.press(widget, bar_state, at.0);
                     if act != bar::Act::None {
@@ -2166,9 +2170,6 @@ fn run_script(
                 }
                 select::Event::Nothing => {}
             }
-            if event != select::Event::Nothing {
-                buttons.0 = false;
-            }
         }
 
         // A movie frame arrives at the size the window wants it, because the
@@ -2344,19 +2345,28 @@ fn run_script(
         if let Some((pending, map)) = &choice {
             if pending.visible(at) {
                 if let Some(((mw, mh), boxes)) = map.map_size().zip(map.bounds()) {
-                    // Rebuilt when the labels change, which is once, or when the
-                    // pointer moves to another of them, which lights it.
+                    // What colour each label is this frame, and whether it is
+                    // drawn at all: lit or plain while the box is live, and
+                    // ramping to nothing once it has been answered.
+                    let colours: Vec<Option<select::Rgba>> = (0..pending.labels.len())
+                        .map(|index| pending.label_colour(index, at))
+                        .collect();
+                    // Rebuilt when the labels change, which is once, or when
+                    // the colour under one of them changes — the pointer
+                    // moving to another box, or the answer starting the fade.
+                    // The alpha is a modulation on the finished texture, so a
+                    // fade does not re-render a glyph 60 times a second.
+                    let rgb: Vec<Option<[u8; 3]>> = colours
+                        .iter()
+                        .map(|c| c.map(|c| [c.red, c.green, c.blue]))
+                        .collect();
                     let stale = choice_labels.as_ref().is_none_or(|cached| {
-                        cached.highlight != pending.highlight || cached.labels != pending.labels
+                        cached.colours != rgb || cached.labels != pending.labels
                     });
                     if stale {
                         let mut drawn = Vec::new();
                         for (index, label) in pending.labels.iter().enumerate() {
-                            let colour = if pending.highlight == Some(index) {
-                                [255, 236, 160]
-                            } else {
-                                [255, 255, 255]
-                            };
+                            let colour = rgb[index].unwrap_or([0, 0, 0]);
                             let image = text::render_line(player.font, label, colour, english);
                             let mut texture = new_texture(
                                 creator,
@@ -2370,11 +2380,11 @@ fn run_script(
                         }
                         choice_labels = Some(ChoiceLabels {
                             labels: pending.labels.clone(),
-                            highlight: pending.highlight,
+                            colours: rgb,
                             drawn,
                         });
                     }
-                    if let Some(cached) = &choice_labels {
+                    if let Some(cached) = &mut choice_labels {
                         // `FUN_0044ced0` gives a label the font's whole
                         // 48-pixel cell — unlike a dialogue line, which
                         // `_DAT_004d6770` squashes to 42 — so a rendered label
@@ -2383,10 +2393,14 @@ fn run_script(
                         // letterbox, exactly as for the dialogue above.
                         let geometry = text::Geometry::native(left_arrangement);
                         let text_scale = select::label_scale(geometry) * scale;
-                        for (index, (w, h, texture)) in cached.drawn.iter().enumerate() {
+                        for (index, (w, h, texture)) in cached.drawn.iter_mut().enumerate() {
                             let Some(region) = boxes.get(index) else {
                                 continue;
                             };
+                            let Some(colour) = colours[index] else {
+                                continue;
+                            };
+                            texture.set_alpha_mod(colour.alpha);
                             let tw = *w as f32 * text_scale;
                             let th = *h as f32 * text_scale;
                             let cx = (f32::from(region.x as u16) + region.width as f32 / 2.0)
@@ -2498,6 +2512,14 @@ fn run_script(
         }
 
         canvas.present();
+        // A press lasts exactly one pass, whoever read it. The original
+        // latches a button down in its window procedure and never handles the
+        // matching button-up at all (`FUN_00466ce0`); `FUN_00467540` hands the
+        // latch out and zeroes it in the same breath, and `FUN_0042b770` is
+        // the one caller, taking the whole input snapshot once a frame. So
+        // holding the button is not a press held down, and every consumer this
+        // pass sees the same one press.
+        buttons = (false, false);
         // The script clock is the authority; this only keeps the loop from
         // spinning a core between the frames the display can actually show.
         cadence.wait(now);

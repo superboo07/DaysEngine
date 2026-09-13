@@ -40,6 +40,22 @@
 //! the auto flag turns a timeout into a *random* pick, a replay overrides the
 //! pick with what was recorded, and the host's `+0x98` member replaces it
 //! outright. See [`Choice::tick`].
+//!
+//! # An answered box fades; it does not vanish
+//!
+//! The answer does not take the box off the screen. `FUN_00431740` stamps the
+//! frame into every label (`FUN_0044ddd0`) and marks the one that was picked
+//! (`FUN_0044ddb0`), and `FUN_0044ced0` then runs each label through its own
+//! ramp: the picked one holds lit for [`FADE_FRAMES`] and the rest ramp out
+//! over the same span. Whichever finishes first sets the box's count to -1 and
+//! `FUN_0044d6e0` stops drawing, which on a two-choice box is always the
+//! unpicked label. See [`Choice::label_colour`].
+//!
+//! # The highlight is a colour, not a sprite
+//!
+//! `System/Select/` ships no art, so there is nothing to light: `FUN_0044d3f0`
+//! sets the label under the pointer to [`LABEL_LIT`] and every other to
+//! [`LABEL_PLAIN`], and that is the whole of it.
 
 use crate::install::config::{Config, Flag};
 use crate::install::ini::Ini;
@@ -49,6 +65,39 @@ use crate::ui::menu::SystemSe;
 use crate::ui::screen::{Error, Resolution};
 use days_script::Frame;
 use days_ui::cmap::Cmap;
+
+/// A label colour, as `FUN_0044ced0` hands one to the sprite: ARGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgba {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Rgba {
+    pub const fn rgb(red: u8, green: u8, blue: u8) -> Rgba {
+        Rgba {
+            red,
+            green,
+            blue,
+            alpha: 0xff,
+        }
+    }
+}
+
+/// A label that is not under the pointer, `0xfff0f0f0` in `FUN_0044d3f0`.
+pub const LABEL_PLAIN: Rgba = Rgba::rgb(0xf0, 0xf0, 0xf0);
+
+/// The one that is, `0xfffe4a1f` in the same function. Highlighting a choice is
+/// a colour change and nothing else: there is no art behind a label to light.
+pub const LABEL_LIT: Rgba = Rgba::rgb(0xfe, 0x4a, 0x1f);
+
+/// How long a label takes to fade once the box has been answered, in frames.
+///
+/// `DAT_0050c468`, which `FUN_0044a620` sets to 0x18 and nothing else writes —
+/// 24 frames, one second at the engine's 24 fps.
+pub const FADE_FRAMES: u32 = 24;
 
 /// How the two boxes are arranged, and so which axis a click is split on.
 ///
@@ -349,6 +398,9 @@ pub struct Choice {
     /// Set the frame the box goes up, so it goes up once.
     raised: bool,
     decided: Option<Option<usize>>,
+    /// The frame the answer settled on, which is what the fade counts from.
+    /// `FUN_0044ddd0` stores it into every box as `entry+0x4c`.
+    decided_at: Option<Frame>,
 }
 
 impl Choice {
@@ -372,6 +424,7 @@ impl Choice {
             pointer: None,
             raised: false,
             decided: None,
+            decided_at: None,
         }
     }
 
@@ -380,8 +433,87 @@ impl Choice {
     }
 
     /// Whether the box should be on screen at `frame`.
+    ///
+    /// An answered box does not vanish: it fades, and `FUN_0044d6e0` keeps
+    /// drawing it until the first label to run out of fade sets the box's own
+    /// count to -1. That is the frame below — see [`Choice::label_colour`] for
+    /// the fade itself, and for why the shortest label wins.
     pub fn visible(&self, frame: Frame) -> bool {
-        frame >= self.start && self.decided.is_none()
+        if frame < self.start {
+            return false;
+        }
+        let Some(at) = self.decided_at else {
+            return true;
+        };
+        frame.0.saturating_sub(at.0) <= self.fade_span()
+    }
+
+    /// The frame count after the answer at which the whole box stops drawing.
+    ///
+    /// Each label runs its own fade — `FADE_FRAMES` for one that was not
+    /// picked, twice that for the one that was — but the first to finish sets
+    /// `box+0x1c8` to -1, and `FUN_0044d6e0` draws nothing at all for a count
+    /// that is neither 1 nor 2. So on a two-choice box the unpicked label ends
+    /// the box, and the picked label's own fade-out is never reached: it is
+    /// simply cut. That is the retail behaviour, not an approximation of it.
+    fn fade_span(&self) -> u32 {
+        (0..self.count())
+            .map(|index| {
+                if self.decided == Some(Some(index)) {
+                    FADE_FRAMES * 2
+                } else {
+                    FADE_FRAMES
+                }
+            })
+            .min()
+            .unwrap_or(FADE_FRAMES)
+    }
+
+    /// The colour one label is drawn in at `frame`, or `None` for not drawn.
+    ///
+    /// `FUN_0044ced0`, which runs the whole life of a label through three
+    /// states held in `entry+0x44`:
+    ///
+    /// ```text
+    /// 1  live      entry+0x0c, which FUN_0044d3f0 sets: LIT on the
+    ///              highlighted box and PLAIN on every other
+    /// 2  spent     PLAIN, alpha ramped to zero over FADE_FRAMES
+    /// 3  picked    LIT held solid for FADE_FRAMES, then ramped to zero
+    ///              over another FADE_FRAMES
+    /// ```
+    ///
+    /// The answer moves every label out of state 1 at once — `FUN_0044ddd0`
+    /// raises `entry+0x49` on all of them and stamps the frame into
+    /// `entry+0x4c` — and `FUN_0044ddb0` raises `entry+0x4a` on the one that
+    /// was picked, which is what sends that one to state 3 instead of 2.
+    pub fn label_colour(&self, index: usize, frame: Frame) -> Option<Rgba> {
+        if index >= self.count() || !self.visible(frame) {
+            return None;
+        }
+        let Some(at) = self.decided_at else {
+            return Some(if self.highlight == Some(index) {
+                LABEL_LIT
+            } else {
+                LABEL_PLAIN
+            });
+        };
+        let elapsed = frame.0.saturating_sub(at.0);
+        let (rgb, held) = if self.decided == Some(Some(index)) {
+            (LABEL_LIT, FADE_FRAMES)
+        } else {
+            (LABEL_PLAIN, 0)
+        };
+        if elapsed < held {
+            return Some(rgb);
+        }
+        let into = elapsed - held;
+        if into >= FADE_FRAMES {
+            return None;
+        }
+        Some(Rgba {
+            alpha: (0xff - (into * 0xff) / FADE_FRAMES) as u8,
+            ..rgb
+        })
     }
 
     /// The answer, once there is one: `Some(None)` for cancelled or timed out.
@@ -421,8 +553,8 @@ impl Choice {
         if Frame(frame.0 + 1) < self.end {
             match self.poll(select, input) {
                 Poll::Undecided => Event::Nothing,
-                Poll::Chosen(index) => self.settle(Some(index)),
-                Poll::Cancelled => self.settle(None),
+                Poll::Chosen(index) => self.settle(Some(index), frame),
+                Poll::Cancelled => self.settle(None, frame),
             }
         } else {
             // The window is spent. Skipping draws one of `count + 1` answers,
@@ -433,7 +565,7 @@ impl Choice {
             } else {
                 None
             };
-            self.settle(picked)
+            self.settle(picked, frame)
         }
     }
 
@@ -483,8 +615,9 @@ impl Choice {
     ///
     /// `FUN_00431740` plays index 1 for a box that was chosen and index 0 for
     /// an answer of "none", which is the same sound a cancelled menu makes.
-    fn settle(&mut self, picked: Option<usize>) -> Event {
+    fn settle(&mut self, picked: Option<usize>, frame: Frame) -> Event {
         self.decided = Some(picked);
+        self.decided_at = Some(frame);
         match picked {
             Some(index) => Event::Decided(index as i32, SystemSe::Select),
             None => Event::Decided(-1, SystemSe::Cancel),
@@ -693,7 +826,81 @@ mod tests {
             Event::Decided(-1, SystemSe::Cancel)
         );
         assert_eq!(c.decision(), Some(None));
-        assert!(!c.visible(Frame(4)));
+        // A timed-out box fades like any other: both labels ramp out over
+        // FADE_FRAMES and the box is gone the frame after.
+        assert!(c.visible(Frame(4 + FADE_FRAMES)));
+        assert!(!c.visible(Frame(5 + FADE_FRAMES)));
+    }
+
+    #[test]
+    fn a_picked_label_holds_lit_while_the_other_fades_under_it() {
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
+        let s = split(Layout::Sideways, 2);
+        let mut rng = |_: usize| 0;
+        let on_the_left = Input {
+            pointer: (0.25, 0.5),
+            ..Input::default()
+        };
+        c.tick(Frame(0), &s, on_the_left, false, &mut rng);
+        let picking = Input {
+            pick: true,
+            ..on_the_left
+        };
+        assert_eq!(
+            c.tick(Frame(1), &s, picking, false, &mut rng),
+            Event::Decided(0, SystemSe::Select)
+        );
+        // The picked label is held at full LIT for the whole ramp...
+        assert_eq!(c.label_colour(0, Frame(1)), Some(LABEL_LIT));
+        assert_eq!(
+            c.label_colour(0, Frame(1 + FADE_FRAMES - 1)),
+            Some(LABEL_LIT)
+        );
+        // ...while the other ramps out from PLAIN, having lost the highlight
+        // colour it never had here anyway.
+        assert_eq!(c.label_colour(1, Frame(1)), Some(LABEL_PLAIN));
+        assert_eq!(
+            c.label_colour(1, Frame(1 + FADE_FRAMES / 2)),
+            Some(Rgba {
+                alpha: 0x80,
+                ..LABEL_PLAIN
+            })
+        );
+        // And the one that runs out first takes the whole box with it, so the
+        // picked label's own fade-out is never reached.
+        assert_eq!(c.label_colour(1, Frame(1 + FADE_FRAMES)), None);
+        assert!(!c.visible(Frame(2 + FADE_FRAMES)));
+    }
+
+    #[test]
+    fn a_one_choice_box_is_the_only_one_that_reaches_the_second_ramp() {
+        let mut c = Choice::new("a", None, Frame(0), Frame(100));
+        let s = split(Layout::Sideways, 1);
+        let mut rng = |_: usize| 0;
+        let on_it = Input {
+            pointer: (0.5, 0.5),
+            ..Input::default()
+        };
+        c.tick(Frame(0), &s, on_it, false, &mut rng);
+        c.tick(
+            Frame(1),
+            &s,
+            Input {
+                pick: true,
+                ..on_it
+            },
+            false,
+            &mut rng,
+        );
+        assert_eq!(c.label_colour(0, Frame(1 + FADE_FRAMES)), Some(LABEL_LIT));
+        assert_eq!(
+            c.label_colour(0, Frame(1 + FADE_FRAMES + FADE_FRAMES / 2)),
+            Some(Rgba {
+                alpha: 0x80,
+                ..LABEL_LIT
+            })
+        );
+        assert!(!c.visible(Frame(2 + FADE_FRAMES * 2)));
     }
 
     #[test]

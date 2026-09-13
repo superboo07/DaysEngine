@@ -1116,6 +1116,15 @@ what the pointer is on, 1 cancels with 0 up, 4 and 5 walk the highlight with
 wrapping, 6 confirms it and 7 cancels. It returns the choice, `-1` for declined
 or `-2` for undecided, and `-2` is what the tick gates on.
 
+**A press is an edge, not a level.** The window procedure `FUN_00466ce0` latches
+a button *down* into a global — `DAT_0050c64c` for the left button, the four
+after it for the others — and has no `WM_LBUTTONUP` case at all. `FUN_00467540`
+hands a latch out and zeroes it in the same breath, and its one per-frame caller
+is `FUN_0042b770`, which takes the whole input snapshot — cursor, two buttons,
+wheel, six keys — into the members host slot `+0x148` then reads. So holding the
+button down is not a press held down, every consumer in a frame sees the same
+one press, and nothing has to consume it to stop it repeating.
+
 Three things can answer instead of the player:
 
 - with the auto flag (host `+0x134`) set, a spent window is **drawn at random**:
@@ -1128,6 +1137,32 @@ Three things can answer instead of the player:
 
 A decided choice plays SE index 1, a declined one index 0, and the box going up
 plays index 5.
+
+**An answered box fades out; it does not vanish.** Each label lives at
+`box + 0x128 + n * 0x50` and carries its own state in `entry + 0x44`, a colour
+in `entry + 0x0c` and a stamp in `entry + 0x4c`. `FUN_0044dcc0` raises them all
+when the box goes up. On the answer `FUN_00431740` calls `FUN_0044ddb0` on the
+label that was picked — `entry + 0x4a` — and then `FUN_004316b0`, whose
+`FUN_0044ddd0` flags every label spent (`entry + 0x49`) and stamps the current
+frame into `entry + 0x4c`; `box + 0x1cc` is that frame, written each tick by
+`FUN_004320c0`. `FUN_0044ced0` then draws, with `t` the frames since the stamp
+and `D` the 24 in `DAT_0050c468` (`FUN_0044a620` sets it and nothing else
+writes it — one second at 24 fps):
+
+| state | which label | colour |
+|---|---|---|
+| 1 | live | `entry + 0x0c`, which `FUN_0044d3f0` sets to `0xfffe4a1f` under the pointer and `0xfff0f0f0` elsewhere |
+| 2 | spent, not picked | `0xf0f0f0` with alpha `0xff - t * 0xff / D`, gone at `t = D` |
+| 3 | spent, picked | `0xfffe4a1f` held to `t = D`, then `0xfe4a1f` with alpha `0xff - (t - D) * 0xff / D`, gone at `t = 2D` |
+
+The first label to run out sets `box + 0x1c8` — the choice count — to `-1`, and
+`FUN_0044d6e0` draws nothing for a count that is neither 1 nor 2. So on a
+two-choice box the unpicked label ends the whole box at `t = D` and **the picked
+label's own fade-out is never reached**: it holds lit and is cut. Only a
+one-choice box reaches state 3's second ramp. That is the retail behaviour.
+
+The highlight is that colour and nothing else — with no art under a label there
+is nothing to light.
 
 `FUN_0044ca10` lays the labels out. The line limit is 11 characters by default
 and, with `[UseEnglish]`, 33 when `[SelectType]` is zero on a two-choice box or

@@ -312,6 +312,10 @@ struct SelectArgs {
     /// Hit-test a normalised point, as `X,Y` in 0.0..1.0.
     #[arg(long = "at")]
     at: Vec<String>,
+    /// Answer the box with this choice, or -1 to decline it, and report the
+    /// fade that follows.
+    #[arg(long)]
+    pick: Option<i32>,
 }
 
 #[derive(clap::Args)]
@@ -1352,6 +1356,60 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
     for (i, label) in choice.labels.iter().enumerate() {
         for line in metrics.lines(label) {
             println!("  label {i}: {line:?}");
+        }
+    }
+
+    if let Some(pick) = args.pick {
+        // Answered through the real tick, so this is the engine's own fade and
+        // not a second implementation of it: a pointer on the box being picked
+        // plus a press, or the right button for a decline.
+        // A window long enough that the answer is the player's and not the
+        // timeout's; the box above is built with a one-frame one.
+        let mut choice = Choice::new(&args.label, args.label2.as_deref(), Frame(0), Frame(1000));
+        let pointer = match usize::try_from(pick)
+            .ok()
+            .and_then(|i| Some((i, select.bounds()?)))
+        {
+            Some((i, bounds)) => match bounds.get(i) {
+                Some(r) => {
+                    let (w, h) = select.map_size().unwrap_or((1, 1));
+                    (
+                        (f64::from(r.x as u16) + f64::from(r.width) / 2.0) / f64::from(w),
+                        (f64::from(r.y as u16) + f64::from(r.height) / 2.0) / f64::from(h),
+                    )
+                }
+                None => bail!("there is no box {pick}"),
+            },
+            None => (0.5, 0.5),
+        };
+        let mut rng = |_: usize| 0;
+        let hover = daysengine::ui::select::Input {
+            pointer,
+            ..Default::default()
+        };
+        choice.tick(Frame(0), &select, hover, false, &mut rng);
+        let answering = daysengine::ui::select::Input {
+            pick: pick >= 0,
+            dismiss: pick < 0,
+            ..hover
+        };
+        let event = choice.tick(Frame(1), &select, answering, false, &mut rng);
+        println!("answered at frame 1: {event:?}");
+        for frame in 1.. {
+            if !choice.visible(Frame(frame)) {
+                println!("  frame {frame}: the box is gone");
+                break;
+            }
+            let colours: Vec<String> = (0..choice.count())
+                .map(|i| match choice.label_colour(i, Frame(frame)) {
+                    Some(c) => format!(
+                        "#{:02x}{:02x}{:02x} alpha {:3}",
+                        c.red, c.green, c.blue, c.alpha
+                    ),
+                    None => "not drawn         ".to_string(),
+                })
+                .collect();
+            println!("  frame {frame}: {}", colours.join("   "));
         }
     }
 
