@@ -675,7 +675,18 @@ fn cmd_assets(game: &Path) -> Result<()> {
             let (asset, ext) = match &e.command {
                 days_script::Command::PlayVoice { path, .. } => (path, "ogg"),
                 days_script::Command::PlaySe { path, .. } => (path, "ogg"),
-                days_script::Command::PlayBgm { path } => (path, "ogg"),
+                // `[PlayBgm]` names a pair, not a file: the engine opens
+                // `<path>_int` and `<path>_loop`, and most tracks ship only
+                // those. Checking the bare name reported every looping track
+                // as missing. `[EndBGM]` really is a bare file — it is a
+                // one-shot in sound slot 8 — so it stays a plain lookup.
+                days_script::Command::PlayBgm { path } => {
+                    checked += 1;
+                    if vfs.resolve_bgm(path).is_none() {
+                        *missing.entry(format!("{path}_loop.ogg")).or_default() += 1;
+                    }
+                    continue;
+                }
                 days_script::Command::EndBgm { path } => (path, "ogg"),
                 days_script::Command::CreateBg { path, .. } => (path, "png"),
                 days_script::Command::PlayMovie { path, .. } => (path, "wmv"),
@@ -2098,17 +2109,39 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
         return config_roundtrip(&path, &config);
     }
     println!();
-    println!("volumes (level, then the attenuation the DLL's formula gives):");
+    println!("volumes (level, then what reaches the sound layer):");
     for channel in Channel::ALL {
+        let level = config.volume(channel);
+        let played = config.effective_level(channel);
         println!(
-            "  {:<12} {:>2}/10   {:>6.1} dB   gain {:.3}",
+            "  {:<12} {:>2}/10   {:>6} cB {:>7.2} dB   gain {:.3}{}",
             channel.key(),
-            config.volume(channel),
+            level,
+            config.centibels(played),
             config.attenuation_db(channel),
             config.gain(channel),
+            if played == level {
+                String::new()
+            } else {
+                format!("   (muted: played at level {played})")
+            },
         );
     }
     println!("  {:<12} {:>6.3}", "MasterVolume", config.master_volume());
+    // The menus' own sounds follow SeVolume and ignore Mute, so they are worth
+    // printing beside the three rather than left to be assumed.
+    println!(
+        "  {:<12} {:>27.3}   (SeVolume, never muted)",
+        "menu sounds",
+        config.system_se_gain()
+    );
+    println!();
+    println!("the ladder, level by level:");
+    print!("  ");
+    for level in 0..=daysengine::install::config::MAX_VOLUME {
+        print!("{level:>2}:{:<6} ", config.centibels(level));
+    }
+    println!();
     println!();
     println!("settings:");
     for flag in Flag::ALL {

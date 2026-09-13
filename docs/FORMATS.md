@@ -54,7 +54,7 @@ Exactly 14 commands exist across all 1,857 scripts:
 | `PrintText` | speaker, text | 30,486 |
 | `PlayVoice` | path, male-voice flag, speaker tag | 30,413 |
 | `CreateBG` | `BGS`, image path | 13,024 |
-| `PlaySe` | slot (1-5), path | 3,552 |
+| `PlaySe` | slot (0-8), path | 3,552 |
 | `PlayMovie` | path, loop flag | 2,042 |
 | `SkipFRAME` | *(one timecode)* — where the skip control jumps to | 1,857 |
 | `Next` | *(one timecode)* — end of script | 1,857 |
@@ -71,8 +71,18 @@ Notes:
 - Every statement carries both a start and an end timecode, so the script is a
   **timeline**, not a program counter. The engine is closer to a video editor's
   EDL than to a VN bytecode interpreter.
-- `PlaySe` slot 5 is sometimes handed a `Voice...` path — the game reuses the SE
-  mixer for voice that is not meant to drive a mouth overlay.
+- `PlaySe`'s slot **is the index outright**, 0 to 8. The engine's arm stores at
+  `slot * 4 + 0x39c` with no adjustment and no bounds check, and the retail
+  scripts use all nine: 2,106 statements on slot 1, then 925, 265, 148, 76, 23,
+  5 and 2 down to slot 8, and one on slot 0. Slots are sometimes handed a
+  `Voice...` path — the game reuses them for voice that is not meant to drive a
+  mouth overlay.
+- **`EndBGM` is not a BGM stream.** Its arm stops slot 8 (`this + 0x2b4`, which
+  is `+0x39c + 8 * 4`), stores its own sound there, and opens it with
+  `FUN_00442bf0(obj, path, NULL, 0)` — no `_int`/`_loop` pair and no looping. So
+  it is a one-shot on the sound-effect volume that a later `PlaySe` on slot 8
+  cuts off, and its path is a plain file: every one of the 67 in the retail
+  scripts resolves directly, where a `PlayBgm` path usually does not.
 - **166 voice references point at clips that do not exist**, out of 50,653 asset
   references across all scripts. They cluster on `PlayVoice` statements whose
   male-voice and speaker-tag fields were left blank, which reads as a scripter
@@ -1670,10 +1680,59 @@ getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):
 | `UseSOM` | bool | false | SOMCON tab |
 
 `MasterVolume` is a float the same write-back stores; the shipped value is
-`-1.0`. A channel's volume reaches the sound layer as
-`(11 - level) * MasterVolume` (`FUN_10006fd0`), which is an attenuation in
-decibels — level 10 is -1 dB and level 0 is -11 dB — so louder is a *smaller*
-number. Index 3 of that function is a fixed level of 2, used when muted.
+`-1.0`.
+
+### What a volume level is worth, and what each slider covers
+
+`FUN_10006fd0(category)` turns a level into `(11 - level) * MasterVolume`, and
+the category is which slider: **0** reads `+0x98` (`VoiceVolume`), **1** reads
+`+0xa0` (`SeVolume`), **2** reads `+0x9c` (`BgmVolume`), and **3** is a fixed
+level of 2. That figure is not the attenuation. `FUN_004434a0` is the whole
+conversion, and the decompiler hides half of it — the disassembly at
+`0x004434a7` is
+
+```text
+FLD   float ptr [EBP + 0x8]        the ladder figure
+FMUL  double ptr [0x004d5098]      175.0
+CALL  0x0047b710                   round to an integer
+      clamp to -10000 ..= 0
+FCOMP double ptr [0x004d5090]      == -11.0 ? then -10000
+FCOMP double ptr [0x004d5088]      == -1.0  ? then 0
+```
+
+before `FUN_0041a0a0` hands the result to the sound buffer, which is
+DirectSound's **centibel** scale. So a level is worth **1.75 dB**, not the 1 dB
+the ladder reads as, and both ends are special-cased — level 10 is full volume
+and level 0 is true silence, being the levels whose ladder figures are exactly
+-1.0 and -11.0. The ladder in centibels is
+
+| level | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| cB | -10000 | -1750 | -1575 | -1400 | -1225 | -1050 | -875 | -700 | -525 | -350 | 0 |
+
+Which sounds each slider covers is not a guess: every sound object asks
+`_GetMasterVolume@4` for a category, once when the option changes and again on
+every frame.
+
+| Slider | Category | Objects | Per-frame updater |
+|---|---|---|---|
+| `VoiceVolume` | 0 | the voice list at `+0x364` — `PlayVoice` | `FUN_0043c900` |
+| `SeVolume` | 1 | the nine sound slots at `+0x39c` — `PlaySe`, `EndBGM` | `FUN_0043ea80` |
+| `SeVolume` | 1 | the menus' own run at `+0x540` | `FUN_00429c80` |
+| `BgmVolume` | 2 | the script streams at `+0x304` / `+0x30c` — `PlayBgm` | `FUN_00429250` |
+
+So **the menus' clicks are on the sound-effect slider**, and `[EndBGM]` is too.
+
+`Mute` swaps category 3 in for the script's three — `FUN_0043ea80` with
+`(-(muted != 0) & 2) + 1`, `FUN_00429250` with `(muted != 0) + 2`,
+`FUN_0043c900` with `-(muted != 0) & 3` — so **it is an attenuation, not a
+silence**: every group plays at a fixed level 2, which is -15.75 dB. The menus'
+run is not among them and keeps its own level; `FUN_0042a160`, which the widget
+reaches, never touches it.
+
+There is a second voice-category list at `+0x380` (`FUN_0043cff0`) that takes
+category 0 unconditionally, so it is not muted either. **What feeds it has not
+been recovered.**
 
 `Format`, `WindowWidth`, `WindowHeight`, `DisplayType`, `TypeMiniNote`,
 `WindowMode`, `UseAgate` and `Wheel` are written back untouched by the Option

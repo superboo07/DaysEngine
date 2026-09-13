@@ -5,25 +5,64 @@
 //! channel layout follows the script commands rather than anything in the
 //! engine's own design:
 //!
-//! * one **BGM** channel, driven by `[PlayBgm]` / `[EndBGM]`
-//! * five **SE** slots, addressed by number in `[PlaySe]`
+//! * one **BGM** channel, driven by `[PlayBgm]`
+//! * nine **SE** slots, addressed by number in `[PlaySe]` — and slot 8 is also
+//!   what `[EndBGM]` plays into
 //! * one **voice** channel, driven by `[PlayVoice]`
 //!
-//! Scripts hand `[PlaySe]` slot 5 a `Voice...` path fairly often — the game
-//! reuses the SE mixer for lines that are not lip-synced — so the SE slots are
-//! not special-cased for sound effects.
+//! Scripts hand the SE slots a `Voice...` path fairly often — the game reuses
+//! the SE slots for lines that are not lip-synced — so they are not
+//! special-cased for sound effects.
 //!
 //! Those are the script's channels, and they are the ones
 //! [`Mixer::pause_script`] holds. The menus' own sounds go to a channel beside
 //! them ([`Mixer::play_system_se`]), because in the original they are a
-//! different object: the script's streams are `FILMOBJ::BgmSound`s owned by the
-//! timeline, and a menu that is up over a paused script still clicks.
+//! different object: the script's slots belong to the timeline, the menus' run
+//! hangs off the engine at `+0x540`, and a menu that is up over a paused script
+//! still clicks.
+//!
+//! # The three volume options
+//!
+//! Each channel here belongs to exactly one of the Sound tab's sliders, and
+//! which one is recovered rather than guessed — every sound object asks
+//! `_GetMasterVolume@4` for a category, and the category is the slider:
+//!
+//! ```text
+//! category 0  VoiceVolume   the voice list at +0x364      FUN_0043c900
+//! category 1  SeVolume      the nine slots at +0x39c      FUN_0043ea80
+//!                           the menus' own run at +0x540  FUN_00429c80
+//! category 2  BgmVolume     the script streams at +0x304  FUN_00429250
+//! category 3  (muted)       a fixed level of 2
+//! ```
+//!
+//! So the menus are on the **sound-effect** slider, and `Mute` swaps category 3
+//! in for the script's three but not for the menus'. See
+//! [`crate::install::config::Config::centibels`] for what a level is worth.
 
 use crate::media::AudioBuffer;
 use std::sync::{Arc, Mutex};
 
-/// How many `[PlaySe]` slots exist. Scripts address them as 1..=5.
-pub const SE_SLOTS: usize = 5;
+/// How many `[PlaySe]` slots exist, and the number a script may write.
+///
+/// `FUN_0043ea80` walks eight at `+0x39c` and then one more at `+0x3bc`, and
+/// `[PlaySe]`'s own arm stores at `slot * 4 + 0x39c` with **no adjustment and
+/// no bounds check** — so the slot in the script is the index, `0` included,
+/// and `8` lands on that ninth pointer. Retail scripts use every one of 0 to 8.
+///
+/// A slot above 8 would run off the end of the run in the original, over the
+/// pointer `[PlayBgm]` keeps at `+0x3c4`. No shipped script does it, so nothing
+/// here reproduces that; [`Mixer::play_se`] logs and drops instead.
+pub const SE_SLOTS: usize = 9;
+
+/// The slot `[EndBGM]` plays into.
+///
+/// It is not a BGM stream at all. The `[EndBGM]` arm stores its sound at the
+/// ninth slot — `this + 0x2b4`, which is `+0x39c + 8 * 4` — after stopping
+/// whatever was there with `FUN_0043ebb0(timeline, 8)`, and opens it with
+/// `FUN_00442bf0(obj, path, NULL, 0)`: no `_int`/`_loop` pair and no looping,
+/// exactly as `[PlaySe]` does. So it is a one-shot on the sound-effect slider,
+/// and a `[PlaySe]` on slot 8 cuts it off.
+pub const END_BGM_SLOT: u8 = 8;
 
 /// The playback rate above which the original stops letting the audio be heard.
 ///
@@ -166,7 +205,10 @@ pub struct MixerState {
     /// script does not silence a menu over it and a script cannot cut a click
     /// short by reusing a slot.
     system: Option<Voice>,
-    master: Option<f32>,
+    /// One gain per Sound-tab slider, and the menus' own. Every sound in the
+    /// original carries the level of the category it asks for, so these are
+    /// applied per channel on the way into the sum rather than over the mix.
+    gains: Gains,
     /// The playback rate the control bar's speed widgets select, as a
     /// multiplier on the source. `None` is 1x.
     ///
@@ -178,11 +220,32 @@ pub struct MixerState {
     rate: Option<f32>,
 }
 
-impl MixerState {
-    fn master(&self) -> f32 {
-        self.master.unwrap_or(1.0)
-    }
+/// The gain each group of sounds plays at, as [`Mixer::set_gains`] was last
+/// told.
+///
+/// Not the levels and not the settings: the linear factor the samples are
+/// multiplied by, so the mixer needs to know nothing about the ladder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gains {
+    pub bgm: f32,
+    pub se: f32,
+    pub voice: f32,
+    /// The menus' own sounds, which follow `SeVolume` but not `Mute`.
+    pub system: f32,
+}
 
+impl Default for Gains {
+    fn default() -> Gains {
+        Gains {
+            bgm: 1.0,
+            se: 1.0,
+            voice: 1.0,
+            system: 1.0,
+        }
+    }
+}
+
+impl MixerState {
     fn rate(&self) -> f32 {
         self.rate.unwrap_or(1.0)
     }
@@ -206,18 +269,21 @@ impl MixerState {
         let rate = f64::from(rate);
 
         if let Some(v) = &mut self.bgm {
+            v.volume = self.gains.bgm;
             if !v.mix_into(out, rate, silent) {
                 self.bgm = None;
             }
         }
         for slot in &mut self.se {
             if let Some(v) = slot {
+                v.volume = self.gains.se;
                 if !v.mix_into(out, rate, silent) {
                     *slot = None;
                 }
             }
         }
         if let Some(v) = &mut self.voice {
+            v.volume = self.gains.voice;
             if !v.mix_into(out, rate, silent) {
                 self.voice = None;
             }
@@ -225,15 +291,9 @@ impl MixerState {
         // The menus are not on the rate-adjusted stream and are never muted by
         // it: the speed widgets belong to the script.
         if let Some(v) = &mut self.system {
+            v.volume = self.gains.system;
             if !v.mix_into(out, 1.0, false) {
                 self.system = None;
-            }
-        }
-
-        let master = self.master();
-        if master != 1.0 {
-            for s in out.iter_mut() {
-                *s *= master;
             }
         }
         // Several channels can peak together; clamp rather than wrap.
@@ -283,14 +343,17 @@ impl Mixer {
         self.with(|s| s.bgm = None);
     }
 
-    /// Plays a sound on one of the numbered slots. `slot` is 1-based, as scripts
-    /// write it; anything out of range is dropped with a warning rather than
-    /// panicking, since it would come from script data.
+    /// Plays a sound on one of the numbered slots.
+    ///
+    /// The slot is the script's own number and indexes the run directly — see
+    /// [`SE_SLOTS`]. Starting a slot stops whatever it held, which is the
+    /// original's `FUN_0043ebb0` before the store.
     pub fn play_se(&self, slot: u8, buffer: Arc<AudioBuffer>) {
-        let Some(index) = (slot as usize).checked_sub(1).filter(|i| *i < SE_SLOTS) else {
-            log::warn!("[PlaySe] slot {slot} is out of range 1..={SE_SLOTS}; ignoring");
+        let index = slot as usize;
+        if index >= SE_SLOTS {
+            log::warn!("[PlaySe] slot {slot} is past the {SE_SLOTS} the game has; ignoring");
             return;
-        };
+        }
         self.with(|s| s.se[index] = Some(Voice::once(buffer, 1.0)));
     }
 
@@ -358,8 +421,33 @@ impl Mixer {
         });
     }
 
-    pub fn set_master_volume(&self, volume: f32) {
-        self.with(|s| s.master = Some(volume.clamp(0.0, 1.0)));
+    /// Sets the gain each group plays at.
+    ///
+    /// Applied on the next block rather than to the sounds already started,
+    /// which is what the original does too: every per-frame updater pushes the
+    /// category's level onto its objects again, so a slider moved mid-line
+    /// takes hold on the line in hand.
+    pub fn set_gains(&self, gains: Gains) {
+        let clamp = |g: f32| {
+            if g.is_finite() {
+                g.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        self.with(|s| {
+            s.gains = Gains {
+                bgm: clamp(gains.bgm),
+                se: clamp(gains.se),
+                voice: clamp(gains.voice),
+                system: clamp(gains.system),
+            }
+        });
+    }
+
+    /// What the groups are playing at now.
+    pub fn gains(&self) -> Gains {
+        self.with(|s| s.gains)
     }
 
     /// Sets the playback rate every channel is resampled at.
@@ -586,23 +674,54 @@ mod tests {
         assert!(out.iter().all(|&s| s == 1.0), "{out:?}");
     }
 
+    /// Slot 0 is a real slot — the script's number is the index — and the
+    /// retail scripts use it. Only a slot past the ninth has nowhere to go.
     #[test]
-    fn out_of_range_se_slots_are_ignored() {
+    fn slot_zero_plays_and_only_past_the_ninth_is_dropped() {
         let m = Mixer::new();
-        m.play_se(0, buffer(4, 1.0));
+        m.play_se(0, buffer(4, 0.5));
+        let mut out = vec![0.0; 4];
+        m.render(&mut out);
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "{out:?}");
+
+        let m = Mixer::new();
+        m.play_se(END_BGM_SLOT, buffer(4, 0.5));
         m.play_se(9, buffer(4, 1.0));
         let mut out = vec![0.0; 4];
         m.render(&mut out);
-        assert!(out.iter().all(|&s| s == 0.0));
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "{out:?}");
     }
 
+    /// Each slider scales its own group and nothing else, which is the whole
+    /// point of them: a quiet BGM must not quieten the voice over it.
     #[test]
-    fn master_volume_scales_the_mix() {
+    fn each_group_is_scaled_on_its_own() {
         let m = Mixer::new();
-        m.set_master_volume(0.5);
-        m.play_se(1, buffer(2, 0.8));
+        m.set_gains(Gains {
+            bgm: 0.5,
+            se: 0.25,
+            voice: 1.0,
+            system: 0.5,
+        });
+        m.play_bgm(None, buffer(2, 0.4));
         let mut out = vec![0.0; 4];
         m.render(&mut out);
-        assert!(out.iter().all(|&s| (s - 0.4).abs() < 1e-6), "{out:?}");
+        assert!(out.iter().all(|&s| (s - 0.2).abs() < 1e-6), "bgm {out:?}");
+
+        let m = Mixer::new();
+        m.set_gains(Gains {
+            bgm: 0.5,
+            se: 0.25,
+            voice: 1.0,
+            system: 0.5,
+        });
+        m.play_se(1, buffer(2, 0.4));
+        m.play_voice(buffer(2, 0.4));
+        let mut out = vec![0.0; 4];
+        m.render(&mut out);
+        assert!(
+            out.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "se+voice {out:?}"
+        );
     }
 }

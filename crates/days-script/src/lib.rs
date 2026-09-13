@@ -162,8 +162,12 @@ pub enum Command {
         kind: String,
         path: String,
     },
-    /// Sound effect on one of five mixer slots. Slot 5 is sometimes handed a
-    /// `Voice...` path — the game reuses the SE mixer for voice that is not
+    /// Sound effect on one of the game's nine sound slots.
+    ///
+    /// `slot` is the index outright: the engine's `[PlaySe]` arm stores at
+    /// `slot * 4 + 0x39c` with no adjustment, so `0` is a slot like any other
+    /// and `8` is the ninth. Retail scripts use all nine. Slots are sometimes
+    /// handed a `Voice...` path — the game reuses them for voice that is not
     /// meant to drive a mouth overlay.
     PlaySe {
         slot: u8,
@@ -176,7 +180,12 @@ pub enum Command {
     PlayBgm {
         path: String,
     },
-    /// BGM for the ending sequence.
+    /// A one-shot into sound slot 8, despite the name.
+    ///
+    /// The `[EndBGM]` arm stops slot 8 and stores its own sound there, opening
+    /// it unlooped and with no `_int`/`_loop` pair — so it is a sound effect on
+    /// the sound-effect volume, not a music stream, and a later `[PlaySe]` on
+    /// slot 8 cuts it off.
     EndBgm {
         path: String,
     },

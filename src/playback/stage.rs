@@ -522,7 +522,7 @@ impl Stage {
                     self.load_mouth(vfs, &tag);
                 }
             }
-            Command::PlayBgm { path } | Command::EndBgm { path } => {
+            Command::PlayBgm { path } => {
                 let bgm = vfs
                     .resolve_bgm(path)
                     .with_context(|| format!("resolving BGM {path}"))?;
@@ -532,6 +532,14 @@ impl Stage {
                 };
                 let looped = self.audio(vfs, bgm.looped)?;
                 mixer.play_bgm(intro, looped);
+            }
+            // Not a BGM stream. `[EndBGM]` opens its sound with
+            // `FUN_00442bf0(obj, path, NULL, 0)` — no `_int`/`_loop` pair, no
+            // looping — and stores it in the ninth sound slot, so it is a
+            // one-shot on the sound-effect volume. See [`mixer::END_BGM_SLOT`].
+            Command::EndBgm { path } => {
+                let buffer = self.audio_by_path(vfs, path)?;
+                mixer.play_se(crate::playback::mixer::END_BGM_SLOT, buffer);
             }
             Command::PlaySe { slot, path } => {
                 let buffer = self.audio_by_path(vfs, path)?;

@@ -890,15 +890,22 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
 /// has one master gain, so until the mixer grows per-channel gain the quietest
 /// of the three is what it can honestly apply. Muting is exact either way.
 fn apply_settings(session: &Session, mixer: &Mixer) {
-    let gain = if session.config.flag(Flag::Mute) {
-        0.0
-    } else {
-        Channel::ALL
-            .iter()
-            .map(|c| session.config.gain(*c))
-            .fold(f32::INFINITY, f32::min)
-    };
-    mixer.set_master_volume(gain);
+    apply_volumes(&session.config, mixer);
+}
+
+/// Hands the mixer the gain each group of sounds plays at.
+///
+/// Every sound in the original carries the level of the category it asks
+/// `_GetMasterVolume@4` for, and `Mute` swaps a fixed level 2 in for the
+/// script's three — but not for the menus', which keep `SeVolume`. See
+/// [`daysengine::install::config::Config::centibels`].
+fn apply_volumes(config: &Config, mixer: &Mixer) {
+    mixer.set_gains(daysengine::playback::mixer::Gains {
+        bgm: config.gain(Channel::Bgm),
+        se: config.gain(Channel::Se),
+        voice: config.gain(Channel::Voice),
+        system: config.system_se_gain(),
+    });
 }
 
 /// Runs the menus until they start a script or the game is closed.
@@ -1950,6 +1957,13 @@ fn run_script(
         let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
         stage.set_video_size(window_px.0, window_px.1);
 
+        // The three volume sliders, pushed at the sound every tick. That is
+        // how the original does it — `FUN_0043ea80`, `FUN_00429250` and
+        // `FUN_0043c900` each re-ask `_GetMasterVolume@4` for their category
+        // and set it on every object they own, every frame — so a slider moved
+        // on the Sound tab the bar just opened takes hold on the sound in hand
+        // rather than at the next script. See `daysengine::playback::mixer`.
+        apply_volumes(&config, player.mixer);
         // Male voice lines are refused while `MenVoice` is off, and the
         // original asks it per tick rather than per statement: `FUN_0043c900`
         // walks the live voice list every frame and `FUN_0044e800` calls

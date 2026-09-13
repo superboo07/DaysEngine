@@ -418,36 +418,97 @@ impl Config {
         }
     }
 
-    /// The attenuation in decibels a channel's level works out to.
+    /// What the DLL's ladder gives for a level: `FUN_10006fd0`'s
+    /// `(11 - level) * MasterVolume`.
     ///
-    /// `FUN_10006fd0`: `(11 - level) * MasterVolume`. With the shipped
-    /// `MasterVolume` of -1.0 that is -1 dB at level 10 down to -11 dB at level
-    /// 0 — an attenuation ladder, which is why louder is a *smaller* number.
-    /// The DLL's fourth case, index 3, is a fixed level of 2 used when the
-    /// player has muted; [`Config::mute_gain_db`] is that case.
-    pub fn attenuation_db(&self, channel: Channel) -> f32 {
-        self.level_attenuation_db(self.volume(channel))
-    }
-
-    /// The attenuation the muted case uses, from the same function's index 3.
-    pub fn mute_gain_db(&self) -> f32 {
-        self.level_attenuation_db(2)
-    }
-
-    fn level_attenuation_db(&self, level: i32) -> f32 {
+    /// This is the figure that crosses the boundary, and it is **not** the
+    /// attenuation that reaches the device — see [`Config::centibels`], which
+    /// is where the factor and the two endpoint overrides are. With the shipped
+    /// `MasterVolume` of -1.0 it runs from -1.0 at level 10 to -11.0 at level 0.
+    pub fn ladder(&self, level: i32) -> f32 {
         (11 - level) as f32 * self.master_volume()
+    }
+
+    /// The level every group drops to while `Mute` is on.
+    ///
+    /// Muting does not silence anything. Each of the three per-frame updaters
+    /// swaps its own category for `FUN_10006fd0`'s index 3 — `FUN_0043ea80`
+    /// with `(-(muted != 0) & 2) + 1`, `FUN_00429250` with `(muted != 0) + 2`,
+    /// `FUN_0043c900` with `-(muted != 0) & 3` — and index 3 is a **fixed level
+    /// of 2**, which is -15.75 dB with the shipped `MasterVolume` and not
+    /// silence.
+    pub const MUTE_LEVEL: i32 = 2;
+
+    /// A level as the hundredths of a decibel the sound layer is given.
+    ///
+    /// `FUN_004434a0` is the whole conversion, and the decompiler hides half of
+    /// it; the disassembly at `0x004434a7` is
+    ///
+    /// ```text
+    /// FLD   float ptr [EBP + 0x8]        the ladder figure
+    /// FMUL  double ptr [0x004d5098]      175.0
+    /// CALL  0x0047b710                   round to an integer
+    /// ...   clamp to -10000 ..= 0
+    /// FCOMP double ptr [0x004d5090]      == -11.0 ? then -10000
+    /// FCOMP double ptr [0x004d5088]      == -1.0  ? then 0
+    /// ```
+    ///
+    /// then `FUN_0041a0a0` hands the result to the sound buffer, which is
+    /// DirectSound's centibel scale. So a level is worth **1.75 dB**, not the
+    /// 1 dB the ladder reads as, and the two ends are special-cased: level 10
+    /// is full volume and level 0 is true silence, because those are the levels
+    /// whose ladder figures are exactly -1.0 and -11.0.
+    ///
+    /// The comparisons are `float` against `double`, so the overrides only fire
+    /// where the product is exact — which it is for the shipped `MasterVolume`
+    /// of -1.0 and integer levels.
+    pub fn centibels(&self, level: i32) -> i32 {
+        let db = self.ladder(level);
+        if db == -11.0 {
+            return -10000;
+        }
+        if db == -1.0 {
+            return 0;
+        }
+        ((db * 175.0).round() as i32).clamp(-10000, 0)
+    }
+
+    /// The attenuation in decibels a channel's level reaches the device as,
+    /// with `Mute` taken into account.
+    pub fn attenuation_db(&self, channel: Channel) -> f32 {
+        self.centibels(self.effective_level(channel)) as f32 / 100.0
+    }
+
+    /// The level a channel is actually played at: its own, or
+    /// [`Config::MUTE_LEVEL`] while `Mute` is on.
+    pub fn effective_level(&self, channel: Channel) -> i32 {
+        if self.flag(Flag::Mute) {
+            Config::MUTE_LEVEL
+        } else {
+            self.volume(channel)
+        }
     }
 
     /// A channel's attenuation as a linear gain in `0.0..=1.0`.
     ///
-    /// The original hands the decibel figure to DirectSound; this engine's
+    /// The original hands the centibel figure to DirectSound; this engine's
     /// mixer multiplies samples, so the conversion happens here rather than
     /// silently in a driver.
     pub fn gain(&self, channel: Channel) -> f32 {
-        if self.flag(Flag::Mute) {
-            return 0.0;
-        }
         db_to_gain(self.attenuation_db(channel))
+    }
+
+    /// The gain the menus' own sounds play at.
+    ///
+    /// They are not a fourth setting and they are not on the script's groups
+    /// either: host slot `+0x50` (`FUN_00429c80`) keeps them in its own run at
+    /// `+0x540`, opens them unlooped at rate 1.0, and gives them
+    /// `_GetMasterVolume@4(1)` — the **sound-effect** level — with no mute
+    /// question asked. `FUN_0042a160`, which is what the Mute widget reaches,
+    /// never touches that run, so a click keeps its level while everything the
+    /// script owns drops.
+    pub fn system_se_gain(&self) -> f32 {
+        db_to_gain(self.centibels(self.volume(Channel::Se)) as f32 / 100.0)
     }
 
     /// Encodes the file: the banner, every entry in order, deflated under the
@@ -644,25 +705,49 @@ mod tests {
         assert_eq!(odd.volume(Channel::Se), MAX_VOLUME);
     }
 
-    /// `(11 - level) * MasterVolume`, so louder is a smaller attenuation.
+    /// A level is worth 1.75 dB, not the 1 dB the ladder figure reads as, and
+    /// the two ends are special-cased in `FUN_004434a0` — which is why the
+    /// slider reaches real silence at 0 and real full volume at 10.
     #[test]
-    fn the_attenuation_ladder_matches_the_dlls_formula() {
+    fn a_level_is_worth_one_and_three_quarter_decibels_with_both_ends_forced() {
         let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
         config.set_volume(Channel::Bgm, 10);
-        assert_eq!(config.attenuation_db(Channel::Bgm), -1.0);
+        assert_eq!(config.centibels(10), 0, "the ladder's -1.0 is forced full");
+        assert_eq!(config.gain(Channel::Bgm), 1.0);
         config.set_volume(Channel::Bgm, 0);
-        assert_eq!(config.attenuation_db(Channel::Bgm), -11.0);
-        assert_eq!(config.mute_gain_db(), -9.0);
+        assert_eq!(
+            config.centibels(0),
+            -10000,
+            "the ladder's -11.0 is the floor"
+        );
+        assert!(
+            config.gain(Channel::Bgm) < 1.0 / 32768.0,
+            "-100 dB is under a 16-bit step, which is what the floor is for"
+        );
+        // Every step in between is the ladder figure times 175.
+        assert_eq!(config.centibels(9), -350);
+        assert_eq!(config.centibels(5), -1050);
+        assert_eq!(config.centibels(1), -1750);
     }
 
+    /// Mute is an attenuation, not a silence: every group is played at a fixed
+    /// level of 2. A `Mute` that silenced the game would be louder-sounding
+    /// nonsense the first time a player turned it on expecting the original.
     #[test]
-    fn muting_silences_every_channel() {
-        let mut config = Config::default();
-        assert!(config.gain(Channel::Bgm) > 0.0);
+    fn muting_drops_every_script_group_to_level_two() {
+        let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
         config.set_flag(Flag::Mute, true);
         for channel in Channel::ALL {
-            assert_eq!(config.gain(channel), 0.0);
+            assert_eq!(config.effective_level(channel), 2);
+            assert_eq!(config.attenuation_db(channel), -15.75);
+            assert!(config.gain(channel) > 0.0, "muting is not silence");
         }
+        // Even a channel the player had set to silence comes back up to 2.
+        config.set_volume(Channel::Bgm, 0);
+        assert_eq!(config.effective_level(Channel::Bgm), 2);
+        // The menus keep their own level through it.
+        config.set_volume(Channel::Se, 10);
+        assert_eq!(config.system_se_gain(), 1.0);
     }
 
     /// A rewrite has to survive a round trip *and* keep the keys this engine
