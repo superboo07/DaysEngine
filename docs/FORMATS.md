@@ -2982,10 +2982,35 @@ from — nothing else writes them but step 4 and `FUN_10026050`.
 
 `FUN_10026050` — MenuBar vtable `+0x38` — is the other way the gauge comes
 down. It reads the two counters, puts the gauge at them with no ramp, resets the
-machine and lowers the flag, and the engine calls it from `FUN_00423a70` when
-playback starts and from `FUN_00424020` when a script ends. `_SetFeeling@8` is
-called from the choice handler, so a raise that the ramp has not finished by the
-end of its script is cut short there.
+machine and lowers the flag. The engine has two call sites for it, and **only
+one of them can be reached**:
+
+- `FUN_00423a70`, which is a film run starting: its first two acts are
+  `_LoadInitScript@4` and `_ZeroReset@4`. Every way into playback goes through
+  it, so a New Game, a slot and a story point all settle the gauge.
+- `FUN_00424020`, at the end of a script — but under `if (this+0x560)`, and
+  `this+0x560` is **never set**. Two methods agree: Ghidra's instruction
+  listing has fourteen references to that displacement, of which exactly two
+  are stores and both are `MOV byte ptr [reg+0x560],0x0` (`0x00423200` in the
+  initialiser and `0x004248af` in `FUN_00424020` itself); and a raw scan of the
+  file for the four bytes `60 05 00 00` preceded by a `MOV` store opcode with a
+  `disp32` ModRM finds fifteen occurrences of the displacement and the same two
+  stores, both with the immediate zero. Its blind spot would be a store built
+  from a register-held offset, which nothing in this function does.
+
+So **no script ending settles the gauge**, and that is what gives the ramp room
+to run. `_SetFeeling@8` is called from the choice handler, and a choice box sits
+in the last seconds of its script — `01-00-B00` raises one over
+`00:08:12..00:13:12` of a script that ends at `00:13:12` — so a raise that a
+script boundary cut short would nearly always be cut short. Instead it keeps
+sliding over the opening of the next scene, which is where most of a raise is
+actually seen.
+
+That is also why the ramp's state cannot live on anything built per script.
+`FILM::MenuBar` is one static object for the session and `timeGetTime` is one
+clock for the session; `DaysEngine` keeps its ramp and a session clock on the
+player for the same reason, while the bar's own fade stays per script because
+`FUN_10024c00` puts `DAT_100508c8` back to 0 as it loads the strip.
 
 Step 0's colour is why `FUN_10025690` skipping those four sprites does not leave
 a gauge invisible: whatever alpha they were carrying when the bar faded out, the

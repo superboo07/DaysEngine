@@ -495,9 +495,11 @@ impl Progress {
 
     /// Hides the gauge, through the same slot `+0x30` that raised it.
     ///
-    /// Two things do it in the original: the last step of the gauge's own ramp,
-    /// which is how it comes down in ordinary play, and `FUN_10026050` when the
-    /// engine settles the gauge at the start of a script or the end of one.
+    /// The last step of the gauge's own ramp is what does it in ordinary play.
+    /// The only other way is a film run starting, which settles the gauge
+    /// through `FUN_10026050`. **A script ending does not**: the engine's other
+    /// `+0x38` call is under a member that is never set. See
+    /// [`crate::ui::bar::gauge::Anim::settle`].
     pub fn lower_gauge(&mut self) {
         self.gauge_raised = false;
     }

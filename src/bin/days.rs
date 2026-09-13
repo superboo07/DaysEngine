@@ -1032,8 +1032,8 @@ fn cmd_render(
         let dll = system_menu_dll(game)?;
         match daysengine::ui::bar::Bar::load(&vfs, &dll, daysengine::ui::screen::Resolution::Wide) {
             Ok(mut strip) => {
-                strip.point_at(Some((0, 0)), 0, false);
-                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1, false);
+                strip.point_at(Some((0, 0)), 0);
+                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1);
                 Some(strip)
             }
             Err(err) => {
@@ -1193,14 +1193,16 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     // ramps from there to `--feeling`, one step per frame, and `--after` is how
     // far into that ramp the picture is taken.
     let mut gauge_sound = None;
+    let mut ramp = bar::gauge::Anim::default();
     if let Some((first, second)) = was {
-        bar.settle_gauge(first, second);
+        ramp.settle(first, second);
     }
     if let (true, Some((first, second))) = (args.gauge, feeling) {
-        bar.advance_gauge(0, first, second);
-        gauge_sound = bar.advance_gauge(0, first, second).sound;
-        bar.advance_gauge(settled, first, second);
+        ramp.advance(0, first, second);
+        gauge_sound = ramp.advance(0, first, second).sound;
+        ramp.advance(settled, first, second);
     }
+    state.gauge_leads = ramp.leads();
     if let Some(want) = args.transparency {
         match (bar::indicator::FIRST_WIDGET..)
             .take(bar::indicator::CELLS)
@@ -1283,7 +1285,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     match state.gauge {
         None => println!("gauge: no save to read the counters from"),
         Some((first, second)) => {
-            let (lead, _) = bar.gauge_leads();
+            let (lead, _) = state.gauge_leads;
             println!(
                 "gauge: {} {first}, {} {second} — lead {lead:+}px to the {}, {}",
                 daysengine::install::feeling::FIRST,
@@ -1379,8 +1381,8 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             .with_context(|| format!("--pointer wants X,Y or `off`, got {}", args.pointer))?;
         Some((x.trim().parse::<u32>()?, y.trim().parse::<u32>()?))
     };
-    bar.point_at(at, 0, state.gauge_raised);
-    let hovered = bar.point_at(at, settled, state.gauge_raised);
+    bar.point_at(at, 0);
+    let hovered = bar.point_at(at, settled);
     println!(
         "pointer {} — the bar {}, alpha {}",
         match at {

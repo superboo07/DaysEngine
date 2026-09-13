@@ -615,6 +615,21 @@ struct StillFrame<'r> {
 struct Player<'a> {
     /// `DaysEngine.ini`: the choices that are the engine's, not the game's.
     settings: Settings,
+    /// The affection gauge's ramp, which outlives any one script.
+    ///
+    /// `FILM::MenuBar` is one static object for the whole session, so a delta
+    /// credited in the last seconds of a scene goes on sliding over the start
+    /// of the next one. Our [`Bar`] is rebuilt per script; this is not.
+    gauge: bar::gauge::Anim,
+    /// A clock for the whole session, which is what `timeGetTime` is to the
+    /// original.
+    ///
+    /// The bar's fade runs on a clock that restarts with each script, because
+    /// the fade itself does — `FUN_10024c00` puts `DAT_100508c8` back to 0 as
+    /// it loads the strip. [`Player::gauge`] must not: a ramp that crossed a
+    /// script boundary would see its start time jump into the future and stop
+    /// where it stood.
+    clock: Instant,
     vfs: &'a Vfs,
     font: &'a Font,
     mixer: &'a Mixer,
@@ -834,6 +849,8 @@ fn main() -> Result<()> {
         vfs: &vfs,
         font: &font,
         mixer: &mixer,
+        gauge: bar::gauge::Anim::default(),
+        clock: Instant::now(),
         sounds: Sounds::default(),
         film: &film,
         system_se: SystemSounds::from_ini(&film),
@@ -920,6 +937,7 @@ fn main() -> Result<()> {
                     next = wanted.clone();
                     if let Some(p) = progress.as_mut() {
                         p.film_start();
+                        settle_gauge(&mut player, p);
                     }
                 }
                 // A replay names its own script, which the DLL's table spells
@@ -947,6 +965,7 @@ fn main() -> Result<()> {
                     // nothing too, and leaves nothing behind when it ends.
                     if let Some(p) = progress.as_mut() {
                         p.film_start();
+                        settle_gauge(&mut player, p);
                     }
                 }
                 // Loading from the title puts the player wherever the slot
@@ -1097,15 +1116,6 @@ fn main() -> Result<()> {
             // been torn down, so there is nothing to go back to and this falls
             // through to where a finished session goes.
         }
-        // The end of a script is where the original re-reads the two affection
-        // counters and puts the gauge down again: `FUN_00424020` calls MenuBar
-        // vtable `+0x38` — `FUN_10026050`, which sizes the pieces from the
-        // counters and then clears the flag through host `+0x30`.
-        if outcome == Outcome::Finished {
-            if let Some(p) = progress.as_mut() {
-                p.lower_gauge();
-            }
-        }
         if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
             // A replay walks the scene's own list, by its branch table where it
             // has one and straight down the list where it does not —
@@ -1243,11 +1253,13 @@ fn enter_slot(
 ) -> Option<String> {
     player.following_record = recorded;
     let game = player.game.clone();
-    match progress.and_then(|p| p.load_from(&game, player.film, slot)) {
+    let progress = progress?;
+    match progress.load_from(&game, player.film, slot) {
         Some(script) => {
             if recorded {
                 log::info!("playing slot {slot} back by its own answers");
             }
+            settle_gauge(player, progress);
             Some(script.rsplit('/').next().unwrap_or(&script).to_string())
         }
         None => {
@@ -1256,6 +1268,19 @@ fn enter_slot(
             None
         }
     }
+}
+
+/// Puts the gauge at the counters the store now holds, with no ramp and no
+/// raise: MenuBar vtable `+0x38`, `FUN_10026050`.
+///
+/// Every way into playback runs it. `FUN_00427780` — the film run — calls
+/// `FUN_00423a70`, which settles the gauge whether the run is a New Game, a
+/// slot or a story point, and the state each of those installs is what it
+/// settles to.
+fn settle_gauge(player: &mut Player, progress: &mut Progress) {
+    let ((first, second), _) = progress.gauge();
+    player.gauge.settle(first, second);
+    progress.lower_gauge();
 }
 
 /// Puts the player at a story point the run has passed, as the route map does.
@@ -1267,8 +1292,12 @@ fn enter_slot(
 /// that leaves the player where they were.
 fn enter_story(player: &mut Player, progress: Option<&mut Progress>, story: u32) -> Option<String> {
     player.following_record = false;
-    match progress.and_then(|p| p.from_story(story)) {
-        Some(script) => Some(script.rsplit('/').next().unwrap_or(&script).to_string()),
+    let progress = progress?;
+    match progress.from_story(story) {
+        Some(script) => {
+            settle_gauge(player, progress);
+            Some(script.rsplit('/').next().unwrap_or(&script).to_string())
+        }
         None => {
             log::warn!("this run never reached SP{story:03}");
             None
@@ -2235,7 +2264,7 @@ fn snap(elapsed: Duration, interval: Duration) -> Duration {
 /// sized from the two affection counters rather than from any record, so those
 /// belong in the key too, and so do the two alphas for the one case where the
 /// fade has to be composited in rather than modulated.
-type BarLayer = (Vec<usize>, (f32, f32), Option<(u8, u8)>);
+type BarLayer = (Vec<usize>, (f32, f32), Option<u8>);
 
 /// Where the control bar's strip lands in the window.
 ///
@@ -2403,16 +2432,6 @@ fn run_script(
         }
     };
     let mut bar_state = bar::State::from_config(&config);
-    // `FUN_00423a70` calls MenuBar vtable `+0x38` when playback starts, which
-    // puts the gauge at the counters as they stand, with no ramp, and lowers
-    // it. The bar here is built once per script, so this is that call.
-    if let Some(p) = progress.as_deref_mut() {
-        let ((first, second), _) = p.gauge();
-        if let Some(control) = &mut control {
-            control.settle_gauge(first, second);
-        }
-        p.lower_gauge();
-    }
     // A script always starts at 1x. The original does this twice over:
     // `FUN_00423130` initialises the rate member `+0x538` to 1.0 when a session
     // starts, and `FUN_004236f0` puts it back to 1.0 when a script is freed.
@@ -2653,9 +2672,10 @@ fn run_script(
         // `FUN_10021c20` gives the base sprite the same half-pixel inset every
         // other sprite gets, so the origin is the only placement there is.
         bar_state.paused = paused;
-        // A wall clock, because the gauge's ramp and the bar's fade are both in
-        // milliseconds of real time and neither stops when playback is paused.
-        let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        // A wall clock, because the bar's fade ramps in milliseconds of real
+        // time and so cannot hang off the script clock, which stops when
+        // playback is paused. This one restarts with the script; the gauge's
+        // does not, and is `player.clock`.
         // The gauge draws the two counters the branch system keeps, and shows
         // over a faded bar only while a delta has raised it.
         //
@@ -2664,25 +2684,26 @@ fn run_script(
         // same flag. The ramp is what plays the rise or the fall, slides the
         // gauge to the new lead, holds it there and then puts it down again —
         // so this is also where the flag is cleared in ordinary play.
+        let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
         if let Some(p) = progress.as_deref_mut() {
             let ((first, second), raised) = p.gauge();
             bar_state.gauge = Some((first, second));
             bar_state.gauge_raised = raised;
             if raised {
-                if let Some(control) = &mut control {
-                    let tick = control.advance_gauge(now_ms, first, second);
-                    if let Some(se) = tick.sound {
-                        player
-                            .system_se
-                            .play(se, player.vfs, &mut player.sounds, player.mixer);
-                    }
-                    if tick.lowered {
-                        p.lower_gauge();
-                        bar_state.gauge_raised = false;
-                    }
+                let at = player.clock.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                let tick = player.gauge.advance(at, first, second);
+                if let Some(se) = tick.sound {
+                    player
+                        .system_se
+                        .play(se, player.vfs, &mut player.sounds, player.mixer);
+                }
+                if tick.lowered {
+                    p.lower_gauge();
+                    bar_state.gauge_raised = false;
                 }
             }
         }
+        bar_state.gauge_leads = player.gauge.leads();
         // Host `+0x98`, which is what the bar's right-hand box is about: the
         // slider lights up, its ten cells become pressable, and the REPLAYMODE
         // indicator goes on the picture.
@@ -2715,7 +2736,7 @@ fn run_script(
             };
             let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
                 .then_some((sx as u32, sy as u32));
-            hovered = control.point_at(over, now_ms, bar_state.gauge_raised);
+            hovered = control.point_at(over, now_ms);
 
             // A click only reaches the bar while the bar is actually on
             // screen, and only the widget it lands on takes it. A press the
@@ -3372,10 +3393,10 @@ fn run_script(
             // gauge is raised, and one texture cannot be modulated twice — so
             // that case composites the fade in and is keyed on both alphas.
             let pinned = control.pinned(bar_state);
-            let alphas = pinned.then(|| (control.fade().alpha(), control.fade().gauge_alpha()));
+            let alphas = pinned.then(|| control.fade().alpha());
             let records = (
                 control.records(hovered, bar_state, elapsed),
-                control.gauge_leads(),
+                bar_state.gauge_leads,
                 alphas,
             );
             let stale = bar_texture
