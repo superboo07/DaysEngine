@@ -302,10 +302,20 @@ impl Progress {
 
     /// Puts a slot back, as loading one does.
     ///
-    /// The slot's own store replaces the save's, and its script decides the
-    /// position: the shipped loader hands the script and the version to
-    /// `FUN_0042a760` rather than trusting the `ROUTE`/`SCENE` in the store,
-    /// so a slot whose store disagrees with its script follows the script.
+    /// **The position comes out of the store, not out of the script name.**
+    /// `FUN_004336c0` reads the slot's first record — the script name, the
+    /// version and a variable map — and hands that map to `FUN_00428a20`,
+    /// which puts it into the engine's own store at `engine + 0x40`. That is
+    /// the same member the route DLL questions through host `+0x08`/`+0x0c`,
+    /// and `ROUTE` and `SCENE` are two of its names, so restoring the store
+    /// *is* restoring the position. The script name is only the file to open:
+    /// `FUN_0042a760` takes it to `FUN_00430d20` and nothing on that path
+    /// touches either name.
+    ///
+    /// So a slot whose store disagrees with its script keeps its store. That
+    /// cannot arise from a save this game wrote — every one of the 1857 script
+    /// names across the 55 route tables is unique, so a name resolves to one
+    /// scene — and a disagreement is logged rather than corrected.
     pub fn from_slot(&mut self, slot: Slot) -> Option<String> {
         self.version = slot.version;
         self.stores.save = slot.store;
@@ -313,8 +323,19 @@ impl Progress {
         self.choices = slot.choices;
         self.stores.choice = -1;
         self.gauge_raised = false;
-        if !self.enter(&slot.script) {
-            log::warn!("{} is in no route table", slot.script);
+        let (route, scene) = self.position();
+        match self.routes.find(&qualify(&slot.script)) {
+            Some(table) if table == (route as usize, scene as usize) => {
+                log::info!("{} is ROUTE {route} SCENE {scene}", slot.script);
+            }
+            Some((r, s)) => log::warn!(
+                "{} sits at ROUTE {r} SCENE {s} in the tables, but the slot stored                  ROUTE {route} SCENE {scene}; playing on from the slot",
+                slot.script
+            ),
+            None => log::warn!(
+                "{} is in no route table; the slot puts the player at ROUTE {route} SCENE {scene}",
+                slot.script
+            ),
         }
         Some(slot.script)
     }

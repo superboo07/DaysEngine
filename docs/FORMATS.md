@@ -1114,10 +1114,41 @@ reads at `FUN_00425550` case 6, which raises `FLAG_LOGO`, goes to its case 9 —
 `FUN_0042bd20`, the loading picture, drawn only when `+0x2d0` is not -1 — and
 puts the engine into state 0, the state `FUN_004278a0` reports as stopped.
 
-**Where the picked slot is put back to -1 after a load has not been
-recovered.** The one clear found is `FUN_100135c0`, the save/load module's own
-open, and a scan of the executable for `engine + 0x2d0` finds only
-`FUN_00423130`'s initialiser and the two comparisons above.
+The slot is spent exactly once because **a film run is a thread**.
+`FUN_00427850` calls `FUN_0046b070`, which is a `_beginthreadex` on
+`FUN_00427780` — and `FUN_00427780` opens with `FUN_00423130`, the initialiser
+that writes `engine + 0x2d0 = -1`, before `FUN_00423a70` reads the slot out of
+`+0x1c0`. So case 4 of the next time round sees -1 and goes to the title, and a
+loaded film does not reload itself. Mode 1's cases 2 and 3 are the other half
+of that lifecycle: `FUN_004278f0` posts `0x8000` to the thread and
+`FUN_00427930` waits on its handle.
+
+### Loading restores the position, and the script name is only a file name
+
+The slot's first record is the script name, the version, and a variable map.
+`FUN_004336c0` hands that map to `FUN_00428a20`, which is `engine + 0x40` —
+the same store the route DLL questions through host `+0x08`/`+0x0c`, and
+`ROUTE` and `SCENE` are two of its names. **So restoring the store is
+restoring the position**, and nothing re-derives it from the script name:
+`FUN_0042a760` takes that name to `FUN_00430d20` and opens the file, and
+touches neither name on the way.
+
+This matters because the two could disagree, and the store is what wins. They
+cannot disagree in a save this game wrote — all 1857 script names across the 55
+route tables are unique, so a name resolves to exactly one scene, and every one
+of a player's slots round-trips through `Progress` byte for byte with the
+position taken from the store.
+
+One difference from a snapshot is worth writing down: `FUN_0045fcd0` **merges**.
+It walks the slot's map and calls `FUN_004603f0` — find-or-insert — for each
+name, so a name the live store holds and the slot does not **survives the
+load**. The counters are exempt because `_ZeroReset@4` runs first, at the top
+of `FUN_00423a70`, zeroing every name the `FeelingScript.ini` head declares.
+The marks and the recorded choices are not merged but emptied, by
+`FUN_00432850` -> `FUN_00432870`, and even that is conditional: it skips the
+clear when `_GetRouteLoad@0` is non-zero. **What raises `_GetRouteLoad@0` has
+not been recovered** — it is a `RouteProcSDHQ.dll` export and that DLL is not
+in the Ghidra project.
 
 ### The bar is a drop-down, and translucent
 
