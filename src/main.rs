@@ -493,29 +493,15 @@ fn main() -> Result<()> {
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
                 // fresh `searchRoot` on the name.
-                // A row of the play-data list is the same load with the
-                // recorded answers followed: `FUN_1001dfe0` hands the host
-                // `+0x48(slot)`, `+0x94(1)` and then `+0x4c(8)`.
+                // A slot that will not read starts nothing, and the menus
+                // keep the screen.
                 Outcome::LoadSlot { slot, recorded } => {
-                    player.following_record = recorded;
-                    match progress
-                        .as_mut()
-                        .and_then(|p| p.load_from(&game, &film, slot))
+                    if let Some(script) = enter_slot(&mut player, progress.as_mut(), slot, recorded)
                     {
-                        Some(script) => {
-                            next = script.rsplit('/').next().unwrap_or(&script).to_string();
-                            if player.following_record {
-                                log::info!("playing slot {slot} back by its own answers");
-                            }
-                            chained = true;
-                            continue;
-                        }
-                        None => {
-                            log::warn!("slot {slot} would not load");
-                            player.following_record = false;
-                            continue;
-                        }
+                        next = script;
+                        chained = true;
                     }
+                    continue;
                 } // There is nothing to save from the title — the player has no
                   // position — so this only happens from playback, where the
                   // save is taken before the menus open.
@@ -607,6 +593,29 @@ fn main() -> Result<()> {
         // Cleared here and set only on a chain step below, so a chase that
         // runs out of route cannot leak into whatever is played next.
         chasing_choice = false;
+        // A slot picked in the menus the control bar opened leaves playback,
+        // and what it leaves to is the slot — not the title. `FUN_0041d7f0` is
+        // the mode that plays a film: its case 4 asks host `+0x44`
+        // (`FUN_00427ad0`) for the slot the load screen stored and returns its
+        // own mode number when there is one, so the shell comes straight back
+        // round to case 0, which reads that slot again and hands it to
+        // `FUN_00427850` — the call that starts the film engine on it. Mode 2,
+        // the title, is where the *absence* of a slot goes: case 4 returns it
+        // only when `+0x44` is -1.
+        //
+        // A load replaces the position outright, so a replay scene that was
+        // running ends here rather than carrying its list across.
+        if let Outcome::LoadSlot { slot, recorded } = outcome {
+            replaying = None;
+            if let Some(script) = enter_slot(&mut player, progress.as_mut(), slot, recorded) {
+                next = script;
+                chained = true;
+                continue;
+            }
+            // The slot would not read. The script that was playing has already
+            // been torn down, so there is nothing to go back to and this falls
+            // through to where a finished session goes.
+        }
         // The end of a script is where the original re-reads the two affection
         // counters and puts the gauge down again: `FUN_00424020` calls MenuBar
         // vtable `+0x38` — `FUN_10026050`, which sizes the pieces from the
@@ -721,11 +730,44 @@ fn start_script(start: &Ini) -> String {
         .to_string()
 }
 
-/// Runs the menus until they start a script or the game is closed.
+/// Puts the player where a slot says, and names the script to play from there.
 ///
-/// The menu is a still image that only changes when the selection does, so this
-/// recomposites on demand rather than per frame: a frame is a 800x450 software
-/// composite and there is nothing animating between clicks.
+/// Loading is one rule wherever it is asked for, because the engine only ever
+/// does it in one place. Whichever screen picked the slot stores it on the
+/// engine through host `+0x48` (`FUN_0042c020`, writing `engine + 0x2d0`) and
+/// then leaves the menus; the mode that plays a film reads it back through
+/// `+0x44` and hands it to `FUN_00427850`, and `FUN_00423a70` is what opens
+/// the file — `[SaveFileName]` formatted with the slot number.
+///
+/// Which of two loads it runs is host `+0x98`, the flag the play-data list
+/// raises with `+0x94(1)`: `FUN_0042b250` while it is clear, and
+/// `FUN_00428ab0` — the same file, read so the slot's own answers are followed
+/// — while it is set.
+///
+/// `None` means the slot would not read, and nothing was started.
+fn enter_slot(
+    player: &mut Player,
+    progress: Option<&mut Progress>,
+    slot: u32,
+    recorded: bool,
+) -> Option<String> {
+    player.following_record = recorded;
+    let game = player.game.clone();
+    match progress.and_then(|p| p.load_from(&game, player.film, slot)) {
+        Some(script) => {
+            if recorded {
+                log::info!("playing slot {slot} back by its own answers");
+            }
+            Some(script.rsplit('/').next().unwrap_or(&script).to_string())
+        }
+        None => {
+            log::warn!("slot {slot} would not load");
+            player.following_record = false;
+            None
+        }
+    }
+}
+
 /// Loads the picture that goes behind the title.
 ///
 /// This belongs to the engine, not to the menu module: `Title.png` is
@@ -795,6 +837,11 @@ fn apply_settings(session: &Session, mixer: &Mixer) {
     mixer.set_master_volume(gain);
 }
 
+/// Runs the menus until they start a script or the game is closed.
+///
+/// The menu is a still image that only changes when the selection does, so this
+/// recomposites on demand rather than per frame: a frame is a 800x450 software
+/// composite and there is nothing animating between clicks.
 fn run_menu(
     player: &mut Player,
     canvas: &mut Canvas<Window>,

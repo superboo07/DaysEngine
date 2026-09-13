@@ -1067,6 +1067,58 @@ picked**, -1 for none. `FUN_00423130` initialises it to -1 and
 `FUN_004253f0` ends the playback loop when it is anything else, which is how
 loading a slot from the menus stops the script that was running.
 
+### Where a load goes, wherever it was asked for
+
+Stopping the script is only half of it, and the other half is why a load never
+lands on the title. `FUN_0041d7f0` is the mode that plays a film, and it is
+built around that same member:
+
+```text
+case 0   slot = host +0x44 ;  FUN_00427850(engine, slot)   start on it
+case 1   wait while FUN_004278a0 says the engine is running
+case 2-3 stop it and wait for the stop
+case 4   host +0x104 or +0x98 set  ->  mode 5
+         host +0x44 == -1          ->  mode 2, the title
+         otherwise                 ->  mode 1, itself
+```
+
+So the mode repeats itself whenever a slot is waiting, and comes back round to
+its own case 0, which reads the slot and starts the film engine on it.
+`FUN_0041e600` is the dispatcher that does the repeating: it stores the
+returned mode in `+0x24c` and, for 1, skips the fade every other mode takes.
+The title is where the **absence** of a slot goes and nothing else.
+
+`FUN_00427850` stores the slot at `engine + 0x1c0` and puts the engine into
+state 1, and `FUN_00423a70` is where that number is spent:
+
+```text
++0x1c0 < 0       play the script named at +0x188
+0 .. 99          host +0x98 clear  ->  FUN_0042b250   load the slot
+                 host +0x98 set    ->  FUN_00428ab0   load it, answers followed
+>= 100           FUN_00428400
+```
+
+`FUN_0042b250` and `FUN_00428ab0` are the same function twice over — format
+`[SaveFileName]` with the slot number, open it, hand the stream to the store at
+`engine + 0xac` — differing only in which reader they hand it to, `FUN_004336c0`
+against `FUN_00434020`. Both then set the script flag `BackSel` to -1 and drop
+the loading picture. So `+0x98`, the flag the play-data list raises with
+`+0x94(1)`, is the whole difference between a plain load and one that follows
+the slot's own answers, and both are otherwise the load the Load screen asks
+for.
+
+The Load screen asks for it with `FUN_10011d50`: host `+0x48(page * 10 + row)`
+and then `+0x4c(8)` — and only for a filled row, which it knows from
+`this + 0x11c + row * 4`. Code 8 is the leave code the over-playback driver
+reads at `FUN_00425550` case 6, which raises `FLAG_LOGO`, goes to its case 9 —
+`FUN_0042bd20`, the loading picture, drawn only when `+0x2d0` is not -1 — and
+puts the engine into state 0, the state `FUN_004278a0` reports as stopped.
+
+**Where the picked slot is put back to -1 after a load has not been
+recovered.** The one clear found is `FUN_100135c0`, the save/load module's own
+open, and a scan of the executable for `engine + 0x2d0` finds only
+`FUN_00423130`'s initialiser and the two comparisons above.
+
 ### The bar is a drop-down, and translucent
 
 The bar is on screen only while the pointer is inside its strip.
