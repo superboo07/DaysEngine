@@ -485,7 +485,8 @@ fn resampled(src: &Image, rect: (u32, u32, u32, u32), size: (u32, u32)) -> Optio
     }
     let src_size = (sw as usize, sh as usize);
     let dst_size = (size.0 as usize, size.1 as usize);
-    let mut rgba = Scaler::new(src_size, dst_size).resample(&cut, src_size, dst_size)?;
+    let mut scaler = Scaler::new(src_size, dst_size);
+    let mut rgba = scaler.resample(&cut, src_size, dst_size)?.to_vec();
     for px in rgba.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
         if a == 0 {

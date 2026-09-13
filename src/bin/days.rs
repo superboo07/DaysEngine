@@ -787,7 +787,9 @@ fn cmd_render(game: &Path, name: &str, at: &[String], out: &Path, bar: bool) -> 
         let visual = stage.visual_at(target);
         let described = format!(
             "movie={} still={} text={:?} fade={:?} select={:?}",
-            visual.movie.is_some(),
+            visual
+                .movie_id
+                .map_or("-".to_string(), |(clip, index)| format!("{clip}#{index}")),
             visual.still.map(|s| s.path.as_str()).unwrap_or("-"),
             visual.text.map(|(s, t)| format!("{s}: {t}")),
             visual.fade,

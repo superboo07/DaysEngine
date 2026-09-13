@@ -45,14 +45,54 @@
 //!
 //! Separably, and with the weights cached. A frame's scale factors only change
 //! when the window does, so the per-axis weight tables are built once and then
-//! reused: each output pixel is a short gather over the source, four taps when
-//! upscaling and more when the picture is being shrunk. Horizontal first into a
-//! scratch buffer of `dst_w x src_h`, then vertical, which is the cheaper order
-//! whenever the output is wider than it is taller relative to the source.
+//! reused: each output pixel is a short gather over the source, at most four
+//! taps when upscaling and more when the picture is being shrunk. Horizontal
+//! first into a scratch of f32, then vertical down it.
 //!
 //! Downscaling widens the kernel in source space by the scale factor, so
 //! shrinking averages over every source pixel that lands in the footprint
 //! rather than point-sampling four of them and aliasing.
+//!
+//! # Keeping up with the picture
+//!
+//! This runs on every movie frame, so it has a deadline. The engine's clock is
+//! 24 fps — 41ms a frame for decode, mixing, this, the upload and the present —
+//! and a frame that misses it judders. A full-screen frame is the hard case:
+//! 800x452 onto a 4K panel is 8.3 million output pixels, each four taps in each
+//! direction, which is a hundred and thirty million multiply-adds that have to
+//! happen between one frame and the next.
+//!
+//! Four things are what make it fit. Only the last of them is about the filter.
+//!
+//! **Threads.** A band of output rows reads the source and writes its own rows
+//! of the frame and touches nothing else, so bands go to a scoped thread each
+//! and the picture is resampled on every core the machine has. This is the only
+//! parallel code in the engine. It is parallel over the data rather than over
+//! the work, so the whole of the synchronisation is handing out the next band —
+//! and a resample small enough for one worker takes the loop inline instead,
+//! because spawning a thread to give work to yourself is pure overhead.
+//!
+//! **Bands.** [`BAND`] output rows at a time through both passes, rather than
+//! each pass over the whole frame. That is what gives the threads something
+//! divisible, and it bounds the f32 scratch between the passes at a few hundred
+//! kilobytes rather than the 27MB a full 4K frame would need. Neighbouring
+//! bands overlap by the kernel's support and filter those few rows twice, which
+//! is cheaper than any way of sharing them would be.
+//!
+//! **The buffers are kept.** [`Scaler`] owns the output, so a 33MB 4K frame is
+//! not allocated and zeroed again every time, and [`Scaler::resample`] hands
+//! back a slice of it rather than a `Vec`.
+//!
+//! **Four taps go straight through.** Trimming zero-weight taps makes every
+//! interior pixel of an upscale exactly four, and [`column`] takes that case
+//! with the four source values and the sum in registers — one load per tap and
+//! a store, instead of an accumulator read and written once per tap. What a
+//! resample is bound by is that traffic, not the arithmetic.
+//!
+//! Two of these were arrived at by measuring rather than by reasoning, and the
+//! reasoning would have got them wrong: band-tiling on its own, without the
+//! threads, measured no faster at all, and the single largest saving in the
+//! whole module was the float-to-byte conversion at the end — see [`to_byte`].
 
 /// One output pixel's taps along one axis.
 struct Taps {
@@ -63,15 +103,59 @@ struct Taps {
     weights: Vec<f32>,
 }
 
-/// A cached set of resampling weights for one source and destination size.
+/// How many output rows one band covers.
+///
+/// Small enough that a band's scratch — the source rows it reads, filtered
+/// horizontally — stays in a core's own cache, and large enough that the rows
+/// of overlap between neighbouring bands are a rounding error rather than real
+/// duplicated work.
+const BAND: usize = 32;
+
+/// How many f32 of one output row the vertical pass accumulates at a time.
+///
+/// The accumulator is read and written once per tap, so it wants to be in L1:
+/// a whole 4K row of it is 61KB and is not.
+const STRIP: usize = 1024;
+
+/// A cached set of resampling weights for one source and destination size,
+/// with the buffers the passes need.
 #[derive(Default)]
 pub struct Scaler {
     src: (usize, usize),
     dst: (usize, usize),
     horizontal: Vec<Taps>,
     vertical: Vec<Taps>,
-    /// Scratch for the horizontal pass: `dst_w x src_h` in RGBA f32.
+    /// One scratch per worker, each `band_rows` source rows of `dst_w` RGBA f32.
     scratch: Vec<f32>,
+    /// The most source rows any one band reads, which is how tall a scratch is.
+    band_rows: usize,
+    /// The finished frame, kept between calls so a 4K one is not reallocated
+    /// and rezeroed on every frame of every movie.
+    out: Vec<u8>,
+}
+
+/// Turns one filtered f32 channel into the byte that goes on screen.
+///
+/// The clamp is a guard the B-spline does not need — its weights are
+/// non-negative and sum to one, so a value here cannot leave `0.0..=255.0` by
+/// more than float error — but it costs nothing, and it is what makes the line
+/// below safe to write.
+///
+/// That line is the measured reason this is a function and not `as u8`. Adding
+/// `1.5 * 2^23` to a value in `0..=255` forces the exponent to 23, where a
+/// binary32's ULP is exactly 1, so the addition rounds to the nearest integer
+/// and leaves it in the low bits of the mantissa; reading those bits back is
+/// the conversion. It avoids the float-to-int instruction altogether, which is
+/// what stops LLVM vectorising the loop: over a frame's worth of bytes this
+/// measured 4ms against 17ms for `(x + 0.5) as u8`. `f32::round` — the obvious
+/// way to write it — is worse still, a libm call per byte on a baseline x86-64
+/// target, and it cost more than the filter did.
+#[inline]
+fn to_byte(v: f32) -> u8 {
+    /// `1.5 * 2^23`, the smallest bias that puts every byte value in the low
+    /// mantissa bits of a normal binary32.
+    const BIAS: f32 = 12582912.0;
+    (v.clamp(0.0, 255.0) + BIAS).to_bits() as u8
 }
 
 /// The cubic B-spline kernel, `B = 1, C = 0`.
@@ -130,6 +214,18 @@ fn axis(src: usize, dst: usize) -> Vec<Taps> {
                     *w /= total;
                 }
             }
+            // A tap at exactly the kernel's radius has weight zero, which
+            // happens whenever an output pixel's centre lands on a source
+            // pixel's. Dropping those is not just saved work: it is what makes
+            // every upscaled output pixel exactly four taps, which is the case
+            // the passes have a fast path for.
+            while weights.len() > 1 && weights[0] == 0.0 {
+                weights.remove(0);
+                start += 1;
+            }
+            while weights.len() > 1 && weights[weights.len() - 1] == 0.0 {
+                weights.pop();
+            }
             // The folding above already pulls the footprint inside the
             // image except in the degenerate one-tap case. Bringing it into
             // range here means the passes can index the row directly instead
@@ -140,15 +236,42 @@ fn axis(src: usize, dst: usize) -> Vec<Taps> {
         .collect()
 }
 
+/// The most source rows any one band reads.
+fn band_rows(vertical: &[Taps]) -> usize {
+    vertical
+        .chunks(BAND)
+        .map(|band| {
+            let first = band[0].start;
+            band.last()
+                .map_or(0, |taps| taps.start + taps.weights.len() - first)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// How many bands to filter at once: one per core, and never more than there
+/// are bands to hand out.
+fn workers(bands: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(bands)
+        .max(1)
+}
+
 impl Scaler {
-    /// Builds the weights for one source and destination size.
+    /// Builds the weights and buffers for one source and destination size.
     pub fn new(src: (usize, usize), dst: (usize, usize)) -> Scaler {
+        let vertical = axis(src.1, dst.1);
+        let rows = band_rows(&vertical);
+        let workers = workers(vertical.len().div_ceil(BAND).max(1));
         Scaler {
             src,
             dst,
             horizontal: axis(src.0, dst.0),
-            vertical: axis(src.1, dst.1),
-            scratch: vec![0.0; dst.0 * src.1 * 4],
+            band_rows: rows,
+            scratch: vec![0.0; workers * rows * dst.0 * 4],
+            out: vec![0; dst.0 * dst.1 * 4],
+            vertical,
         }
     }
 
@@ -162,15 +285,16 @@ impl Scaler {
 
     /// Resamples `rgba` from `src` to `dst`.
     ///
-    /// Returns `None` when there is nothing to do — the sizes already match, or
-    /// either is empty — so the caller can upload the source as it stands
-    /// rather than pay for a pass that would only soften it.
+    /// The frame comes back as a slice of the scaler's own buffer, valid until
+    /// the next call. Returns `None` when there is nothing to do — the sizes
+    /// already match, or either is empty — so the caller can upload the source
+    /// as it stands rather than pay for a pass that would only soften it.
     pub fn resample(
         &mut self,
         rgba: &[u8],
         src: (usize, usize),
         dst: (usize, usize),
-    ) -> Option<Vec<u8>> {
+    ) -> Option<&[u8]> {
         if src == dst || src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
             return None;
         }
@@ -185,58 +309,177 @@ impl Scaler {
         }
         self.fit(src, dst);
 
-        // Horizontal, into the scratch as f32 so the vertical pass does not
-        // round twice. One output pixel gathers a short run of the source row,
-        // so the row is sliced once and the taps read it in order.
-        for (in_row, out_row) in rgba[..src.0 * src.1 * 4]
-            .chunks_exact(src.0 * 4)
-            .zip(self.scratch.chunks_exact_mut(dst.0 * 4))
-        {
-            for (out, taps) in out_row
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(&self.horizontal)
-            {
-                let mut acc = [0.0f32; 4];
-                let run = &in_row[taps.start * 4..(taps.start + taps.weights.len()) * 4];
-                for (px, w) in run.as_chunks::<4>().0.iter().zip(&taps.weights) {
-                    for (a, s) in acc.iter_mut().zip(px) {
-                        *a += f32::from(*s) * w;
-                    }
-                }
-                out.copy_from_slice(&acc);
-            }
-        }
-
-        // Vertical, straight out to bytes. This one accumulates a whole
-        // output row per tap rather than a pixel at a time: the taps of one
-        // output row are whole scratch rows, so each is a single pass in order
-        // rather than a walk down a column.
+        let Scaler {
+            horizontal,
+            vertical,
+            scratch,
+            band_rows,
+            out,
+            ..
+        } = self;
         let stride = dst.0 * 4;
-        let mut out = vec![0u8; stride * dst.1];
-        let mut acc = vec![0.0f32; stride];
-        for (taps, out_row) in self.vertical.iter().zip(out.chunks_exact_mut(stride)) {
-            acc.fill(0.0);
-            let run =
-                &self.scratch[taps.start * stride..(taps.start + taps.weights.len()) * stride];
-            for (row, w) in run.chunks_exact(stride).zip(&taps.weights) {
-                let w = *w;
-                for (a, s) in acc.iter_mut().zip(row) {
-                    *a += *s * w;
+        let pad = *band_rows * stride;
+
+        // One band of output rows is one unit of work: it reads the source, it
+        // writes its own rows and nothing else's, and it borrows a scratch of
+        // its own. Nothing is shared, so handing the next one out is the whole
+        // of the synchronisation.
+        let mut queue = vertical.chunks(BAND).zip(out.chunks_mut(stride * BAND));
+        if scratch.len() <= pad {
+            // One worker's worth: a UI sprite, or a machine with one core.
+            // Spawning a thread to hand work to yourself is pure overhead.
+            for (taps, out_band) in queue {
+                band(rgba, src.0, stride, horizontal, taps, scratch, out_band);
+            }
+        } else {
+            let queue = &std::sync::Mutex::new(&mut queue);
+            let horizontal = &*horizontal;
+            std::thread::scope(|scope| {
+                for scratch in scratch.chunks_mut(pad) {
+                    scope.spawn(move || loop {
+                        // Locked only to take the next band, never while one is
+                        // being filtered. A poisoned lock means another worker
+                        // panicked; there is nothing useful to do but stop.
+                        let Ok(mut queue) = queue.lock() else {
+                            return;
+                        };
+                        let Some((taps, out_band)) = queue.next() else {
+                            return;
+                        };
+                        drop(queue);
+                        band(rgba, src.0, stride, horizontal, taps, scratch, out_band);
+                    });
+                }
+            });
+        }
+        Some(&self.out[..stride * dst.1])
+    }
+}
+
+/// Filters one band of output rows.
+///
+/// `taps` is the band's slice of the vertical weights and `out_band` its rows
+/// of the frame; `scratch` is this worker's own, big enough for every source
+/// row the band reads.
+fn band(
+    rgba: &[u8],
+    src_w: usize,
+    stride: usize,
+    horizontal: &[Taps],
+    taps: &[Taps],
+    scratch: &mut [f32],
+    out_band: &mut [u8],
+) {
+    // The span of source rows this band reads. Neighbouring bands overlap by
+    // the kernel's support and filter those few rows twice, which is cheaper
+    // than any way of sharing them would be.
+    let first = taps[0].start;
+    let Some(last) = taps.last().map(|t| t.start + t.weights.len()) else {
+        return;
+    };
+
+    // Horizontal, into the scratch as f32 so the vertical pass does not round
+    // twice. One output pixel gathers a short run of the source row, so the row
+    // is sliced once and the taps read it in order.
+    for (in_row, out_row) in rgba[first * src_w * 4..last * src_w * 4]
+        .chunks_exact(src_w * 4)
+        .zip(scratch.chunks_exact_mut(stride))
+    {
+        for (out, taps) in out_row.as_chunks_mut::<4>().0.iter_mut().zip(horizontal) {
+            let mut acc = [0.0f32; 4];
+            let run = &in_row[taps.start * 4..(taps.start + taps.weights.len()) * 4];
+            for (px, w) in run.as_chunks::<4>().0.iter().zip(&taps.weights) {
+                for (a, s) in acc.iter_mut().zip(px) {
+                    *a += f32::from(*s) * w;
                 }
             }
-            for (o, a) in out_row.iter_mut().zip(&acc) {
-                // Rounded by adding a half rather than by `f32::round`, which
-                // is a libm call on a baseline x86-64 target — once per byte,
-                // it cost more than the filter did. Every value here is
-                // non-negative, so adding a half and truncating is the same
-                // number, and the cast to `u8` saturates, which is the range
-                // clamp the kernel is too well behaved to need.
-                *o = (a + 0.5) as u8;
+            out.copy_from_slice(&acc);
+        }
+    }
+
+    // Vertical, straight out to bytes. A tap of an output row is a whole
+    // scratch row, so this reads along rows rather than down a column.
+    for (taps, out_row) in taps.iter().zip(out_band.chunks_exact_mut(stride)) {
+        let at = (taps.start - first) * stride;
+        let run = &scratch[at..at + taps.weights.len() * stride];
+        column(run, stride, &taps.weights, out_row);
+    }
+}
+
+/// One output row, from the scratch rows its taps name.
+fn column(run: &[f32], stride: usize, weights: &[f32], out: &mut [u8]) {
+    // Up to four taps is every pixel of an upscale, once zero weights are
+    // trimmed, and it is worth taking straight: the source values and the
+    // running sum all stay in registers, so an output byte costs one load per
+    // tap and a store. The general case below accumulates into a buffer and so
+    // reads and writes that buffer once per tap — and the traffic, not the
+    // arithmetic, is what a resample is bound by.
+    if run.len() == weights.len() * stride && stride >= out.len() {
+        // Four is the interior of every upscale, and gets written out rather
+        // than left to the generic form below, which measures 40% slower on it.
+        if let ([w0, w1, w2, w3], [r0, r1, r2, r3]) = (weights, &rows::<4>(run, stride, out.len()))
+        {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = to_byte(r0[i] * w0 + r1[i] * w1 + r2[i] * w2 + r3[i] * w3);
+            }
+            return;
+        }
+        match weights.len() {
+            1 => return straight::<1>(run, stride, weights, out),
+            2 => return straight::<2>(run, stride, weights, out),
+            3 => return straight::<3>(run, stride, weights, out),
+            _ => {}
+        }
+    }
+
+    // Anything else: a downscale, whose footprint is as wide as the shrink
+    // factor. A strip at a time, on the stack, because a 4K row of accumulator
+    // does not fit in L1.
+    for (strip, out_strip) in (0..).zip(out.chunks_mut(STRIP)) {
+        let from = strip * STRIP;
+        let mut acc = [0.0f32; STRIP];
+        let acc = &mut acc[..out_strip.len()];
+        for (row, w) in run.chunks_exact(stride).zip(weights) {
+            let w = *w;
+            for (a, s) in acc.iter_mut().zip(&row[from..from + out_strip.len()]) {
+                *a += *s * w;
             }
         }
-        Some(out)
+        for (o, a) in out_strip.iter_mut().zip(&*acc) {
+            *o = to_byte(*a);
+        }
+    }
+}
+
+/// The `N` scratch rows of `run`, each sliced to `len` so indexing them carries
+/// no bounds check into the filter loop.
+fn rows<const N: usize>(run: &[f32], stride: usize, len: usize) -> [&[f32]; N] {
+    let mut rows: [&[f32]; N] = [&[]; N];
+    for (slot, row) in rows.iter_mut().zip(run.chunks_exact(stride)) {
+        *slot = &row[..len];
+    }
+    rows
+}
+
+/// One output row from exactly `N` taps, with nothing spilled to memory.
+///
+/// `N` is a constant so the inner sum unrolls into registers, and every row is
+/// sliced to the output's own length so the indexing carries no check into the
+/// loop. Both of those matter: writing this with a bounds-checked `get` instead
+/// stopped it vectorising and cost more than the whole fast path saves.
+///
+/// The caller guarantees `run` holds exactly `N` rows of `stride` and that
+/// `stride` covers `out`.
+fn straight<const N: usize>(run: &[f32], stride: usize, weights: &[f32], out: &mut [u8]) {
+    let rows = rows::<N>(run, stride, out.len());
+    let mut w = [0.0f32; N];
+    w.copy_from_slice(&weights[..N]);
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut v = 0.0f32;
+        for (row, w) in rows.iter().zip(&w) {
+            v += row[i] * *w;
+        }
+        *o = to_byte(v);
     }
 }
 
@@ -263,6 +506,74 @@ mod tests {
             let x = step as f32 / 100.0;
             assert!(kernel(x) >= 0.0, "k({x}) = {}", kernel(x));
         }
+    }
+
+    /// `to_byte` is a bit trick, so it is checked against the arithmetic it
+    /// stands for across the whole range, and at the ends where it could wrap.
+    #[test]
+    fn the_byte_conversion_rounds_and_clamps() {
+        for v in 0..=255u32 {
+            assert_eq!(to_byte(v as f32), v as u8, "{v} exactly");
+            assert_eq!(to_byte(v as f32 + 0.25), v as u8, "{v} and a quarter");
+        }
+        assert_eq!(to_byte(-0.4), 0, "below the range clamps, it does not wrap");
+        assert_eq!(to_byte(-1000.0), 0);
+        assert_eq!(to_byte(255.7), 255, "above it clamps too");
+        assert_eq!(to_byte(1e9), 255);
+        assert_eq!(to_byte(0.5), 0, "a tie goes to even");
+        assert_eq!(to_byte(1.5), 2);
+    }
+
+    /// Upscaling never needs more than four taps once the zero-weight ones at
+    /// the kernel's radius are trimmed. [`column`] takes that path straight
+    /// into registers, so this is the property the speed rests on — including
+    /// at whole-number ratios, where the untrimmed footprint is five wide.
+    #[test]
+    fn an_upscale_never_needs_more_than_four_taps() {
+        for (src, dst) in [(800, 1920), (452, 1085), (720, 2160), (7, 21), (100, 101)] {
+            let taps = axis(src, dst);
+            let widest = taps.iter().map(|t| t.weights.len()).max().unwrap_or(0);
+            assert!(widest <= 4, "{src} -> {dst} needed {widest} taps");
+            for t in &taps {
+                assert!(t.weights.iter().all(|w| *w != 0.0), "a zero tap survived");
+                assert!(
+                    t.start + t.weights.len() <= src,
+                    "{src} -> {dst} runs off the end"
+                );
+            }
+        }
+    }
+
+    /// The frame is filtered in bands of [`BAND`] output rows, on as many
+    /// threads as the machine has, and neighbouring bands share the rows their
+    /// kernels overlap on. A band that read the wrong rows, or a worker that
+    /// wrote into another's, would show up as a seam every 32 rows — so this
+    /// upscales a vertical ramp tall enough to cross many band boundaries and
+    /// insists it is still a ramp the whole way down.
+    #[test]
+    fn bands_join_without_a_seam() {
+        let (w, h) = (8usize, 64usize);
+        let mut src = vec![0u8; w * h * 4];
+        for (y, row) in src.chunks_exact_mut(w * 4).enumerate() {
+            let v = (y * 255 / (h - 1)) as u8;
+            row.fill(v);
+        }
+        let (dw, dh) = (16usize, 500usize);
+        let mut scaler = Scaler::default();
+        let out = scaler
+            .resample(&src, (w, h), (dw, dh))
+            .expect("should scale");
+        let at = |y: usize| out[y * dw * 4] as i32;
+        for y in 1..dh {
+            let step = at(y) - at(y - 1);
+            assert!(
+                (0..=3).contains(&step),
+                "row {y} jumped by {step}: a band boundary at {}",
+                y % BAND
+            );
+        }
+        assert_eq!(at(0), 0, "the top stays the top");
+        assert_eq!(at(dh - 1), 255, "and the bottom the bottom");
     }
 
     /// Nothing to do is nothing done: an unscaled frame is handed back

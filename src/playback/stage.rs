@@ -44,6 +44,15 @@ pub struct Still {
 pub struct Visual<'a> {
     /// The movie frame to show, if a movie is playing.
     pub movie: Option<&'a VideoFrame>,
+    /// Which picture [`Self::movie`] is: the clip's path and the frame's
+    /// 0-based index in it.
+    ///
+    /// The playback loop runs far faster than 24 fps — it has to, to stay
+    /// responsive to the pointer — so it asks for the visual many times per
+    /// movie frame and would resample the same picture over and over. Two
+    /// visuals carrying the same pair here are the same picture, and the second
+    /// one needs no work at all.
+    pub movie_id: Option<(&'a str, u64)>,
     /// The still background to show, if one is set and no movie covers it.
     pub still: Option<&'a Still>,
     /// Speaker and line of the active `[PrintText]`.
@@ -404,8 +413,13 @@ impl Stage {
             }
         }
 
+        let movie = self
+            .movie
+            .as_ref()
+            .and_then(|m| Some((m, m.current.as_ref()?)));
         let mut visual = Visual {
-            movie: self.movie.as_ref().and_then(|m| m.current.as_ref()),
+            movie: movie.map(|(_, frame)| frame),
+            movie_id: movie.map(|(clip, frame)| (clip.path.as_str(), frame.index)),
             still: self.still.as_ref(),
             fade: self.fade.as_ref().map(|f| (f.colour, f.opacity(at))),
             ..Default::default()

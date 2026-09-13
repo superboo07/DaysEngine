@@ -38,7 +38,7 @@ use sdl3::EventPump;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Presentation size. Movies decode at 800x452 and still backgrounds are
 /// 800x450; everything is drawn into this box and the box is letterboxed into
@@ -130,14 +130,42 @@ impl SystemSounds {
     }
 }
 
-/// The dialogue currently on screen, cached on the lines it was built from.
+/// The dialogue currently on screen, cached on the line it was built from.
 ///
 /// Each line is uploaded at the layout's own size; where it lands and how far
 /// it is stretched comes from `playback::text::place`, so the texture's own
 /// dimensions are not needed again once it is made.
+///
+/// Keyed on the script's own line rather than on the wrapped result, so a pass
+/// round the loop that changes nothing does not re-wrap it to find that out.
 struct DialogueBlock<'r> {
+    source: String,
     lines: Vec<String>,
     drawn: Vec<Texture<'r>>,
+}
+
+/// The choice labels currently on screen, cached on the labels and which of
+/// them is lit.
+///
+/// Same reason as [`DialogueBlock`], and more urgently: this was rendering both
+/// labels and creating a texture for each of them on every pass round the loop,
+/// hundreds of times a second, for a box that changes when the pointer moves.
+struct ChoiceLabels<'r> {
+    labels: Vec<String>,
+    highlight: Option<usize>,
+    drawn: Vec<(u32, u32, Texture<'r>)>,
+}
+
+/// One mouth patch's texture, and which patch and image it holds.
+///
+/// A mouth flaps at its voice's envelope, a few times a second; without this
+/// the patch went up to the GPU on every pass round the loop instead.
+struct MouthPatch<'r> {
+    /// Patch rectangle and which of the three images — the whole of what
+    /// decides the pixels.
+    key: (usize, usize, usize, usize, usize),
+    size: (usize, usize),
+    texture: Texture<'r>,
 }
 
 /// Everything the two loops both need.
@@ -223,6 +251,14 @@ fn main() -> Result<()> {
         .resizable()
         .build()
         .context("creating window")?;
+    // Present in step with the display rather than as fast as the loop can go.
+    // A movie is 24 frames a second and the bar's ramps are a few hundred
+    // milliseconds; past the rate the panel can show them, a present is work
+    // nobody sees, and an unsynchronised one tears. This is a hint rather than
+    // a call because the safe SDL binding does not expose `SDL_SetRenderVSync`,
+    // and `src/media` is the only module here allowed to reach past it —
+    // [`present_interval`] paces the loop for the case where it is refused.
+    sdl3::hint::set("SDL_RENDER_VSYNC", "1");
     let mut canvas = window.into_canvas();
     let creator = canvas.texture_creator();
 
@@ -616,7 +652,10 @@ fn run_menu(
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
     let mut size = (0, 0);
+    // Paced to the display, not to how fast the loop can spin.
+    let mut interval = present_interval(canvas);
     loop {
+        let pass = Instant::now();
         for event in events.poll_iter() {
             let action = match event {
                 Event::Quit { .. } => return Ok(Outcome::Quit),
@@ -724,6 +763,9 @@ fn run_menu(
                     menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
                     menu.session_mut().display = player.display;
                     under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
+                    // Full screen can land the window on a panel that refreshes
+                    // at another rate.
+                    interval = present_interval(canvas);
                     texture = None;
                 }
                 Action::Sound(se) => {
@@ -837,11 +879,11 @@ fn run_menu(
             let want = (at.0 as usize, at.1 as usize);
             let (w, h, rgba) = match scaler.resample(&image.rgba, src, want) {
                 Some(scaled) => (at.0, at.1, scaled),
-                None => (image.width, image.height, image.rgba),
+                None => (image.width, image.height, image.rgba.as_slice()),
             };
             size = at;
             let mut new = new_texture(creator, w, h)?;
-            new.update(None, &rgba, w as usize * 4)?;
+            new.update(None, rgba, w as usize * 4)?;
             texture = Some(new);
         }
 
@@ -853,7 +895,7 @@ fn run_menu(
                 .map_err(|e| anyhow::anyhow!("drawing the menu: {e}"))?;
         }
         canvas.present();
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        pace(pass, interval);
     }
 }
 
@@ -910,7 +952,10 @@ fn comment_loop(
     let mut size = (0u32, 0u32);
     let mut dirty = true;
 
+    // Paced to the display, not to how fast the loop can spin.
+    let interval = present_interval(canvas);
     loop {
+        let pass = Instant::now();
         // Collected first: the handlers below need the pump again for the
         // modifier state, and cannot hold its iterator while they do.
         let pending: Vec<Event> = events.poll_iter().collect();
@@ -1016,7 +1061,7 @@ fn comment_loop(
                 .map_err(|e| anyhow::anyhow!("drawing the comment dialog: {e}"))?;
         }
         canvas.present();
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        pace(pass, interval);
     }
 }
 
@@ -1121,6 +1166,44 @@ fn apply_display(
     Ok(())
 }
 
+/// How long one pass round a drawing loop should take.
+///
+/// The loops have to run faster than the 24 fps a script is clocked at: they
+/// poll the pointer, the bar ramps in over 300ms and the auto indicator spins.
+/// They do not have to run faster than the display can show, and before this
+/// they ran as fast as a 2ms sleep allowed — some hundreds of presents a second
+/// on a panel doing 60. Vsync should already be blocking in `present`; this is
+/// what paces the loop when the driver refused the hint, and it is why the
+/// sleep is measured from the top of the pass rather than added to the end.
+///
+/// A display that will not say what it does, or claims something absurd, gets
+/// 60: wrong and smooth beats wrong and spinning.
+fn present_interval(canvas: &Canvas<Window>) -> Duration {
+    let hz = canvas
+        .window()
+        .get_display()
+        .and_then(|display| display.get_mode())
+        .map(|mode| mode.refresh_rate)
+        .unwrap_or(0.0);
+    let hz = if hz.is_finite() && (20.0..=1000.0).contains(&hz) {
+        hz
+    } else {
+        60.0
+    };
+    Duration::from_secs_f32(1.0 / hz)
+}
+
+/// Sleeps out the rest of a pass that began at `started`.
+///
+/// Measured from the top of the pass, not added to the end, so a pass that took
+/// most of its budget — a 4K frame being resampled — does not then sleep a
+/// whole interval on top and halve the rate.
+fn pace(started: Instant, interval: Duration) {
+    if let Some(left) = interval.checked_sub(started.elapsed()) {
+        std::thread::sleep(left);
+    }
+}
+
 /// Where the control bar's strip lands in the window.
 ///
 /// `strip` is the strip's size in the art set the display mode chose — 800x75
@@ -1197,13 +1280,18 @@ fn run_script(
     let mut still_texture: Option<(String, (u32, u32), Texture)> = None;
     // The movie frame resampled to the window, and the weights that did it.
     let mut movie_scaled: Option<(u32, u32, Texture)> = None;
+    // Which picture the movie textures are holding: clip, frame index, the
+    // window size it was scaled for, and whether it went into `movie_scaled`
+    // or straight into `movie_texture`.
+    let mut movie_shown: Option<(String, u64, (u32, u32), bool)> = None;
     let mut scaler = scale::Scaler::default();
-    // The wrapped lines and a texture each, cached on the lines themselves.
+    // The wrapped lines and a texture each, cached on the script's own line.
     let mut text_texture: Option<DialogueBlock<'_>> = None;
-    // One patch texture, rebuilt only when a mouth of a different size shows
-    // up. Mouths are tens of pixels across and change three times a second, so
-    // allocating per frame would be pure churn.
-    let mut mouth_texture: Option<(usize, usize, Texture)> = None;
+    // One patch per mouth on screen at once, which is all but always exactly
+    // one. Mouths are tens of pixels across and change three times a second, so
+    // rebuilding the texture per pass would be pure churn.
+    let mut mouth_patches: Vec<MouthPatch<'_>> = Vec::new();
+    let mut choice_labels: Option<ChoiceLabels<'_>> = None;
 
     let mut stage = Stage::new(script);
     let config = Config::load(&player.game);
@@ -1250,7 +1338,10 @@ fn run_script(
     // playback is paused, and the bar still has to fade.
     let start = Instant::now();
 
+    // Paced to the display, not to how fast the loop can spin.
+    let mut interval = present_interval(canvas);
     loop {
+        let pass = Instant::now();
         // The rate the clock runs at, from the speed widget that is lit. Read
         // once per frame because every use of the clock in this iteration has
         // to agree about it.
@@ -1477,7 +1568,8 @@ fn run_script(
                             origin = Instant::now();
                             player.mixer.set_rate(bar_state.rate);
                             // The Option screen can change the display mode,
-                            // and the bar's own art set follows it.
+                            // which moves both the art set the bar draws from
+                            // and the rate the window is presented at.
                             if let Err(err) =
                                 control.set_resolution(player.vfs, &player.dll, player.resolution())
                             {
@@ -1486,8 +1578,12 @@ fn run_script(
                                     player.resolution().name()
                                 );
                             }
+                            interval = present_interval(canvas);
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
+                            movie_shown = None;
+                            mouth_patches.clear();
+                            choice_labels = None;
                             bar_texture = None;
                             still_texture = None;
                             text_texture = None;
@@ -1578,42 +1674,62 @@ fn run_script(
         }
 
         // The frame the window actually shows, resampled to the letterbox
-        // rather than stretched onto it by the driver. The texture is rebuilt
-        // whenever the window resizes, because the weights and the upload size
-        // both follow it. See `daysengine::playback::scale`.
+        // rather than stretched onto it by the driver. See
+        // `daysengine::playback::scale`.
+        //
+        // Resampled once per *picture*, not once per pass round this loop. The
+        // loop has to spin much faster than 24 fps to stay responsive to the
+        // pointer, so it sees each movie frame several times over, and scaling
+        // one is the most expensive thing it does. `movie_id` is what says two
+        // of those are the same picture; the window size joins it because a
+        // resize changes the answer.
         let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
         if let Some(frame) = visual.movie {
-            let src = (frame.width as usize, frame.height as usize);
-            match scaler.resample(
-                &frame.rgba,
-                src,
-                (window_px.0 as usize, window_px.1 as usize),
-            ) {
-                Some(scaled) => {
-                    if movie_scaled
-                        .as_ref()
-                        .is_none_or(|(w, h, _)| (*w, *h) != window_px)
-                    {
-                        let texture = new_texture(creator, window_px.0, window_px.1)?;
-                        movie_scaled = Some((window_px.0, window_px.1, texture));
+            let showing = visual
+                .movie_id
+                .map(|(clip, index)| (clip, index, window_px));
+            let stale = movie_shown.as_ref().is_none_or(|(clip, index, size, _)| {
+                showing != Some((clip.as_str(), *index, *size))
+            });
+            if stale {
+                let src = (frame.width as usize, frame.height as usize);
+                let want = (window_px.0 as usize, window_px.1 as usize);
+                let scaled = match scaler.resample(&frame.rgba, src, want) {
+                    Some(scaled) => {
+                        if movie_scaled
+                            .as_ref()
+                            .is_none_or(|(w, h, _)| (*w, *h) != window_px)
+                        {
+                            let texture = new_texture(creator, window_px.0, window_px.1)?;
+                            movie_scaled = Some((window_px.0, window_px.1, texture));
+                        }
+                        if let Some((w, _, texture)) = &mut movie_scaled {
+                            texture
+                                .update(None, scaled, *w as usize * 4)
+                                .context("uploading movie frame")?;
+                        }
+                        true
                     }
-                    if let Some((w, _, texture)) = &mut movie_scaled {
-                        texture
-                            .update(None, &scaled, *w as usize * 4)
+                    // The window is already the frame's own size, so there is
+                    // nothing to scale and the frame goes up as it stands.
+                    None => {
+                        movie_texture
+                            .update(None, &frame.rgba, frame.width as usize * 4)
                             .context("uploading movie frame")?;
-                        canvas
-                            .copy(texture, None, dst)
-                            .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
+                        false
                     }
-                }
-                None => {
-                    movie_texture
-                        .update(None, &frame.rgba, frame.width as usize * 4)
-                        .context("uploading movie frame")?;
-                    canvas
-                        .copy(&movie_texture, None, dst)
-                        .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
-                }
+                };
+                movie_shown =
+                    showing.map(|(clip, index, size)| (clip.to_string(), index, size, scaled));
+            }
+            let texture = match movie_shown {
+                Some((_, _, _, true)) => movie_scaled.as_ref().map(|(_, _, t)| t),
+                _ => Some(&movie_texture),
+            };
+            if let Some(texture) = texture {
+                canvas
+                    .copy(texture, None, dst)
+                    .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
             }
         } else if let Some(still) = visual.still {
             // Rebuild the texture when the background changes or the window
@@ -1629,10 +1745,10 @@ fn run_script(
                     (window_px.0 as usize, window_px.1 as usize),
                 ) {
                     Some(scaled) => (window_px.0, window_px.1, scaled),
-                    None => (still.width, still.height, still.rgba.clone()),
+                    None => (still.width, still.height, still.rgba.as_slice()),
                 };
                 let mut texture = new_texture(creator, w, h)?;
-                texture.update(None, &rgba, w as usize * 4)?;
+                texture.update(None, rgba, w as usize * 4)?;
                 still_texture = Some((still.path.clone(), window_px, texture));
             }
             if let Some((_, _, texture)) = &still_texture {
@@ -1643,28 +1759,43 @@ fn run_script(
         }
 
         // Mouth patches, over the background and under the fade, matching the
-        // order the engine composites them in.
-        for (mouth, index) in &visual.mouths {
-            let stale = mouth_texture
-                .as_ref()
-                .is_none_or(|(w, h, _)| (*w, *h) != (mouth.width, mouth.height));
-            if stale {
+        // order the engine composites them in. One texture per patch, kept
+        // until the patch or the image it shows changes.
+        mouth_patches.truncate(visual.mouths.len());
+        for (slot, (mouth, index)) in visual.mouths.iter().enumerate() {
+            let key = (mouth.x, mouth.y, mouth.width, mouth.height, *index);
+            let size = (mouth.width, mouth.height);
+            if mouth_patches.get(slot).is_none_or(|p| p.size != size) {
                 let mut texture = new_texture(creator, mouth.width as u32, mouth.height as u32)?;
                 texture.set_blend_mode(BlendMode::Blend);
-                mouth_texture = Some((mouth.width, mouth.height, texture));
+                let patch = MouthPatch {
+                    // Not `key`: the upload below is what makes it true.
+                    key: (0, 0, 0, 0, usize::MAX),
+                    size,
+                    texture,
+                };
+                match mouth_patches.get_mut(slot) {
+                    Some(slot) => *slot = patch,
+                    None => mouth_patches.push(patch),
+                }
             }
-            let Some((_, _, texture)) = &mut mouth_texture else {
+            let Some(patch) = mouth_patches.get_mut(slot) else {
                 continue;
             };
-            texture.update(None, mouth.image(*index), mouth.width * 4)?;
-            let patch = FRect::new(
+            if patch.key != key {
+                patch
+                    .texture
+                    .update(None, mouth.image(*index), mouth.width * 4)?;
+                patch.key = key;
+            }
+            let at = FRect::new(
                 dst.x + mouth.x as f32 * scale,
                 dst.y + mouth.y as f32 * scale,
                 mouth.width as f32 * scale,
                 mouth.height as f32 * scale,
             );
             canvas
-                .copy(&*texture, None, patch)
+                .copy(&patch.texture, None, at)
                 .map_err(|e| anyhow::anyhow!("drawing mouth: {e}"))?;
         }
 
@@ -1686,11 +1817,11 @@ fn run_script(
             // The speaker field is not drawn: the original never hands it to
             // the text layer, only to the backlog. See `playback::text`.
             let _ = speaker;
-            let lines = text::wrap(line, english);
             let stale = text_texture
                 .as_ref()
-                .is_none_or(|cached| cached.lines != lines);
+                .is_none_or(|cached| cached.source != line);
             if stale {
+                let lines = text::wrap(line, english);
                 let mut drawn = Vec::new();
                 for one in &lines {
                     let image = text::render_line(player.font, one, [255, 255, 255], english);
@@ -1700,7 +1831,11 @@ fn run_script(
                     texture.update(None, &image.rgba, image.width * 4)?;
                     drawn.push(texture);
                 }
-                text_texture = Some(DialogueBlock { lines, drawn });
+                text_texture = Some(DialogueBlock {
+                    source: line.to_string(),
+                    lines,
+                    drawn,
+                });
             }
             if let Some(block_lines) = &text_texture {
                 // Placed by `FUN_0044bf30`: centred on each line's own width
@@ -1732,40 +1867,57 @@ fn run_script(
         if let Some((pending, map)) = &choice {
             if pending.visible(at) {
                 if let Some(((mw, mh), boxes)) = map.map_size().zip(map.bounds()) {
-                    for (index, label) in pending.labels.iter().enumerate() {
-                        let Some(region) = boxes.get(index) else {
-                            continue;
-                        };
-                        let lit = pending.highlight == Some(index);
-                        let colour = if lit {
-                            [255, 236, 160]
-                        } else {
-                            [255, 255, 255]
-                        };
-                        let image = text::render_line(player.font, label, colour, english);
-                        let mut texture =
-                            new_texture(creator, image.width as u32, image.height as u32)?;
-                        texture.set_blend_mode(BlendMode::Blend);
-                        texture.update(None, &image.rgba, image.width * 4)?;
+                    // Rebuilt when the labels change, which is once, or when the
+                    // pointer moves to another of them, which lights it.
+                    let stale = choice_labels.as_ref().is_none_or(|cached| {
+                        cached.highlight != pending.highlight || cached.labels != pending.labels
+                    });
+                    if stale {
+                        let mut drawn = Vec::new();
+                        for (index, label) in pending.labels.iter().enumerate() {
+                            let colour = if pending.highlight == Some(index) {
+                                [255, 236, 160]
+                            } else {
+                                [255, 255, 255]
+                            };
+                            let image = text::render_line(player.font, label, colour, english);
+                            let mut texture =
+                                new_texture(creator, image.width as u32, image.height as u32)?;
+                            texture.set_blend_mode(BlendMode::Blend);
+                            texture.update(None, &image.rgba, image.width * 4)?;
+                            drawn.push((image.width as u32, image.height as u32, texture));
+                        }
+                        choice_labels = Some(ChoiceLabels {
+                            labels: pending.labels.clone(),
+                            highlight: pending.highlight,
+                            drawn,
+                        });
+                    }
+                    if let Some(cached) = &choice_labels {
                         let text_scale = scale * 0.5;
-                        let tw = image.width as f32 * text_scale;
-                        let th = image.height as f32 * text_scale;
-                        let cx =
-                            (f32::from(region.x as u16) + region.width as f32 / 2.0) / mw as f32;
-                        let cy =
-                            (f32::from(region.y as u16) + region.height as f32 / 2.0) / mh as f32;
-                        canvas
-                            .copy(
-                                &texture,
-                                None,
-                                FRect::new(
-                                    dst.x + dst.w * cx - tw / 2.0,
-                                    dst.y + dst.h * cy - th / 2.0,
-                                    tw,
-                                    th,
-                                ),
-                            )
-                            .map_err(|e| anyhow::anyhow!("drawing a choice label: {e}"))?;
+                        for (index, (w, h, texture)) in cached.drawn.iter().enumerate() {
+                            let Some(region) = boxes.get(index) else {
+                                continue;
+                            };
+                            let tw = *w as f32 * text_scale;
+                            let th = *h as f32 * text_scale;
+                            let cx = (f32::from(region.x as u16) + region.width as f32 / 2.0)
+                                / mw as f32;
+                            let cy = (f32::from(region.y as u16) + region.height as f32 / 2.0)
+                                / mh as f32;
+                            canvas
+                                .copy(
+                                    texture,
+                                    None,
+                                    FRect::new(
+                                        dst.x + dst.w * cx - tw / 2.0,
+                                        dst.y + dst.h * cy - th / 2.0,
+                                        tw,
+                                        th,
+                                    ),
+                                )
+                                .map_err(|e| anyhow::anyhow!("drawing a choice label: {e}"))?;
+                        }
                     }
                 }
             }
@@ -1799,9 +1951,9 @@ fn run_script(
         }
 
         canvas.present();
-        // The script clock is the authority; sleeping a little keeps us from
-        // spinning a core between frames.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // The script clock is the authority; this only keeps the loop from
+        // spinning a core between the frames the display can actually show.
+        pace(pass, interval);
     }
 }
 
