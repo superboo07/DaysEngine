@@ -58,6 +58,21 @@
 //!
 //! An empty chain is no graph at all, which is the original's path exactly.
 //!
+//! # Input and rumble
+//!
+//! `[Input]` is the binding table — every key and every controller button,
+//! rebindable. See [`super::binding`].
+//!
+//! `[Rumble] Strength` scales what the game's own `MoveSom` statements ask
+//! for. The toy those statements were written for is a serial device nobody
+//! can buy any more; a controller's rumble motor takes the same numbers. The
+//! Option screen's SOMCON tab is the switch, exactly as it always was, and
+//! `Strength = 0` turns the whole thing off here instead.
+//!
+pub use super::binding::{Action, Bindings, Trigger};
+use super::binding::{
+    DEFAULT_CURSOR_SPEED, DEFAULT_DEADZONE, DEFAULT_REPEAT_DELAY, DEFAULT_REPEAT_INTERVAL,
+};
 pub use crate::media::VideoScaler;
 pub use crate::playback::scale::Kernel;
 use std::path::PathBuf;
@@ -162,10 +177,22 @@ pub const DEFAULT_FILTERS_AFTER: &str = "";
 /// `[Video] Grain = 0` turns it off.
 pub const DEFAULT_GRAIN: u8 = 2;
 
+/// How hard a `MoveSom` level is felt, as a percentage of what it asks for.
+///
+/// 100 is the level the script named, unaltered: the game's own five
+/// intensities are `0x33`, `0x66`, `0x99`, `0xcc`, `0xff` — a fifth of full
+/// scale apiece — and at 100 they arrive as a fifth of the motor apiece. Above
+/// 100 for a weak motor, 0 to turn rumble off without touching the game's own
+/// `UseSOM` setting. See [`crate::playback::som`].
+pub const DEFAULT_RUMBLE_STRENGTH: u16 = 100;
+
+/// The most [`Settings::rumble_strength`] will take.
+pub const MAX_RUMBLE_STRENGTH: u16 = 400;
+
 /// Everything `DaysEngine.ini` can say.
 ///
 /// Not `Copy`, because two of these are filter chains and a chain is a string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub video_scaler: VideoScaler,
     /// libavfilter chain applied to each movie frame before it is scaled to
@@ -180,6 +207,12 @@ pub struct Settings {
     /// Draw the game at a whole-number multiple of its own size. See
     /// [`Settings::pixel_perfect`].
     pub pixel_perfect: bool,
+    /// Which key and which controller button does what. See
+    /// [`super::binding`].
+    pub bindings: Bindings,
+    /// Percentage of the level a `MoveSom` asks for that reaches the motor.
+    /// See [`DEFAULT_RUMBLE_STRENGTH`].
+    pub rumble_strength: u16,
 }
 
 impl Default for Settings {
@@ -191,6 +224,8 @@ impl Default for Settings {
             video_grain: DEFAULT_GRAIN,
             ui_scaler: UiScaler::default(),
             pixel_perfect: false,
+            bindings: Bindings::default(),
+            rumble_strength: DEFAULT_RUMBLE_STRENGTH,
         }
     }
 }
@@ -345,6 +380,19 @@ impl Settings {
                     UiScaler::NAMES
                 ),
             },
+            ("rumble", "strength") => match value.trim().parse::<u16>() {
+                Ok(percent) if percent <= MAX_RUMBLE_STRENGTH => self.rumble_strength = percent,
+                _ => log::warn!(
+                    "{FILE} line {line}: {value:?} is not a rumble strength; 0 to {MAX_RUMBLE_STRENGTH}"
+                ),
+            },
+            // The binding table owns its own keys, because there are twenty of
+            // them and they are the actions themselves.
+            ("input", _) => {
+                if !self.bindings.set_from_ini(key, value, line) {
+                    log::warn!("{FILE} line {line}: nothing reads [{section}] {key}");
+                }
+            }
             ("", _) => log::warn!("{FILE} line {line}: {key} is outside any [Section]"),
             _ => log::warn!("{FILE} line {line}: nothing reads [{section}] {key}"),
         }
@@ -410,13 +458,62 @@ pub fn template() -> String {
          ; `pixel` is the band-limited pixel filter, crisp at any scale, which\n\
          ; is what gamescope's PIXEL filter does. The rest are one cubic\n\
          ; family, softest first.\n\
-         Scaler = pixel\n",
+         Scaler = pixel\n\
+         \n\
+         [Input]\n\
+         ; Every control, rebindable. The keys below are the ones the original\n\
+         ; game uses; the pad: entries beside them are this engine's own, and\n\
+         ; are why the game can be played with a controller at all.\n\
+         ;\n\
+         ; A trigger is a key by SDL's name for it (`up`, `space`, `keypad\n\
+         ; enter`), a pad button (`pad:a`, `pad:dpup`, `pad:leftshoulder`), or\n\
+         ; a pad axis pushed one way (`pad:-lefty` is the left stick up,\n\
+         ; `pad:+righttrigger` is the right trigger pulled).\n\
+         ;\n\
+         ; Naming an action REPLACES its list — so one trigger here means one\n\
+         ; trigger, not one more. An empty value turns the action off.\n\
+         ;\n\
+         ; Left and Right move the selection where there is one; during\n\
+         ; playback with nothing selected they seek, which is what the arrow\n\
+         ; keys have always done. FocusBar puts the selection on the control\n\
+         ; bar, which is otherwise reachable only with a pointer.\n\
+         {}\n\
+         \n\
+         ; How far a stick has to move before it counts as pressed, of 32767.\n\
+         Deadzone = {}\n\
+         \n\
+         ; A held direction waits this long, then repeats this often (ms).\n\
+         RepeatDelay = {}\n\
+         RepeatInterval = {}\n\
+         \n\
+         ; How fast the right stick moves the pointer, in pixels a second.\n\
+         ; 0 leaves the pointer to the mouse.\n\
+         CursorSpeed = {}\n\
+         \n\
+         [Rumble]\n\
+         ; The game's scripts carry `MoveSom` statements: five intensities for\n\
+         ; a peripheral that talks over a COM port, which is a device nobody\n\
+         ; can buy any more. They are levels, and a controller's rumble motor\n\
+         ; takes levels, so this engine sends them there.\n\
+         ;\n\
+         ; The switch is the game's own: the Option screen's SOMCON tab, where\n\
+         ; `Port number` picks which connected controller feels them. This is\n\
+         ; only how hard, as a percentage of what the script asked for. 0 to\n\
+         ; {}; 0 turns rumble off without touching the game's own setting.\n\
+         Strength = {}\n",
         VideoScaler::NAMES,
         DEFAULT_FILTERS,
         DEFAULT_FILTERS_AFTER,
         crate::media::grain::MAX,
         DEFAULT_GRAIN,
         UiScaler::NAMES,
+        Bindings::default().template_body().trim_end(),
+        DEFAULT_DEADZONE,
+        DEFAULT_REPEAT_DELAY,
+        DEFAULT_REPEAT_INTERVAL,
+        DEFAULT_CURSOR_SPEED,
+        MAX_RUMBLE_STRENGTH,
+        DEFAULT_RUMBLE_STRENGTH,
     )
 }
 

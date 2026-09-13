@@ -417,6 +417,16 @@ struct MenuArgs {
     /// asks that second question only when the control bar opened it.
     #[arg(long, value_name = "N")]
     run_from_slot: Option<u32>,
+    /// Stand in a peripheral on this `Port number`, one-based, so the SOMCON
+    /// tab can be inspected as it looks with a device held.
+    ///
+    /// There is no device here: this tool has no SDL and opens no controller.
+    /// The tab's find button, its port buttons and its test all go out to the
+    /// engine as requests (`Action::Som`) and the engine answers them, so
+    /// without something standing in for one the tab can only ever be seen in
+    /// its empty state — and the base art changes with the answer.
+    #[arg(long, value_name = "N")]
+    som_port: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -730,6 +740,25 @@ fn cmd_settings(template: bool) {
         println!("          Scaler         (unused: nothing is resampled)");
     } else {
         println!("          Scaler       = {:?}", settings.ui_scaler);
+    }
+    println!("  [Rumble] Strength   = {}%", settings.rumble_strength);
+    println!("  [Input] every control, with what it is bound to:");
+    let width = daysengine::install::binding::Action::ALL
+        .into_iter()
+        .map(|action| action.key().len())
+        .max()
+        .unwrap_or(0);
+    for (action, triggers) in settings.bindings.all() {
+        let list: Vec<String> = triggers.iter().map(ToString::to_string).collect();
+        println!(
+            "          {:<width$} = {}",
+            action.key(),
+            if list.is_empty() {
+                "(unbound)".to_string()
+            } else {
+                list.join(", ")
+            }
+        );
     }
     println!(
         "\nA file of the defaults is written beside the binary on its first run. \
@@ -2463,7 +2492,15 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             wide: resolution != Resolution::Standard,
             full_screen: false,
         },
-        som: Som::default(),
+        // `UseSOM` is the half of this the settings file carries; whether a
+        // port is held is the engine's answer, and `--som-port` is what
+        // stands in for one here.
+        som: Som {
+            enabled: Config::load(game).flag(daysengine::install::config::Flag::UseSom),
+            attached: args.som_port.is_some(),
+            port: args.som_port.and_then(|n| n.checked_sub(1)).unwrap_or(0),
+            testing: false,
+        },
         slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
         english,
         text_input: film.get_bool("TextInput").unwrap_or(false),
@@ -2643,6 +2680,41 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                     }
                 );
                 break;
+            }
+            // The SOMCON tab asks the engine, never the screen, so the tool
+            // has to answer it the way the engine does. `--som-port` is what
+            // stands in for a device; without one every request honestly
+            // answers "nothing here".
+            Action::Som(request) => {
+                let mut som = menu.session().som;
+                som.enabled = menu
+                    .session()
+                    .config
+                    .flag(daysengine::install::config::Flag::UseSom);
+                let stand_in = args.som_port.and_then(|n| n.checked_sub(1));
+                match request {
+                    daysengine::ui::options::SomRequest::Detect => {
+                        som.attached = stand_in.is_some();
+                        som.port = stand_in.unwrap_or(0);
+                    }
+                    daysengine::ui::options::SomRequest::Release => {
+                        som.attached = false;
+                        som.testing = false;
+                    }
+                    daysengine::ui::options::SomRequest::Port(port) => {
+                        som.attached = stand_in.is_some();
+                        som.port = port;
+                    }
+                    daysengine::ui::options::SomRequest::Test(on) => {
+                        som.testing = on && som.attached
+                    }
+                }
+                if !som.enabled {
+                    som.attached = false;
+                    som.testing = false;
+                }
+                println!("  (peripheral: {som:?})");
+                menu.set_som(&vfs, &dll, som)?;
             }
             // The Option screen's Close flushes and then leaves like any
             // other screen, so report where leaving lands — that is the half

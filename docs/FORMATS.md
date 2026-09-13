@@ -88,7 +88,8 @@ Notes:
   male-voice and speaker-tag fields were left blank, which reads as a scripter
   marking "no clip for this line". One background PNG is likewise absent
   (`Event01/01-00/01-00-T00/01-00-T00-009`). A missing asset must not be fatal.
-- `MoveSom` drives a toy; the retail engine no-ops it without hardware.
+- `MoveSom` drives the SOMCON peripheral. See
+  [MoveSom](#movesom--the-levels-a-script-asks-for).
 - **`Next` and `SetSELECT` carry no targets.** The branch graph is not here.
 - `PrintText`'s text field is not plain: it may carry a `\n` **escape** — two
   characters, a backslash and an `n` — as a hard line break, and the ruby marks
@@ -603,9 +604,9 @@ See `daysengine::options`.
 
 ### SOMCON — `MENU::SomconSet`
 
-SOMCON is the peripheral toy the game can drive, not a gamepad. The tab's own
-art says `Port number` and `SOMCON test`, and the DLL imports no input API of
-any kind — no DirectInput, nothing. What it imports is `CreateFileA`,
+SOMCON is the peripheral toy the game drives, not an input device. The tab's
+own art says `Port number` and `SOMCON test`, and the DLL imports no input API
+of any kind — no DirectInput, nothing. What it imports is `CreateFileA`,
 `GetCommState`, `SetCommState`, `GetCommTimeouts`, `SetCommTimeouts`,
 `SetCommMask`, `WaitCommEvent`, `ClearCommError`, `GetOverlappedResult`,
 `ReadFile` and `WriteFile`. The toy is a **serial device** and a "port number"
@@ -634,13 +635,16 @@ of reply:
 indices 0 to 8 in turn, opening each and sending `s00`, and keeps the first
 that answers.
 
-**Nothing in this engine drives a toy, and nothing is planned to.** The tab is
-a working screen and `UseSOM` is stored with the rest of the settings, but no
-port is opened and no byte is written. The protocol above is proprietary to one
-discontinued device; if this engine ever moves a toy it should do it through
-[Intiface](https://intiface.com/) rather than reimplement this. It is recorded
-here because recovering it is what established that SOMCON is not an input
-device — not because it is a plan.
+**This engine opens no COM port.** The protocol above is proprietary to one
+discontinued device and reimplementing it would drive nothing anybody owns.
+What the tab drives instead is whatever `daysengine::playback::som::Device`
+stands behind it — in `daysengine`, the connected controllers, whose rumble
+motors take the same levels the scripts already carry. Nothing about the screen
+changes: nine ports, a find button, a release button and a test, with
+`_GetSomFlag@0`'s answer still the engine's rather than the screen's. An
+[Intiface](https://intiface.com/) backend — where the toys this game was
+actually written for still live — is another implementation of that trait and
+no change anywhere else.
 
 One mismatch is the DLL's own: the screen has ten `Port number` buttons and the
 port-name table has nine entries. The tenth button selects index 9, and the
@@ -648,6 +652,40 @@ string that follows `COM9` in `.rdata` is the `s%02x` format itself, so the
 shipped build would ask `CreateFileA` to open a file called `s%02x` and fail.
 This engine refuses the tenth button rather than reproducing an out-of-bounds
 read.
+
+### MoveSom — the levels a script asks for
+
+`[MoveSom]=<start>	<intensity>	<end>;` is the statement. 46 of the 1857 retail
+scripts carry one, 281 statements in all, and every one of them uses an
+intensity of 1 to 5.
+
+`FUN_0043dbe0` — the per-tick statement walk — dispatches it, and asks three
+things first:
+
+| Question | How | Meaning |
+|---|---|---|
+| Is a port open? | `_GetSomFlag@0`, the DLL's `+0x31c` | no device, no statement |
+| Host `+0x114 == 1` | `FUN_0042bfb0`, engine `+0x1f4` | the engine is on its playback tick — not in a menu (3), a skip (4) or leaving (5) |
+| Host `+0x11c == 0` | `FUN_0042c060`, engine `+0x504` | the lit speed widget is 1x. **Fast-forward does not drive the device.** |
+
+The intensity is then parsed, must be above zero, and goes through
+`FUN_00438470` — a five-case switch, everything else falling through to zero:
+
+| Intensity | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| Level | `0x33` | `0x66` | `0x99` | `0xcc` | `0xff` |
+
+`FUN_0042a200` stores the end frame at `engine+0x790`, an active flag at
+`+0x794` and the level at `+0x798`, and calls `_SomMove@4(level)` — which is
+`s%02x` with that byte and no further mapping. `FUN_0042a250`, called from the
+playback tick `FUN_00424020`, sends `_SomStop@0` once the frame reaches the
+stored end. Suspending playback stops it and resuming puts the same level back
+(`FUN_00424910` / `FUN_00424a10`), and `FUN_00425bf0` clears all three members
+when a script ends, is skipped or is left.
+
+So a `[MoveSom]` is live across its own `[start, end)` window and nowhere else,
+which is how every other statement in an `.ORS` behaves. See
+`daysengine::playback::som`.
 
 ### Replay — `MENU::SceneView`, mode 5, and `MENU::SceneCheck`, mode 8
 

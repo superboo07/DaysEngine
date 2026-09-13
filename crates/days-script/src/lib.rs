@@ -202,7 +202,13 @@ pub enum Command {
         a: String,
         b: Option<String>,
     },
-    /// Drives a peripheral. No-op without hardware.
+    /// Drives the SOMCON peripheral for the length of its window.
+    ///
+    /// The intensity is 1 to 5 in every retail script. What each one means as
+    /// a level, and the conditions the engine puts in front of the statement,
+    /// are the runtime's — see `daysengine::playback::som`. With no device
+    /// attached the statement does nothing, which is the engine's answer and
+    /// not the parser's.
     MoveSom {
         intensity: i32,
     },

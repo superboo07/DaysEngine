@@ -4,12 +4,14 @@
 //! [`stage`] walks one clock across the whole file and reports the state at a
 //! frame; [`mixer`] sums the audio that state says is playing, [`lipsync`]
 //! flaps a speaker's mouth for as long as their clip is audible, [`text`] lays
-//! dialogue out in the game's own font, and [`compose`] draws the lot on the
-//! CPU so a frame can be checked without a display.
+//! dialogue out in the game's own font, [`compose`] draws the lot on the CPU so
+//! a frame can be checked without a display, and [`som`] is the levels a script
+//! asks a peripheral for.
 
 pub mod compose;
 pub mod lipsync;
 pub mod mixer;
 pub mod scale;
+pub mod som;
 pub mod stage;
 pub mod text;

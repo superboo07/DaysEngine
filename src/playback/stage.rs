@@ -11,6 +11,7 @@
 use crate::install::vfs::Vfs;
 use crate::media::{AudioBuffer, VideoDecoder, VideoFrame};
 use crate::playback::lipsync::{self, Envelope, Mouth};
+use crate::playback::som;
 use anyhow::{Context, Result};
 use days_script::{Command, Fade, Frame, Script};
 use std::collections::{BTreeMap, HashMap};
@@ -66,6 +67,16 @@ pub struct Visual<'a> {
     pub select: Option<SelectWindow<'a>>,
     /// Fade overlay: colour and opacity in `0.0..=1.0`.
     pub fade: Option<([u8; 3], f32)>,
+    /// The level the active `[MoveSom]` asks the peripheral for, or `None`
+    /// where no statement covers this frame.
+    ///
+    /// Not a visual, but it belongs to the same walk for the same reason the
+    /// choice window does: it is a statement with a `[start, end)` window, and
+    /// the tick that reads the timeline is the tick that has to act on it. The
+    /// gates the original puts in front of it — a device at all, the engine on
+    /// its playback tick, and 1x — are the caller's, because only the caller
+    /// knows any of them. See [`crate::playback::som`].
+    pub som: Option<u8>,
     /// Mouth patches to draw over the still, each with the index of the image
     /// showing this frame. Empty unless a tagged voice line is speaking over a
     /// background that ships overlays for it.
@@ -716,6 +727,13 @@ impl Stage {
                         end: event.end,
                     })
                 }
+                // `FUN_0043dbe0` refuses an intensity of zero or less before
+                // it maps it, so a statement asking for nothing at all is not
+                // a statement that moves the device to zero — it is one the
+                // engine never dispatches.
+                Command::MoveSom { intensity } if *intensity > 0 => {
+                    visual.som = Some(som::level(*intensity))
+                }
                 _ => {}
             }
         }
@@ -853,6 +871,36 @@ mod tests {
             stage.mouths.is_empty(),
             "a movie must not inherit the background's mouths"
         );
+    }
+
+    /// `[MoveSom]` is live exactly across its own window and nowhere else,
+    /// and an intensity the original refuses is not a statement that moves the
+    /// device to nothing — `FUN_0043dbe0` never dispatches it at all. The
+    /// script here is 05-SE-N00's first two statements, which are real.
+    #[test]
+    fn a_movesom_is_live_across_its_own_window_and_no_further() {
+        let event = |start: &str, end: &str, intensity: i32| days_script::Event {
+            start: Frame::parse(start).unwrap(),
+            end: Frame::parse(end).unwrap(),
+            command: Command::MoveSom { intensity },
+        };
+        let mut stage = Stage::new(Script {
+            length: Frame::parse("01:00:00").unwrap(),
+            events: vec![
+                event("00:04:11", "00:06:18", 5),
+                event("00:06:18", "00:09:12", 4),
+                event("00:10:00", "00:11:00", 0),
+            ],
+            ..Default::default()
+        });
+        let mut at = |frame: &str| stage.visual_at(Frame::parse(frame).unwrap()).som;
+
+        assert_eq!(at("00:04:10"), None, "before the first window");
+        assert_eq!(at("00:04:11"), Some(0xff), "the frame it starts on");
+        assert_eq!(at("00:06:17"), Some(0xff), "the last frame of it");
+        assert_eq!(at("00:06:18"), Some(0xcc), "the next statement takes over");
+        assert_eq!(at("00:09:12"), None, "the end frame is past it");
+        assert_eq!(at("00:10:12"), None, "an intensity of zero is refused");
     }
 
     /// A zero-length fade is instant, not a divide by zero.

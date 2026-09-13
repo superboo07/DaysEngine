@@ -129,12 +129,14 @@ pub struct Display {
 
 /// What the SOMCON tab knows.
 ///
-/// SOMCON is the peripheral toy the game can drive. It is **not** a gamepad —
-/// the tab's own art says `Port number` and `SOMCON test`, and the DLL imports
-/// no input API at all. What it imports is `CreateFileA`, `GetCommState`,
-/// `SetCommState`, `SetCommTimeouts`, `SetCommMask`, `WaitCommEvent`,
-/// `ReadFile` and `WriteFile`: the toy is a **serial device**, and a "port
-/// number" is a COM port. See [`SOM_PORTS`] for the protocol.
+/// SOMCON is the peripheral toy the game drives. It is **not** an input
+/// device — the tab's own art says `Port number` and `SOMCON test`, and the
+/// DLL imports no input API at all. What it imports is `CreateFileA`,
+/// `GetCommState`, `SetCommState`, `SetCommTimeouts`, `SetCommMask`,
+/// `WaitCommEvent`, `ReadFile` and `WriteFile`: the toy is a **serial
+/// device**, and in the shipped game a "port number" is a COM port. See
+/// [`SOM_PORTS`] for the protocol, and [`crate::playback::som::Device`] for
+/// what a port is here.
 ///
 /// `+0x328` is the `UseSOM` setting, `+0x31c` is whether a port was actually
 /// opened, `+0x324` is which one, and `+0x320` is whether the test is running.
@@ -157,21 +159,23 @@ pub struct Som {
 /// see there.
 pub const SOM_PORT_BUTTONS: usize = 10;
 
-/// How many serial ports the DLL can actually open.
+/// How many devices the tab can reach.
 ///
-/// `FUN_10021070` selects from a table of nine ASCII names, `COM1` to `COM9`,
-/// and opens the chosen one with `CreateFileA` at 9600 baud, 8 data bits, no
-/// parity, one stop bit, 500 ms timeouts and `EV_RXCHAR`. It then talks a
-/// two-command ASCII protocol: `FUN_100214d0` writes `s%02x` — `s` and a level
-/// in hex, the test button sending `0x96` — and `FUN_100215d0` writes `b` to
-/// stop. Each is followed by a read of up to 256 bytes of reply.
+/// The figure is the shipped game's: `FUN_10021070` selects from a table of
+/// nine ASCII names, `COM1` to `COM9`, and opens the chosen one with
+/// `CreateFileA` at 9600 baud, 8 data bits, no parity, one stop bit, 500 ms
+/// timeouts and `EV_RXCHAR`. It then talks a two-command ASCII protocol:
+/// `FUN_100214d0` writes `s%02x` — `s` and a level in hex, the test button
+/// sending `0x96` — and `FUN_100215d0` writes `b` to stop. Each is followed by
+/// a read of up to 256 bytes of reply.
 ///
-/// **This engine drives nothing.** The tab is a working screen and the `UseSOM`
-/// setting is stored, but no port is opened and no command is sent: the
-/// protocol above is proprietary to one discontinued device, and if this engine
-/// ever moves a toy it should do it through Intiface rather than reimplement
-/// it. So [`Som::attached`] and [`Som::testing`] are whatever the engine says
-/// they are, and the screen honestly shows "no port" until something sets them.
+/// This engine opens no COM port. That protocol belongs to one discontinued
+/// device, and reimplementing it would drive nothing anybody owns. What it
+/// drives instead is whatever [`crate::playback::som::Device`] is behind the
+/// screen — in `daysengine`, the connected controllers, whose rumble motors
+/// take the same levels the scripts already carry. The tab is unchanged: nine
+/// ports, a find button, a release button and the test, and
+/// [`Som::attached`] is still the engine's answer rather than the screen's.
 ///
 /// The mismatch with [`SOM_PORT_BUTTONS`] is the DLL's own: the tenth button
 /// selects index 9 of a nine-entry table. The string that follows it in
@@ -179,6 +183,25 @@ pub const SOM_PORT_BUTTONS: usize = 10;
 /// `CreateFileA` to open a file called `s%02x` and fail. This engine refuses
 /// the tenth button instead of reproducing an out-of-bounds read.
 pub const SOM_PORTS: usize = 9;
+
+/// What the SOMCON tab has asked the engine to do with the peripheral.
+///
+/// The four things the tab can ask, which are the four the DLL asks its own
+/// serial object: find one, let it go, take a particular one, and run the
+/// test. The engine answers by writing the result back into [`Som`] — see
+/// [`crate::ui::menu::Action::Som`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SomRequest {
+    /// `FUN_10007850`: try every port in turn and keep the first that answers.
+    Detect,
+    /// Let go of whatever is held.
+    Release,
+    /// Take this port, zero-based.
+    Port(usize),
+    /// Start or stop the `SOMCON test`, which sends
+    /// [`crate::playback::som::TEST_LEVEL`].
+    Test(bool),
+}
 
 /// Which way a volume arrow moves a level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

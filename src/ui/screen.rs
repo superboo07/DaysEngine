@@ -427,6 +427,43 @@ impl Screen {
         (index < self.atlas.widgets.len()).then_some(index)
     }
 
+    /// A point inside a widget's hit region, in the same output space
+    /// [`Screen::hit`] takes.
+    ///
+    /// For driving a screen without a pointer: a selection that lands on a
+    /// widget has to become a position, because the control bar's fade, its
+    /// caption strip and its dispatch are all asked about a position rather
+    /// than about a widget.
+    ///
+    /// The middle of the bounding box where the widget owns it, and the first
+    /// pixel it does own otherwise — the route map's cells are not
+    /// rectangular, and the middle of a bounding box there can belong to
+    /// nothing at all.
+    pub fn widget_point(&self, widget: usize) -> Option<(u32, u32)> {
+        let id = u8::try_from(widget + 1).ok()?;
+        let bounds = self.display.bounds(id)?;
+        let middle = (bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        let point = if self.display.region_at(middle.0, middle.1) == id {
+            middle
+        } else {
+            let mut owned = None;
+            'scan: for y in bounds.y..bounds.y + bounds.height {
+                for x in bounds.x..bounds.x + bounds.width {
+                    if self.display.region_at(x, y) == id {
+                        owned = Some((x, y));
+                        break 'scan;
+                    }
+                }
+            }
+            owned?
+        };
+        let scale = f64::from(self.out.0) / f64::from(self.display.width().max(1));
+        Some((
+            (f64::from(point.0) * scale) as u32,
+            (f64::from(point.1) * scale) as u32,
+        ))
+    }
+
     /// Maps a native-space rectangle into display space.
     /// Places a rectangle given in 800x450 layout space, the way a widget is
     /// placed.

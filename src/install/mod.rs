@@ -8,10 +8,12 @@
 //! affection counters the branch system keeps ([`feeling`]) and the player's
 //! place in the branch graph ([`progress`]).
 //!
-//! One file here is the exception, and it is ours rather than theirs:
+//! Two files here are the exception, and they are ours rather than theirs:
 //! [`engine`] reads `DaysEngine.ini`, which holds the choices the original
-//! never had to make.
+//! never had to make, and [`binding`] is the part of it that says which key or
+//! which controller button does what.
 
+pub mod binding;
 pub mod clock;
 pub mod config;
 pub mod dialog;

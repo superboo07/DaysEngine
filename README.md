@@ -41,11 +41,11 @@ Early. What works today:
 | UI rendering — title, menubar, options, replay grid, backlog, route maps | **Composites** — the game's own art, at all four resolutions; `days ui` renders any screen headlessly |
 | UI rendering — save/load | **Works** — the game's own LOAD/SAVE screen, its ten rows, ten page buttons and route-map button, from the player's art; picking a row loads or writes that slot. Its chip table needed the atlas matcher to believe a long exact run rather than a majority of regions, because ten of its rows are one sprite behind two hit regions each — and that one sprite is what both halves light, so pointing at a comment highlights the whole row. The ten records that are three rows tall are not hover art at all: they size the panel of the expanded-comment tooltip, which works — pointing at a row opens its whole comment over the list, wrapped the way the DLL wraps it, opening upwards on the last two rows so it cannot run off the bottom. The comment column and the tooltip are both gated on `FILMENGINE.INI [TextInput]`, which is what host `+0xd8` answers. Naming a save works: the original opens a Win32 dialog from the executable's own resources, and this draws that template — caption, prompt, button captions and every rectangle out of the player's exe — with SDL text input behind it so an IME works. Every row shows its timestamp, chapter and comment: the DLL rasterises all thirty columns into one 2048x1024 off-screen surface and gives each column a sprite that cuts it, and both the cut and the placement are recovered — including the fact that the second band of ten records is not a duplicate of the first but where the comment goes |
 | UI rendering — replay play-data list | **Works** — the player's own save slots, three columns a row, the expanded comment on hover; picking one plays that save back by the answers it recorded |
-| UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
+| UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer, keyboard and controller, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
 | Replay | **Works** — the 41 scenes, their unlock flags, their scripts and the branch tables eleven of them walk are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it through, following the player's choices |
-| In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that move to the next script hand over to the branch graph; which menu each one opens is not recovered. The right-hand box is the replay-mode indicator's transparency slider: its ten cells set how solid the `REPLAYMODE` sign on the picture is drawn, and the whole box lights up only while playback is following a save's recorded answers. `days bar` prints the table |
-| Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
+| In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch, reachable by pointer or by a controller selection that walks the live ones; pause, the auto flag and restart act; the five rate buttons fast-forward, scaling the script clock and retiming the audio with it — resampled at 1x, 2x and 4x and muted above, which is `FUN_004433d0`'s own rule. The buttons that move to the next script hand over to the branch graph. Three of the four menu buttons open the screen they ask for — save, load and Option; the third asks for a code `setSystemInit` has a case for but whose screen is **not recovered**, so that one button is the one this engine cannot answer. The right-hand box is the replay-mode indicator's transparency slider: its ten cells set how solid the `REPLAYMODE` sign on the picture is drawn, and the whole box lights up only while playback is following a save's recorded answers. `days bar` prints the table |
+| Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer, keyboard and controller — the four navigation slots the original's own `+0x148` carries and `FUN_0044de50` reads — and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Subtitles | **Works, the game's own way** — broken by `FUN_0043f600` (62 columns, word-wrapped at spaces, English only, `\n` as a hard break, ruby marks recognised), spaced by the recovered pitch and kerning table rather than by measuring the glyph, and placed by `FUN_0044bf30`: centred on each line's own width, anchored to the bottom, at the per-resolution scale, with `[LeftArrangement]` switching to a left-aligned block. The speaker name is not drawn, because the original never hands it to the text layer, and the whole block is behind the `TextView` setting |
 | Text box art, backlog | Not started |
 | Route / branch graph | **Recovered** — the 55 routes, their 1,857-entry script tables and all 55 transition state machines come out of the user's own `RouteProcSDHQ.dll`, the tables by content and the machines by decoding the handlers, with no address embedded. Scripts chain: a choice moves the player through the graph and credits what it earns. `days route --edges` prints every edge and checks the graph against the tables |
@@ -192,12 +192,62 @@ Grain = 2
 Scaler = pixel
 ; Whole-number scaling: no resampling at all, at the cost of a border
 PixelPerfect = off
+
+[Input]
+; Every control, rebindable. A trigger is a key by SDL's name for it, a
+; pad button (`pad:a`), or a pad axis pushed one way (`pad:-lefty`).
+Confirm = return, keypad enter, space, pad:a
+Cancel  = escape, pad:b
+; ...and seventeen more; `days settings` lists them all
+
+[Rumble]
+; How much of the level a `MoveSom` asks for reaches the motor, as a
+; percentage. 0 turns it off.
+Strength = 100
 ```
 
 A first run writes the file out with every default already filled in, and a
 value it cannot read is a line in the log and nothing more. `days settings
 --template` prints the same copy to standard output, and `days settings` says
 which file is in force and what it currently means.
+
+### Playing it with a controller
+
+The original is keyboard and mouse, and it has no input API at all — the menu
+DLL imports none. A controller is this engine's own addition, and it is here
+because a game that can only be played with two hands on a keyboard and a mouse
+cannot be played by everyone.
+
+The d-pad or the left stick moves the selection, A confirms, B backs out. During
+playback Start pauses, the shoulders seek, the triggers change speed, and Up (or
+the right stick button) puts the selection on the control bar — a strip the
+original can only be reached with a pointer, so without this half of it a
+controller would leave most of the game out of reach. The right stick drives a
+pointer for anything a selection cannot land on.
+
+Every one of those is a line in `[Input]`, and naming an action replaces its
+list rather than adding to it, so a player who wants one binding gets one
+binding. `days settings` prints the table in force.
+
+### Rumble, which is the game's own feature
+
+The scripts carry `[MoveSom]` statements — 281 of them across 46 scripts — with
+five intensities for SOMCON, a toy the game drives over a COM port. The device
+is long discontinued and its protocol is proprietary to it, but the intensities
+are levels, and `FUN_00438470` maps them to a fifth of full scale apiece. A
+rumble motor takes exactly that.
+
+So the levels go to a controller. The switch is the game's own: the Option
+screen's SOMCON tab, unchanged — nine `Port number` buttons, a find button, a
+release button and the `SOMCON test` — where a port is now a connected
+controller. Every recovered condition is followed, including the two that are
+easy to miss: the device is silent while playback is suspended, and silent
+above 1x. `[Rumble] Strength` is the only knob that is ours.
+
+The engine talks to it through one trait, `playback::som::Device`, which is the
+five operations the menu DLL's serial object has. An
+[Intiface](https://intiface.com/) backend — where the toys this was written for
+still live — is another implementation of it and no change anywhere else.
 
 The two scalers are separate because the two jobs are. `[Video] Scaler` is the
 picture — movie frames *and* still backgrounds, both through libswscale. A

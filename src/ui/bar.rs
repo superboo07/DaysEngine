@@ -508,6 +508,42 @@ pub fn action(widget: usize, state: State, latched: bool) -> Act {
     }
 }
 
+/// The widgets [`action`] dispatches on, by name.
+///
+/// The numbers are the hit map's own and belong to `FUN_10024100`'s switch;
+/// these are here so an engine that presses a widget without a pointer on it —
+/// a key, a controller button — presses the same widget the pointer would,
+/// through the same dispatch and the same enable rules, rather than
+/// short-circuiting to the [`Act`] it expects.
+pub mod widget {
+    /// Toggle auto-advance.
+    pub const AUTO: usize = 0;
+    /// Pause or resume.
+    pub const PAUSE: usize = 1;
+    /// Restart the script; a second press inside the latch leaves it.
+    pub const RESTART: usize = 2;
+    /// Leave the script for whatever follows it.
+    pub const NEXT: usize = 3;
+    /// Jump to the choice this script raises.
+    pub const SKIP: usize = 4;
+    /// Open the save screen.
+    pub const SAVE: usize = 10;
+    /// Open the load screen.
+    pub const LOAD: usize = 11;
+    /// Open the Option screen.
+    pub const OPTION: usize = 13;
+    /// Stop playing and go back to the title.
+    pub const LEAVE: usize = 14;
+
+    /// The widget for a rate, by its index into [`super::SPEEDS`].
+    ///
+    /// Clamped rather than wrapped: the two end widgets are the two ends of
+    /// the list, and a request past either is the end it is past.
+    pub fn speed(index: usize) -> usize {
+        5 + index.min(super::SPEEDS.len() - 1)
+    }
+}
+
 /// How widget 2's latch moves when it is pressed or time passes.
 ///
 /// `FUN_10025b90` sets the latch on the first press but only when playback is

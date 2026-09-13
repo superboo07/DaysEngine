@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
+use daysengine::install::binding::{Action as Control, Bindings, Sign, Trigger};
 use daysengine::install::config::{Channel, Config, Flag};
 use daysengine::install::engine::Settings;
 use daysengine::install::progress::Progress;
@@ -20,6 +21,7 @@ use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
 use daysengine::media::ImageScaler;
 use daysengine::playback::lipsync::compose_mouths;
+use daysengine::playback::som::{self, Device};
 use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::comment;
 use daysengine::ui::ending;
@@ -32,12 +34,15 @@ use daysengine::ui::select::{self, Choice, Input, Select};
 use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
+use sdl3::gamepad::{Axis, Button, Gamepad};
+use sdl3::joystick::JoystickId;
 use sdl3::keyboard::Keycode;
 use sdl3::mouse::MouseButton;
 use sdl3::pixels::{Color, PixelFormat};
 use sdl3::render::{BlendMode, Canvas, FRect, ScaleMode, Texture, TextureCreator};
 use sdl3::video::{Window, WindowContext};
 use sdl3::EventPump;
+use sdl3::GamepadSubsystem;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,6 +136,419 @@ impl SystemSounds {
         if let Some(buffer) = sounds.get(vfs, path) {
             mixer.play_system_se(buffer);
         }
+    }
+}
+
+/// How long a rumble effect is asked for, in milliseconds.
+///
+/// SDL effects lapse on their own, which is the right default for a game that
+/// might crash — nobody wants a controller left buzzing. A `[MoveSom]` window
+/// can run for seconds, so the effect is renewed while it lasts; this is the
+/// length of one renewal and [`RUMBLE_RENEW`] is how often.
+const RUMBLE_MS: u32 = 1000;
+
+/// How often a rumble effect is renewed, comfortably inside [`RUMBLE_MS`].
+const RUMBLE_RENEW: Duration = Duration::from_millis(400);
+
+/// The controllers SDL has found, and which one is holding a level.
+///
+/// This is the [`Device`] behind the Option screen's SOMCON tab. The tab was
+/// written for a toy on a COM port — nine `Port number` buttons, a find
+/// button, a release button and a test — and every one of those questions has
+/// an answer here: a port is a connected controller, finding one is asking
+/// each in turn whether it can rumble, and a level is a level. See
+/// [`daysengine::playback::som`] for the levels themselves and where they come
+/// from.
+struct Pads {
+    /// `None` when SDL could not start its gamepad subsystem at all, which
+    /// costs the player controller support and nothing else.
+    subsystem: Option<GamepadSubsystem>,
+    /// Every controller SDL has opened, in the order it announced them. The
+    /// tab's `Port number` buttons stand for this list.
+    open: Vec<(JoystickId, Gamepad)>,
+    /// Which of them is holding the level, or `None` for no port.
+    held: Option<usize>,
+    /// The level last asked for, 0 to 255.
+    level: u8,
+    /// `[Rumble] Strength`, a percentage of what the script asked for.
+    strength: u16,
+    /// When the effect was last sent, so it can be renewed before it lapses.
+    sent: Option<Instant>,
+}
+
+impl Pads {
+    fn new(subsystem: Option<GamepadSubsystem>, strength: u16) -> Pads {
+        let mut pads = Pads {
+            subsystem,
+            open: Vec::new(),
+            held: None,
+            level: 0,
+            strength,
+            sent: None,
+        };
+        // Whatever is already plugged in. SDL only sends an added event for a
+        // controller that arrives after the subsystem is up.
+        match pads.subsystem.as_ref().map(GamepadSubsystem::gamepads) {
+            Some(Ok(ids)) => {
+                for id in ids {
+                    pads.added(id);
+                }
+            }
+            Some(Err(err)) => log::warn!("asking SDL for the controllers: {err}"),
+            None => {}
+        }
+        pads
+    }
+
+    /// Opens a controller SDL has just announced.
+    fn added(&mut self, id: JoystickId) {
+        if self.open.iter().any(|(known, _)| *known == id) {
+            return;
+        }
+        let Some(subsystem) = &self.subsystem else {
+            return;
+        };
+        match subsystem.open(id) {
+            Ok(pad) => {
+                log::info!(
+                    "controller {}: {}",
+                    self.open.len() + 1,
+                    pad.name().unwrap_or_else(|| "unnamed".to_string())
+                );
+                self.open.push((id, pad));
+            }
+            Err(err) => log::warn!("opening controller {id:?}: {err}"),
+        }
+    }
+
+    /// Forgets one that has gone away, and lets its port go with it.
+    fn removed(&mut self, id: JoystickId) {
+        let Some(at) = self.open.iter().position(|(known, _)| *known == id) else {
+            return;
+        };
+        self.open.remove(at);
+        match self.held {
+            // The port in hand was unplugged. Nothing is holding a level any
+            // more, which is exactly what the DLL's `+0x31c` going to zero
+            // means to every screen that reads it.
+            Some(held) if held == at => {
+                self.held = None;
+                self.level = 0;
+                self.sent = None;
+            }
+            Some(held) if held > at => self.held = Some(held - 1),
+            _ => {}
+        }
+    }
+
+    /// A raw axis reading from the first controller, for the stick-driven
+    /// pointer.
+    fn axis(&self, axis: Axis) -> i16 {
+        self.open.first().map_or(0, |(_, pad)| pad.axis(axis))
+    }
+
+    /// Whether any controller is connected at all.
+    fn any(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// Which port is holding the level, if one is. The engine's answer to
+    /// `_GetSomFlag@0`.
+    fn holding(&self) -> Option<usize> {
+        self.held
+    }
+
+    /// Renews the effect before it lapses, and lets it lapse once the level is
+    /// zero.
+    fn renew(&mut self, now: Instant) {
+        if self.level == 0 || self.held.is_none() {
+            return;
+        }
+        if self
+            .sent
+            .is_some_and(|at| now.duration_since(at) < RUMBLE_RENEW)
+        {
+            return;
+        }
+        self.send();
+    }
+
+    /// Puts the level on the controller in hand. A controller that refuses is
+    /// not an error worth stopping for: the player loses the rumble and keeps
+    /// the game.
+    fn send(&mut self) {
+        let magnitude = som::scaled(self.level, self.strength);
+        let Some((_, pad)) = self.held.and_then(|at| self.open.get_mut(at)) else {
+            return;
+        };
+        // Both motors together. The original's device has one level and one
+        // motor; splitting it across a controller's two would be inventing a
+        // second number the scripts never carried.
+        if let Err(err) = pad.set_rumble(magnitude, magnitude, RUMBLE_MS) {
+            log::warn!("the controller would not take a level: {err}");
+        }
+        self.sent = Some(Instant::now());
+    }
+
+    /// Whether a controller will take a level at all, asked the only way that
+    /// does not need `unsafe`: by sending it nothing and seeing whether it was
+    /// accepted.
+    ///
+    /// SDL answers this through a property, and reading a property means
+    /// `SDL_GetGamepadProperties` — which the safe binding only offers behind
+    /// `unsafe`, and `src/media` is the only module in this engine allowed
+    /// that. `SDL_RumbleGamepad` reports the same refusal through its return
+    /// value, so this asks it that way.
+    fn takes_a_level(&mut self, at: usize) -> bool {
+        self.open
+            .get_mut(at)
+            .is_some_and(|(_, pad)| pad.set_rumble(0, 0, 1).is_ok())
+    }
+}
+
+impl Device for Pads {
+    fn ports(&self) -> Vec<String> {
+        self.open
+            .iter()
+            .map(|(_, pad)| pad.name().unwrap_or_else(|| "unnamed".to_string()))
+            .collect()
+    }
+
+    fn open(&mut self, port: usize) -> bool {
+        // `FUN_10021070` opens the port and its caller sends `s00` straight
+        // away, so a device that was already moving stops as it is taken. The
+        // capability check above has already sent this one a zero.
+        if !self.takes_a_level(port) {
+            return false;
+        }
+        self.stop();
+        self.held = Some(port);
+        self.level = 0;
+        self.sent = None;
+        true
+    }
+
+    fn detect(&mut self) -> Option<usize> {
+        // `FUN_10007850` tries indices 0 upward and keeps the first that
+        // answers. The list here is shorter than its nine more often than not.
+        (0..self.open.len().min(daysengine::ui::options::SOM_PORTS)).find(|port| self.open(*port))
+    }
+
+    fn close(&mut self) {
+        self.stop();
+        self.held = None;
+    }
+
+    fn set_level(&mut self, level: u8) {
+        // The original sends `s%02x` on every tick the statement covers and
+        // the device makes nothing of the repeats. A rumble effect is not
+        // idempotent that way — re-sending it restarts it — so the level is
+        // sent when it changes and renewed on [`Pads::renew`]'s clock.
+        if self.level == level {
+            return;
+        }
+        self.level = level;
+        self.send();
+    }
+
+    fn stop(&mut self) {
+        self.level = 0;
+        self.sent = None;
+        if let Some((_, pad)) = self.held.and_then(|at| self.open.get_mut(at)) {
+            if let Err(err) = pad.set_rumble(0, 0, 0) {
+                log::warn!("the controller would not stop: {err}");
+            }
+        }
+    }
+}
+
+/// The binding table, resolved against SDL and tracking what is held down.
+///
+/// [`daysengine::install::binding`] is the table itself and knows nothing
+/// about SDL, which is the right place for it — it is a file in the player's
+/// install, not a window. This is the other half: SDL's names looked up once
+/// at startup, the deadzone that turns a stick into a button, and the repeat
+/// a held direction needs because a controller has no key repeat of its own.
+struct Controls {
+    /// Lowercased SDL key name to the actions it presses.
+    keys: HashMap<String, Vec<Control>>,
+    buttons: HashMap<Button, Vec<Control>>,
+    axes: HashMap<(Axis, Sign), Vec<Control>>,
+    /// Which way each axis is currently pushed, past the deadzone.
+    pushed: HashMap<Axis, Sign>,
+    /// Directions being held, each with the moment it next repeats.
+    repeating: Vec<(Control, Instant)>,
+    deadzone: i16,
+    delay: Duration,
+    interval: Duration,
+    /// Pixels a second the right stick moves the pointer; 0 for not at all.
+    cursor_speed: f32,
+}
+
+impl Controls {
+    /// Resolves a binding table. A name SDL does not know is a warning and a
+    /// trigger that never fires, which is the rule every unreadable setting in
+    /// `DaysEngine.ini` follows.
+    fn new(bindings: &Bindings) -> Controls {
+        let mut controls = Controls {
+            keys: HashMap::new(),
+            buttons: HashMap::new(),
+            axes: HashMap::new(),
+            pushed: HashMap::new(),
+            repeating: Vec::new(),
+            deadzone: bindings.deadzone,
+            delay: Duration::from_millis(u64::from(bindings.repeat_delay)),
+            interval: Duration::from_millis(u64::from(bindings.repeat_interval)),
+            cursor_speed: bindings.cursor_speed,
+        };
+        for (action, triggers) in bindings.all() {
+            for trigger in triggers {
+                match trigger {
+                    Trigger::Key(name) => {
+                        controls.keys.entry(name.clone()).or_default().push(action)
+                    }
+                    Trigger::Button(name) => match Button::from_string(name) {
+                        Some(button) => controls.buttons.entry(button).or_default().push(action),
+                        None => log::warn!("{trigger} is not a controller button SDL knows"),
+                    },
+                    Trigger::Axis(name, sign) => match Axis::from_string(name) {
+                        Some(axis) => controls.axes.entry((axis, *sign)).or_default().push(action),
+                        None => log::warn!("{trigger} is not a controller axis SDL knows"),
+                    },
+                }
+            }
+        }
+        controls
+    }
+
+    /// The actions one SDL event presses.
+    ///
+    /// Nothing in this engine acts on a release, so a release produces no
+    /// actions — it only takes the repeat off whatever was held.
+    fn take(&mut self, event: &Event, now: Instant) -> Vec<Control> {
+        match event {
+            // SDL's own key repeat already does for the keyboard what
+            // [`Controls::due`] does for a controller, so a repeat is a press
+            // and registers nothing further.
+            Event::KeyDown {
+                keycode: Some(key),
+                repeat,
+                ..
+            } => {
+                let actions = self.for_key(*key);
+                if !repeat {
+                    self.hold(&actions, now);
+                }
+                actions
+            }
+            Event::KeyUp {
+                keycode: Some(key), ..
+            } => {
+                let actions = self.for_key(*key);
+                self.let_go(&actions);
+                Vec::new()
+            }
+            Event::GamepadButtonDown { button, .. } => {
+                let actions = self.buttons.get(button).cloned().unwrap_or_default();
+                self.hold(&actions, now);
+                actions
+            }
+            Event::GamepadButtonUp { button, .. } => {
+                let actions = self.buttons.get(button).cloned().unwrap_or_default();
+                self.let_go(&actions);
+                Vec::new()
+            }
+            Event::GamepadAxisMotion { axis, value, .. } => {
+                let now_pushed = (value.unsigned_abs() >= self.deadzone.unsigned_abs())
+                    .then(|| Sign::of(*value));
+                let was = self.pushed.get(axis).copied();
+                if was == now_pushed {
+                    return Vec::new();
+                }
+                if let Some(sign) = was {
+                    let actions = self.axes.get(&(*axis, sign)).cloned().unwrap_or_default();
+                    self.let_go(&actions);
+                }
+                match now_pushed {
+                    Some(sign) => {
+                        self.pushed.insert(*axis, sign);
+                        let actions = self.axes.get(&(*axis, sign)).cloned().unwrap_or_default();
+                        self.hold(&actions, now);
+                        actions
+                    }
+                    None => {
+                        self.pushed.remove(axis);
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn for_key(&self, key: Keycode) -> Vec<Control> {
+        self.keys
+            .get(&key.name().to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Starts the repeat clock on whichever of these repeat at all.
+    fn hold(&mut self, actions: &[Control], now: Instant) {
+        for action in actions {
+            if !action.repeats() || self.repeating.iter().any(|(held, _)| held == action) {
+                continue;
+            }
+            self.repeating.push((*action, now + self.delay));
+        }
+    }
+
+    fn let_go(&mut self, actions: &[Control]) {
+        self.repeating.retain(|(held, _)| !actions.contains(held));
+    }
+
+    /// The held directions whose repeat has come round again.
+    fn due(&mut self, now: Instant) -> Vec<Control> {
+        let mut out = Vec::new();
+        for (action, at) in &mut self.repeating {
+            if now >= *at {
+                *at = now + self.interval;
+                out.push(*action);
+            }
+        }
+        out
+    }
+
+    /// Nothing is held any more — for a loop that is handing over to another
+    /// one, so a direction held across the change does not repeat into it.
+    fn clear(&mut self) {
+        self.repeating.clear();
+        self.pushed.clear();
+    }
+
+    /// How far the right stick moves the pointer this pass, in window pixels.
+    ///
+    /// Squared response, so small movements are fine and a stick pushed to its
+    /// stop is fast. Returns `None` while the stick is inside the deadzone,
+    /// which is what leaves the pointer alone.
+    fn cursor(&self, pads: &Pads, elapsed: Duration) -> Option<(f32, f32)> {
+        if self.cursor_speed <= 0.0 || !pads.any() {
+            return None;
+        }
+        let read = |axis| {
+            let raw = f32::from(pads.axis(axis)) / f32::from(i16::MAX);
+            if raw.abs() * f32::from(i16::MAX) < f32::from(self.deadzone) {
+                0.0
+            } else {
+                raw * raw.abs()
+            }
+        };
+        let (x, y) = (read(Axis::RightX), read(Axis::RightY));
+        if x == 0.0 && y == 0.0 {
+            return None;
+        }
+        let step = self.cursor_speed * elapsed.as_secs_f32();
+        Some((x * step, y * step))
     }
 }
 
@@ -228,6 +646,11 @@ struct Player<'a> {
     /// one resolves to `FUN_00428a80`, the recorded answer, and the moment the
     /// player answers one themselves it comes back down.
     following_record: bool,
+    /// The controllers, and whichever one the SOMCON tab has taken. This is
+    /// the [`Device`] the game's own `[MoveSom]` statements drive.
+    pads: Pads,
+    /// The binding table resolved against SDL, and what is held down.
+    controls: Controls,
     /// The index the last choice box settled on, which is what a replay's
     /// branch table is read by. The film object's `+0x1f8`: `FUN_004388c0`
     /// sets it to -2 once, when the object is constructed, and only a settling
@@ -283,6 +706,9 @@ fn main() -> Result<()> {
                 println!("Menu:   arrows or pointer to choose, Enter or click to confirm,");
                 println!("        Esc to back out.");
                 println!("Script: Space pause, Left/Right seek 5s, R restart, Esc quit.");
+                println!("A controller works everywhere: d-pad or left stick to choose, A to");
+                println!("confirm, B to back out, Up for the control bar, right stick for the");
+                println!("pointer. Every binding is in DaysEngine.ini under [Input].");
                 return Ok(());
             }
             other if other.starts_with('-') => bail!("unknown option {other}"),
@@ -367,9 +793,26 @@ fn main() -> Result<()> {
     // rectangle, anything else the captioned window at the saved
     // `WindowPosX`/`WindowPosY`. So 1 is full screen and 0 is windowed, and
     // the game reopens in whichever the player left it in.
+    // Controllers. A subsystem that will not start costs the player controller
+    // support and nothing else, so it is a warning and an empty list — the
+    // same rule a missing asset follows.
+    let pads = Pads::new(
+        match sdl.gamepad() {
+            Ok(subsystem) => Some(subsystem),
+            Err(err) => {
+                log::warn!("SDL gamepad: {err} — no controller support this session");
+                None
+            }
+        },
+        settings.rumble_strength,
+    );
+    let controls = Controls::new(&settings.bindings);
+
     let boot_config = Config::load(&game);
     let mut player = Player {
         settings,
+        pads,
+        controls,
         game: game.clone(),
         display: Display {
             wide: boot_config
@@ -702,6 +1145,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Never leave a controller buzzing. The effect lapses on its own inside
+    // [`RUMBLE_MS`], but an engine that closed cleanly should not need it to.
+    player.pads.close();
     Ok(())
 }
 
@@ -855,6 +1301,7 @@ fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
 /// an empty grid and says why, which is the same rule every other missing asset
 /// follows.
 fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progress>) -> Session {
+    let config = Config::load(&player.game);
     let scenes = match Scenes::recover(&player.dll) {
         Ok(scenes) => scenes,
         Err(err) => {
@@ -865,15 +1312,23 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
     Session {
         save: SaveState::from_flags(&player.flags, start),
         flags: player.flags.clone(),
-        config: Config::load(&player.game),
         scenes,
         // The Def tab shows which value is in force and greys the other, so
         // this has to be the engine's real mode rather than a fixed answer.
         // The original asks the same two questions through host `+0xb8` and
         // `+0xbc`.
         display: player.display,
-        som: Som::default(),
+        // The SOMCON tab shows what the engine is really holding, the way
+        // `FUN_100073a0` draws it from `_GetSomFlag@0` and `+0x324` rather
+        // than from the settings file. `UseSOM` is the one half that is stored.
+        som: Som {
+            enabled: config.flag(Flag::UseSom),
+            attached: player.pads.holding().is_some(),
+            port: player.pads.holding().unwrap_or(0),
+            testing: false,
+        },
         english,
+        config,
         text_input: player.film.get_bool("TextInput").unwrap_or(false),
         // The screen reports a slot as present when its file opens, and takes
         // the line it shows from the global store.
@@ -975,64 +1430,85 @@ fn run_menu(
     // Whole-number scaling, which decides both where the screen lands and how
     // it gets there.
     let whole = player.whole_pixels();
+    // Where the stick-driven pointer is, in window pixels. Only the stick
+    // moves it; the mouse is read from its own events, as it always was.
+    let mut cursor = (0.0f32, 0.0f32);
+    // A direction held across the way in, so it does not repeat into a screen
+    // the player has only just opened.
+    player.controls.clear();
     // Paced to the display, and deciding on its grid rather than on whatever
     // moment the last pass ended.
     let mut cadence = Cadence::new(canvas);
     loop {
         let now = cadence.tick();
+        // Everything the player asked for this pass: the events SDL had, and
+        // the repeats of whatever is still held down.
+        let mut asked: Vec<Control> = Vec::new();
+        let mut pointed: Option<(i32, i32)> = None;
+        let mut clicked = false;
         for event in events.poll_iter() {
-            let action = match event {
+            match &event {
                 Event::Quit { .. } => return Ok(Outcome::Quit),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => menu.cancel(player.vfs, &player.dll)?,
-                Event::KeyDown {
-                    keycode: Some(Keycode::Up),
-                    ..
-                } => menu.navigate(Dir::Up),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Down),
-                    ..
-                } => menu.navigate(Dir::Down),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Left),
-                    ..
-                } => menu.navigate(Dir::Left),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Right),
-                    ..
-                } => menu.navigate(Dir::Right),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Return | Keycode::KpEnter | Keycode::Space),
-                    ..
-                } => confirm(&mut menu, player)?,
-                Event::MouseMotion { x, y, .. } => match to_screen(canvas, &menu, whole, x, y) {
-                    Some((sx, sy)) => menu.point_at(sx, sy),
-                    None => menu.point_away(),
-                },
+                Event::GamepadAdded { which, .. } => player.pads.added(*which),
+                Event::GamepadRemoved { which, .. } => player.pads.removed(*which),
+                Event::MouseMotion { x, y, .. } => {
+                    cursor = (*x, *y);
+                    pointed = Some((*x as i32, *y as i32));
+                }
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Left,
                     x,
                     y,
                     ..
-                } => match to_screen(canvas, &menu, whole, x, y) {
-                    Some((sx, sy)) => {
-                        // Clicking is pointing and then confirming: the original
-                        // acts on whatever the cursor is over, not on whatever
-                        // the keyboard last selected.
-                        menu.point_at(sx, sy);
-                        confirm(&mut menu, player)?
-                    }
-                    None => Action::Stay,
-                },
+                } => {
+                    cursor = (*x, *y);
+                    pointed = Some((*x as i32, *y as i32));
+                    clicked = true;
+                }
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Right,
                     ..
-                } => menu.cancel(player.vfs, &player.dll)?,
-                _ => Action::Stay,
-            };
+                } => asked.push(Control::Cancel),
+                _ => {}
+            }
+            asked.extend(player.controls.take(&event, now));
+        }
+        asked.extend(player.controls.due(now));
+        // The right stick moves the pointer, for the screens a selection
+        // cannot reach every part of.
+        if let Some((dx, dy)) = player.controls.cursor(&player.pads, cadence.interval()) {
+            let (w, h) = canvas.window().size();
+            cursor.0 = (cursor.0 + dx).clamp(0.0, w.saturating_sub(1) as f32);
+            cursor.1 = (cursor.1 + dy).clamp(0.0, h.saturating_sub(1) as f32);
+            pointed = Some((cursor.0 as i32, cursor.1 as i32));
+        }
 
+        // The pointer first, so a confirm in the same pass acts on what it is
+        // over — which is what a click is: the original acts on whatever the
+        // cursor is on, not on whatever the selection last was.
+        let mut actions: Vec<Action> = Vec::new();
+        if let Some((x, y)) = pointed {
+            actions.push(match to_screen(canvas, &menu, whole, x as f32, y as f32) {
+                Some((sx, sy)) => menu.point_at(sx, sy),
+                None => menu.point_away(),
+            });
+        }
+        if clicked {
+            actions.push(confirm(&mut menu, player)?);
+        }
+        for control in asked {
+            actions.push(match control {
+                Control::Up => menu.navigate(Dir::Up),
+                Control::Down => menu.navigate(Dir::Down),
+                Control::Left => menu.navigate(Dir::Left),
+                Control::Right => menu.navigate(Dir::Right),
+                Control::Confirm => confirm(&mut menu, player)?,
+                Control::Cancel => menu.cancel(player.vfs, &player.dll)?,
+                _ => Action::Stay,
+            });
+        }
+
+        for action in actions {
             match action {
                 Action::Play => return Ok(Outcome::Play),
                 Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
@@ -1105,6 +1581,55 @@ fn run_menu(
                     // Full screen can land the window on a panel that refreshes
                     // at another rate.
                     cadence = Cadence::new(canvas);
+                    texture = None;
+                }
+                // The SOMCON tab asked something of the device, and the
+                // engine is the half that knows what is really there.
+                // `FUN_10007850` walks the ports itself and `_GetSomFlag@0`
+                // reports what it found, so the answer goes straight back into
+                // the screen and the art follows it.
+                Action::Som(request) => {
+                    let mut som = menu.session().som;
+                    som.enabled = menu.session().config.flag(Flag::UseSom);
+                    match request {
+                        options::SomRequest::Detect => match player.pads.detect() {
+                            Some(port) => {
+                                log::info!("rumble: port {} took the level", port + 1);
+                                som.attached = true;
+                                som.port = port;
+                            }
+                            None => {
+                                log::info!("rumble: no controller would take a level");
+                                som.attached = false;
+                            }
+                        },
+                        options::SomRequest::Release => {
+                            player.pads.close();
+                            som.attached = false;
+                            som.testing = false;
+                        }
+                        options::SomRequest::Port(port) => {
+                            som.attached = player.pads.open(port);
+                            som.port = port;
+                            som.testing = false;
+                        }
+                        // The test is the DLL's own `s96`, held until the
+                        // player stops it.
+                        options::SomRequest::Test(on) => {
+                            som.testing = on && som.attached;
+                            player
+                                .pads
+                                .set_level(if som.testing { som::TEST_LEVEL } else { 0 });
+                        }
+                    }
+                    // `UseSOM` off is no device at all, whatever was held.
+                    if !som.enabled {
+                        player.pads.close();
+                        som.attached = false;
+                        som.testing = false;
+                    }
+                    menu.set_som(player.vfs, &player.dll, som)?;
+                    apply_settings(menu.session(), player.mixer);
                     texture = None;
                 }
                 Action::Sound(se) => {
@@ -1643,6 +2168,14 @@ impl Cadence {
         }
     }
 
+    /// One refresh, which is how long a pass round the loop stands for.
+    ///
+    /// What the stick-driven pointer moves by: a speed in pixels a second is
+    /// only a speed if it is multiplied by the time a pass covers.
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
     /// The refresh this pass is drawing for, which is what it decides with.
     fn tick(&self) -> Instant {
         self.anchor + snap(self.anchor.elapsed(), self.interval)
@@ -1660,6 +2193,29 @@ impl Cadence {
             std::thread::sleep(left);
         }
     }
+}
+
+/// The first control bar widget a selection can land on.
+///
+/// The bar's own order, so this is widget 0 — auto-advance — unless something
+/// has turned it off, which nothing does.
+fn first_bar_widget(state: bar::State) -> Option<usize> {
+    (0..bar::WIDGETS).find(|widget| bar::enabled(*widget, state))
+}
+
+/// The next live control bar widget along, wrapping.
+///
+/// Dead widgets are stepped over rather than landed on: `FUN_10023fb0` answers
+/// for each of them and a press on one is swallowed *and silent*, so a
+/// selection that could rest on one would look like a control that had stopped
+/// working. The bar is one strip, so this is the whole of its navigation.
+fn step_bar(from: usize, forward: bool, state: bar::State) -> Option<usize> {
+    (1..=bar::WIDGETS)
+        .map(|step| {
+            let step = if forward { step } else { bar::WIDGETS - step };
+            (from + step) % bar::WIDGETS
+        })
+        .find(|widget| bar::enabled(*widget, state))
 }
 
 /// `elapsed` rounded to the nearest whole refresh.
@@ -1797,6 +2353,12 @@ fn run_script(
     mut progress: Option<&mut Progress>,
 ) -> Result<Outcome> {
     player.mixer.stop_all();
+    // Nothing carries over from the last script: `FUN_004236f0` clears the
+    // peripheral's three members as it frees one.
+    player.pads.stop();
+    // A direction held on the way in would otherwise repeat into the first
+    // frame of the script.
+    player.controls.clear();
 
     // The background as it will be shown: mouth patches already in it, scaled
     // to the window. Keyed by everything that decides those pixels, so a pass
@@ -1864,6 +2426,10 @@ fn run_script(
     let mut paused = false;
     let mut pointer = (0.0f32, 0.0f32);
     let mut buttons = (false, false);
+    // Which control bar widget the selection is on, for a player who is not
+    // using a pointer. `None` leaves the bar to the pointer, which is the only
+    // way the original has of reaching it at all.
+    let mut bar_focus: Option<usize> = None;
     // A wall clock for the bar's fade, which ramps in milliseconds of real time
     // and so cannot hang off the script clock: the script clock stops when
     // playback is paused, and the bar still has to fade.
@@ -1879,49 +2445,31 @@ fn run_script(
         // to agree about it.
         let rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
 
+        // What the player asked for this pass, and where it goes. A control
+        // bar widget the selection is on is pressed by pushing its number
+        // here, which is the same list a click produces — so a button and a
+        // click reach the bar's dispatch by one road, with the bar's own
+        // enable rules in front of both.
+        let mut asked: Vec<Control> = Vec::new();
+        let mut pressed: Vec<usize> = Vec::new();
+        let mut answer = Input::default();
         for event in events.poll_iter() {
-            match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => return Ok(Outcome::Quit),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Space),
-                    ..
-                } => {
-                    if paused {
-                        origin = now;
-                    } else {
-                        offset = clock(origin, now, offset, rate);
-                    }
-                    paused = !paused;
+            match &event {
+                Event::Quit { .. } => return Ok(Outcome::Quit),
+                Event::GamepadAdded { which, .. } => player.pads.added(*which),
+                Event::GamepadRemoved { which, .. } => player.pads.removed(*which),
+                Event::MouseMotion { x, y, .. } => {
+                    pointer = (*x, *y);
+                    // The pointer has moved, so it owns the bar again: two
+                    // highlights disagreeing about which widget is hovered is
+                    // worse than either alone.
+                    bar_focus = None;
                 }
-                Event::KeyDown {
-                    keycode: Some(key @ (Keycode::Right | Keycode::Left)),
-                    ..
-                } => {
-                    let at = clock(origin, now, offset, rate);
-                    let delta = 5 * FPS;
-                    offset = if key == Keycode::Right {
-                        Frame(at.0 + delta)
-                    } else {
-                        Frame(at.0.saturating_sub(delta))
-                    };
-                    origin = now;
-                }
-                Event::KeyDown {
-                    keycode: Some(Keycode::R),
-                    ..
-                } => {
-                    offset = Frame::ZERO;
-                    origin = now;
-                }
-                Event::MouseMotion { x, y, .. } => pointer = (x, y),
                 Event::MouseButtonDown {
                     mouse_btn, x, y, ..
                 } => {
-                    pointer = (x, y);
+                    pointer = (*x, *y);
+                    bar_focus = None;
                     match mouse_btn {
                         MouseButton::Left => buttons.0 = true,
                         MouseButton::Right => buttons.1 = true,
@@ -1933,6 +2481,97 @@ fn run_script(
                     MouseButton::Right => buttons.1 = false,
                     _ => {}
                 },
+                _ => {}
+            }
+            asked.extend(player.controls.take(&event, now));
+        }
+        asked.extend(player.controls.due(now));
+        if let Some((dx, dy)) = player.controls.cursor(&player.pads, cadence.interval()) {
+            let (w, h) = canvas.window().size();
+            pointer.0 = (pointer.0 + dx).clamp(0.0, w.saturating_sub(1) as f32);
+            pointer.1 = (pointer.1 + dy).clamp(0.0, h.saturating_sub(1) as f32);
+            bar_focus = None;
+        }
+
+        // Where a direction goes depends on what is on screen, the same way
+        // the original's own eight input slots do: with a choice box up they
+        // are the box's four (`FUN_0044de50` reads slots 4 to 7), with the
+        // selection on the bar they walk it, and with neither they seek, which
+        // is what the arrow keys have always done here.
+        //
+        // Both snapshots are taken before the actions are read, because one
+        // press can carry two actions — Escape is bound to Cancel and to Quit,
+        // and a Cancel that took the selection off the bar must not let the
+        // Quit behind it through.
+        let answering = choice.is_some();
+        let focused = bar_focus.is_some();
+        for control in asked {
+            match control {
+                Control::Quit if !answering && !focused => return Ok(Outcome::Quit),
+                Control::Cancel if answering => answer.cancel = true,
+                Control::Cancel => bar_focus = None,
+                Control::Confirm if answering => answer.confirm = true,
+                Control::Confirm => pressed.extend(bar_focus),
+                Control::Up if answering => answer.prev = true,
+                Control::Down if answering => answer.next = true,
+                // Up reaches for the bar, which is where the bar is: a strip
+                // along the top of the picture. Down lets it go again.
+                Control::Up if !focused => bar_focus = first_bar_widget(bar_state),
+                Control::Up => {}
+                Control::Down => bar_focus = None,
+                Control::FocusBar => {
+                    bar_focus = if focused {
+                        None
+                    } else {
+                        first_bar_widget(bar_state)
+                    }
+                }
+                Control::Left if answering => answer.prev = true,
+                Control::Right if answering => answer.next = true,
+                Control::Left | Control::Right => match bar_focus {
+                    Some(widget) => {
+                        bar_focus = step_bar(widget, control == Control::Right, bar_state)
+                    }
+                    None => {
+                        let at = clock(origin, now, offset, rate);
+                        let delta = 5 * FPS;
+                        offset = if control == Control::Right {
+                            Frame(at.0 + delta)
+                        } else {
+                            Frame(at.0.saturating_sub(delta))
+                        };
+                        origin = now;
+                    }
+                },
+                Control::SeekForward | Control::SeekBack => {
+                    let at = clock(origin, now, offset, rate);
+                    let delta = 5 * FPS;
+                    offset = if control == Control::SeekForward {
+                        Frame(at.0 + delta)
+                    } else {
+                        Frame(at.0.saturating_sub(delta))
+                    };
+                    origin = now;
+                }
+                // The rest are the bar's own widgets, pressed by number. The
+                // bar decides whether each is live, plays the click and
+                // dispatches, exactly as it does for a click on it.
+                // Space is bound to Confirm and to Pause, because that is
+                // what the two loops did separately before there was one
+                // table. A confirm something took — a choice box, or the
+                // selection sitting on a bar widget — is not also a pause.
+                Control::Pause if !answering && !focused => pressed.push(bar::widget::PAUSE),
+                Control::Auto => pressed.push(bar::widget::AUTO),
+                Control::Restart => pressed.push(bar::widget::RESTART),
+                Control::SkipToChoice => pressed.push(bar::widget::SKIP),
+                Control::SaveMenu => pressed.push(bar::widget::SAVE),
+                Control::LoadMenu => pressed.push(bar::widget::LOAD),
+                Control::OptionMenu => pressed.push(bar::widget::OPTION),
+                Control::LeavePlayback => pressed.push(bar::widget::LEAVE),
+                Control::Faster => pressed.push(bar::widget::speed(bar_state.speed + 1)),
+                Control::Slower => {
+                    pressed.push(bar::widget::speed(bar_state.speed.saturating_sub(1)))
+                }
                 _ => {}
             }
         }
@@ -1974,6 +2613,20 @@ fn run_script(
         stage.seek_to(at, player.vfs, player.mixer)?;
         let visual = stage.visual_at(at);
 
+        // The peripheral. `FUN_0043dbe0` asks two things of the host before it
+        // moves it — the engine is on its playback tick, and the lit speed
+        // widget is 1x — and the statement's own window is the rest:
+        // `FUN_0042a250` stops the device once the frame reaches the end it
+        // stored. Pausing is one of the states that is not the playback tick,
+        // which is why it stops here too. See `daysengine::playback::som`.
+        player.pads.set_level(
+            visual
+                .som
+                .filter(|_| som::gated(!paused, bar_state.speed))
+                .unwrap_or(0),
+        );
+        player.pads.renew(now);
+
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
 
@@ -2004,8 +2657,21 @@ fn run_script(
             // Whether the pointer is inside the strip's own rectangle at all is
             // the question the bar's visibility turns on, so it is asked here
             // and not derived from whether a widget was hit.
-            let sx = (pointer.0 - strip.x) / bar_scale;
-            let sy = (pointer.1 - strip.y) / bar_scale;
+            //
+            // A selection on the bar stands in for the pointer being on it.
+            // The fade, the caption strip and the dispatch are every one of
+            // them asked about a *position* — the bar has no notion of a
+            // selection, because the original has no way of reaching it
+            // without a pointer — so the selection becomes the position its
+            // widget occupies, and everything downstream is the pointer path
+            // unchanged.
+            let (sx, sy) = match bar_focus.and_then(|w| control.screen().widget_point(w)) {
+                Some((x, y)) => (x as f32, y as f32),
+                None => (
+                    (pointer.0 - strip.x) / bar_scale,
+                    (pointer.1 - strip.y) / bar_scale,
+                ),
+            };
             let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
                 .then_some((sx as u32, sy as u32));
             let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
@@ -2022,6 +2688,13 @@ fn run_script(
                     // Consume the press, so a bar widget and a choice box
                     // under it do not both answer to one click.
                     buttons.0 = false;
+                    pressed.push(widget);
+                }
+            }
+            // Clicks and bound buttons both arrive here, as widget numbers, so
+            // there is one dispatch and one set of enable rules for the two.
+            for widget in std::mem::take(&mut pressed) {
+                {
                     let act = control.press(widget, bar_state, at.0);
                     if act != bar::Act::None {
                         player.system_se.play(
@@ -2152,6 +2825,10 @@ fn run_script(
                                 progress.as_deref_mut(),
                             )?;
                             player.mixer.resume_script();
+                            // The SOMCON tab may have left its test running,
+                            // and the tick below is about to say what the
+                            // script asks for anyway.
+                            player.pads.stop();
                             // The Sound tab may have moved `MenVoice`, which
                             // the loop hands to the stage on its next tick.
                             // Re-reading the file lands on the same value at
@@ -2215,6 +2892,15 @@ fn run_script(
                 }
             }
             control.expire_latch(at.0);
+            // A press can turn the widget the selection is on dead — skipping
+            // to the choice takes the skip widget with it. A selection resting
+            // on a dead widget looks like a control that has stopped working,
+            // so it moves along to the next live one.
+            if let Some(widget) = bar_focus {
+                if !bar::enabled(widget, bar_state) {
+                    bar_focus = step_bar(widget, true, bar_state);
+                }
+            }
         }
 
         // The choice box. It is raised and decided by the script clock, not by
@@ -2236,6 +2922,11 @@ fn run_script(
             _ => {}
         }
         if let Some((pending, map)) = &mut choice {
+            // The four navigation slots are the original's own: host
+            // `+0x148` carries eight buttons and `FUN_0044de50` reads six of
+            // them — the pointer's pick and dismiss, and slots 4 to 7 for
+            // previous, next, confirm and cancel. The pointer half was always
+            // here; the other four are what a player without one presses.
             let input = Input {
                 pointer: (
                     f64::from((pointer.0 - dst.x) / dst.w),
@@ -2243,7 +2934,7 @@ fn run_script(
                 ),
                 pick: buttons.0,
                 dismiss: buttons.1,
-                ..Input::default()
+                ..answer
             };
             let event = pending.tick(at, map, input, bar_state.auto, &mut |n| {
                 // The original seeds from `GetTickCount` and draws once; any

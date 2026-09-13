@@ -381,6 +381,14 @@ pub enum Action {
     /// The DLL only records the request; who acts on it is not recovered. See
     /// [`crate::ui::options::DisplayRequest`].
     Display(options::DisplayRequest),
+    /// The SOMCON tab asked the engine to do something with the peripheral.
+    ///
+    /// Whether a port is really there is the engine's to answer, never the
+    /// DLL's: `FUN_10007850` walks the ports itself and `_GetSomFlag@0`
+    /// reports what it found. The screen's job is to ask and to draw the
+    /// answer, so this goes out and the engine writes the result back into
+    /// [`Session::som`]. See [`crate::playback::som::Device`].
+    Som(options::SomRequest),
     /// Load a save slot and play what it names.
     Load(u32),
     /// Jump to a story point the run has passed, from the route map.
@@ -1642,33 +1650,22 @@ impl Menu {
             }
             options::Act::Close => Ok(Action::SettingsSaved),
             options::Act::Display(request) => Ok(Action::Display(request)),
-            options::Act::SomDetect | options::Act::SomRelease => {
+            // Whether a port is really there is the engine's to answer, never
+            // the screen's: the DLL asks its own serial object and reads the
+            // result back through `_GetSomFlag@0`. So these four go out as
+            // requests and the engine hands the answer back to
+            // [`Menu::set_som`], which is what reloads the art the answer
+            // chooses.
+            options::Act::SomDetect => {
                 options::apply(&mut self.session.config, act);
-                // Whether a port is really there is the engine's to answer, and
-                // this engine opens none — see `options::SOM_PORTS`. Asking is
-                // all this screen does. The background art changes with the
-                // answer, so the screen reloads.
-                self.session.som.enabled = self
-                    .session
-                    .config
-                    .flag(crate::install::config::Flag::UseSom);
-                if !self.session.som.enabled {
-                    self.session.som.attached = false;
-                    self.session.som.testing = false;
-                }
-                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
-                Ok(Action::SettingsChanged)
+                Ok(Action::Som(options::SomRequest::Detect))
             }
-            options::Act::SomPort(port) => {
-                self.session.som.port = port;
-                self.refresh();
-                Ok(Action::Stay)
+            options::Act::SomRelease => {
+                options::apply(&mut self.session.config, act);
+                Ok(Action::Som(options::SomRequest::Release))
             }
-            options::Act::SomTest(on) => {
-                self.session.som.testing = on;
-                self.refresh();
-                Ok(Action::Stay)
-            }
+            options::Act::SomPort(port) => Ok(Action::Som(options::SomRequest::Port(port))),
+            options::Act::SomTest(on) => Ok(Action::Som(options::SomRequest::Test(on))),
             options::Act::None => Ok(Action::Stay),
             _ => {
                 options::apply(&mut self.session.config, act);
@@ -1676,6 +1673,24 @@ impl Menu {
                 Ok(Action::SettingsChanged)
             }
         }
+    }
+
+    /// Records what the engine made of an [`Action::Som`].
+    ///
+    /// `FUN_100073a0` picks the tab's background from whether a port is held,
+    /// and each port button's highlight from which one it is, so the answer
+    /// changes what is on screen. A change to whether the toy is asked for at
+    /// all swaps the base art and needs the screen loading again; anything
+    /// else is a repaint.
+    pub fn set_som(&mut self, vfs: &Vfs, dll: &[u8], som: options::Som) -> Result<(), Error> {
+        let was = self.session.som;
+        self.session.som = som;
+        if was.enabled != som.enabled && self.mode == Mode::OPTION {
+            self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+        } else {
+            self.refresh();
+        }
+        Ok(())
     }
 
     /// The replay grid's dispatch.
