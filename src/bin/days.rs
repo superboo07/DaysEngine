@@ -2660,6 +2660,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         let (episode, page, chart) = menu.chart();
         let charted = menu.charted();
         let pickable = menu.pickable();
+        let marker = menu.marker();
         println!(
             "  route map, episode {} page {}, {} story points",
             episode + 1,
@@ -2669,13 +2670,18 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         for cell in 0..chart.cells {
             let story = daysengine::ui::routemap::story(episode, chart.base, cell);
             println!(
-                "    {:<6} {:<10} {}",
+                "    {:<6} {:<10} {:<14} {}",
                 daysengine::ui::routemap::story_flag(story),
                 if charted[cell] { "charted" } else { "blank" },
                 if pickable[cell] {
                     "can be picked"
                 } else {
                     "not this run"
+                },
+                if marker == Some(cell) {
+                    "you are here"
+                } else {
+                    ""
                 }
             );
         }

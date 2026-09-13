@@ -2208,12 +2208,62 @@ look at with every cell inert, and the same screen reached from the control bar
 mid-playthrough is how the player jumps back.
 
 `FUN_1000e060` opens it on the player's own episode and page when there is a
-playthrough, from `_GetStory@4` and `_GetRouteMapPage@8`. Both are
-`RouteProcSDHQ.dll` tables over `ROUTE`; eight of the 55 routes answer the
-second by asking `_CheckScript@8` instead, and **`_CheckScript@8` is not
-recovered** — it dispatches to one function per route, 55 of them. Those eight
-open on the episode's first page here. The same call is what `+0x3e4`, the
-"you are here" marker, is computed from, so **that marker is not implemented**.
+playthrough, from `_GetStory@4` and `_GetRouteMapPage@8`, both
+`RouteProcSDHQ.dll` tables over `ROUTE`. The second is a plain table for 46 of
+the 55 routes and asks `_CheckScript@8` where the player is for the other nine.
+
+### `_CheckScript@8` — where the player is standing
+
+`_CheckScript@8` (`0x100084d0`) reads `ROUTE` out of the save's store and
+dispatches to one function per route, 55 of them. It takes an episode and
+answers **0** unless that episode is `_GetStory@4 - 1`, so it only ever speaks
+for the episode the player is in.
+
+What it returns is a **cell widget**: `0xb` plus the story point's index within
+the episode, the same index a page's `base + cell` makes. `FUN_1000d890` holds
+it as `+0x3e4 = _CheckScript@8(episode) - base`, which is the widget of the
+cell on the page showing, and `FUN_1000c3d0`'s draw loop runs `0xb` to
+`0xb + cells` and compares against it directly.
+
+All 55 dispatch targets have one shape:
+
+```text
+switch (SCENE)            the save's store, the route's own handful of scenes
+  <a scene it names>   -> the cell widget for that scene
+  default              -> walk the episode's story points from last to first,
+                          answer 0xb + the index of the furthest the save
+                          carries, or 0 if it carries none
+```
+
+The six scanners are `FUN_10003ba0` (`SP100 .. SP103`), `FUN_10003c40`
+(`SP200 .. SP208`), `FUN_10003d80` (`SP300 .. SP310`), `FUN_10003f10`
+(`SP400 .. SP434`), `FUN_100043d0` (`SP500 .. SP556`) and `FUN_10004b70`
+(`SP600 .. SP644`) — 4, 9, 11, 35, 57 and 45 names, which is what the page
+table below sums to episode by episode. Two routes call a scanner that is not
+their episode's: `FUN_1001aa20` (ROUTE `0x0b`, episode 4) and `FUN_10032930`
+(ROUTE `0x1d`, episode 5) both call episode 3's, so for those two the fallback
+lands near the front of the episode whatever the player has passed. Their own
+`SCENE` arms answer in their own episode's numbering.
+
+The nine routes `_GetRouteMapPage@8` decides this way are `4`, `0xf`, `0x10`,
+`0x11`, `0x15`, `0x1d`, `0x28`, `0x31` and `0x33`, and its arms are transcribed
+as the switch has them: two of route `0xf`'s comparisons and one of route
+`0x1d`'s name a page that does not hold the cell they test for, and one of
+route `0x1d`'s cannot come up at all because that route's scan is episode 3's.
+
+### The "you are here" marker
+
+`FUN_1000ce40` cuts the marker's sprite into `+0x1e0` and raises `+0x4e4` only
+when `+0x3e4` is `0xb` or more **and** the page showing is the one
+`_GetRouteMapPage@8` names; `FUN_1000d890` zeroes `+0x4e4` on every page and
+episode change, and `FUN_1000c3d0` draws `+0x1e0` over the cell whose widget
+matches `+0x3e4`. So the marker appears on one page of one episode — the
+player's own — and nowhere else on the chart. Both of those live behind
+`+0x4ec`, so the chart opened from the title has no marker.
+
+It is cut from the **third** of the page's four per-cell bands, record
+`0x21 + 2 * cells + i`, and drawn after the cell's own state sprite and before
+the hover one.
 
 ### The page table
 
@@ -2254,7 +2304,7 @@ The records are 33 fixed ones and then four bands of one per cell, and
 ```text
 0x21 + i               hover      -- and what the hit map's regions match
 0x21 + cells + i       charted, not passed this run
-0x21 + 2 * cells + i   unused by the draw
+0x21 + 2 * cells + i   the "you are here" marker
 0x21 + 3 * cells + i   passed this run, pickable
 ```
 

@@ -953,11 +953,13 @@ impl Menu {
 
     /// The sprites this screen draws that are not widget states.
     ///
-    /// Two screens have them: the Sound tab's three volume bars, cut from the
-    /// chip sheet, and the replay grid's thumbnails, cut from the page's own
-    /// sheet. See [`options::volume_bar`] and [`replay::Thumbnails`]. Both are
-    /// drawn at their source size; the save/load rows are not, so they take the
-    /// separate path in [`Menu::compose`].
+    /// Three screens have them: the Sound tab's three volume bars, cut from the
+    /// chip sheet, the replay grid's thumbnails, cut from the page's own sheet,
+    /// and the route map's "you are here" marker, which goes over a cell rather
+    /// than instead of it. See [`options::volume_bar`], [`replay::Thumbnails`]
+    /// and [`routemap::Standing::marker`]. All three are drawn at their source
+    /// size; the save/load rows are not, so they take the separate path in
+    /// [`Menu::compose`].
     fn sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
         let mut out = Vec::new();
         match self.mode {
@@ -990,6 +992,33 @@ impl Menu {
                     if let Some(sprite) = table.sprite(slot, self.selection == Some(widget)) {
                         out.push((sheet, sprite));
                     }
+                }
+            }
+            // The "you are here" marker, which goes over the cell the player is
+            // standing on rather than replacing its state sprite — so it is a
+            // sprite of its own and not a `WidgetState::Extra`.
+            //
+            // `FUN_1000ce40` cuts it from the third of the page's four per-cell
+            // bands, record `0x21 + 2 * cells + i`, and the atlas numbers its
+            // alternates from the end of the second, so it is `cells + i` here.
+            //
+            // `FUN_1000c3d0` draws the three sprites a cell can carry in a
+            // fixed order — its state, then the marker, then the hover art —
+            // and all three are the same opaque 38x38 dot in the same place, so
+            // the hover art wins wherever the pointer is. Here the states go
+            // down in one pass before these sprites do, which puts the marker
+            // on top of the hover art rather than under it; holding it back on
+            // the cell the pointer is on is that order's visible half.
+            Mode::ROUTEMAP => {
+                let page = self.chart_page();
+                if let Some(sprite) = self.marker().and_then(|cell| {
+                    self.screen
+                        .atlas()
+                        .extras
+                        .get(page.cells + cell)
+                        .filter(|_| self.selection != Some(routemap::FIRST_CELL + cell))
+                }) {
+                    out.push((self.screen.chip(), *sprite));
                 }
             }
             _ => {}
@@ -1113,9 +1142,11 @@ impl Menu {
             // for a story point this run has not passed and `+0x21 + 3 * cells
             // + i` for one it has — and `FUN_1000c3d0` paints it only where the
             // global store says the point has ever been seen. The band the
-            // regions themselves matched is the third, `+0x21 + i`, which is
+            // regions themselves matched is the first, `+0x21 + i`, which is
             // the hover art, so a cell the pointer is on wants its own record
-            // and not an alternate.
+            // and not an alternate. The band between the two here is the "you
+            // are here" marker, which is not a widget state: see
+            // [`Menu::sprites`].
             Mode::ROUTEMAP => {
                 let cells = self.chart_page().cells;
                 let routemap::Act::Cell(cell) = routemap::action(cells, widget) else {
@@ -1404,6 +1435,17 @@ impl Menu {
             .collect()
     }
 
+    /// Which cell of the page the player is standing on, from `_CheckScript@8`
+    /// by way of [`routemap::Standing::marker`].
+    ///
+    /// `None` on every page but the one the player's own story point is on, and
+    /// on every page at all when the chart was opened from the title.
+    pub fn marker(&self) -> Option<usize> {
+        let page = self.chart_page();
+        self.standing(|standing| standing.marker(self.episode, self.map_page, page))
+            .flatten()
+    }
+
     /// The route map's dispatch, from `FUN_1000e8b0`.
     ///
     /// Picking a cell leaves the menus the way the Load screen's rows do, with
@@ -1478,16 +1520,34 @@ impl Menu {
     /// first of each when it was not — the constructor's zeroes, which the
     /// title-rooted screen never overwrites.
     fn open_routemap(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
-        let (episode, page) = match self
+        let (episode, page) = self
+            .standing(|standing| standing.opened_at())
+            .unwrap_or((0, 0));
+        self.show_chart(vfs, dll, episode, page)
+    }
+
+    /// Where the playthrough stands, for the two `RouteProcSDHQ.dll` functions
+    /// the route map asks — `_CheckScript@8` and `_GetRouteMapPage@8`.
+    ///
+    /// `None` unless a playthrough is running, which is the same test
+    /// [`Menu::pickable`] makes and the same one the module's `+0x4ec` is: the
+    /// chart reached from the title has no player to place.
+    ///
+    /// The `Standing` borrows the run, so it is handed to a closure rather than
+    /// returned.
+    fn standing<T>(&self, with: impl FnOnce(&routemap::Standing) -> T) -> Option<T> {
+        let run = self
             .session
             .run
             .as_ref()
-            .filter(|_| self.entry == Entry::Playback)
-        {
-            Some(run) => routemap::opened_at(run.int("ROUTE"), run.flag("EndClear")),
-            None => (0, 0),
-        };
-        self.show_chart(vfs, dll, episode, page)
+            .filter(|_| self.entry == Entry::Playback)?;
+        let passed = |story: u32| run.flag(&routemap::story_flag(story));
+        Some(with(&routemap::Standing {
+            route: run.int("ROUTE"),
+            scene: run.int("SCENE"),
+            end_clear: run.flag("EndClear"),
+            passed: &passed,
+        }))
     }
 
     /// Opens the save/load screen for one of its two jobs.
