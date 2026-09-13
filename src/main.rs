@@ -2235,7 +2235,7 @@ fn snap(elapsed: Duration, interval: Duration) -> Duration {
 /// sized from the two affection counters rather than from any record, so those
 /// belong in the key too, and so do the two alphas for the one case where the
 /// fade has to be composited in rather than modulated.
-type BarLayer = (Vec<usize>, Option<(i32, i32)>, Option<(u8, u8)>);
+type BarLayer = (Vec<usize>, (f32, f32), Option<(u8, u8)>);
 
 /// Where the control bar's strip lands in the window.
 ///
@@ -2403,6 +2403,16 @@ fn run_script(
         }
     };
     let mut bar_state = bar::State::from_config(&config);
+    // `FUN_00423a70` calls MenuBar vtable `+0x38` when playback starts, which
+    // puts the gauge at the counters as they stand, with no ramp, and lowers
+    // it. The bar here is built once per script, so this is that call.
+    if let Some(p) = progress.as_deref_mut() {
+        let ((first, second), _) = p.gauge();
+        if let Some(control) = &mut control {
+            control.settle_gauge(first, second);
+        }
+        p.lower_gauge();
+    }
     // A script always starts at 1x. The original does this twice over:
     // `FUN_00423130` initialises the rate member `+0x538` to 1.0 when a session
     // starts, and `FUN_004236f0` puts it back to 1.0 when a script is freed.
@@ -2643,12 +2653,35 @@ fn run_script(
         // `FUN_10021c20` gives the base sprite the same half-pixel inset every
         // other sprite gets, so the origin is the only placement there is.
         bar_state.paused = paused;
+        // A wall clock, because the gauge's ramp and the bar's fade are both in
+        // milliseconds of real time and neither stops when playback is paused.
+        let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
         // The gauge draws the two counters the branch system keeps, and shows
         // over a faded bar only while a delta has raised it.
-        if let Some(p) = progress.as_deref() {
-            let (values, raised) = p.gauge();
-            bar_state.gauge = Some(values);
+        //
+        // While it is up it is also *moving*: `FUN_10024c60`, the bar's
+        // graphics-module update pass, steps the ramp every frame under that
+        // same flag. The ramp is what plays the rise or the fall, slides the
+        // gauge to the new lead, holds it there and then puts it down again —
+        // so this is also where the flag is cleared in ordinary play.
+        if let Some(p) = progress.as_deref_mut() {
+            let ((first, second), raised) = p.gauge();
+            bar_state.gauge = Some((first, second));
             bar_state.gauge_raised = raised;
+            if raised {
+                if let Some(control) = &mut control {
+                    let tick = control.advance_gauge(now_ms, first, second);
+                    if let Some(se) = tick.sound {
+                        player
+                            .system_se
+                            .play(se, player.vfs, &mut player.sounds, player.mixer);
+                    }
+                    if tick.lowered {
+                        p.lower_gauge();
+                        bar_state.gauge_raised = false;
+                    }
+                }
+            }
         }
         // Host `+0x98`, which is what the bar's right-hand box is about: the
         // slider lights up, its ten cells become pressable, and the REPLAYMODE
@@ -2682,7 +2715,6 @@ fn run_script(
             };
             let over = (sx >= 0.0 && sy >= 0.0 && sx < bw as f32 && sy < bh as f32)
                 .then_some((sx as u32, sy as u32));
-            let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
             hovered = control.point_at(over, now_ms, bar_state.gauge_raised);
 
             // A click only reaches the bar while the bar is actually on
@@ -3332,10 +3364,10 @@ fn run_script(
             .filter(|c| c.fade().drawn() || c.pinned(bar_state))
         {
             let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-            // The cache key carries the gauge's counters as well as the
-            // record list: the gauge's three pieces are sized from those and
-            // not from any record, so a layer keyed on records alone would keep
-            // showing the lead the player had before the last delta.
+            // The cache key carries the gauge's leads as well as the record
+            // list: the gauge's three pieces are sized from those and not from
+            // any record, so a layer keyed on records alone would hold one
+            // frame of the ramp still for the whole of it.
             // Two sprites out of the strip carry an alpha of their own once the
             // gauge is raised, and one texture cannot be modulated twice — so
             // that case composites the fade in and is keyed on both alphas.
@@ -3343,7 +3375,7 @@ fn run_script(
             let alphas = pinned.then(|| (control.fade().alpha(), control.fade().gauge_alpha()));
             let records = (
                 control.records(hovered, bar_state, elapsed),
-                bar_state.gauge,
+                control.gauge_leads(),
                 alphas,
             );
             let stale = bar_texture

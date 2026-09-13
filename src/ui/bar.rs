@@ -11,7 +11,7 @@
 //! ```text
 //! +0x08 release textures   +0x20 update: hit test and dispatch  (FUN_10024100)
 //! +0x0c load and lay out   +0x24 dirty the rate readout (FUN_10027210)
-//! +0x10 re-place on resize +0x28 set widget 2's latch    (FUN_10027230)
+//! +0x10 step the gauge ramp +0x28 set widget 2's latch    (FUN_10027230)
 //! +0x14 draw               +0x2c draw the play/pause widget      (FUN_100258f0)
 //! +0x18 -                  +0x30 widget 2's action               (FUN_10025b90)
 //! +0x1c set host pointers  +0x34 widget 0's action               (FUN_10025cf0)
@@ -23,22 +23,35 @@
 //! `+0x2c`, `+0x30`, `+0x34`, `+0x38` — all land inside this vtable, which is
 //! what confirms the member.
 //!
-//! # Nothing calls the draw by name
+//! # Two slots the engine never asks for
 //!
-//! `+0x14` is **not** one of those eleven, and there is no call site for it
-//! anywhere: `FUN_10024ca0` is reached only through the vtable slot, and the
-//! exe's `.text` holds no `CALL dword ptr [reg+0x14]` at all. The bar is not
-//! drawn by being asked to. It is **registered as a graphics module**, and the
-//! renderer walks the list:
+//! `+0x10` and `+0x14` are **not** among those eleven. Only a function holding
+//! `engine + 0x330` can reach the object at all, and a sweep of every one of
+//! them for the form this compiler emits a virtual call in — `MOV reg,[vtbl +
+//! off]` and then `CALL reg`, never the one-instruction `CALL dword ptr
+//! [reg+off]` — turns up the eleven above and nothing else.
+//!
+//! Those two come from somewhere else. The bar is **registered as a graphics
+//! module**, `DXGraphicModuleList` is itself one, and its four passes hand each
+//! module in turn its `+0x0c`, `+0x10`, `+0x14` and `+0x18` — `FUN_00414310`,
+//! `FUN_004143f0`, `FUN_004144c0` and `FUN_00414590`, which are that list's own
+//! slots of the same numbers. `FUN_0040e540` runs three of them every rendered
+//! frame:
 //!
 //! ```text
 //! FUN_004253f0   the frame step
 //!   FUN_004252e0   MenuBar +0x20, the update
-//!   FUN_0040e540   Clear, BeginScene
-//!     FUN_004144c0   DXGraphicModuleList slot +0x14
-//!       for each module:  module -> slot +0x14      <- FUN_10024ca0
+//!   FUN_0040e540   the render frame
+//!     list +0x10   for each module: module -> +0x10  <- FUN_10024c60
+//!     Clear, BeginScene
+//!     list +0x14   for each module: module -> +0x14  <- FUN_10024ca0
 //!     EndScene, Present
+//!     list +0x18
 //! ```
+//!
+//! So the bar is not drawn by being asked to, and the affection gauge's ramp is
+//! not stepped by being asked to either — see [`gauge::Anim`], which is all
+//! `FUN_10024c60` does.
 //!
 //! `FUN_004230b0` puts it there — `MenuBar->+0x0c(device)` and then
 //! `FUN_0040e940(engine+0x330)`, the global register — and `FUN_00423650`,
@@ -175,10 +188,10 @@ pub struct Fade {
     /// `FUN_10025690` sets one ARGB on every sprite the bar owns **except**
     /// `this+0x80` and `this+0x98..0xa0` — the bed and the three pieces — which
     /// it skips whenever host `+0x154` answers non-zero. Skipping is not the
-    /// same as setting them opaque: they keep whatever they last held. So a
-    /// gauge raised while the bar is up stays on screen at full alpha after the
-    /// bar has faded away, and one raised while the bar is already gone is
-    /// pinned at nothing and does not appear at all.
+    /// same as setting them opaque: they keep whatever they last held. What
+    /// makes them opaque is the raise itself — [`gauge::Anim`]'s first step
+    /// sets `0xffffffff` on all four — so the gauge is solid for as long as it
+    /// is up, and then rejoins the bar's own alpha when it comes down.
     gauge_alpha: u8,
 }
 
@@ -231,6 +244,15 @@ impl Fade {
     /// The alpha the gauge bed and the gauge's three pieces are modulated by.
     pub fn gauge_alpha(&self) -> u8 {
         self.gauge_alpha
+    }
+
+    /// Makes the gauge opaque, which starting the ramp does.
+    ///
+    /// `FUN_10026b40`'s step 0 sets `0xffffffff` through `DX9Sprite2D` slot
+    /// `+0x14` on `this+0x80` and each of `this+0x98..0xa0`, so a gauge raised
+    /// while the bar is already faded out still appears.
+    pub fn light_gauge(&mut self) {
+        self.gauge_alpha = 255;
     }
 
     /// Puts the bar straight into its hidden state, for a fresh script.
@@ -395,16 +417,25 @@ pub struct State {
     /// The member is `engine + 0x79c`, and what raises it is a feeling
     /// change: `FUN_10005c60` in `RouteProcSDHQ.dll` sets it through host slot
     /// `+0x30` after crediting a delta, but only when the counter it moved was
-    /// `001` or `002` — the two the gauge draws. `FUN_10026050` clears it
-    /// again through the same slot once it has read the two values. So the
-    /// gauge surfaces over a faded bar exactly when the affection counters
-    /// just moved. See [`crate::install::feeling`].
-    pub gauge_raised: bool,
-    /// The two counters the gauge draws, `(001, 002)`, if they are known.
+    /// `001` or `002` — the two the gauge draws. So the gauge surfaces over a
+    /// faded bar exactly when the affection counters just moved. See
+    /// [`crate::install::feeling`].
     ///
-    /// `FUN_10026050` asks the host for these two by name through slot `+8`.
-    /// They live in the save's variable store, so a bar drawn without save
-    /// state has nothing to show and this is `None`.
+    /// Two things put it down again. The ramp does, at the end of its own
+    /// three and a half seconds — [`gauge::Anim`], which is the usual way a
+    /// gauge comes down — and `FUN_10026050` does when the engine settles the
+    /// gauge at the start of a script or the end of one.
+    pub gauge_raised: bool,
+    /// The two counters as the save holds them, `(001, 002)`, if they are
+    /// known.
+    ///
+    /// `FUN_10026050` and [`gauge::Anim`]'s first step both ask the host for
+    /// these two by name through slot `+8`. They live in the save's variable
+    /// store, so a bar drawn without save state has nothing to show and this
+    /// is `None`.
+    ///
+    /// **Not what the gauge draws.** The gauge draws its own pair, which
+    /// chases this one over a ramp; [`Bar::gauge_leads`] is that.
     pub gauge: Option<(i32, i32)>,
 }
 
@@ -663,6 +694,8 @@ pub struct Bar {
     /// `this+0xec`: how solid the replay-mode indicator is drawn, 0 to 10.
     /// See [`indicator`].
     transparency: usize,
+    /// The affection gauge's ramp, `this+0x2c..0x58`.
+    gauge: gauge::Anim,
 }
 
 impl Bar {
@@ -676,6 +709,7 @@ impl Bar {
             latch: None,
             fade: Fade::default(),
             transparency: indicator::INITIAL_LEVEL,
+            gauge: gauge::Anim::default(),
         })
     }
 
@@ -728,6 +762,33 @@ impl Bar {
 
     pub fn fade(&self) -> Fade {
         self.fade
+    }
+
+    /// The gauge's leads, which are what its three pieces are sized from.
+    pub fn gauge_leads(&self) -> (f32, f32) {
+        self.gauge.leads()
+    }
+
+    /// Puts the gauge at a pair of counters with no ramp, as MenuBar vtable
+    /// `+0x38` does at the start of a script and at the end of one.
+    ///
+    /// The caller lowers the gauge afterwards, which is the rest of
+    /// `FUN_10026050`.
+    pub fn settle_gauge(&mut self, first: i32, second: i32) {
+        self.gauge.settle(first, second);
+    }
+
+    /// One frame of `FUN_10024c60`, the graphics-module update pass: steps the
+    /// gauge's ramp and re-sizes the pieces from where it leaves the leads.
+    ///
+    /// Only called while the gauge is raised, because that is the only time the
+    /// original calls it — the pass tests host `+0x154` and does nothing else.
+    pub fn advance_gauge(&mut self, now_ms: u32, first: i32, second: i32) -> gauge::Tick {
+        let tick = self.gauge.advance(now_ms, first, second);
+        if tick.lit {
+            self.fade.light_gauge();
+        }
+        tick
     }
 
     /// Hides the bar again, for the start of a script.
@@ -1009,14 +1070,19 @@ impl Bar {
     ///
     /// Empty while the counters are unknown: the pieces' visibility flags are
     /// only ever set by `FUN_10026540`, which nothing has run.
+    ///
+    /// The pieces are sized from the ramp's leads and not from
+    /// [`State::gauge`], because the two disagree for the three and a half
+    /// seconds a raise lasts — that is the whole of what the ramp is.
     pub fn gauge_cuts(&self, state: State) -> Vec<Cut> {
-        let Some((first, second)) = state.gauge else {
+        if state.gauge.is_none() {
             return Vec::new();
-        };
+        }
         if !self.records(None, state, 0).contains(&record::GAUGE_BED) {
             return Vec::new();
         }
-        gauge::pieces(first, second)
+        let (first, second) = self.gauge.leads();
+        gauge::pieces_at(first, second)
             .drawn()
             .map(|piece| cut(piece.src, piece.dst))
             .collect()
@@ -1064,9 +1130,6 @@ impl Bar {
             let mut over = self
                 .screen
                 .compose_sprites(&self.states_of(&pinned), &pinned_cuts);
-            // The gauge is the only part whose alpha the raise pins; the rate
-            // readout is simply never in `FUN_10025690`'s list, so it keeps the
-            // opaque colour `FUN_10022650` gave it.
             // The gauge is the only part whose alpha the raise pins; the rate
             // readout is simply never in `FUN_10025690`'s list, so it keeps the
             // opaque colour `FUN_10022650` gave it.
@@ -1192,27 +1255,26 @@ mod tests {
         assert_eq!(fade.alpha(), 255);
     }
 
-    /// `FUN_10025690` skips the gauge while it is raised, which is not the
-    /// same as holding it up: what it keeps is the alpha it had when the raise
-    /// happened, so a gauge raised over a bar that is already gone stays gone.
+    /// `FUN_10025690` skips the gauge while it is raised, and the ramp's first
+    /// step makes it opaque — so a gauge raised over a bar that has already
+    /// faded away is on screen at full strength, and only rejoins the bar's own
+    /// alpha once it comes down.
     #[test]
-    fn a_raised_gauge_holds_the_alpha_it_was_raised_at() {
+    fn a_raised_gauge_is_opaque_whatever_the_bar_is_doing() {
         let mut fade = Fade::default();
-        fade.update(0, true, false);
-        fade.update(FADE_IN_MS, true, false);
-        assert_eq!(fade.gauge_alpha(), 255);
+        // The bar has never been up, so everything on it is at nothing.
+        fade.update(0, false, false);
+        assert_eq!(fade.gauge_alpha(), 0);
 
-        // Raised with the bar up, the gauge survives the whole ramp out.
+        // The raise lights the gauge, and the bar staying away does not dim it.
+        fade.light_gauge();
         fade.update(1_000, false, true);
         fade.update(1_000 + FADE_OUT_MS, false, true);
         assert_eq!(fade.alpha(), 0);
         assert_eq!(fade.gauge_alpha(), 255);
 
-        // Lowering lets it catch up, and raising it again from there pins it at
-        // nothing.
+        // Lowered, it follows the bar again.
         fade.update(3_000, false, false);
-        assert_eq!(fade.gauge_alpha(), 0);
-        fade.update(4_000, false, true);
         assert_eq!(fade.gauge_alpha(), 0);
     }
 
@@ -1600,6 +1662,8 @@ pub mod indicator {
 /// axis, and the destinations start half a pixel back, which is the half-texel
 /// offset every other sprite the bar draws gets as well.
 pub mod gauge {
+    use crate::ui::menu::SystemSe;
+
     /// `_DAT_1003d858`, a double: points of lead to pixels.
     pub const SCALE: f32 = 2.5;
     /// `_DAT_1003d878`, a double: added to a lead before it is tested.
@@ -1693,10 +1757,18 @@ pub mod gauge {
         (d, -d)
     }
 
-    /// Sizes the three pieces from the two counters, as `FUN_10026540` does.
+    /// Sizes the three pieces from a settled pair of counters.
     pub fn pieces(first: i32, second: i32) -> Pieces {
         let (lead_first, lead_second) = leads(first, second);
+        pieces_at(lead_first, lead_second)
+    }
 
+    /// Sizes the three pieces from the two leads, as `FUN_10026540` does.
+    ///
+    /// The leads are the only thing it reads — `this+0x48` and `this+0x4c` —
+    /// which is what lets [`Anim`] slide the gauge between two pairs of
+    /// counters without the pieces knowing anything about either pair.
+    pub fn pieces_at(lead_first: f32, lead_second: f32) -> Pieces {
         // `this+0x98`: driven by the second side's lead, anchored at LEFT, and
         // cut from the far end of its strip.
         let second_piece = bar(lead_second).map(|len| Piece {
@@ -1773,6 +1845,197 @@ pub mod gauge {
         }
         Some(len.clamp(0.0, MAX_LEN))
     }
+
+    /// How long the gauge takes to slide from the old lead to the new one.
+    ///
+    /// `0x5dc` is the cutoff `FUN_10026b40` compares the elapsed time against,
+    /// and `_DAT_1003ab20` — a double, `1500.0` — is what it divides by, so the
+    /// ramp reaches the new lead exactly as the window closes.
+    pub const RAMP_MS: u32 = 1500;
+
+    /// How long the gauge is held at the new lead before it puts itself down.
+    ///
+    /// The test is `1999 < elapsed`, so it takes a full two seconds to pass.
+    pub const HOLD_MS: u32 = 2000;
+
+    /// What one step of the gauge's ramp asks the engine to do.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Tick {
+        /// The sound the ramp starts with, played once. `None` on every other
+        /// step, and on a raise that turns out to move neither counter.
+        pub sound: Option<SystemSe>,
+        /// The gauge has finished and lowered itself, which the original does
+        /// through host `+0x30(0)` — [`crate::install::progress::Progress::lower_gauge`]
+        /// is this engine's side of that.
+        pub lowered: bool,
+        /// The bed and the three pieces are to be made opaque, which the first
+        /// step does through `DX9Sprite2D` slot `+0x14`. See
+        /// [`super::Fade::light_gauge`].
+        pub lit: bool,
+    }
+
+    /// The gauge's ramp: `FUN_10026b40`, and the values it slides between.
+    ///
+    /// # Where it runs
+    ///
+    /// `FILM::MenuBar` is a graphics module, and `DXGraphicModuleList`'s four
+    /// passes call each module's `+0x0c`, `+0x10`, `+0x14` and `+0x18` in turn.
+    /// `FUN_0040e540` — the render frame — runs the `+0x10` pass, then `+0x14`
+    /// inside `BeginScene`/`EndScene`, then `+0x18`. The bar's `+0x10` is
+    /// `FUN_10024c60`, three lines long:
+    ///
+    /// ```text
+    /// if (host->+0x154())  { FUN_10026b40(this); FUN_10026540(this); }
+    /// ```
+    ///
+    /// So while a delta has the gauge raised, this steps once per rendered
+    /// frame and the pieces are re-sized from whatever it leaves in the leads.
+    /// Nothing steps it while the gauge is down.
+    ///
+    /// # The five steps
+    ///
+    /// `this+0x44` is the step number, and the machine runs 0, 1, 2, 3, 4 and
+    /// back to 0 across successive frames:
+    ///
+    /// ```text
+    /// 0  make the bed and the three pieces opaque; read `001` and `002` as
+    ///    the targets; keep the leads in force as the ramp's start
+    /// 1  play the rise or the fall, and start the clock — or, if neither
+    ///    counter moved, skip straight to the hold and play nothing
+    /// 2  slide the leads for RAMP_MS, then snap to the target and restart
+    ///    the clock
+    /// 3  hold for HOLD_MS
+    /// 4  commit the targets as the values now on screen, and lower the gauge
+    /// ```
+    ///
+    /// # Which sound, and why those two
+    ///
+    /// Step 1 plays host `+0x50(3)` when the counter it is watching went up and
+    /// `+0x50(4)` when it went down — [`SystemSe::Up`] and [`SystemSe::Down`],
+    /// the `SeUp` and `SeDown` keys of `FILMENGINE.INI`. The counter it watches
+    /// is `001` whenever `001` moved at all; only when `001` stood still does
+    /// `002`'s direction decide.
+    ///
+    /// # The two values it slides between
+    ///
+    /// `this+0x34` and `this+0x3c` are the counters **as the gauge is
+    /// currently drawing them**, not as the save holds them. Only two things
+    /// write them: [`Anim::settle`] and step 4. That is what gives the ramp
+    /// something to slide from — a gauge sized straight off the save would
+    /// already be at the new lead by the time the ramp started.
+    ///
+    /// `FILM::MenuBar` is a static object and its constructor `FUN_100216e0`
+    /// initialises none of these, so they all start at zero: before the first
+    /// settle the gauge is a tie.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Anim {
+        /// `this+0x34` / `this+0x3c`: the counters the gauge is drawing.
+        shown: (f32, f32),
+        /// `this+0x38` / `this+0x40`: the counters it is sliding towards, read
+        /// from the save at step 0.
+        target: (f32, f32),
+        /// `this+0x2c` / `this+0x30`: `target - shown`, each side's move.
+        change: (f32, f32),
+        /// `this+0x48` / `this+0x4c`: the leads the pieces are sized from.
+        leads: (f32, f32),
+        /// `this+0x50` / `this+0x54`: the leads the ramp started at.
+        from: (f32, f32),
+        /// `this+0x44`.
+        step: u32,
+        /// `this+0x58`, the tick the ramp or the hold started on.
+        ///
+        /// `None` is the original's zero. It matters in one place: step 1's
+        /// no-change arm goes to the hold without stamping this, and the hold
+        /// then measures against a `timeGetTime` that is never near zero, so it
+        /// expires at once. A wall clock that starts at zero would instead hold
+        /// for two seconds, which is why this is an option and not a `0`.
+        since: Option<u32>,
+    }
+
+    impl Anim {
+        /// The leads the three pieces are sized from.
+        pub fn leads(&self) -> (f32, f32) {
+            self.leads
+        }
+
+        /// Puts the gauge at a pair of counters with no ramp: `FUN_10026050`.
+        ///
+        /// The engine calls this through MenuBar vtable `+0x38` twice — from
+        /// `FUN_00423a70` when playback starts and from `FUN_00424020` when a
+        /// script ends — and both times it lowers the gauge afterwards, which
+        /// is the caller's half of the same act.
+        pub fn settle(&mut self, first: i32, second: i32) {
+            self.shown = (first as f32, second as f32);
+            self.leads = leads(first, second);
+            self.step = 0;
+            self.since = None;
+        }
+
+        /// One frame of the ramp, given the wall clock and the counters as the
+        /// save holds them now.
+        pub fn advance(&mut self, now_ms: u32, first: i32, second: i32) -> Tick {
+            let mut tick = Tick::default();
+            match self.step {
+                0 => {
+                    tick.lit = true;
+                    self.target = (first as f32, second as f32);
+                    self.from = self.leads;
+                    self.change = (self.target.0 - self.shown.0, self.target.1 - self.shown.1);
+                    self.step = 1;
+                }
+                1 => {
+                    // `001` decides whenever it moved at all; `002` only gets
+                    // to when `001` stood still. Both arms test `new <= old`,
+                    // but equality has already been ruled out by the arm that
+                    // was taken, so each is really a strict `<`.
+                    let fell = if self.shown.0 != self.target.0 {
+                        Some(self.target.0 < self.shown.0)
+                    } else if self.shown.1 != self.target.1 {
+                        Some(self.target.1 < self.shown.1)
+                    } else {
+                        None
+                    };
+                    match fell {
+                        None => self.step = 3,
+                        Some(fell) => {
+                            self.step = 2;
+                            self.since = Some(now_ms);
+                            tick.sound = Some(if fell { SystemSe::Down } else { SystemSe::Up });
+                        }
+                    }
+                }
+                2 => {
+                    let run = now_ms.saturating_sub(self.since.unwrap_or(now_ms));
+                    if run < RAMP_MS {
+                        let moved =
+                            run as f32 * (self.change.0 - self.change.1) * SCALE / RAMP_MS as f32;
+                        self.leads = (self.from.0 + moved, self.from.1 - moved);
+                    } else {
+                        let d = (self.target.0 - self.target.1) * SCALE;
+                        self.leads = (d, -d);
+                        self.since = Some(now_ms);
+                        self.step = 3;
+                    }
+                }
+                3 => {
+                    let done = match self.since {
+                        Some(at) => now_ms.saturating_sub(at) >= HOLD_MS,
+                        None => true,
+                    };
+                    if done {
+                        self.step = 4;
+                    }
+                }
+                _ => {
+                    self.since = None;
+                    self.step = 0;
+                    self.shown = self.target;
+                    tick.lowered = true;
+                }
+            }
+            tick
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1816,6 +2079,7 @@ mod indicator_tests {
 #[cfg(test)]
 mod gauge_tests {
     use super::gauge::*;
+    use crate::ui::menu::SystemSe;
 
     /// The two leads are one number and its negation, so the gauge can only
     /// ever show a difference.
@@ -1895,5 +2159,79 @@ mod gauge_tests {
         // 83.4 is not reachable from integer counters, so the boundary is
         // checked through the same arithmetic the real values take.
         assert!(pieces(83, 0).first.is_none());
+    }
+
+    /// The gauge does not jump to the new counters; it slides. Nothing else in
+    /// the bar has a value that lags its source, and getting this wrong is
+    /// invisible in a still.
+    #[test]
+    fn a_raise_slides_from_the_old_pair_to_the_new_one() {
+        let mut anim = Anim::default();
+        anim.settle(60, 60);
+        assert_eq!(anim.leads(), (0.0, -0.0));
+        // Step 0 reads the targets, step 1 starts the clock.
+        anim.advance(0, 70, 60);
+        anim.advance(0, 70, 60);
+        assert_eq!(anim.leads(), (0.0, -0.0), "the ramp has not moved yet");
+        anim.advance(RAMP_MS / 2, 70, 60);
+        assert_eq!(anim.leads(), (12.5, -12.5), "half way to a lead of ten");
+        anim.advance(RAMP_MS, 70, 60);
+        assert_eq!(anim.leads(), (25.0, -25.0));
+    }
+
+    /// A rise and a fall are different sounds, and which counter decides is
+    /// not symmetric: `001` decides whenever it moved at all.
+    #[test]
+    fn the_ramp_plays_the_direction_of_the_counter_that_moved() {
+        let sound = |from: (i32, i32), to: (i32, i32)| {
+            let mut anim = Anim::default();
+            anim.settle(from.0, from.1);
+            anim.advance(0, to.0, to.1);
+            anim.advance(0, to.0, to.1).sound
+        };
+        assert_eq!(sound((60, 60), (70, 60)), Some(SystemSe::Up));
+        assert_eq!(sound((60, 60), (50, 60)), Some(SystemSe::Down));
+        assert_eq!(sound((60, 60), (60, 70)), Some(SystemSe::Up));
+        assert_eq!(sound((60, 60), (60, 50)), Some(SystemSe::Down));
+        // `001` fell and `002` rose: the first counter's direction is the one
+        // that plays, and the second's is not consulted.
+        assert_eq!(sound((60, 60), (50, 70)), Some(SystemSe::Down));
+        // Nothing moved, so there is no ramp and no sound.
+        assert_eq!(sound((60, 60), (60, 60)), None);
+    }
+
+    /// The gauge puts itself down when its hold is over, which is what takes it
+    /// off the screen in ordinary play — the end of the script is the other
+    /// way, and most scripts run well past three and a half seconds.
+    #[test]
+    fn the_ramp_lowers_the_gauge_once_it_has_held_the_new_lead() {
+        let mut anim = Anim::default();
+        anim.settle(60, 60);
+        anim.advance(0, 70, 60);
+        anim.advance(0, 70, 60);
+        // The ramp's own window, then the hold, then the step that commits.
+        assert!(!anim.advance(RAMP_MS, 70, 60).lowered);
+        assert!(!anim.advance(RAMP_MS + HOLD_MS - 1, 70, 60).lowered);
+        assert!(!anim.advance(RAMP_MS + HOLD_MS, 70, 60).lowered);
+        assert!(anim.advance(RAMP_MS + HOLD_MS, 70, 60).lowered);
+        // And it is left holding the pair it slid to, so the next raise has
+        // somewhere to start from.
+        assert_eq!(anim.leads(), (25.0, -25.0));
+        anim.advance(0, 80, 60);
+        anim.advance(0, 80, 60);
+        anim.advance(RAMP_MS, 80, 60);
+        assert_eq!(anim.leads(), (50.0, -50.0));
+    }
+
+    /// A raise that moves neither counter skips the ramp and comes straight
+    /// down: the hold measures against a stamp that was never taken.
+    #[test]
+    fn a_raise_that_moves_nothing_comes_straight_back_down() {
+        let mut anim = Anim::default();
+        anim.settle(60, 60);
+        anim.advance(0, 60, 60);
+        assert_eq!(anim.advance(0, 60, 60).sound, None);
+        assert!(!anim.advance(0, 60, 60).lowered, "one step for the hold");
+        assert!(anim.advance(0, 60, 60).lowered);
     }
 }

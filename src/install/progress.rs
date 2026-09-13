@@ -483,12 +483,21 @@ impl Progress {
         self.from_slot(data)
     }
 
-    /// The two values the gauge draws, and whether it should be showing.
+    /// The two counters as the save holds them, and whether the gauge should
+    /// be showing.
+    ///
+    /// These are what the gauge is chasing, not what it is drawing: the ramp
+    /// takes about three and a half seconds to reach them. See
+    /// [`crate::ui::bar::gauge::Anim`].
     pub fn gauge(&self) -> ((i32, i32), bool) {
         (feeling::gauge(&self.stores.save), self.gauge_raised)
     }
 
-    /// Hides the gauge, which `FUN_10026050` does through slot `+0x30`.
+    /// Hides the gauge, through the same slot `+0x30` that raised it.
+    ///
+    /// Two things do it in the original: the last step of the gauge's own ramp,
+    /// which is how it comes down in ordinary play, and `FUN_10026050` when the
+    /// engine settles the gauge at the start of a script or the end of one.
     pub fn lower_gauge(&mut self) {
         self.gauge_raised = false;
     }

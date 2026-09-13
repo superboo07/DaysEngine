@@ -299,9 +299,15 @@ struct BarArgs {
     #[arg(long)]
     feeling: Option<String>,
     /// Raise the gauge, which a delta to either counter does: it then draws
-    /// over a bar that is otherwise faded away.
+    /// over a bar that is otherwise faded away, plays its rise or its fall,
+    /// and slides to `--feeling` over 1.5 seconds.
     #[arg(long)]
     gauge: bool,
+    /// The pair the gauge was last settled at, as `001,002`. With `--gauge`
+    /// this is where the ramp starts, so `--after` shows it part way to
+    /// `--feeling`. Defaults to `--feeling`, which is a ramp that never moves.
+    #[arg(long)]
+    feeling_was: Option<String>,
     /// PNG to write the composited bar to. It has an alpha channel: the strip
     /// is a layer the engine draws over the frame, not a picture with a black
     /// bar in it.
@@ -1141,16 +1147,21 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     let bar = Bar::load(&vfs, &dll, resolution)?;
 
     let config = daysengine::install::config::Config::load(game);
+    let counters = |pair: &str, flag: &str| -> anyhow::Result<(i32, i32)> {
+        let (a, b) = pair
+            .split_once(',')
+            .with_context(|| format!("{flag} wants 001,002, got {pair}"))?;
+        Ok((a.trim().parse()?, b.trim().parse()?))
+    };
     let feeling = match &args.feeling {
-        Some(pair) => {
-            let (a, b) = pair
-                .split_once(',')
-                .with_context(|| format!("--feeling wants 001,002, got {pair}"))?;
-            Some((a.trim().parse()?, b.trim().parse()?))
-        }
+        Some(pair) => Some(counters(pair, "--feeling")?),
         None => {
             slot_feeling(game).map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store))
         }
+    };
+    let was = match &args.feeling_was {
+        Some(pair) => Some(counters(pair, "--feeling-was")?),
+        None => feeling,
     };
     let state = State {
         auto: args.auto,
@@ -1171,6 +1182,25 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     // The level is the bar's own, and the only thing that moves it is a press
     // on one of the ten cells -- so that is how it is set here too.
     let mut bar = bar;
+    // Settling takes one update to start the ramp and one past its end to
+    // finish it, exactly as the original's two calls per frame do.
+    let settled = args
+        .after
+        .unwrap_or(bar::FADE_IN_MS.max(bar::FADE_OUT_MS) + 1);
+    // The gauge draws a pair of its own that chases the save's, so it has to be
+    // put somewhere before anything asks it what it looks like. `--feeling-was`
+    // is the settle MenuBar `+0x38` does at the start of a script; a raise then
+    // ramps from there to `--feeling`, one step per frame, and `--after` is how
+    // far into that ramp the picture is taken.
+    let mut gauge_sound = None;
+    if let Some((first, second)) = was {
+        bar.settle_gauge(first, second);
+    }
+    if let (true, Some((first, second))) = (args.gauge, feeling) {
+        bar.advance_gauge(0, first, second);
+        gauge_sound = bar.advance_gauge(0, first, second).sound;
+        bar.advance_gauge(settled, first, second);
+    }
     if let Some(want) = args.transparency {
         match (bar::indicator::FIRST_WIDGET..)
             .take(bar::indicator::CELLS)
@@ -1253,7 +1283,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     match state.gauge {
         None => println!("gauge: no save to read the counters from"),
         Some((first, second)) => {
-            let (lead, _) = bar::gauge::leads(first, second);
+            let (lead, _) = bar.gauge_leads();
             println!(
                 "gauge: {} {first}, {} {second} — lead {lead:+}px to the {}, {}",
                 daysengine::install::feeling::FIRST,
@@ -1265,7 +1295,27 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
                     "drawn with the bar"
                 },
             );
-            let p = bar::gauge::pieces(first, second);
+            if state.gauge_raised {
+                println!(
+                    "  ramp   {} -> {first},{second} at {settled}ms of {}, then held {}ms — {}",
+                    match was {
+                        Some((a, b)) => format!("{a},{b}"),
+                        None => "0,0".to_string(),
+                    },
+                    bar::gauge::RAMP_MS,
+                    bar::gauge::HOLD_MS,
+                    match gauge_sound {
+                        Some(se) => format!(
+                            "plays {} ({})",
+                            se.key(),
+                            se.path(&film_ini(&vfs))
+                                .unwrap_or("no such key in FILMENGINE.INI")
+                        ),
+                        None => "silent, neither counter moved".to_string(),
+                    },
+                );
+            }
+            let p = bar::gauge::pieces_at(lead, -lead);
             for (name, piece) in [("second", p.second), ("first", p.first), ("level", p.level)] {
                 match piece {
                     None => println!("  {name:6} down"),
@@ -1329,11 +1379,6 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             .with_context(|| format!("--pointer wants X,Y or `off`, got {}", args.pointer))?;
         Some((x.trim().parse::<u32>()?, y.trim().parse::<u32>()?))
     };
-    // Settling takes one update to start the ramp and one past its end to
-    // finish it, exactly as the original's two calls per frame do.
-    let settled = args
-        .after
-        .unwrap_or(bar::FADE_IN_MS.max(bar::FADE_OUT_MS) + 1);
     bar.point_at(at, 0, state.gauge_raised);
     let hovered = bar.point_at(at, settled, state.gauge_raised);
     println!(

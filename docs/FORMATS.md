@@ -2762,8 +2762,9 @@ That two of the five are on the gauge is not the bar's decision. `FUN_10005c60`
 ends with `if (name == "001" || name == "002") host->slot_0x30(1)`, slot `+0x30`
 writes `engine + 0x79c`, and slot `+0x154` — which the control bar asks before
 drawing the gauge over a faded-out bar — reads that member back. So the gauge
-surfaces exactly when those two move, and `FUN_10026050` clears it again
-through `slot_0x30(0)` once it has read them.
+surfaces exactly when those two move, and clears itself again at the end of its
+own ramp — see *The gauge's ramp* below, which is also where the rise and fall
+sounds come from.
 
 `_ZeroReset@4` walks the head's name list setting each to 0; that list, built
 by `FUN_10006230`, is the only thing that ever touches `000` and `003`.
@@ -2771,7 +2772,9 @@ by `FUN_10006230`, is the only thing that ever touches `000` and `003`.
 ### The gauge geometry
 
 `FUN_10026050` reads the two counters through host slot `+8` and derives a
-signed lead for each side, then `FUN_10026540` sizes three sprites:
+signed lead for each side — and the ramp then moves those leads between two
+pairs of counters, which is the only thing `FUN_10026540` reads. It sizes three
+sprites:
 
 ```text
 lead_first  = (first  - second) * 2.5       this+0x48
@@ -2925,22 +2928,73 @@ FUN_004253f0   the frame step
 `FUN_0040e940(engine + 0x330)`, the global register, which forwards to
 `FUN_00413f60` on the list at `DAT_0050b328`. `FUN_00423650` — slot `+0x08`,
 the release — takes it back out through `FUN_0040e960`. `DXGraphicModuleList`
-is an RTTI name off its vftable at `0x004d0fd0`, not an inference, and its
-`FUN_004144c0` walks its modules calling each one's `+0x14` **with no test of
-any kind**, ANDing the results.
+is an RTTI name off its vftable at `0x004d0fd0`, not an inference. The list is
+itself a graphics module, and its own `+0x0c`, `+0x10`, `+0x14` and `+0x18` —
+`FUN_00414310`, `FUN_004143f0`, `FUN_004144c0` and `FUN_00414590` — each walk
+its modules calling that same slot on every one, **with no test of any kind**,
+ANDing the results. `FUN_0040e540`, the render frame, runs three of the four:
+`+0x10`, then `+0x14` inside `BeginScene`/`EndScene`, then `+0x18`.
 
 So the draw runs every frame for as long as playback is loaded, whatever the
 bar is doing, and the two sprites drawn past `this+0xbc` and host `+0x140`
-really are on the picture with the bar gone. `DaysEngine` reproduces both. Skipping is not holding them
-opaque — they keep whatever they last held. So a gauge raised while the bar is
-up stays on screen at full alpha after the bar has faded away, and one raised
-while the bar is already gone is pinned at nothing and never appears.
+really are on the picture with the bar gone. `DaysEngine` reproduces both.
 
-`+0x154` is raised by a delta to `001` or `002` and lowered by MenuBar vtable
-`+0x38` (`FUN_10026050`), which the engine calls at the end of a script —
-`FUN_00424020`, on the object at `engine + 0x330` — and again from
-`FUN_00423a70` when playback starts. `_SetFeeling@8` is called from the choice
-handler, so the window is from the player's answer to the end of that script.
+Neither `+0x10` nor `+0x14` is among the eleven slots the engine calls on
+`engine + 0x330`. Only a function holding that member can reach the object, and
+a sweep of all of them for the form this compiler gives a virtual call —
+`MOV reg,[vtbl + off]` followed by `CALL reg`, never the one-instruction
+`CALL dword ptr [reg+off]`, of which the exe has none at either offset — finds
+`+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`, `+0x28`, `+0x2c`, `+0x30`,
+`+0x34` and `+0x38` and no others.
+
+### The gauge's ramp
+
+`+0x154` is raised by a delta to `001` or `002`, and while it is up the bar's
+`+0x10` pass — `FUN_10024c60`, three lines long — steps the gauge every frame:
+
+```text
+if (host->+0x154())  { FUN_10026b40(this); FUN_10026540(this); }
+```
+
+`FUN_10026b40` is a five-step machine on `this+0x44`, one step per frame:
+
+```text
+0  set 0xffffffff on the bed `this+0x80` and the three pieces `+0x98..0xa0`;
+   read `001` into `+0x38` and `002` into `+0x40` as the targets; copy the
+   leads `+0x48`/`+0x4c` into `+0x50`/`+0x54` as the ramp's start; work out
+   `+0x2c = +0x38 - +0x34` and `+0x30 = +0x40 - +0x3c`
+1  if neither counter moved, straight to step 3 and no sound. Otherwise stamp
+   `+0x58` with `timeGetTime` and play host `+0x50(3)` if the counter went up
+   or `+0x50(4)` if it went down — `SeUp` and `SeDown`. `001` decides whenever
+   it moved at all; `002`'s direction is consulted only when `001` stood still
+2  for `0x5dc` ms slide the leads from `+0x50`/`+0x54` towards the target,
+   dividing by `_DAT_1003ab20` (a double, 1500.0); then snap them to the
+   target, restamp `+0x58` and go on
+3  hold while `1999 < timeGetTime() - +0x58`
+4  zero `+0x58` and the step, commit `+0x34 = +0x38` and `+0x3c = +0x40`, and
+   lower the gauge through host `+0x30(0)`
+```
+
+So a raise lasts about three and a half seconds and takes itself down: the
+sound, a 1.5 s slide and a 2 s hold. `this+0x34` and `this+0x3c` are the
+counters **as the gauge is drawing them**, which is what the slide has to start
+from — nothing else writes them but step 4 and `FUN_10026050`.
+
+`FUN_10026050` — MenuBar vtable `+0x38` — is the other way the gauge comes
+down. It reads the two counters, puts the gauge at them with no ramp, resets the
+machine and lowers the flag, and the engine calls it from `FUN_00423a70` when
+playback starts and from `FUN_00424020` when a script ends. `_SetFeeling@8` is
+called from the choice handler, so a raise that the ramp has not finished by the
+end of its script is cut short there.
+
+Step 0's colour is why `FUN_10025690` skipping those four sprites does not leave
+a gauge invisible: whatever alpha they were carrying when the bar faded out, the
+raise makes them opaque, and they only rejoin the bar's own alpha once the gauge
+is down again.
+
+`FILM::MenuBar` is a static object and `FUN_100216e0` initialises none of
+`+0x2c..+0x58`, so they are all zero until the first settle: the gauge starts at
+a tie.
 
 ### Exports
 
