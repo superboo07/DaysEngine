@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
 use daysengine::install::config::{Channel, Config, Flag};
+use daysengine::install::engine::Settings;
 use daysengine::install::progress::Progress;
 use daysengine::install::save::FlagStore;
 use daysengine::install::vfs::Vfs;
@@ -156,6 +157,21 @@ struct ChoiceLabels<'r> {
     drawn: Vec<(u32, u32, Texture<'r>)>,
 }
 
+/// The movie texture and which picture is in it.
+///
+/// Uploaded once per picture rather than once per pass round the loop, which
+/// spins far faster than the 24 fps a clip is played at. `clip` and `index` are
+/// what say two passes are looking at the same picture; `window` is the size
+/// the decoder was asked for, so a resize counts as a different one.
+struct MovieFrame<'r> {
+    clip: String,
+    index: u64,
+    window: (u32, u32),
+    /// The texture's own size, which is what the decoder actually gave.
+    size: (u32, u32),
+    texture: Texture<'r>,
+}
+
 /// One mouth patch's texture, and which patch and image it holds.
 ///
 /// A mouth flaps at its voice's envelope, a few times a second; without this
@@ -170,6 +186,8 @@ struct MouthPatch<'r> {
 
 /// Everything the two loops both need.
 struct Player<'a> {
+    /// `DaysEngine.ini`: the choices that are the engine's, not the game's.
+    settings: Settings,
     vfs: &'a Vfs,
     font: &'a Font,
     mixer: &'a Mixer,
@@ -243,6 +261,12 @@ fn main() -> Result<()> {
             .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?,
     )?;
 
+    // The engine's own settings, which are not the game's — `DaysEngine.ini`
+    // beside this binary. The UI kernel is fixed here, before a single screen
+    // is composed, because every scaler built afterwards reads it.
+    let settings = Settings::load();
+    daysengine::playback::scale::set_kernel(settings.ui_scaler.mitchell());
+
     let sdl = sdl3::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video: {e}"))?;
     let window = video
@@ -257,7 +281,7 @@ fn main() -> Result<()> {
     // nobody sees, and an unsynchronised one tears. This is a hint rather than
     // a call because the safe SDL binding does not expose `SDL_SetRenderVSync`,
     // and `src/media` is the only module here allowed to reach past it —
-    // [`present_interval`] paces the loop for the case where it is refused.
+    // [`Cadence`] paces the loop for the case where it is refused.
     sdl3::hint::set("SDL_RENDER_VSYNC", "1");
     let mut canvas = window.into_canvas();
     let creator = canvas.texture_creator();
@@ -294,6 +318,7 @@ fn main() -> Result<()> {
     // desktop; the Option screen is one click away.
     let boot_config = Config::load(&game);
     let mut player = Player {
+        settings,
         game: game.clone(),
         display: Display {
             wide: boot_config
@@ -652,10 +677,11 @@ fn run_menu(
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
     let mut size = (0, 0);
-    // Paced to the display, not to how fast the loop can spin.
-    let mut interval = present_interval(canvas);
+    // Paced to the display, and deciding on its grid rather than on whatever
+    // moment the last pass ended.
+    let mut cadence = Cadence::new(canvas);
     loop {
-        let pass = Instant::now();
+        let now = cadence.tick();
         for event in events.poll_iter() {
             let action = match event {
                 Event::Quit { .. } => return Ok(Outcome::Quit),
@@ -765,7 +791,7 @@ fn run_menu(
                     under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
                     // Full screen can land the window on a panel that refreshes
                     // at another rate.
-                    interval = present_interval(canvas);
+                    cadence = Cadence::new(canvas);
                     texture = None;
                 }
                 Action::Sound(se) => {
@@ -895,7 +921,7 @@ fn run_menu(
                 .map_err(|e| anyhow::anyhow!("drawing the menu: {e}"))?;
         }
         canvas.present();
-        pace(pass, interval);
+        cadence.wait(now);
     }
 }
 
@@ -952,10 +978,11 @@ fn comment_loop(
     let mut size = (0u32, 0u32);
     let mut dirty = true;
 
-    // Paced to the display, not to how fast the loop can spin.
-    let interval = present_interval(canvas);
+    // Paced to the display, and deciding on its grid rather than on whatever
+    // moment the last pass ended.
+    let cadence = Cadence::new(canvas);
     loop {
-        let pass = Instant::now();
+        let now = cadence.tick();
         // Collected first: the handlers below need the pump again for the
         // modifier state, and cannot hold its iterator while they do.
         let pending: Vec<Event> = events.poll_iter().collect();
@@ -1061,7 +1088,7 @@ fn comment_loop(
                 .map_err(|e| anyhow::anyhow!("drawing the comment dialog: {e}"))?;
         }
         canvas.present();
-        pace(pass, interval);
+        cadence.wait(now);
     }
 }
 
@@ -1166,42 +1193,96 @@ fn apply_display(
     Ok(())
 }
 
-/// How long one pass round a drawing loop should take.
+/// The display's presentation grid: when each refresh is, and which one a pass
+/// is drawing for.
 ///
-/// The loops have to run faster than the 24 fps a script is clocked at: they
-/// poll the pointer, the bar ramps in over 300ms and the auto indicator spins.
-/// They do not have to run faster than the display can show, and before this
-/// they ran as fast as a 2ms sleep allowed — some hundreds of presents a second
-/// on a panel doing 60. Vsync should already be blocking in `present`; this is
-/// what paces the loop when the driver refused the hint, and it is why the
-/// sleep is measured from the top of the pass rather than added to the end.
+/// # Why a pass does not simply read the clock
 ///
-/// A display that will not say what it does, or claims something absurd, gets
-/// 60: wrong and smooth beats wrong and spinning.
-fn present_interval(canvas: &Canvas<Window>) -> Duration {
-    let hz = canvas
-        .window()
-        .get_display()
-        .and_then(|display| display.get_mode())
-        .map(|mode| mode.refresh_rate)
-        .unwrap_or(0.0);
-    let hz = if hz.is_finite() && (20.0..=1000.0).contains(&hz) {
-        hz
-    } else {
-        60.0
-    };
-    Duration::from_secs_f32(1.0 / hz)
+/// A 24 fps clip on a 60 Hz panel shows one source frame for three refreshes
+/// and the next for two, forever. That ratio is 2.5 and there is no way to
+/// spend it evenly; every film on every 60 Hz screen does the same thing. What
+/// turns that beat into *judder* is the pattern going irregular, and it goes
+/// irregular when the frame to draw is chosen from a wall-clock reading taken
+/// at whatever moment the last pass happened to finish. A frame boundary that
+/// falls within a millisecond of a refresh then flips between one side of it
+/// and the other as the work in a pass varies — and at 24 against 60, a
+/// boundary lands on a refresh every other frame, so it flips constantly.
+///
+/// So the instant a pass decides with is the wall clock **snapped to the
+/// nearest refresh**. Which frame is drawn becomes a function of the refresh
+/// number and nothing else, the repeat pattern is the same every time round,
+/// and the beat is as even as the ratio allows. The clock is still the wall
+/// clock: the snap moves it by at most half a refresh, against a frame that
+/// lasts 41ms.
+///
+/// # What it does not fix
+///
+/// The grid is predicted from the refresh rate the display *reports*. A panel
+/// that says 60 and runs at 59.94 slides against it by one refresh every
+/// seventeen seconds or so, and the snap corrects that in one step — a single
+/// frame a refresh short, rather than a drift in playback. Correcting the
+/// picture towards the wall clock is the right way round: the audio device is
+/// not going to wait.
+struct Cadence {
+    /// Refresh zero. Every grid point is a whole number of intervals from here.
+    anchor: Instant,
+    /// One refresh, from the display or [`Cadence::FALLBACK_HZ`].
+    interval: Duration,
 }
 
-/// Sleeps out the rest of a pass that began at `started`.
-///
-/// Measured from the top of the pass, not added to the end, so a pass that took
-/// most of its budget — a 4K frame being resampled — does not then sleep a
-/// whole interval on top and halve the rate.
-fn pace(started: Instant, interval: Duration) {
-    if let Some(left) = interval.checked_sub(started.elapsed()) {
-        std::thread::sleep(left);
+impl Cadence {
+    /// What a display that will not say what it does, or claims something
+    /// absurd, is assumed to be doing. Wrong and smooth beats wrong and
+    /// spinning.
+    const FALLBACK_HZ: f32 = 60.0;
+
+    /// Reads the rate of the display the window is on.
+    fn new(canvas: &Canvas<Window>) -> Cadence {
+        let hz = canvas
+            .window()
+            .get_display()
+            .and_then(|display| display.get_mode())
+            .map(|mode| mode.refresh_rate)
+            .unwrap_or(0.0);
+        let hz = if hz.is_finite() && (20.0..=1000.0).contains(&hz) {
+            hz
+        } else {
+            Cadence::FALLBACK_HZ
+        };
+        log::info!("presenting at {hz:.2} Hz");
+        Cadence {
+            anchor: Instant::now(),
+            interval: Duration::from_secs_f32(1.0 / hz),
+        }
     }
+
+    /// The refresh this pass is drawing for, which is what it decides with.
+    fn tick(&self) -> Instant {
+        self.anchor + snap(self.anchor.elapsed(), self.interval)
+    }
+
+    /// Sleeps until the refresh after the one `tick` named.
+    ///
+    /// Vsync should already have blocked in `present` by the time this is
+    /// reached, leaving nothing to wait for; this is what paces the loop when
+    /// the driver refused it. Either way the deadline is a point on the grid
+    /// and not an interval added to the end of the pass, so a pass that ran
+    /// long does not push every pass after it.
+    fn wait(&self, tick: Instant) {
+        if let Some(left) = (tick + self.interval).checked_duration_since(Instant::now()) {
+            std::thread::sleep(left);
+        }
+    }
+}
+
+/// `elapsed` rounded to the nearest whole refresh.
+///
+/// Nearest rather than last: a pass wakes either side of the refresh it is
+/// drawing for by a scheduler's worth of noise, and rounding is what makes
+/// both answers the same one. See [`Cadence`].
+fn snap(elapsed: Duration, interval: Duration) -> Duration {
+    let ticks = (elapsed.as_secs_f64() / interval.as_secs_f64()).round();
+    interval.mul_f64(ticks.max(0.0))
 }
 
 /// Where the control bar's strip lands in the window.
@@ -1275,15 +1356,8 @@ fn run_script(
 ) -> Result<Outcome> {
     player.mixer.stop_all();
 
-    let mut movie_texture =
-        new_texture(creator, STAGE_WIDTH, STAGE_HEIGHT).context("creating movie texture")?;
     let mut still_texture: Option<(String, (u32, u32), Texture)> = None;
-    // The movie frame resampled to the window, and the weights that did it.
-    let mut movie_scaled: Option<(u32, u32, Texture)> = None;
-    // Which picture the movie textures are holding: clip, frame index, the
-    // window size it was scaled for, and whether it went into `movie_scaled`
-    // or straight into `movie_texture`.
-    let mut movie_shown: Option<(String, u64, (u32, u32), bool)> = None;
+    let mut movie_texture: Option<MovieFrame<'_>> = None;
     let mut scaler = scale::Scaler::default();
     // The wrapped lines and a texture each, cached on the script's own line.
     let mut text_texture: Option<DialogueBlock<'_>> = None;
@@ -1294,6 +1368,7 @@ fn run_script(
     let mut choice_labels: Option<ChoiceLabels<'_>> = None;
 
     let mut stage = Stage::new(script);
+    stage.set_video_scaler(player.settings.video_scaler);
     let config = Config::load(&player.game);
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
@@ -1338,10 +1413,11 @@ fn run_script(
     // playback is paused, and the bar still has to fade.
     let start = Instant::now();
 
-    // Paced to the display, not to how fast the loop can spin.
-    let mut interval = present_interval(canvas);
+    // Paced to the display, and deciding on its grid rather than on whatever
+    // moment the last pass ended.
+    let mut cadence = Cadence::new(canvas);
     loop {
-        let pass = Instant::now();
+        let now = cadence.tick();
         // The rate the clock runs at, from the speed widget that is lit. Read
         // once per frame because every use of the clock in this iteration has
         // to agree about it.
@@ -1359,9 +1435,9 @@ fn run_script(
                     ..
                 } => {
                     if paused {
-                        origin = Instant::now();
+                        origin = now;
                     } else {
-                        offset = clock(origin, offset, rate);
+                        offset = clock(origin, now, offset, rate);
                     }
                     paused = !paused;
                 }
@@ -1369,21 +1445,21 @@ fn run_script(
                     keycode: Some(key @ (Keycode::Right | Keycode::Left)),
                     ..
                 } => {
-                    let now = clock(origin, offset, rate);
+                    let at = clock(origin, now, offset, rate);
                     let delta = 5 * FPS;
                     offset = if key == Keycode::Right {
-                        Frame(now.0 + delta)
+                        Frame(at.0 + delta)
                     } else {
-                        Frame(now.0.saturating_sub(delta))
+                        Frame(at.0.saturating_sub(delta))
                     };
-                    origin = Instant::now();
+                    origin = now;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::R),
                     ..
                 } => {
                     offset = Frame::ZERO;
-                    origin = Instant::now();
+                    origin = now;
                 }
                 Event::MouseMotion { x, y, .. } => pointer = (x, y),
                 Event::MouseButtonDown {
@@ -1408,21 +1484,25 @@ fn run_script(
         let at = if paused {
             offset
         } else {
-            clock(origin, offset, rate)
+            clock(origin, now, offset, rate)
         };
         if stage.finished(at) {
             log::info!("script finished");
             return Ok(Outcome::Finished);
         }
 
+        // Where the picture lands, worked out before the frame is asked for:
+        // the decoder scales to it, so it has to know first.
+        let dst = letterbox(canvas, STAGE_WIDTH, STAGE_HEIGHT);
+        let scale = dst.h / STAGE_HEIGHT as f32;
+        let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
+        stage.set_video_size(window_px.0, window_px.1);
+
         stage.seek_to(at, player.vfs, player.mixer)?;
         let visual = stage.visual_at(at);
 
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
-
-        let dst = letterbox(canvas, STAGE_WIDTH, STAGE_HEIGHT);
-        let scale = dst.h / STAGE_HEIGHT as f32;
 
         // The control bar's own space is 800x75 with its origin at the strip's
         // top-left corner; the engine places that strip, and the DLL's
@@ -1479,9 +1559,9 @@ fn run_script(
                         }
                         bar::Act::TogglePause => {
                             if paused {
-                                origin = Instant::now();
+                                origin = now;
                             } else {
-                                offset = clock(origin, offset, rate);
+                                offset = clock(origin, now, offset, rate);
                             }
                             paused = !paused;
                         }
@@ -1509,14 +1589,14 @@ fn run_script(
                         // silent. `Mixer::set_rate` is both halves of that.
                         bar::Act::Speed(index) => {
                             if bar_state.set_speed(index) {
-                                offset = clock(origin, offset, rate);
-                                origin = Instant::now();
+                                offset = clock(origin, now, offset, rate);
+                                origin = now;
                                 player.mixer.set_rate(bar_state.rate);
                             }
                         }
                         bar::Act::Seek(code) if code == bar::Seek::RESTART => {
                             offset = Frame::ZERO;
-                            origin = Instant::now();
+                            origin = now;
                         }
                         // Everything past a restart lands in the executable's
                         // state 4, which is the "this script is finished" path:
@@ -1554,7 +1634,7 @@ fn run_script(
                             // rate comes off for the duration and goes back on
                             // return — otherwise a menu opened at 24x would be
                             // silent.
-                            offset = clock(origin, offset, rate);
+                            offset = clock(origin, now, offset, rate);
                             player.mixer.set_rate(1.0);
                             let outcome = run_menu(
                                 player,
@@ -1565,7 +1645,6 @@ fn run_script(
                                 MenuEntry::OverPlayback(mode, kind),
                                 progress.as_deref_mut(),
                             )?;
-                            origin = Instant::now();
                             player.mixer.set_rate(bar_state.rate);
                             // The Option screen can change the display mode,
                             // which moves both the art set the bar draws from
@@ -1578,10 +1657,15 @@ fn run_script(
                                     player.resolution().name()
                                 );
                             }
-                            interval = present_interval(canvas);
+                            // The menu may have moved the window to another
+                            // display, so the grid is read again — and the
+                            // clock re-bases onto it, not onto the wall clock,
+                            // so the first frame back is on the beat.
+                            cadence = Cadence::new(canvas);
+                            origin = cadence.tick();
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
-                            movie_shown = None;
+                            movie_texture = None;
                             mouth_patches.clear();
                             choice_labels = None;
                             bar_texture = None;
@@ -1673,60 +1757,47 @@ fn run_script(
             }
         }
 
-        // The frame the window actually shows, resampled to the letterbox
-        // rather than stretched onto it by the driver. See
-        // `daysengine::playback::scale`.
-        //
-        // Resampled once per *picture*, not once per pass round this loop. The
-        // loop has to spin much faster than 24 fps to stay responsive to the
-        // pointer, so it sees each movie frame several times over, and scaling
-        // one is the most expensive thing it does. `movie_id` is what says two
-        // of those are the same picture; the window size joins it because a
-        // resize changes the answer.
-        let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
+        // A movie frame arrives at the size the window wants it, because the
+        // decoder was asked for that size: libswscale folds the scale into the
+        // colour conversion every frame goes through anyway, in hand-written
+        // SIMD. See `daysengine::media::VideoDecoder::set_output_size`. What is
+        // left here is the upload, and that happens once per *picture* — the
+        // loop spins much faster than 24 fps to stay responsive to the pointer,
+        // so it sees each frame several times over. `movie_id` is what says two
+        // of those are the same picture.
         if let Some(frame) = visual.movie {
             let showing = visual
                 .movie_id
                 .map(|(clip, index)| (clip, index, window_px));
-            let stale = movie_shown.as_ref().is_none_or(|(clip, index, size, _)| {
-                showing != Some((clip.as_str(), *index, *size))
-            });
+            let stale = movie_texture
+                .as_ref()
+                .is_none_or(|held| showing != Some((held.clip.as_str(), held.index, held.window)));
             if stale {
-                let src = (frame.width as usize, frame.height as usize);
-                let want = (window_px.0 as usize, window_px.1 as usize);
-                let scaled = match scaler.resample(&frame.rgba, src, want) {
-                    Some(scaled) => {
-                        if movie_scaled
-                            .as_ref()
-                            .is_none_or(|(w, h, _)| (*w, *h) != window_px)
-                        {
-                            let texture = new_texture(creator, window_px.0, window_px.1)?;
-                            movie_scaled = Some((window_px.0, window_px.1, texture));
-                        }
-                        if let Some((w, _, texture)) = &mut movie_scaled {
-                            texture
-                                .update(None, scaled, *w as usize * 4)
-                                .context("uploading movie frame")?;
-                        }
-                        true
+                let size = (frame.width, frame.height);
+                if movie_texture.as_ref().is_none_or(|held| held.size != size) {
+                    movie_texture = Some(MovieFrame {
+                        // Nothing is in it yet; the upload below is what makes
+                        // an identity true.
+                        clip: String::new(),
+                        index: 0,
+                        window: (0, 0),
+                        size,
+                        texture: new_texture(creator, size.0, size.1)?,
+                    });
+                }
+                if let Some(held) = &mut movie_texture {
+                    held.texture
+                        .update(None, &frame.rgba, frame.width as usize * 4)
+                        .context("uploading movie frame")?;
+                    if let Some((clip, index, window)) = showing {
+                        held.clip.clear();
+                        held.clip.push_str(clip);
+                        held.index = index;
+                        held.window = window;
                     }
-                    // The window is already the frame's own size, so there is
-                    // nothing to scale and the frame goes up as it stands.
-                    None => {
-                        movie_texture
-                            .update(None, &frame.rgba, frame.width as usize * 4)
-                            .context("uploading movie frame")?;
-                        false
-                    }
-                };
-                movie_shown =
-                    showing.map(|(clip, index, size)| (clip.to_string(), index, size, scaled));
+                }
             }
-            let texture = match movie_shown {
-                Some((_, _, _, true)) => movie_scaled.as_ref().map(|(_, _, t)| t),
-                _ => Some(&movie_texture),
-            };
-            if let Some(texture) = texture {
+            if let Some(MovieFrame { texture, .. }) = &movie_texture {
                 canvas
                     .copy(texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
@@ -1953,12 +2024,15 @@ fn run_script(
         canvas.present();
         // The script clock is the authority; this only keeps the loop from
         // spinning a core between the frames the display can actually show.
-        pace(pass, interval);
+        cadence.wait(now);
     }
 }
 
-/// Current script frame from wall-clock elapsed time plus the seek offset.
-/// The frame playback is at: the base frame plus the scaled elapsed wall time.
+/// The frame playback is at: the base frame plus the scaled time elapsed since
+/// the clock was last re-based.
+///
+/// `now` is the instant to answer for, which the loops take from [`Cadence`]
+/// rather than from the wall clock directly — see there for why.
 ///
 /// `FUN_00422f70` is this function. `offset` is the executable's `+0x540`, the
 /// frame the clock was last re-based to; `origin` stands for the `timeGetTime`
@@ -1966,8 +2040,9 @@ fn run_script(
 /// slot `+0x8c` stores out of the speed table. Folding the elapsed frames back
 /// into `offset` and taking a fresh `origin` is `FUN_00424910` followed by
 /// `FUN_00424a10`, which is exactly what the original does on a rate change.
-fn clock(origin: Instant, offset: Frame, rate: f32) -> Frame {
-    Frame(offset.0 + Frame::from_duration_at(origin.elapsed(), rate).0)
+fn clock(origin: Instant, now: Instant, offset: Frame, rate: f32) -> Frame {
+    let elapsed = now.saturating_duration_since(origin);
+    Frame(offset.0 + Frame::from_duration_at(elapsed, rate).0)
 }
 
 /// Resolves a script name to its pack path, preferring the configured language.
@@ -2013,6 +2088,77 @@ fn discover_game_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The judder fix, which is the whole point of [`Cadence`].
+    ///
+    /// A 24 fps clip on a 60 Hz panel holds one source frame for three
+    /// refreshes and the next for two; that ratio is 2.5 and there is no even
+    /// way to spend it. What must not happen is the pattern changing with how
+    /// long the last pass took — that is the difference between a beat and
+    /// judder. So: run the same walk twice, once with a pass waking exactly on
+    /// its refresh and once with it waking late by a jittery few milliseconds,
+    /// and insist the two produce the same frame at every single refresh.
+    #[test]
+    fn which_frame_is_shown_does_not_depend_on_when_the_pass_woke() {
+        let interval = Duration::from_secs_f64(1.0 / 59.88);
+        // Milliseconds late, arbitrary, and deliberately wider than the margin
+        // between a 24 fps boundary and a 60 Hz refresh — which is where a
+        // frame flips sides.
+        let jitter: [f64; 8] = [0.0, 2.9, 1.7, 0.4, 3.0, 1.1, 2.2, 0.8];
+        let walk = |late: bool| {
+            (0..600u32)
+                .map(|tick| {
+                    let mut wall = interval.mul_f64(f64::from(tick));
+                    if late {
+                        wall +=
+                            Duration::from_secs_f64(jitter[tick as usize % jitter.len()] / 1000.0);
+                    }
+                    Frame::from_duration_at(snap(wall, interval), 1.0)
+                })
+                .collect::<Vec<_>>()
+        };
+        let on_time = walk(false);
+        assert_eq!(
+            walk(true),
+            on_time,
+            "the frame shown moved because a pass woke late"
+        );
+
+        // And what it settles into is the 3:2 beat: every frame held two or
+        // three refreshes, both lengths present.
+        let mut held = Vec::new();
+        let mut run = 1usize;
+        for pair in on_time.windows(2) {
+            if pair[0] == pair[1] {
+                run += 1;
+            } else {
+                held.push(run);
+                run = 1;
+            }
+        }
+        let held = &held[1..];
+        assert!(
+            held.iter().all(|n| (2..=3).contains(n)),
+            "a frame was held for something other than two or three refreshes: {held:?}"
+        );
+        assert!(held.contains(&2) && held.contains(&3), "{held:?}");
+    }
+
+    /// Snapping is to the nearest refresh, and never runs backwards.
+    #[test]
+    fn the_grid_rounds_to_the_nearest_refresh() {
+        let interval = Duration::from_millis(10);
+        assert_eq!(snap(Duration::from_millis(0), interval), Duration::ZERO);
+        assert_eq!(snap(Duration::from_millis(4), interval), Duration::ZERO);
+        assert_eq!(
+            snap(Duration::from_millis(6), interval),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            snap(Duration::from_millis(94), interval),
+            Duration::from_millis(90)
+        );
+    }
 
     /// The control bar covers the picture's full width and the same fraction of
     /// its height whichever art set is loaded, because every set is the same

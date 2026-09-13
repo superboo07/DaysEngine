@@ -7,10 +7,15 @@
 //! ([`save`]) that sits beside the executable rather than in a pack, the
 //! affection counters the branch system keeps ([`feeling`]) and the player's
 //! place in the branch graph ([`progress`]).
+//!
+//! One file here is the exception, and it is ours rather than theirs:
+//! [`engine`] reads `DaysEngine.ini`, which holds the choices the original
+//! never had to make.
 
 pub mod clock;
 pub mod config;
 pub mod dialog;
+pub mod engine;
 pub mod feeling;
 pub mod ini;
 pub mod progress;

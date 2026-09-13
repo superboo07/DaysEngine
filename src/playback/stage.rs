@@ -135,6 +135,16 @@ pub struct Stage {
     /// per background too, and re-checking it every frame would mean three
     /// failed pack lookups per speaker per frame.
     mouths: BTreeMap<String, Option<Mouth>>,
+    /// The filter movie frames are scaled with, from `DaysEngine.ini`.
+    video_scaler: crate::media::VideoScaler,
+    /// The size movie frames are wanted at, or `None` for the clip's own.
+    ///
+    /// The window is almost never 800x452, and a frame has to be scaled to it
+    /// somewhere. Here is the cheapest place: libswscale is already converting
+    /// every frame out of the codec's colour space, so the scale is folded into
+    /// a pass the frame was making anyway. See
+    /// [`crate::media::VideoDecoder::set_output_size`].
+    video_size: Option<(u32, u32)>,
 }
 
 /// A voice line that may be flapping a mouth.
@@ -156,6 +166,53 @@ impl Stage {
             men_voice: true,
             voices: BTreeMap::new(),
             mouths: BTreeMap::new(),
+            video_scaler: crate::media::VideoScaler::default(),
+            video_size: None,
+        }
+    }
+
+    /// Asks for movie frames at `width` x `height`, applying it to whatever is
+    /// playing and to every clip this stage opens afterwards.
+    ///
+    /// A size the decoder will not take is reported and otherwise ignored: a
+    /// movie at the wrong size is still a movie, and losing playback over it
+    /// would be worse.
+    pub fn set_video_size(&mut self, width: u32, height: u32) {
+        if self.video_size == Some((width, height)) {
+            return;
+        }
+        self.video_size = Some((width, height));
+        if let Some(movie) = &mut self.movie {
+            if let Err(err) = movie.decoder.set_output_size(width, height) {
+                log::warn!("{}: cannot decode at {width}x{height}: {err}", movie.path);
+            }
+        }
+    }
+
+    /// Chooses the filter movie frames are scaled with, applying it to whatever
+    /// is playing and to every clip this stage opens afterwards.
+    pub fn set_video_scaler(&mut self, scaler: crate::media::VideoScaler) {
+        if self.video_scaler == scaler {
+            return;
+        }
+        self.video_scaler = scaler;
+        if let Some(movie) = &mut self.movie {
+            if let Err(err) = movie.decoder.set_scaler(scaler) {
+                log::warn!("{}: cannot scale with {scaler:?}: {err}", movie.path);
+            }
+        }
+    }
+
+    /// Puts this stage's video settings on a freshly opened clip.
+    fn size_video(&self, decoder: &mut VideoDecoder, path: &str) {
+        if let Err(err) = decoder.set_scaler(self.video_scaler) {
+            log::warn!("{path}: cannot scale with {:?}: {err}", self.video_scaler);
+        }
+        let Some((width, height)) = self.video_size else {
+            return;
+        };
+        if let Err(err) = decoder.set_output_size(width, height) {
+            log::warn!("{path}: cannot decode at {width}x{height}: {err}");
         }
     }
 
@@ -243,8 +300,9 @@ impl Stage {
                 let bytes = vfs
                     .read_path_as(path, "wmv")
                     .with_context(|| format!("loading movie {path}"))?;
-                let decoder =
+                let mut decoder =
                     VideoDecoder::open(bytes).with_context(|| format!("opening movie {path}"))?;
+                self.size_video(&mut decoder, path);
                 self.movie = Some(Movie {
                     decoder,
                     start,
@@ -335,7 +393,8 @@ impl Stage {
             }
             Command::EndRoll { path } => {
                 let bytes = vfs.read_path_as(path, "wmv")?;
-                let decoder = VideoDecoder::open(bytes)?;
+                let mut decoder = VideoDecoder::open(bytes)?;
+                self.size_video(&mut decoder, path);
                 self.movie = Some(Movie {
                     decoder,
                     start,

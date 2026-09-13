@@ -137,6 +137,8 @@ days render 00-00-A00 --at 00:39:00 -o /tmp/frames
 days ui System/Title/Title -r full --active 1 -o /tmp/title.png
 days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 days config                          # the player's settings, as the Option screen reads them
+days settings                        # DaysEngine's own settings, and where they come from
+days media Movie00/00-00/00-00-A00/00-00-A00-001 --at-size 1920x1085  # can this machine hold 24 fps?
 days replay                          # the replay scene table, and what the save has unlocked
 days save --slot 0                   # decode a save slot: position, story points, choices
 days save --roundtrip                # read every save file, write it back, compare bytes
@@ -167,6 +169,34 @@ limits, and where a normalised point lands.
 `enter`, `esc`, `at:X:Y`, `click:X:Y` — against the real screens and reports
 where each one lands. Every decision the menus make happens there, so the state machine is
 testable on a machine with no GPU even though the SDL player draws through one.
+
+## Settings of our own
+
+Everything the engine reads is the player's, with one exception:
+`DaysEngine.ini`, **beside the `daysengine` binary**. It holds the choices the
+original never had to make, because it handed its frames to Direct3D and took
+whatever filter the driver gave:
+
+```ini
+[Video]
+; fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area
+Scaler = bicubic
+
+[UI]
+; bspline, mitchell, catmull_rom — one cubic family, softest first
+Scaler = bspline
+```
+
+The file is optional, never written by the game, and a value it cannot read is
+a line in the log and nothing more. `days settings --template` prints a
+commented copy to start from, and `days settings` says which file is in force
+and what it currently means.
+
+The two scalers are separate because the two jobs are. A movie frame is scaled
+by libswscale inside the colour conversion it already goes through, so the
+filter costs only its own width; the game's own art goes through the engine's
+resampler in `playback::scale`. A libavfilter graph — a debander before the
+scale, say — is **not implemented**; the decoder is where it would go.
 
 ## Layout
 

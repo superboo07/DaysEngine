@@ -70,6 +70,11 @@ two large C codebases that parse untrusted media, rather than freezing a copy
 that goes stale. It also means the build depends on the host having them —
 see the README for the per-distro package names.
 
+**libswscale must be new enough for `sws_scale_frame`** (ffmpeg 5.0, 2022).
+That entry point, not the older `sws_scale`, is the one that honours the
+`threads` option, and a movie frame scaled to a 4K window on one thread costs
+more than the 41ms a 24 fps frame gets. See `media::video::new_scaler`.
+
 Note that ffmpeg will be parsing media out of the user's own game install, which
 is not attacker-controlled in the normal case. Keep it that way: never point the
 decoder at a file the user did not supply themselves.

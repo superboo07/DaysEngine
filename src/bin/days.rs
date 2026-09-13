@@ -71,6 +71,11 @@ enum Cmd {
         /// Write the first decoded video frame here as a PPM.
         #[arg(long)]
         dump_frame: Option<PathBuf>,
+        /// Decode video at this window size, e.g. "1920x1085", the way the
+        /// player does. Reports how long a frame costs, which is what says
+        /// whether a machine can hold 24 fps at that size.
+        #[arg(long, value_name = "WxH")]
+        at_size: Option<String>,
     },
     /// Composite frames of a script to PNG, without a display.
     ///
@@ -131,6 +136,17 @@ enum Cmd {
         /// Read every save file, write it back, and check the bytes match.
         #[arg(long)]
         roundtrip: bool,
+    },
+    /// Print DaysEngine's own settings, and a template for the file they
+    /// come from.
+    ///
+    /// These are the engine's choices, not the game's: which filter scales a
+    /// movie frame, which scales the UI art. The game's own settings are
+    /// `days config`.
+    Settings {
+        /// Print a commented file of the defaults, to redirect into place.
+        #[arg(long)]
+        template: bool,
     },
     /// Print the player's settings, as the Option screen reads them.
     ///
@@ -357,6 +373,21 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
+    // The engine's own settings are the one thing here that is not about the
+    // player's install, so this answers without needing to find one.
+    if let Cmd::Settings { template } = cli.cmd {
+        cmd_settings(template);
+        return Ok(());
+    }
+
+    // These tools are the verification path for what the engine draws, so they
+    // have to draw it the same way: same UI kernel, out of the same file.
+    daysengine::playback::scale::set_kernel(
+        daysengine::install::engine::Settings::load()
+            .ui_scaler
+            .mitchell(),
+    );
+
     let game = match cli.game {
         Some(dir) => dir,
         None => discover_game_dir()?,
@@ -416,7 +447,13 @@ fn main() -> Result<()> {
         Cmd::Scripts { stats } => cmd_scripts(&game, stats)?,
         Cmd::Script { name } => cmd_script(&game, &name)?,
         Cmd::Assets => cmd_assets(&game)?,
-        Cmd::Media { path, dump_frame } => cmd_media(&game, &path, dump_frame.as_deref())?,
+        // Handled before the install is found.
+        Cmd::Settings { .. } => {}
+        Cmd::Media {
+            path,
+            dump_frame,
+            at_size,
+        } => cmd_media(&game, &path, dump_frame.as_deref(), at_size.as_deref())?,
         Cmd::Timing { name } => cmd_timing(&game, &name)?,
         Cmd::Font {
             text,
@@ -591,7 +628,33 @@ fn cmd_assets(game: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
+/// Reports the engine's own settings, or prints a file to start from.
+fn cmd_settings(template: bool) {
+    use daysengine::install::engine::{self, Settings};
+    if template {
+        print!("{}", engine::template());
+        return;
+    }
+    match Settings::path() {
+        Some(path) if path.is_file() => println!("{}", path.display()),
+        Some(path) => println!("{} (absent; these are the defaults)", path.display()),
+        None => println!("(cannot find this binary's own directory)"),
+    }
+    let settings = Settings::load();
+    println!("  [Video] Scaler = {:?}", settings.video_scaler);
+    println!("  [UI]    Scaler = {:?}", settings.ui_scaler);
+    println!(
+        "\nWrite a file to start from with: days settings --template > {}",
+        engine::FILE
+    );
+}
+
+fn cmd_media(
+    game: &Path,
+    path: &str,
+    dump_frame: Option<&Path>,
+    at_size: Option<&str>,
+) -> Result<()> {
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     println!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
@@ -606,9 +669,19 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
     if name.to_ascii_lowercase().ends_with(".wmv") {
         let mut decoder = daysengine::media::VideoDecoder::open(bytes)?;
         println!("video {}x{}", decoder.width(), decoder.height());
+        if let Some(size) = at_size {
+            // The engine's own settings, so this measures what the player gets
+            // rather than what the defaults would give.
+            let scaler = daysengine::install::engine::Settings::load().video_scaler;
+            decoder.set_scaler(scaler)?;
+            let (w, h) = parse_size(size)?;
+            decoder.set_output_size(w, h)?;
+            println!("decoding at {w}x{h} with {scaler:?}");
+        }
         let mut frames = 0usize;
         let mut last = 0.0;
         let mut first: Option<daysengine::media::VideoFrame> = None;
+        let started = std::time::Instant::now();
         while let Some(frame) = decoder.next_frame()? {
             last = frame.timestamp;
             if first.is_none() {
@@ -616,6 +689,7 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
             }
             frames += 1;
         }
+        let took = started.elapsed();
         println!(
             "{frames} frames, last pts {last:.3}s ({:.2} fps average)",
             if last > 0.0 {
@@ -624,6 +698,14 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
                 0.0
             }
         );
+        if frames > 0 {
+            // What the player has to fit into one 24 fps frame, which is 41ms.
+            let each = took / frames as u32;
+            println!(
+                "decoded and scaled in {took:.2?}, {each:.2?} a frame ({:.0} fps)",
+                frames as f64 / took.as_secs_f64()
+            );
+        }
         if let (Some(path), Some(frame)) = (dump_frame, first) {
             write_ppm(path, &frame)?;
             println!("wrote first frame to {}", path.display());
@@ -638,6 +720,14 @@ fn cmd_media(game: &Path, path: &str, dump_frame: Option<&Path>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parses a `WxH` size.
+fn parse_size(text: &str) -> Result<(u32, u32)> {
+    let (w, h) = text
+        .split_once(['x', 'X'])
+        .with_context(|| format!("{text} is not a WxH size"))?;
+    Ok((w.trim().parse()?, h.trim().parse()?))
 }
 
 /// Writes an RGBA frame as a binary PPM, dropping alpha. Enough to eyeball a

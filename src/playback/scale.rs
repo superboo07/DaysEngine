@@ -1,5 +1,11 @@
 //! Resampling, for getting the game's art onto a window that is not its size.
 //!
+//! This is the engine's own scaler, and what goes through it is the game's
+//! **art**: the menus, the still backgrounds. Movie frames do not — libswscale
+//! scales those inside the colour conversion they already go through, which is
+//! both faster and already written; see
+//! [`crate::media::VideoDecoder::set_output_size`].
+//!
 //! # Why this is not the original's scaler
 //!
 //! Everything else in this engine is a recovered behaviour. This is not: it is
@@ -12,16 +18,14 @@
 //! here that would be worth reproducing, and reproducing a driver's filter
 //! faithfully is not possible anyway.
 //!
-//! What is recovered is that the picture is *filtered*, and that its edges are
+//! What is recovered is that the art is *filtered*, and that its edges are
 //! clamped. This module is both of those; only the kernel is ours.
-//!
-//! So this module scales with a **cubic B-spline** instead. Nothing about the
-//! game's timing, layout or art depends on the filter, so the choice changes
-//! how the frame looks and nothing about how it behaves.
 //!
 //! # The filter
 //!
-//! The Mitchell-Netravali family, at `B = 1, C = 0`:
+//! The Mitchell-Netravali family, whose two parameters are `DaysEngine.ini`'s
+//! `[UI] Scaler` (see [`crate::install::engine::UiScaler`]) and which defaults
+//! to [`B_SPLINE`]:
 //!
 //! ```text
 //!            (12 - 9B - 6C)|x|^3 + (-18 + 12B + 6C)|x|^2 + (6 - 2B)
@@ -33,13 +37,16 @@
 //!                                     6
 //! ```
 //!
-//! which reduces to `(3|x|^3 - 6|x|^2 + 4) / 6` and
-//! `(-|x|^3 + 6|x|^2 - 12|x| + 8) / 6`. It is the smoothest member of the
-//! family: the kernel is everywhere non-negative, so the result cannot
-//! overshoot and there is no ringing or haloing at all. The cost is softness —
-//! a B-spline does not interpolate, it approximates, so even a 1:1 pass would
-//! blur if it were allowed to run. [`Scaler::resample`] returns the source
-//! untouched when nothing needs scaling, so that never happens.
+//! At `B = 1, C = 0` that is the cubic B-spline, the smoothest member: its
+//! kernel is everywhere non-negative, so the result cannot overshoot and there
+//! is no ringing or haloing at all. The cost is softness — a B-spline does not
+//! interpolate, it approximates, so even a 1:1 pass would blur if it were
+//! allowed to run. [`Scaler::resample`] returns the source untouched when
+//! nothing needs scaling, so that never happens.
+//!
+//! Mitchell's own `B = C = 1/3` and Catmull-Rom's `B = 0, C = 1/2` are sharper
+//! and do undershoot; [`to_byte`] clamps, so a player who asks for one of them
+//! gets the ringing and not a wrapped byte.
 //!
 //! # How it runs
 //!
@@ -53,24 +60,24 @@
 //! shrinking averages over every source pixel that lands in the footprint
 //! rather than point-sampling four of them and aliasing.
 //!
-//! # Keeping up with the picture
+//! # Speed, and why it still matters here
 //!
-//! This runs on every movie frame, so it has a deadline. The engine's clock is
-//! 24 fps — 41ms a frame for decode, mixing, this, the upload and the present —
-//! and a frame that misses it judders. A full-screen frame is the hard case:
-//! 800x452 onto a 4K panel is 8.3 million output pixels, each four taps in each
-//! direction, which is a hundred and thirty million multiply-adds that have to
-//! happen between one frame and the next.
+//! Nothing here runs per frame, but everything here runs where a stall shows:
+//! on a still background, which is the whole window, at the moment one is
+//! loaded mid-scene, and on a menu screen every time a hover relights a label.
+//! A full-screen composite on a 4K panel is eight million output pixels, four
+//! taps in each direction — a hundred and thirty million multiply-adds between
+//! a player moving the pointer and the screen agreeing.
 //!
-//! Four things are what make it fit. Only the last of them is about the filter.
+//! Four things make it fast. Only the last of them is about the filter.
 //!
 //! **Threads.** A band of output rows reads the source and writes its own rows
-//! of the frame and touches nothing else, so bands go to a scoped thread each
-//! and the picture is resampled on every core the machine has. This is the only
-//! parallel code in the engine. It is parallel over the data rather than over
-//! the work, so the whole of the synchronisation is handing out the next band —
-//! and a resample small enough for one worker takes the loop inline instead,
-//! because spawning a thread to give work to yourself is pure overhead.
+//! of the output and touches nothing else, so bands go to a scoped thread each
+//! and the picture is resampled on every core the machine has. It is parallel
+//! over the data rather than over the work, so the whole of the synchronisation
+//! is handing out the next band — and a resample small enough for one worker
+//! takes the loop inline instead, because spawning a thread to give work to
+//! yourself is pure overhead.
 //!
 //! **Bands.** [`BAND`] output rows at a time through both passes, rather than
 //! each pass over the whole frame. That is what gives the threads something
@@ -132,21 +139,24 @@ pub struct Scaler {
     /// The finished frame, kept between calls so a 4K one is not reallocated
     /// and rezeroed on every frame of every movie.
     out: Vec<u8>,
+    /// The `(B, C)` the weights were built at, so a refit keeps it.
+    mitchell: (f32, f32),
 }
 
 /// Turns one filtered f32 channel into the byte that goes on screen.
 ///
-/// The clamp is a guard the B-spline does not need — its weights are
-/// non-negative and sum to one, so a value here cannot leave `0.0..=255.0` by
-/// more than float error — but it costs nothing, and it is what makes the line
-/// below safe to write.
+/// The clamp is a guard [`B_SPLINE`] does not need — its weights are
+/// non-negative and sum to one, so a value there cannot leave `0.0..=255.0` by
+/// more than float error. The sharper kernels of the family do undershoot and
+/// overshoot, which is what sharper means; and the clamp measured free either
+/// way. It is also what makes the line below safe to write.
 ///
 /// That line is the measured reason this is a function and not `as u8`. Adding
 /// `1.5 * 2^23` to a value in `0..=255` forces the exponent to 23, where a
 /// binary32's ULP is exactly 1, so the addition rounds to the nearest integer
 /// and leaves it in the low bits of the mantissa; reading those bits back is
 /// the conversion. It avoids the float-to-int instruction altogether, which is
-/// what stops LLVM vectorising the loop: over a frame's worth of bytes this
+/// what stops LLVM vectorising the loop: over a 1920x1085 composite this
 /// measured 4ms against 17ms for `(x + 0.5) as u8`. `f32::round` — the obvious
 /// way to write it — is worse still, a libm call per byte on a baseline x86-64
 /// target, and it cost more than the filter did.
@@ -158,13 +168,43 @@ fn to_byte(v: f32) -> u8 {
     (v.clamp(0.0, 255.0) + BIAS).to_bits() as u8
 }
 
-/// The cubic B-spline kernel, `B = 1, C = 0`.
-fn kernel(x: f32) -> f32 {
+/// `B = 1, C = 0`: the cubic B-spline, and the default.
+pub const B_SPLINE: (f32, f32) = (1.0, 0.0);
+
+/// The kernel every scaler built from here on uses.
+///
+/// A process-wide choice because it is one: it is read out of `DaysEngine.ini`
+/// once, before anything is drawn, and threading a filter parameter through
+/// every `Screen::load` in the engine would be churn for a knob that cannot
+/// change while the game is running. `OnceLock` is what makes "once" true — a
+/// second call is ignored rather than racing a scaler that is mid-frame.
+static KERNEL: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+
+/// Sets the kernel, once, for every [`Scaler`] built afterwards.
+///
+/// Returns whether this call is the one that set it.
+pub fn set_kernel(mitchell: (f32, f32)) -> bool {
+    KERNEL.set(mitchell).is_ok()
+}
+
+/// The kernel in force. [`B_SPLINE`] until something says otherwise.
+pub fn kernel_in_force() -> (f32, f32) {
+    KERNEL.get().copied().unwrap_or(B_SPLINE)
+}
+
+/// The Mitchell-Netravali kernel at `(b, c)`.
+fn kernel(x: f32, (b, c): (f32, f32)) -> f32 {
     let x = x.abs();
+    let (x2, x3) = (x * x, x * x * x);
     if x < 1.0 {
-        (3.0 * x * x * x - 6.0 * x * x + 4.0) / 6.0
+        ((12.0 - 9.0 * b - 6.0 * c) * x3 + (-18.0 + 12.0 * b + 6.0 * c) * x2 + (6.0 - 2.0 * b))
+            / 6.0
     } else if x < 2.0 {
-        (-(x * x * x) + 6.0 * x * x - 12.0 * x + 8.0) / 6.0
+        ((-b - 6.0 * c) * x3
+            + (6.0 * b + 30.0 * c) * x2
+            + (-12.0 * b - 48.0 * c) * x
+            + (8.0 * b + 24.0 * c))
+            / 6.0
     } else {
         0.0
     }
@@ -175,7 +215,7 @@ fn kernel(x: f32) -> f32 {
 /// `support` is the kernel's radius in source pixels: 2 when upscaling, and
 /// widened by the shrink factor when downscaling so the footprint covers every
 /// source pixel that contributes.
-fn axis(src: usize, dst: usize) -> Vec<Taps> {
+fn axis(src: usize, dst: usize, mitchell: (f32, f32)) -> Vec<Taps> {
     let ratio = src as f32 / dst as f32;
     let filter_scale = ratio.max(1.0);
     let support = 2.0 * filter_scale;
@@ -188,7 +228,7 @@ fn axis(src: usize, dst: usize) -> Vec<Taps> {
             let mut weights = Vec::with_capacity((last - first + 1).max(1) as usize);
             let mut total = 0.0f32;
             for i in first..=last {
-                let w = kernel((i as f32 - centre) / filter_scale);
+                let w = kernel((i as f32 - centre) / filter_scale, mitchell);
                 weights.push(w);
                 total += w;
             }
@@ -261,14 +301,21 @@ fn workers(bands: usize) -> usize {
 impl Scaler {
     /// Builds the weights and buffers for one source and destination size.
     pub fn new(src: (usize, usize), dst: (usize, usize)) -> Scaler {
-        let vertical = axis(src.1, dst.1);
+        Scaler::with_kernel(src, dst, kernel_in_force())
+    }
+
+    /// Builds the weights and buffers for one source and destination size, with
+    /// a kernel of its own rather than the one [`kernel_in_force`] gives.
+    pub fn with_kernel(src: (usize, usize), dst: (usize, usize), mitchell: (f32, f32)) -> Scaler {
+        let vertical = axis(src.1, dst.1, mitchell);
         let rows = band_rows(&vertical);
         let workers = workers(vertical.len().div_ceil(BAND).max(1));
         Scaler {
             src,
             dst,
-            horizontal: axis(src.0, dst.0),
+            horizontal: axis(src.0, dst.0, mitchell),
             band_rows: rows,
+            mitchell,
             scratch: vec![0.0; workers * rows * dst.0 * 4],
             out: vec![0; dst.0 * dst.1 * 4],
             vertical,
@@ -279,7 +326,14 @@ impl Scaler {
     /// scaler is usable for them.
     pub fn fit(&mut self, src: (usize, usize), dst: (usize, usize)) {
         if self.src != src || self.dst != dst {
-            *self = Scaler::new(src, dst);
+            // The kernel travels with the scaler: one built for a sharper
+            // filter stays sharp when the window changes size.
+            let mitchell = if self.horizontal.is_empty() {
+                kernel_in_force()
+            } else {
+                self.mitchell
+            };
+            *self = Scaler::with_kernel(src, dst, mitchell);
         }
     }
 
@@ -487,25 +541,68 @@ fn straight<const N: usize>(run: &[f32], stride: usize, weights: &[f32], out: &m
 mod tests {
     use super::*;
 
-    /// The kernel is a partition of unity: whatever the sub-pixel offset, the
-    /// four taps sum to 1, so a flat field stays flat.
+    /// Every kernel in the family is a partition of unity: whatever the
+    /// sub-pixel offset, the four taps sum to 1, so a flat field stays flat.
     #[test]
     fn the_kernel_sums_to_one_at_every_offset() {
-        for step in 0..64 {
-            let frac = step as f32 / 64.0;
-            let sum: f32 = (-1..=2).map(|i| kernel(i as f32 - frac)).sum();
-            assert!((sum - 1.0).abs() < 1e-5, "offset {frac} summed to {sum}");
+        for mitchell in [B_SPLINE, (1.0 / 3.0, 1.0 / 3.0), (0.0, 0.5)] {
+            for step in 0..64 {
+                let frac = step as f32 / 64.0;
+                let sum: f32 = (-1..=2).map(|i| kernel(i as f32 - frac, mitchell)).sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-5,
+                    "{mitchell:?} at offset {frac} summed to {sum}"
+                );
+            }
         }
     }
 
-    /// It is non-negative everywhere, which is the property that rules out
-    /// ringing — the whole reason for choosing a B-spline over Catmull-Rom.
+    /// The B-spline is non-negative everywhere, which is the property that
+    /// rules out ringing and the reason it is the default. The sharper members
+    /// of the family do go negative — that is what sharper means here, and why
+    /// [`to_byte`] clamps rather than trusting the filter.
     #[test]
-    fn the_kernel_never_goes_negative() {
+    fn only_the_b_spline_cannot_ring() {
+        let mut sharper_dips = false;
         for step in -300..=300 {
             let x = step as f32 / 100.0;
-            assert!(kernel(x) >= 0.0, "k({x}) = {}", kernel(x));
+            let spline = kernel(x, B_SPLINE);
+            // Not `>= 0.0`: written in the family's general form, the tail
+            // lands a rounding step below zero just inside `|x| = 2`, where
+            // the weight is zero anyway. A ringing kernel undershoots by
+            // percents, which is what the comparison below catches.
+            assert!(spline > -1e-6, "k({x}) = {spline}");
+            sharper_dips |= kernel(x, (0.0, 0.5)) < -0.01;
         }
+        assert!(sharper_dips, "Catmull-Rom is supposed to undershoot");
+    }
+
+    /// A sharper kernel really is sharper: across the same hard edge, it moves
+    /// less of the dark side's weight into the light one.
+    #[test]
+    fn a_sharper_kernel_keeps_the_edge_tighter() {
+        let spread = |mitchell| {
+            let (w, h) = (8usize, 1usize);
+            let mut src = vec![0u8; w * h * 4];
+            for (x, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let v = if x < w / 2 { 0 } else { 255 };
+                *px = [v, v, v, 255];
+            }
+            let mut scaler = Scaler::with_kernel((w, h), (64, 1), mitchell);
+            let out = scaler.resample(&src, (w, h), (64, 1)).expect("scales");
+            // How many output pixels are neither black nor white: the ramp.
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| (8..248).contains(&p[0]))
+                .count()
+        };
+        assert!(
+            spread((0.0, 0.5)) < spread(B_SPLINE),
+            "Catmull-Rom {} vs B-spline {}",
+            spread((0.0, 0.5)),
+            spread(B_SPLINE)
+        );
     }
 
     /// `to_byte` is a bit trick, so it is checked against the arithmetic it
@@ -531,7 +628,7 @@ mod tests {
     #[test]
     fn an_upscale_never_needs_more_than_four_taps() {
         for (src, dst) in [(800, 1920), (452, 1085), (720, 2160), (7, 21), (100, 101)] {
-            let taps = axis(src, dst);
+            let taps = axis(src, dst, B_SPLINE);
             let widest = taps.iter().map(|t| t.weights.len()).max().unwrap_or(0);
             assert!(widest <= 4, "{src} -> {dst} needed {widest} taps");
             for t in &taps {

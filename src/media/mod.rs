@@ -23,7 +23,7 @@ pub mod audio;
 pub mod video;
 
 pub use audio::{decode_audio, AudioBuffer};
-pub use video::{VideoDecoder, VideoFrame};
+pub use video::{VideoDecoder, VideoFrame, VideoScaler};
 
 /// Mixer sample rate, from `Ini/DX8SOUND.INI` (`SamplePerSec`).
 pub const SAMPLE_RATE: u32 = 44_100;

@@ -23,6 +23,78 @@ pub struct VideoFrame {
     pub timestamp: f64,
 }
 
+/// How a movie frame is scaled to the window.
+///
+/// These are libswscale's own filters, named as `ffmpeg -sws_flags` names them.
+/// The scaling happens inside the colour conversion every frame already goes
+/// through — see [`VideoDecoder::set_output_size`] — so which one is chosen
+/// costs nothing but the filter's own width.
+///
+/// Which one a player gets is `DaysEngine.ini`'s `[Video] Scaler`; see
+/// [`crate::install::engine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoScaler {
+    /// Fastest, and visibly so on the way up.
+    FastBilinear,
+    /// What the original's Direct3D path gives (`FUN_0044a3d0` sets
+    /// `D3DTEXF_LINEAR`), for a player who wants that rather than better.
+    Bilinear,
+    /// The default: sharper than bilinear, cheap enough for 4K.
+    #[default]
+    Bicubic,
+    /// Sharper still, and rings a little.
+    Lanczos,
+    /// Natural bicubic spline.
+    Spline,
+    /// Softer than bicubic, with no ringing at all.
+    Gaussian,
+    /// No filtering. Blocky, and here because someone will want it.
+    Neighbour,
+    /// Averages the source area, which is the right answer going *down*.
+    Area,
+}
+
+impl VideoScaler {
+    /// The `SWS_*` flag this is.
+    pub fn flag(self) -> i64 {
+        let flag = match self {
+            VideoScaler::FastBilinear => ffi::SWS_FAST_BILINEAR,
+            VideoScaler::Bilinear => ffi::SWS_BILINEAR,
+            VideoScaler::Bicubic => ffi::SWS_BICUBIC,
+            VideoScaler::Lanczos => ffi::SWS_LANCZOS,
+            VideoScaler::Spline => ffi::SWS_SPLINE,
+            VideoScaler::Gaussian => ffi::SWS_GAUSS,
+            VideoScaler::Neighbour => ffi::SWS_POINT,
+            VideoScaler::Area => ffi::SWS_AREA,
+        };
+        i64::from(flag)
+    }
+
+    /// Parses a name as `ffmpeg -sws_flags` spells it, give or take the
+    /// separators and the spelling of "neighbour".
+    pub fn from_name(name: &str) -> Option<VideoScaler> {
+        Some(
+            match name.trim().to_ascii_lowercase().replace(['_', '-'], "") {
+                n if n == "fastbilinear" => VideoScaler::FastBilinear,
+                n if n == "bilinear" || n == "linear" => VideoScaler::Bilinear,
+                n if n == "bicubic" || n == "cubic" => VideoScaler::Bicubic,
+                n if n == "lanczos" => VideoScaler::Lanczos,
+                n if n == "spline" => VideoScaler::Spline,
+                n if n == "gauss" || n == "gaussian" => VideoScaler::Gaussian,
+                n if n == "neighbour" || n == "neighbor" || n == "point" || n == "nearest" => {
+                    VideoScaler::Neighbour
+                }
+                n if n == "area" => VideoScaler::Area,
+                _ => return None,
+            },
+        )
+    }
+
+    /// Every name this accepts, for the message that lists them.
+    pub const NAMES: &'static str =
+        "fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area";
+}
+
 /// A lazily-decoding video stream over an in-memory clip.
 pub struct VideoDecoder {
     // Field order matters: `_io` must outlive `format`, and Rust drops in
@@ -32,6 +104,11 @@ pub struct VideoDecoder {
     packet: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
     scaler: *mut ffi::SwsContext,
+    /// The scaler's output, RGBA at [`VideoDecoder::output_size`]. Kept and
+    /// rewritten in place rather than allocated per frame.
+    scaled: *mut ffi::AVFrame,
+    /// Which filter [`VideoDecoder::scaler`] was built with.
+    filter: VideoScaler,
     _io: Box<MemoryIo>,
     stream_index: c_int,
     time_base: f64,
@@ -39,6 +116,9 @@ pub struct VideoDecoder {
     index: u64,
     width: u32,
     height: u32,
+    /// The size frames are handed back at, which is the size the window wants
+    /// them. Starts at the clip's own.
+    output: (u32, u32),
     /// Set once the demuxer is exhausted, so we drain the decoder exactly once.
     draining: bool,
     finished: bool,
@@ -141,23 +221,8 @@ impl VideoDecoder {
             guard.packet = packet;
             guard.frame = frame;
 
-            // SWS_BILINEAR matches what the original D3D path would have done
-            // when scaling; the conversion here is colour-space only (same size).
-            let scaler = ffi::sws_getContext(
-                width as c_int,
-                height as c_int,
-                (*codec).pix_fmt,
-                width as c_int,
-                height as c_int,
-                ffi::AV_PIX_FMT_RGBA,
-                ffi::SWS_BILINEAR as c_int,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            if scaler.is_null() {
-                return Err(Error::Alloc("SwsContext"));
-            }
+            let scaler = new_scaler(VideoScaler::default())?;
+            let scaled = new_rgba_frame((width, height))?;
 
             guard.disarm();
             Ok(VideoDecoder {
@@ -166,6 +231,7 @@ impl VideoDecoder {
                 packet,
                 frame,
                 scaler,
+                scaled,
                 _io: io,
                 stream_index,
                 time_base,
@@ -173,6 +239,8 @@ impl VideoDecoder {
                 index: 0,
                 width,
                 height,
+                output: (width, height),
+                filter: VideoScaler::default(),
                 draining: false,
                 finished: false,
             })
@@ -250,34 +318,78 @@ impl VideoDecoder {
         }
     }
 
+    /// The size frames currently come back at.
+    pub fn output_size(&self) -> (u32, u32) {
+        self.output
+    }
+
+    /// Asks for frames at `width` x `height` instead of the clip's own size.
+    ///
+    /// This is how a movie gets onto a window that is not 800x452: the scale is
+    /// folded into the colour conversion every frame already goes through, in
+    /// libswscale's hand-written SIMD, rather than done again afterwards. A
+    /// full-screen frame on a 4K panel is the case that makes the difference —
+    /// scaling it is otherwise the most expensive thing in a frame, and one a
+    /// 24 fps clock has no room for.
+    ///
+    /// A zero in either dimension, or the size it is already at, is ignored.
+    pub fn set_output_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        if (width, height) == self.output || width == 0 || height == 0 {
+            return Ok(());
+        }
+        // SAFETY: the new frame is built before the old one is freed, so a
+        // failure leaves the decoder producing the size it already was.
+        let scaled = unsafe { new_rgba_frame((width, height))? };
+        unsafe { ffi::av_frame_free(&mut self.scaled) };
+        self.scaled = scaled;
+        self.output = (width, height);
+        Ok(())
+    }
+
+    /// Chooses the filter frames are scaled with, from `DaysEngine.ini`.
+    ///
+    /// Rebuilding the context is the whole of it: libswscale takes the sizes
+    /// from the frames it is handed, so this carries no size with it.
+    pub fn set_scaler(&mut self, filter: VideoScaler) -> Result<(), Error> {
+        if self.filter == filter {
+            return Ok(());
+        }
+        // SAFETY: the new context is built before the old one is freed, so a
+        // failure leaves the decoder with the filter it already had.
+        let scaler = unsafe { new_scaler(filter)? };
+        unsafe { ffi::sws_freeContext(self.scaler) };
+        self.scaler = scaler;
+        self.filter = filter;
+        Ok(())
+    }
+
     /// Converts the decoder's current frame to packed RGBA.
     fn convert_frame(&mut self) -> Result<VideoFrame, Error> {
-        let (w, h) = (self.width as usize, self.height as usize);
+        let (w, h) = (self.output.0 as usize, self.output.1 as usize);
         let mut rgba = vec![0u8; w * h * 4];
-        let stride = (w * 4) as c_int;
 
-        // SAFETY: `rgba` is exactly height * stride bytes, which is what
-        // sws_scale writes given a single plane and matching dimensions.
+        // SAFETY: the scaler writes `self.scaled`, an RGBA frame of exactly
+        // `w` x `h`, and `rgba` is exactly that many packed bytes.
         let index = self.index;
         self.index += 1;
 
         let timestamp = unsafe {
-            let dst_slices = [
-                rgba.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            ];
-            let dst_strides = [stride, 0, 0, 0];
-            ffi::sws_scale(
-                self.scaler,
-                (*self.frame).data.as_ptr() as *const *const u8,
-                (*self.frame).linesize.as_ptr(),
-                0,
-                self.height as c_int,
-                dst_slices.as_ptr(),
-                dst_strides.as_ptr(),
-            );
+            let scaled = ffi::sws_scale_frame(self.scaler, self.scaled, self.frame);
+            if scaled < 0 {
+                ffi::av_frame_unref(self.frame);
+                return Err(Error::Ffmpeg {
+                    what: "sws_scale_frame",
+                    code: scaled,
+                });
+            }
+            // Out of the scaler's own rows, which carry whatever padding its
+            // SIMD wanted, into the packed buffer the rest of the engine works
+            // in.
+            let from = (*self.scaled).data[0];
+            let from_stride = (*self.scaled).linesize[0] as usize;
+            for (row, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+                std::ptr::copy_nonoverlapping(from.add(row * from_stride), out.as_mut_ptr(), w * 4);
+            }
 
             let best = (*self.frame).best_effort_timestamp;
             let pts = if best == ffi::AV_NOPTS_VALUE {
@@ -294,12 +406,89 @@ impl VideoDecoder {
         };
 
         Ok(VideoFrame {
-            width: self.width,
-            height: self.height,
+            width: self.output.0,
+            height: self.output.1,
             rgba,
             index,
             timestamp,
         })
+    }
+}
+
+/// Builds the colour-conversion and scaling context.
+///
+/// Nothing about a size is set here. Modern libswscale reads what to do from
+/// the two frames it is handed and reconfigures itself when they change, so all
+/// this fixes is *how*:
+///
+/// The **filter**, which is where a movie frame is scaled now and not only
+/// where it is converted. The original leaves scaling to Direct3D's bilinear
+/// filter — `FUN_0044a3d0` sets `D3DTEXF_LINEAR` on every sampler stage — and
+/// this engine's deliberate departure is to do better than a driver's bilinear,
+/// so the default is [`VideoScaler::Bicubic`] and `DaysEngine.ini` can say
+/// otherwise. At 1:1 it costs nothing either way: swscale takes its unscaled
+/// path whatever the flag says.
+///
+/// And **slice threads**, which is why this goes the long way round through
+/// `sws_alloc_context` rather than `sws_getContext`: the convenience
+/// constructor has nowhere to put an option, the default is one thread, and one
+/// thread scaling a frame to 4K costs more than the whole 41ms a frame gets.
+/// The threads are also why [`VideoDecoder::convert_frame`] calls
+/// `sws_scale_frame` and not `sws_scale` — the older entry point ignores them.
+///
+/// # Safety
+///
+/// The returned context is owned by the caller and must be freed with
+/// `sws_freeContext`.
+unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsContext, Error> {
+    // SAFETY: the context is freed on the one path that does not return it,
+    // and both options below are ones swscale defines on its own context.
+    unsafe {
+        let scaler = ffi::sws_alloc_context();
+        if scaler.is_null() {
+            return Err(Error::Alloc("SwsContext"));
+        }
+        let opt = scaler.cast();
+        let set =
+            |name: &std::ffi::CStr, value: i64| ffi::av_opt_set_int(opt, name.as_ptr(), value, 0);
+        let flags = set(c"sws_flags", filter.flag());
+        // One slice per core. A machine that will not say how many it has gets
+        // one, which is swscale's own default.
+        let threads = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(64) as i64;
+        let threaded = set(c"threads", threads);
+        if flags < 0 || threaded < 0 {
+            // Not fatal on its own — the defaults still convert — but it means
+            // this build of swscale is not the one the timing assumes.
+            log::warn!("libswscale refused its own options; video scaling will be slow");
+        }
+        Ok(scaler)
+    }
+}
+
+/// Allocates an RGBA frame of `size` for the scaler to write into.
+///
+/// # Safety
+///
+/// The returned frame is owned by the caller and must be freed with
+/// `av_frame_free`.
+unsafe fn new_rgba_frame(size: (u32, u32)) -> Result<*mut ffi::AVFrame, Error> {
+    // SAFETY: the frame is freed on every path that does not return it.
+    unsafe {
+        let mut frame = ffi::av_frame_alloc();
+        if frame.is_null() {
+            return Err(Error::Alloc("AVFrame"));
+        }
+        (*frame).format = ffi::AV_PIX_FMT_RGBA;
+        (*frame).width = size.0 as c_int;
+        (*frame).height = size.1 as c_int;
+        // 0 lets ffmpeg pick the row alignment its SIMD wants.
+        if ffi::av_frame_get_buffer(frame, 0) < 0 {
+            ffi::av_frame_free(&mut frame);
+            return Err(Error::Alloc("AVFrame buffer"));
+        }
+        Ok(frame)
     }
 }
 
@@ -309,6 +498,7 @@ impl Drop for VideoDecoder {
         // freed exactly once.
         unsafe {
             ffi::sws_freeContext(self.scaler);
+            ffi::av_frame_free(&mut self.scaled);
             ffi::av_frame_free(&mut self.frame);
             ffi::av_packet_free(&mut self.packet);
             ffi::avcodec_free_context(&mut self.codec);
