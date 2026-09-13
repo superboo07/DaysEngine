@@ -24,12 +24,22 @@
 //! that: each dispatch arm calls the config object's setter with the key name
 //! before it touches anything else, and widget 3 calls the flush.
 //!
-//! # The current-value marks
+//! # The current-value highlight
 //!
-//! Each setting draws a mark over whichever of its two buttons is the value in
-//! force. That is not derived from the art or from the table: it is a switch
-//! per tab, `FUN_10009fd0`, `FUN_1000a190` and `FUN_1000a250`, transcribed in
-//! [`shows_current_value`]. One of them has a shipped bug, noted there.
+//! Each setting's value in force is shown by a highlight sprite that **moves
+//! between the two buttons of its row**. The tab's draw function keeps one
+//! sprite per row and hands it a whole record — source and destination —
+//! chosen from a pair by the value: the Sound tab's `FUN_100063c0` does
+//! `if (menVoice == 0) rect = &DAT_10043e68; else rect = &DAT_10043e50;` and
+//! then draws that one sprite. [`current_values`] is which button each row
+//! lands on and [`highlight_slot`] is where its record sits.
+//!
+//! A second run of the same records carries the same art with a hover outline,
+//! for the button that is both the value in force and under the pointer.
+//! `FUN_10009fd0`, `FUN_1000a190` and `FUN_1000a250` choose between that and
+//! the widget's own hover art, and are transcribed in
+//! [`withholds_hover_art`]. One of them has a shipped bug, noted there; it
+//! costs an outline and nothing more.
 //!
 //! # Keyboard navigation
 //!
@@ -72,7 +82,7 @@ impl Tab {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Tab::Def => 0,
             Tab::Sound => 1,
@@ -108,11 +118,12 @@ pub struct Display {
     /// The host's `+0xbc` answer, which is **full screen, not windowed**.
     ///
     /// `FUN_0040e830` returns a member and says nothing about its sense; the
-    /// screen does. `FUN_10009fd0` marks widget 6 when the answer is zero and
-    /// widget 7 when it is not, and rendering the real art shows widget 6 is
-    /// `WINDOW` and widget 7 is `FULL`. Naming this the other way round put the
-    /// mark on `FULL` for a windowed engine, which is exactly the kind of
-    /// plausible-looking inversion a screenshot catches and a test does not.
+    /// screen does. `FUN_10005f80` gives the row's highlight widget 6's record
+    /// when the answer is zero and widget 7's when it is not, and rendering the
+    /// real art shows widget 6 is `WINDOW` and widget 7 is `FULL`. Naming this
+    /// the other way round lit `FULL` for a windowed engine, which is exactly
+    /// the kind of plausible-looking inversion a screenshot catches and a test
+    /// does not.
     pub full_screen: bool,
 }
 
@@ -262,17 +273,111 @@ pub fn enabled(tab: Tab, widget: usize, trial: bool, som: Som) -> bool {
     }
 }
 
-/// Whether this widget is the value currently in force, and so draws its mark.
+/// The widget each of a tab's settings currently sits on, and the tab's own
+/// header — the buttons the current-value highlight is drawn over.
 ///
-/// Transcribed from `FUN_10009fd0` (Def), `FUN_1000a190` (Sound) and
-/// `FUN_1000a250` (SomCon).
-pub fn shows_current_value(
+/// The highlight is **not** a per-widget state. Each tab's draw
+/// (`FUN_10005f80` for Def, `FUN_100063c0` for Sound, `FUN_10006910` for
+/// SomCon) keeps one sprite per setting row at `+0x160` and gives it a whole
+/// record — source *and* destination — chosen from a pair by the value in
+/// force: `if (menVoice == 0) rect = &DAT_10043e68; else rect = &DAT_10043e50;`
+/// and so on down the tab. So the highlight moves between the two buttons of a
+/// row rather than one button lighting itself up, and the tab header is the
+/// same thing with the tab as its value.
+///
+/// The records are the screen's first alternate run, laid out as three tab
+/// headers followed by the tab's setting buttons in widget order, which is
+/// what [`highlight_slot`] indexes.
+pub fn current_values(
+    tab: Tab,
+    config: &Config,
+    display: Display,
+    som: Som,
+) -> impl Iterator<Item = usize> {
+    let header = tab.index();
+    let settings: Vec<usize> = match tab {
+        Tab::Def => vec![
+            if display.wide { 4 } else { 5 },
+            if display.full_screen { 7 } else { 6 },
+            if config.flag(Flag::Skip) { 8 } else { 9 },
+            if config.flag(Flag::SuperSkip) {
+                0xa
+            } else {
+                0xb
+            },
+            if config.flag(Flag::TextView) {
+                0xc
+            } else {
+                0xd
+            },
+        ],
+        Tab::Sound => vec![
+            if config.flag(Flag::MenVoice) {
+                0xa
+            } else {
+                0xb
+            },
+            if config.flag(Flag::Mute) { 0xc } else { 0xd },
+        ],
+        // The port row is a record picked by the port number straight out of
+        // the run — `&DAT_100435f8 + (port + 0x17) * 0x18` — which is the same
+        // slot the port's own button has. A tab with no port in hand draws no
+        // port highlight.
+        Tab::SomCon => {
+            let mut out = vec![if som.enabled { 4 } else { 5 }];
+            if som.attached {
+                out.push(som.port + 6);
+            }
+            out.push(if som.testing { 0x10 } else { 0x11 });
+            out
+        }
+    };
+    std::iter::once(header).chain(settings)
+}
+
+/// Where `widget`'s highlight record sits within one of the screen's two
+/// alternate runs.
+///
+/// Both runs have the same shape — three tab headers, then the tab's setting
+/// buttons in widget order — so one index serves both. `FUN_100073a0` builds
+/// the second run's sprites as `+0x104 + slot * 4`, and the three hover
+/// functions reach into that same array with the tab's offset folded into the
+/// base: `+0x100` on the Def tab and `+0xe8` on Sound, which are `slot =
+/// widget - 1` and `slot = widget - 7`.
+pub fn highlight_slot(tab: Tab, widget: usize) -> Option<usize> {
+    if widget < 3 {
+        return Some(widget);
+    }
+    match tab {
+        Tab::Def | Tab::SomCon => widget.checked_sub(1),
+        Tab::Sound => widget.checked_sub(7),
+    }
+}
+
+/// Whether the widget under the pointer keeps its own hover art to itself.
+///
+/// `FUN_10009f30` draws a hovered widget's sprite only when this is false:
+/// `if (FUN_10009f30(this, widget) == 0) { widget_sprite->draw(); }`. When it
+/// is true the function has already drawn that widget's record from the
+/// **second** alternate run instead — the same highlight art with the hover
+/// outline added — which is what a button that is both the value in force and
+/// under the pointer shows.
+///
+/// The current value's own highlight does not come from here; see
+/// [`current_values`].
+///
+/// Transcribed from `FUN_10009f30`'s tab-header arm and `FUN_10009fd0` (Def),
+/// `FUN_1000a190` (Sound) and `FUN_1000a250` (SomCon).
+pub fn withholds_hover_art(
     tab: Tab,
     widget: usize,
     config: &Config,
     display: Display,
     som: Som,
 ) -> bool {
+    if widget == tab.index() {
+        return true;
+    }
     match tab {
         Tab::Def => match widget {
             4 => display.wide,
@@ -288,9 +393,10 @@ pub fn shows_current_value(
             _ => false,
         },
         // `FUN_1000a190` tests `widget == 10` in both of its first two arms, so
-        // the mark for male voice is always on widget 10 and widget 11 never
-        // gets one. That is the shipped behaviour, bug and all; writing the
-        // arm the author meant would make this screen differ from the game.
+        // widget 10 always withholds its hover art and widget 11 never does,
+        // whatever `MenVoice` says. That is the shipped behaviour, bug and all,
+        // and it costs only the outline on those two buttons — the value in
+        // force is drawn by the tab, not here.
         Tab::Sound => match widget {
             0xa => true,
             0xc => config.flag(Flag::Mute),
@@ -302,8 +408,8 @@ pub fn shows_current_value(
             5 => !som.enabled,
             0x10 => som.testing,
             0x11 => !som.testing,
-            // Past those four, `FUN_1000a250` marks whichever port button is
-            // the one in hand.
+            // Past those four, `FUN_1000a250` answers for whichever port button
+            // is the one in hand.
             _ => som.attached && widget == som.port + 6,
         },
     }
@@ -1012,55 +1118,66 @@ mod tests {
         assert!(!enabled(Tab::Sound, 0x2c, false, som));
     }
 
+    /// The highlight follows the value, and the record it uses is the slot of
+    /// the button it lands on. The second row settles on WINDOW when the engine
+    /// is not full screen, which is the pairing a screenshot of the real art
+    /// decided.
     #[test]
-    fn the_def_marks_follow_the_display_and_the_settings() {
+    fn the_def_highlights_follow_the_display_and_the_settings() {
         let mut config = cfg();
-        // The mark on the second row sits on WINDOW when the engine is not
-        // full screen, which is the pairing a screenshot of the real art
-        // settled.
+        let som = Som::default();
         let wide_window = Display {
             wide: true,
             full_screen: false,
         };
-        let som = Som::default();
-        assert!(shows_current_value(Tab::Def, 4, &config, wide_window, som));
-        assert!(!shows_current_value(Tab::Def, 5, &config, wide_window, som));
-        assert!(shows_current_value(Tab::Def, 6, &config, wide_window, som));
-        assert!(!shows_current_value(Tab::Def, 7, &config, wide_window, som));
+        config.set_flag(Flag::SuperSkip, true);
+        let on: Vec<usize> = current_values(Tab::Def, &config, wide_window, som).collect();
+        assert_eq!(on, vec![0, 4, 6, 9, 0xa, 0xc]);
 
-        // TextView defaults on, so the mark starts on widget 12.
-        let d = Display::default();
-        assert!(shows_current_value(Tab::Def, 0xc, &config, d, som));
         config.set_flag(Flag::TextView, false);
-        assert!(shows_current_value(Tab::Def, 0xd, &config, d, som));
-        assert!(!shows_current_value(Tab::Def, 0xc, &config, d, som));
+        config.set_flag(Flag::Skip, true);
+        config.set_flag(Flag::SuperSkip, false);
+        let off: Vec<usize> = current_values(Tab::Def, &config, wide_window, som).collect();
+        assert_eq!(off, vec![0, 4, 6, 8, 0xb, 0xd]);
     }
 
-    /// The mark for male voice is stuck on widget 10 in the shipped build,
-    /// because `FUN_1000a190` tests the same widget number in both arms. This
-    /// pins that rather than quietly fixing it.
+    /// The Sound tab's male-voice highlight moves to the OFF button, which is
+    /// the whole point of the first alternate run: the value in force is not a
+    /// per-widget mark, so `FUN_1000a190`'s stuck arm cannot reach it.
     #[test]
-    fn the_sound_tabs_male_voice_mark_is_stuck_where_the_dll_leaves_it() {
+    fn the_sound_highlight_moves_to_the_button_holding_the_value() {
         let mut config = cfg();
         let d = Display::default();
         let som = Som::default();
-        assert!(shows_current_value(Tab::Sound, 0xa, &config, d, som));
-        assert!(!shows_current_value(Tab::Sound, 0xb, &config, d, som));
-        config.set_flag(Flag::MenVoice, false);
-        assert!(
-            shows_current_value(Tab::Sound, 0xa, &config, d, som),
-            "still on widget 10: the DLL never tests widget 11"
+        assert_eq!(
+            current_values(Tab::Sound, &config, d, som).collect::<Vec<_>>(),
+            vec![1, 0xa, 0xd]
         );
-        assert!(!shows_current_value(Tab::Sound, 0xb, &config, d, som));
-
-        // Mute's pair, in the same function, does work.
-        assert!(shows_current_value(Tab::Sound, 0xd, &config, d, som));
+        config.set_flag(Flag::MenVoice, false);
         config.set_flag(Flag::Mute, true);
-        assert!(shows_current_value(Tab::Sound, 0xc, &config, d, som));
+        assert_eq!(
+            current_values(Tab::Sound, &config, d, som).collect::<Vec<_>>(),
+            vec![1, 0xb, 0xc]
+        );
     }
 
+    /// Both alternate runs are laid out as three headers then the tab's setting
+    /// buttons, which is why the DLL reaches the second with one base per tab:
+    /// `+0x100` on Def and `+0xe8` on Sound, against an array at `+0x104`.
     #[test]
-    fn the_somcon_tab_marks_the_port_in_hand() {
+    fn a_highlight_slot_is_the_offset_the_dll_folds_into_its_base() {
+        assert_eq!(highlight_slot(Tab::Sound, 1), Some(1), "the tab header");
+        assert_eq!(highlight_slot(Tab::Def, 4), Some(3));
+        assert_eq!(highlight_slot(Tab::Sound, 0xa), Some(3));
+        assert_eq!(highlight_slot(Tab::Sound, 0xb), Some(4));
+        assert_eq!(highlight_slot(Tab::SomCon, 4), Some(3));
+        // `&DAT_100435f8 + (port + 0x17) * 0x18` is the port button's own slot.
+        assert_eq!(highlight_slot(Tab::SomCon, 6 + 3), Some(3 + 5));
+    }
+
+    /// A port in hand is the value of the SOMCON tab's port row.
+    #[test]
+    fn the_somcon_tab_highlights_the_port_in_hand() {
         let config = cfg();
         let d = Display::default();
         let held = Som {
@@ -1069,14 +1186,40 @@ mod tests {
             port: 3,
             testing: false,
         };
-        assert!(shows_current_value(Tab::SomCon, 4, &config, d, held));
-        assert!(
-            shows_current_value(Tab::SomCon, 9, &config, d, held),
-            "6 + 3"
+        assert_eq!(
+            current_values(Tab::SomCon, &config, d, held).collect::<Vec<_>>(),
+            vec![2, 4, 9, 0x11]
         );
-        assert!(!shows_current_value(Tab::SomCon, 8, &config, d, held));
-        assert!(shows_current_value(Tab::SomCon, 0x11, &config, d, held));
-        assert!(!shows_current_value(Tab::SomCon, 0x10, &config, d, held));
+        let loose = Som {
+            attached: false,
+            ..held
+        };
+        assert_eq!(
+            current_values(Tab::SomCon, &config, d, loose).collect::<Vec<_>>(),
+            vec![2, 4, 0x11],
+            "no port in hand, no port highlight"
+        );
+    }
+
+    /// The shipped arm that tests widget 10 twice. It decides only whether the
+    /// hovered button keeps its own hover art, so widget 10 never shows its
+    /// outline and widget 11 always does — and neither can move the value.
+    #[test]
+    fn the_sound_tabs_hover_test_is_stuck_where_the_dll_leaves_it() {
+        let mut config = cfg();
+        let d = Display::default();
+        let som = Som::default();
+        config.set_flag(Flag::MenVoice, false);
+        assert!(
+            withholds_hover_art(Tab::Sound, 0xa, &config, d, som),
+            "still widget 10: the DLL never tests widget 11"
+        );
+        assert!(!withholds_hover_art(Tab::Sound, 0xb, &config, d, som));
+
+        // Mute's pair, in the same function, does read its setting.
+        assert!(withholds_hover_art(Tab::Sound, 0xd, &config, d, som));
+        config.set_flag(Flag::Mute, true);
+        assert!(withholds_hover_art(Tab::Sound, 0xc, &config, d, som));
     }
 
     /// The Def tab's five rows are pairs, and left/right walks each pair.

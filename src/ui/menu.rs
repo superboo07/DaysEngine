@@ -962,6 +962,28 @@ impl Menu {
     /// [`Menu::compose`].
     fn sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
         let mut out = Vec::new();
+        // The value in force on every row of an Option tab, and the tab's own
+        // header. Each is one record out of the screen's first alternate run,
+        // carrying its own destination, so the highlight sits on whichever
+        // button of the pair holds the value rather than on a fixed one. The
+        // tab's draw function does exactly this before it looks at the pointer
+        // at all — `FUN_100063c0` for the Sound tab.
+        if self.mode == Mode::OPTION {
+            let values = options::current_values(
+                self.tab,
+                &self.session.config,
+                self.session.display,
+                self.session.som,
+            );
+            for widget in values {
+                let Some(slot) = options::highlight_slot(self.tab, widget) else {
+                    continue;
+                };
+                if let Some(sprite) = self.screen.atlas().extras.get(slot) {
+                    out.push((self.screen.chip(), *sprite));
+                }
+            }
+        }
         match self.mode {
             Mode::OPTION if self.tab == options::Tab::Sound => {
                 for row in 0..options::VOLUME_ROW_COUNT {
@@ -1072,22 +1094,25 @@ impl Menu {
         }
     }
 
+    /// Where the Option screen's second alternate run starts, as an index into
+    /// [`Atlas::extras`](days_ui::atlas::Atlas::extras).
+    ///
+    /// `FUN_100076c0` puts the run's first record in `+0x190` — 27 records in
+    /// for the Def tab, 51 for Sound and 35 for the SOMCON tab — and
+    /// `FUN_100073a0` builds its sprites from there. The per-widget run is as
+    /// long as the hit map has regions, so the alternates start that far in.
+    fn option_run_b(&self) -> Option<usize> {
+        let start = match self.tab {
+            options::Tab::Def => 27usize,
+            options::Tab::Sound => 51,
+            options::Tab::SomCon => 35,
+        };
+        start.checked_sub(self.states.len())
+    }
+
     /// The alternate-state sprite a widget draws instead of its hover art, if
     /// any.
-    ///
-    /// On the Option screens the setting currently in force draws a mark, from
-    /// a run of records that follows the per-widget ones. Which record is a
-    /// per-screen constant the DLL carries in `+0x190` — 27 records in for the
-    /// Def tab, 51 for Sound and 35 for the SOMCON tab — and the per-widget
-    /// run is as long as the hit map has regions, so the index into
-    /// [`Atlas::extras`](days_ui::atlas::Atlas::extras) is that constant minus
-    /// the region count, plus the offset the screen's own switch applies.
-    ///
-    /// The SOMCON tab's selected port is the one case with no sprite at all:
-    /// `FUN_1000a250` reports it as the current value and draws nothing,
-    /// leaving `Option_SomCon_Set.png` to show it.
     fn extra_for(&self, widget: usize) -> Option<usize> {
-        let regions = self.states.len();
         match self.mode {
             Mode::TITLE if widget == 2 && !self.session.save.replay_unlocked() => Some(0),
             // Both replay views mark the tab and the page you are on, which no
@@ -1106,35 +1131,25 @@ impl Menu {
                 }?;
                 (extra < self.screen.atlas().extras.len()).then_some(extra)
             }
+            // The value in force is not a widget state — it is a sprite of
+            // its own, drawn in [`Menu::sprites`]. What a widget can carry here
+            // is the *second* alternate run: the same highlight art with the
+            // hover outline, which the pointer's own widget draws in place of
+            // its hover sprite when it is already the value in force.
             Mode::OPTION => {
-                if !options::shows_current_value(
-                    self.tab,
-                    widget,
-                    &self.session.config,
-                    self.session.display,
-                    self.session.som,
-                ) {
+                if self.selection != Some(widget)
+                    || !options::withholds_hover_art(
+                        self.tab,
+                        widget,
+                        &self.session.config,
+                        self.session.display,
+                        self.session.som,
+                    )
+                {
                     return None;
                 }
-                let (base, slot) = match self.tab {
-                    // `FUN_10009fd0` draws extras[widget - 1] of a run 27 in.
-                    options::Tab::Def => (27usize, widget.checked_sub(1)?),
-                    // `FUN_1000a190`, a run 51 in, indexed from widget 7.
-                    options::Tab::Sound => (51usize, widget.checked_sub(7)?),
-                    // `FUN_1000a250`, a run 35 in, indexed 3..=6 for the four
-                    // widgets that have a mark; the port buttons have none.
-                    options::Tab::SomCon => (
-                        35usize,
-                        match widget {
-                            4 => 3,
-                            5 => 4,
-                            0x10 => 5,
-                            0x11 => 6,
-                            _ => return None,
-                        },
-                    ),
-                };
-                base.checked_sub(regions)?.checked_add(slot)
+                let slot = options::highlight_slot(self.tab, widget)?;
+                self.option_run_b()?.checked_add(slot)
             }
             // A cell of the route map paints its own state over the empty
             // chart in the base art. `FUN_1000ce40` builds the sprite from one

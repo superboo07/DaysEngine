@@ -550,13 +550,40 @@ the widgets fire nothing when the value is already in force.
 module's `+0xa0`, which `FUN_1000a8f0` sets to 1 on the popup's YES and 0 on its
 NO — it is the confirm popup's answer.
 
-The mark showing which value is in force is a per-tab switch — `FUN_10009fd0`,
-`FUN_1000a190`, `FUN_1000a250` — indexing a run of records that begins 27, 51
-and 35 records into each tab's table respectively (`+0x190`). `FUN_1000a190`
-tests `widget == 10` in **both** of its first two arms, so the mark for
-`MenVoice` is stuck on widget 10 and widget 11 never gets one; that is a bug in
-the shipped DLL and the engine reproduces it. The SOMCON tab's selected port is
-reported as the current value but draws no sprite at all.
+### Which value is in force, and the two alternate runs
+
+Each tab's table is followed by **two runs of alternate records**, both shaped
+the same way: the three tab headers, then the tab's setting buttons in widget
+order. `FUN_100076c0` records where the second begins in `+0x190` — 27 records
+in for Def, 51 for Sound, 35 for SOMCON — and `FUN_100073a0` builds a sprite
+per record of it at `+0x104 + slot * 4`.
+
+The **value in force** is the first run, and it is not a per-widget state. Each
+tab's draw function keeps one sprite per setting row at `+0x160 + row * 4` and
+hands it a whole record — source and destination — chosen from a pair by the
+value:
+
+    FUN_100063c0 (Sound)   if (menVoice == 0) rect = &DAT_10043e68   OFF
+                           else               rect = &DAT_10043e50   ON
+                           if (mute == 0)     rect = &DAT_10043e98   OFF
+                           else               rect = &DAT_10043e80   ON
+
+So the highlight *moves between the two buttons of a row*. `FUN_10005f80` does
+the same for the Def tab's five rows and `FUN_10006910` for SOMCON's, where the
+port row picks its record by number outright: `&DAT_100435f8 + (port + 0x17) *
+0x18`. The tab header is the same mechanism with the tab as its value.
+
+The **second run** is that art with the hover outline added, for a button that
+is both the value in force and under the pointer. `FUN_10009fd0`,
+`FUN_1000a190` and `FUN_1000a250` choose between it and the widget's own hover
+sprite, and the hovered widget draws its own only when they answer false:
+`if (FUN_10009f30(this, widget) == 0) { widget_sprite->draw(); }`.
+`FUN_1000a190` tests `widget == 10` in **both** of its first two arms, so on the
+Sound tab widget 10 always takes the second run and widget 11 never does,
+whatever `MenVoice` says; that is a bug in the shipped DLL and the engine
+reproduces it. It costs an outline on those two buttons and nothing else — the
+value in force comes from the first run and is unaffected. The SOMCON tab's
+port buttons have no second-run record, so a held port shows no outline.
 
 Keyboard navigation is a hand-written transition table per tab —
 `FUN_10008da0`, `FUN_100092d0`, `FUN_100098a0` — on `+0x50`/`+0x54`/`+0x58`/
