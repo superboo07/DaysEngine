@@ -641,8 +641,13 @@ fn cmd_settings(template: bool) {
         None => println!("(cannot find this binary's own directory)"),
     }
     let settings = Settings::load();
-    println!("  [Video] Scaler = {:?}", settings.video_scaler);
-    println!("  [UI]    Scaler = {:?}", settings.ui_scaler);
+    println!("  [Video] Scaler       = {:?}", settings.video_scaler);
+    println!("  [UI]    PixelPerfect = {}", settings.pixel_perfect());
+    if settings.pixel_perfect() {
+        println!("          Scaler         (unused: nothing is resampled)");
+    } else {
+        println!("          Scaler       = {:?}", settings.ui_scaler);
+    }
     println!(
         "\nWrite a file to start from with: days settings --template > {}",
         engine::FILE

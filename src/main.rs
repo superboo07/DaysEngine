@@ -216,8 +216,30 @@ struct Player<'a> {
 impl Player<'_> {
     /// The art set to load for the mode in force. See
     /// [`Resolution::for_display`].
+    ///
+    /// Whole-number scaling takes the **native** set instead, and that is a
+    /// deliberate departure from the recovered rule. The four sets are one
+    /// layout at four sizes — `FORMATS.md` shows the 1024x576 and 1280x720 hit
+    /// maps are the 800x450 one scaled by 1.28 and 1.6, and there is only ever
+    /// one `.PNG` behind them — so composing at 1.6 and then scaling that by a
+    /// whole number would put a resample back in the middle of the one path
+    /// whose whole point is not having one. Composing at 1.0 loses nothing:
+    /// same art, same layout, same widgets, and the hit map that matches.
     fn resolution(&self) -> Resolution {
+        if self.settings.pixel_perfect() {
+            return if self.display.wide {
+                Resolution::Wide
+            } else {
+                Resolution::Standard
+            };
+        }
         Resolution::for_display(self.display.wide, self.display.full_screen, self.mini_note)
+    }
+
+    /// Whether the picture is scaled by a whole number. See
+    /// [`daysengine::install::engine::Settings::pixel_perfect`].
+    fn whole_pixels(&self) -> bool {
+        self.settings.pixel_perfect()
     }
 }
 
@@ -677,6 +699,9 @@ fn run_menu(
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
     let mut size = (0, 0);
+    // Whole-number scaling, which decides both where the screen lands and how
+    // it gets there.
+    let whole = player.whole_pixels();
     // Paced to the display, and deciding on its grid rather than on whatever
     // moment the last pass ended.
     let mut cadence = Cadence::new(canvas);
@@ -709,7 +734,7 @@ fn run_menu(
                     keycode: Some(Keycode::Return | Keycode::KpEnter | Keycode::Space),
                     ..
                 } => confirm(&mut menu, player)?,
-                Event::MouseMotion { x, y, .. } => match to_screen(canvas, &menu, x, y) {
+                Event::MouseMotion { x, y, .. } => match to_screen(canvas, &menu, whole, x, y) {
                     Some((sx, sy)) => menu.point_at(sx, sy),
                     None => menu.point_away(),
                 },
@@ -718,7 +743,7 @@ fn run_menu(
                     x,
                     y,
                     ..
-                } => match to_screen(canvas, &menu, x, y) {
+                } => match to_screen(canvas, &menu, whole, x, y) {
                     Some((sx, sy)) => {
                         // Clicking is pointing and then confirming: the original
                         // acts on whatever the cursor is over, not on whatever
@@ -887,12 +912,19 @@ fn run_menu(
             texture = None;
         }
 
-        // The screen's own size, and the rectangle it lands in. The art is
-        // resampled to that rectangle rather than stretched onto it by the
-        // driver — see `daysengine::playback::scale`.
+        // The screen's own size, and the rectangle it lands in.
         let (screen_w, screen_h) = menu.screen().size();
-        let dst = letterbox(canvas, screen_w, screen_h);
-        let at = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
+        let dst = letterbox(canvas, screen_w, screen_h, whole);
+        // What to upload. Fitting the window means resampling to it here, on
+        // the CPU, rather than letting the driver stretch it — see
+        // `daysengine::playback::scale`. Whole-number scaling means not
+        // resampling at all: the composite goes up at its own size and the blit
+        // below turns each of its pixels into the same square block.
+        let at = if whole {
+            (screen_w, screen_h)
+        } else {
+            (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32)
+        };
         if menu.dirty() || texture.is_none() || at != size {
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
@@ -908,7 +940,7 @@ fn run_menu(
                 None => (image.width, image.height, image.rgba.as_slice()),
             };
             size = at;
-            let mut new = new_texture(creator, w, h)?;
+            let mut new = new_texture(creator, w, h, art_sampling(whole))?;
             new.update(None, rgba, w as usize * 4)?;
             texture = Some(new);
         }
@@ -977,6 +1009,7 @@ fn comment_loop(
     let mut texture: Option<Texture> = None;
     let mut size = (0u32, 0u32);
     let mut dirty = true;
+    let whole = player.whole_pixels();
 
     // Paced to the display, and deciding on its grid rather than on whatever
     // moment the last pass ended.
@@ -1048,7 +1081,7 @@ fn comment_loop(
                     ..
                 } => {
                     dirty = true;
-                    match to_dialog(canvas, size, dialog, base, x, y) {
+                    match to_dialog(canvas, size, dialog, base, whole, x, y) {
                         Some(at) => dialog.click(at, base),
                         None => comment::Act::None,
                     }
@@ -1074,7 +1107,7 @@ fn comment_loop(
             );
             image.blit_scaled(&over, (0, 0, w, h), (at.0, at.1, w, h));
             size = (image.width, image.height);
-            let mut new = new_texture(creator, image.width, image.height)?;
+            let mut new = new_texture(creator, image.width, image.height, art_sampling(whole))?;
             new.update(None, &image.rgba, image.width as usize * 4)?;
             texture = Some(new);
             dirty = false;
@@ -1084,7 +1117,7 @@ fn comment_loop(
         canvas.clear();
         if let Some(texture) = &texture {
             canvas
-                .copy(texture, None, letterbox(canvas, size.0, size.1))
+                .copy(texture, None, letterbox(canvas, size.0, size.1, whole))
                 .map_err(|e| anyhow::anyhow!("drawing the comment dialog: {e}"))?;
         }
         canvas.present();
@@ -1098,13 +1131,14 @@ fn to_dialog(
     size: (u32, u32),
     dialog: &comment::Comment,
     base: (i32, i32),
+    whole: bool,
     x: f32,
     y: f32,
 ) -> Option<(i32, i32)> {
     if size.0 == 0 || size.1 == 0 {
         return None;
     }
-    let dst = letterbox(canvas, size.0, size.1);
+    let dst = letterbox(canvas, size.0, size.1, whole);
     let sx = (x - dst.x) / dst.w * size.0 as f32;
     let sy = (y - dst.y) / dst.h * size.1 as f32;
     let (w, h) = dialog.size(base);
@@ -1301,33 +1335,71 @@ fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
 ///
 /// `FUN_0044a3d0` sets `D3DSAMP_MAGFILTER` and `D3DSAMP_MINFILTER` to
 /// `D3DTEXF_LINEAR` on all eight sampler stages, so everything the engine draws
-/// is filtered on its way onto the screen. Saying so here rather than leaving
-/// it to SDL's default is the difference between a recovered choice and an
-/// inherited one.
+/// is filtered on its way onto the screen. Saying so at every call rather than
+/// leaving it to SDL's default is the difference between a recovered choice and
+/// an inherited one — and it is what lets whole-number scaling say otherwise;
+/// see [`art_sampling`].
 fn new_texture<'a>(
     creator: &'a TextureCreator<WindowContext>,
     width: u32,
     height: u32,
+    mode: ScaleMode,
 ) -> Result<Texture<'a>> {
     let mut texture = creator.create_texture_streaming(
         PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
         width,
         height,
     )?;
-    texture.set_scale_mode(ScaleMode::Linear);
+    texture.set_scale_mode(mode);
     Ok(texture)
+}
+
+/// How the game's own art is sampled on its way to the window.
+///
+/// Whole-number scaling means the destination is an exact multiple of the
+/// source, and at an exact multiple point sampling *is* the right answer: every
+/// source pixel becomes the same square block of destination pixels and no
+/// value is invented. Asking for a filter there would only blur the edges of
+/// blocks that are already where they belong.
+fn art_sampling(whole: bool) -> ScaleMode {
+    if whole {
+        ScaleMode::Nearest
+    } else {
+        ScaleMode::Linear
+    }
 }
 
 /// The rectangle a `width` x `height` image is drawn into, centred and scaled
 /// to fit the window without distorting it.
-fn letterbox(canvas: &Canvas<Window>, width: u32, height: u32) -> FRect {
-    let (win_w, win_h) = canvas.output_size().unwrap_or((width, height));
-    let scale = (win_w as f32 / width as f32).min(win_h as f32 / height as f32);
-    let draw_w = width as f32 * scale;
-    let draw_h = height as f32 * scale;
+fn letterbox(canvas: &Canvas<Window>, width: u32, height: u32, whole: bool) -> FRect {
+    let window = canvas.output_size().unwrap_or((width, height));
+    fit(window, (width, height), whole)
+}
+
+/// The rectangle `content` is drawn into inside `window`.
+///
+/// `whole` asks for a whole-number multiple: the largest that still fits,
+/// centred, with a border around the rest. Every pixel of the content then
+/// becomes the same square block of the window's, which is what makes point
+/// sampling exact — see [`art_sampling`]. Below 1:1 there is no multiple to
+/// take, so a window smaller than the game fits it the ordinary way rather than
+/// putting a border around a picture that is already too small.
+fn fit(window: (u32, u32), content: (u32, u32), whole: bool) -> FRect {
+    let (win_w, win_h) = (window.0 as f32, window.1 as f32);
+    let (w, h) = (content.0.max(1) as f32, content.1.max(1) as f32);
+    let fitted = (win_w / w).min(win_h / h);
+    let scale = if whole && fitted >= 1.0 {
+        fitted.floor()
+    } else {
+        fitted
+    };
+    // Clamped to the window: `scale` is a ratio of the two, and at 2.4 the
+    // product comes back a rounding step over the window it was derived from.
+    // In whole-number mode the product is exact and this changes nothing.
+    let (draw_w, draw_h) = ((w * scale).min(win_w), (h * scale).min(win_h));
     FRect::new(
-        (win_w as f32 - draw_w) / 2.0,
-        (win_h as f32 - draw_h) / 2.0,
+        ((win_w - draw_w) / 2.0).round(),
+        ((win_h - draw_h) / 2.0).round(),
         draw_w,
         draw_h,
     )
@@ -1336,9 +1408,15 @@ fn letterbox(canvas: &Canvas<Window>, width: u32, height: u32) -> FRect {
 /// Maps a window pixel to the menu screen's own coordinate space.
 ///
 /// Returns `None` outside the letterboxed image, where there is nothing to hit.
-fn to_screen(canvas: &Canvas<Window>, menu: &Menu, x: f32, y: f32) -> Option<(u32, u32)> {
+fn to_screen(
+    canvas: &Canvas<Window>,
+    menu: &Menu,
+    whole: bool,
+    x: f32,
+    y: f32,
+) -> Option<(u32, u32)> {
     let (w, h) = menu.screen().size();
-    let dst = letterbox(canvas, w, h);
+    let dst = letterbox(canvas, w, h, whole);
     let sx = (x - dst.x) / dst.w * w as f32;
     let sy = (y - dst.y) / dst.h * h as f32;
     (sx >= 0.0 && sy >= 0.0 && sx < w as f32 && sy < h as f32).then_some((sx as u32, sy as u32))
@@ -1369,6 +1447,9 @@ fn run_script(
 
     let mut stage = Stage::new(script);
     stage.set_video_scaler(player.settings.video_scaler);
+    // Whole-number scaling, and what it means for how the art is sampled.
+    let whole = player.whole_pixels();
+    let art = art_sampling(whole);
     let config = Config::load(&player.game);
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
@@ -1493,7 +1574,7 @@ fn run_script(
 
         // Where the picture lands, worked out before the frame is asked for:
         // the decoder scales to it, so it has to know first.
-        let dst = letterbox(canvas, STAGE_WIDTH, STAGE_HEIGHT);
+        let dst = letterbox(canvas, STAGE_WIDTH, STAGE_HEIGHT, player.whole_pixels());
         let scale = dst.h / STAGE_HEIGHT as f32;
         let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
         stage.set_video_size(window_px.0, window_px.1);
@@ -1782,7 +1863,7 @@ fn run_script(
                         index: 0,
                         window: (0, 0),
                         size,
-                        texture: new_texture(creator, size.0, size.1)?,
+                        texture: new_texture(creator, size.0, size.1, ScaleMode::Linear)?,
                     });
                 }
                 if let Some(held) = &mut movie_texture {
@@ -1803,24 +1884,28 @@ fn run_script(
                     .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
             }
         } else if let Some(still) = visual.still {
-            // Rebuild the texture when the background changes or the window
-            // does, since the upload is now at the window's size.
+            // Resampled to the window here, the same as a menu composite is,
+            // unless whole-number scaling is on — then it goes up at its own
+            // size for the blit to multiply. Rebuilt when the background
+            // changes or when the size it was built for does.
+            let at = if whole {
+                (still.width, still.height)
+            } else {
+                window_px
+            };
             let stale = still_texture
                 .as_ref()
-                .is_none_or(|(path, size, _)| path != &still.path || *size != window_px);
+                .is_none_or(|(path, size, _)| path != &still.path || *size != at);
             if stale {
                 let src = (still.width as usize, still.height as usize);
-                let (w, h, rgba) = match scaler.resample(
-                    &still.rgba,
-                    src,
-                    (window_px.0 as usize, window_px.1 as usize),
-                ) {
-                    Some(scaled) => (window_px.0, window_px.1, scaled),
-                    None => (still.width, still.height, still.rgba.as_slice()),
-                };
-                let mut texture = new_texture(creator, w, h)?;
+                let (w, h, rgba) =
+                    match scaler.resample(&still.rgba, src, (at.0 as usize, at.1 as usize)) {
+                        Some(scaled) => (at.0, at.1, scaled),
+                        None => (still.width, still.height, still.rgba.as_slice()),
+                    };
+                let mut texture = new_texture(creator, w, h, art)?;
                 texture.update(None, rgba, w as usize * 4)?;
-                still_texture = Some((still.path.clone(), window_px, texture));
+                still_texture = Some((still.path.clone(), at, texture));
             }
             if let Some((_, _, texture)) = &still_texture {
                 canvas
@@ -1837,7 +1922,8 @@ fn run_script(
             let key = (mouth.x, mouth.y, mouth.width, mouth.height, *index);
             let size = (mouth.width, mouth.height);
             if mouth_patches.get(slot).is_none_or(|p| p.size != size) {
-                let mut texture = new_texture(creator, mouth.width as u32, mouth.height as u32)?;
+                let mut texture =
+                    new_texture(creator, mouth.width as u32, mouth.height as u32, art)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 let patch = MouthPatch {
                     // Not `key`: the upload below is what makes it true.
@@ -1896,8 +1982,15 @@ fn run_script(
                 let mut drawn = Vec::new();
                 for one in &lines {
                     let image = text::render_line(player.font, one, [255, 255, 255], english);
-                    let mut texture =
-                        new_texture(creator, image.width as u32, image.height as u32)?;
+                    // Glyphs, and never at a whole-number scale: the block is
+                    // laid out at 0.75 of its own size before the window's
+                    // scale is applied. See `playback::text`.
+                    let mut texture = new_texture(
+                        creator,
+                        image.width as u32,
+                        image.height as u32,
+                        ScaleMode::Linear,
+                    )?;
                     texture.set_blend_mode(BlendMode::Blend);
                     texture.update(None, &image.rgba, image.width * 4)?;
                     drawn.push(texture);
@@ -1952,8 +2045,12 @@ fn run_script(
                                 [255, 255, 255]
                             };
                             let image = text::render_line(player.font, label, colour, english);
-                            let mut texture =
-                                new_texture(creator, image.width as u32, image.height as u32)?;
+                            let mut texture = new_texture(
+                                creator,
+                                image.width as u32,
+                                image.height as u32,
+                                ScaleMode::Linear,
+                            )?;
                             texture.set_blend_mode(BlendMode::Blend);
                             texture.update(None, &image.rgba, image.width * 4)?;
                             drawn.push((image.width as u32, image.height as u32, texture));
@@ -2004,7 +2101,7 @@ fn run_script(
                 .is_none_or(|(cached, ..)| cached != &records);
             if stale {
                 let image = control.compose(&control.states(hovered, bar_state, elapsed));
-                let mut texture = new_texture(creator, image.width, image.height)?;
+                let mut texture = new_texture(creator, image.width, image.height, art)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 texture.update(None, &image.rgba, image.width as usize * 4)?;
                 bar_texture = Some((records, image.width, image.height, texture));
@@ -2088,6 +2185,48 @@ fn discover_game_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole-number scaling is the whole of pixel-perfect: the game's own
+    /// 800x450 goes up by an integer, centred, and the rest is border. On a
+    /// 1920x1200 panel that is exactly twice — not the 2.4 that fitting the
+    /// window would give, and it is the 0.4 that cannot be drawn without
+    /// inventing pixels.
+    #[test]
+    fn whole_number_scaling_multiplies_by_an_integer() {
+        let content = (800, 450);
+        let whole = fit((1920, 1200), content, true);
+        assert_eq!((whole.w, whole.h), (1600.0, 900.0));
+        assert_eq!((whole.x, whole.y), (160.0, 150.0), "centred, with a border");
+
+        // Every pixel of the source is the same square block of the window.
+        for (window, factor) in [
+            ((1920, 1200), 2.0),
+            ((2560, 1440), 3.0),
+            ((3840, 2160), 4.0),
+            ((1366, 768), 1.0),
+        ] {
+            let at = fit(window, content, true);
+            assert_eq!(at.w, content.0 as f32 * factor, "{window:?} wide");
+            assert_eq!(at.h, content.1 as f32 * factor, "{window:?} high");
+            assert!(at.x >= 0.0 && at.y >= 0.0, "{window:?} overflows");
+        }
+    }
+
+    /// Fitting the window is the other mode, and it fills what it can.
+    #[test]
+    fn fitting_the_window_uses_all_of_one_axis() {
+        let at = fit((1920, 1200), (800, 450), false);
+        assert_eq!((at.w, at.h), (1920.0, 1080.0));
+        assert_eq!((at.x, at.y), (0.0, 60.0));
+    }
+
+    /// A window smaller than the game has no whole multiple to take, so it is
+    /// fitted rather than bordered down to nothing.
+    #[test]
+    fn a_window_too_small_for_the_game_is_still_filled() {
+        let small = fit((640, 360), (800, 450), true);
+        assert_eq!((small.w, small.h), (640.0, 360.0));
+    }
 
     /// The judder fix, which is the whole point of [`Cadence`].
     ///

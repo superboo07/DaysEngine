@@ -183,6 +183,8 @@ whatever filter the driver gave:
 Scaler = bicubic
 
 [UI]
+; Whole-number scaling: no resampling at all, at the cost of a border
+PixelPerfect = off
 ; bspline, mitchell, catmull_rom — one cubic family, softest first
 Scaler = bspline
 ```
@@ -197,6 +199,34 @@ by libswscale inside the colour conversion it already goes through, so the
 filter costs only its own width; the game's own art goes through the engine's
 resampler in `playback::scale`. A libavfilter graph — a debander before the
 scale, say — is **not implemented**; the decoder is where it would go.
+
+### Pixel-perfect
+
+The game is authored at 800x450 and ships nothing larger, so on a modern window
+every pixel of it becomes more than one. Fitting a 1920x1200 panel wants a scale
+of 2.4, and the 0.4 is where softness comes from: two source pixels in five fall
+between destination pixels, and no filter can do anything about that but blur
+across the gap.
+
+`PixelPerfect = on` scales by a whole number instead — the largest that fits,
+centred, with a border around the rest. 1920x1200 takes ×2, so the game draws at
+1600x900 and every source pixel becomes the same exact 2x2 block. Nothing is
+resampled: the composite goes to the GPU at its own size and is point-sampled
+into an exact multiple, which is the one case where point sampling invents
+nothing. `[UI] Scaler` is unused while it is on, because nothing runs it.
+
+This is not nearest-neighbour scaling, which is what turning the filter off at
+2.4 would give — that lands some source pixels on two destination pixels and
+some on three, and looks worse than either. Movies are still filtered on their
+way into the same box; they are photographic and they want it.
+
+The mode also takes the **native** art set rather than the one the display mode
+names, which is a documented departure from the recovered rule in
+`Resolution::for_display`. The four sets are one layout at four sizes — the
+1280x720 hit map is the 800x450 one scaled by 1.6, and there is only ever one
+`.PNG` behind them — so composing at 1.6 and then multiplying by a whole number
+would put a resample back in the middle of the one path whose point is not
+having one.
 
 ## Layout
 

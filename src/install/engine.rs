@@ -102,6 +102,34 @@ impl UiScaler {
 pub struct Settings {
     pub video_scaler: VideoScaler,
     pub ui_scaler: UiScaler,
+    /// Draw the game at a whole-number multiple of its own size. See
+    /// [`Settings::pixel_perfect`].
+    pub pixel_perfect: bool,
+}
+
+impl Settings {
+    /// Whether the picture is scaled by a whole number, centred, with a border
+    /// around whatever is left over.
+    ///
+    /// The game is authored at 800x450 and nothing it ships is bigger, so on
+    /// any modern window every pixel of it has to become more than one. At
+    /// 1920x1200 the fit-the-window scale is 2.4, and 2.4 is where the softness
+    /// comes from: two source pixels in five land between destination pixels,
+    /// and there is nothing a filter can do about that but blur across the gap.
+    ///
+    /// At a whole number there is no gap. Every source pixel becomes an exact
+    /// `N` x `N` block of destination pixels, the same block every time, and
+    /// nothing is resampled at all — 1920x1200 takes `N = 2`, so the game draws
+    /// at 1600x900 with a border. The cost is that border, and it is the whole
+    /// of the cost: this is not nearest-neighbour scaling, which is what 2.4
+    /// would give if the filter were simply turned off, and which lands some
+    /// source pixels on two destination pixels and some on three.
+    ///
+    /// Movies are still filtered on their way to the same box — they are
+    /// photographic and they want it. This is about the art.
+    pub fn pixel_perfect(&self) -> bool {
+        self.pixel_perfect
+    }
 }
 
 /// The file's name, looked for beside the running binary.
@@ -180,6 +208,10 @@ impl Settings {
                     VideoScaler::NAMES
                 ),
             },
+            ("ui", "pixelperfect") => match parse_bool(value) {
+                Some(on) => self.pixel_perfect = on,
+                None => log::warn!("{FILE} line {line}: {value:?} is not on or off"),
+            },
             ("ui", "scaler") => match UiScaler::parse(value) {
                 Some(scaler) => self.ui_scaler = scaler,
                 None => log::warn!(
@@ -190,6 +222,15 @@ impl Settings {
             ("", _) => log::warn!("{FILE} line {line}: {key} is outside any [Section]"),
             _ => log::warn!("{FILE} line {line}: nothing reads [{section}] {key}"),
         }
+    }
+}
+
+/// Reads the spellings of yes a person might type.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Some(true),
+        "0" | "off" | "false" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -209,10 +250,14 @@ pub fn template() -> String {
          Scaler = bicubic\n\
          \n\
          [UI]\n\
-         ; How the game's own art — menus, still backgrounds — is scaled:\n\
+         ; Draw the game at a whole-number multiple of its own 800x450 and put\n\
+         ; a border around the rest, so every pixel of the art becomes an exact\n\
+         ; square block and nothing is resampled. Costs some of the screen.\n\
+         PixelPerfect = off\n\
+         \n\
+         ; How the art is scaled when PixelPerfect is off:\n\
          ;   {}\n\
-         ; One cubic family, softest first. There is no unfiltered option:\n\
-         ; the original filters this art too.\n\
+         ; One cubic family, softest first.\n\
          Scaler = bspline\n",
         VideoScaler::NAMES,
         UiScaler::NAMES,
@@ -230,6 +275,25 @@ mod tests {
         let settings = Settings::parse("");
         assert_eq!(settings.video_scaler, VideoScaler::Bicubic);
         assert_eq!(settings.ui_scaler, UiScaler::BSpline);
+        assert!(!settings.pixel_perfect());
+    }
+
+    /// Whole-number scaling is off unless it is turned on, and a player may
+    /// spell that several ways.
+    #[test]
+    fn pixel_perfect_takes_the_spellings_of_yes() {
+        for on in ["1", "on", "true", "YES"] {
+            let settings = Settings::parse(&format!("[UI]\nPixelPerfect = {on}\n"));
+            assert!(settings.pixel_perfect(), "{on}");
+        }
+        for off in ["0", "off", "FALSE", "no"] {
+            let settings = Settings::parse(&format!("[UI]\nPixelPerfect = {off}\n"));
+            assert!(!settings.pixel_perfect(), "{off}");
+        }
+        assert!(
+            !Settings::parse("[UI]\nPixelPerfect = maybe\n").pixel_perfect(),
+            "a value nobody recognises keeps the default"
+        );
     }
 
     /// Sections and keys are case-insensitive, comments and quotes come off,
