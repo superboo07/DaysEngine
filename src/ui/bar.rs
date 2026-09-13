@@ -716,13 +716,15 @@ impl Bar {
 
     /// Whether anything the strip draws keeps an alpha of its own this frame.
     ///
-    /// `FUN_10025690` names every sprite the bar owns but two: the rate
-    /// readout, which it never touches, and the gauge bed with its three
-    /// pieces, which it skips while the gauge is raised. While either is
-    /// showing the strip cannot be drawn by modulating one texture — the fade
-    /// has to be composited in, which is what [`Bar::compose_faded`] does.
+    /// Only the raised gauge, which the fade skips. While it is showing, the
+    /// strip cannot be drawn by modulating one texture — the fade has to be
+    /// composited in, which is what [`Bar::compose_faded`] does.
+    ///
+    /// The rate readout at `this+0x88` is **not** here, though `FUN_10025690`
+    /// does not name it either. See [`Bar::compose_faded`] for why it is left
+    /// fading with the rest.
     pub fn pinned(&self, state: State) -> bool {
-        state.gauge_raised || self.rate_readout(state).is_some()
+        state.gauge_raised
     }
 
     /// Drops widget 2's latch once its window has passed.
@@ -858,21 +860,7 @@ impl Bar {
             faded.retain(|r| *r != record::GAUGE_BED);
             pinned.push(record::GAUGE_BED);
         }
-        if let Some(readout) = self.rate_readout(state) {
-            // Only the one `records` pushed for the readout: the same number
-            // comes back as the hover sprite when that rate's widget is under
-            // the pointer, and that one does fade.
-            if let Some(at) = faded.iter().position(|r| *r == readout) {
-                faded.remove(at);
-            }
-            pinned.push(readout);
-        }
         (faded, pinned)
-    }
-
-    /// The record the rate readout draws from, while it is showing.
-    fn rate_readout(&self, state: State) -> Option<usize> {
-        (state.rate >= 2.0 && state.speed < SPEEDS.len()).then_some(state.speed + 5)
     }
 
     /// The sprites the bar sizes itself instead of taking whole from a record,
@@ -920,6 +908,23 @@ impl Bar {
     /// animation while `_GetAutoDraw@0` is non-zero, so that one stays at full
     /// alpha. **What that export returns is not recovered**, so the exception is
     /// not reproduced and the whole strip fades together.
+    ///
+    /// Two more are absent from `FUN_10025690`'s list altogether — the rate
+    /// readout at `this+0x88` and the `REPLAYMODE` indicator at `this+0x94` —
+    /// and `FUN_10024ca0` draws both past the `this+0xbc` and host `+0x140`
+    /// tests, which is a branch target and not a reading of indentation. Taken
+    /// at face value that would leave one rate button on the picture for as
+    /// long as the rate is 2.0 or more.
+    ///
+    /// **The readout is faded with the rest here anyway.** The step that would
+    /// make the consequence follow — that `FUN_10024ca0` runs at all while the
+    /// bar is down — is **not recovered**: nothing found calls the draw, so
+    /// whether it is reached in that state is an inference from the function
+    /// testing `this+0xbc` itself. Against that inference stands the game as
+    /// played, where no such button is on screen. The indicator is the one
+    /// exception, and only because the ten-cell slider that sets its
+    /// transparency is evidence in its own right that it is meant to be seen
+    /// without the bar — there would be nothing to adjust otherwise.
     pub fn compose(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Image {
         let records = self.records(hovered, state, elapsed_ms);
         let (faded, pinned) = self.cuts(state);
@@ -996,14 +1001,7 @@ impl Bar {
             // The gauge is the only part whose alpha the raise pins; the rate
             // readout is simply never in `FUN_10025690`'s list, so it keeps the
             // opaque colour `FUN_10022650` gave it.
-            modulate(
-                &mut over,
-                if state.gauge_raised {
-                    self.fade.gauge_alpha()
-                } else {
-                    255
-                },
-            );
+            modulate(&mut over, self.fade.gauge_alpha());
             let (w, h) = (over.width, over.height);
             layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }

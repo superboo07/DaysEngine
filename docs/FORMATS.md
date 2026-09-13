@@ -2362,13 +2362,27 @@ instruction that begins the readout's own test, so this is the branch target
 and not the decompiler's indentation. The consequence is that a rate of 2.0 or
 more leaves one rate button on the picture after the bar has faded away.
 
-**What calls the draw is not recovered**, and that weakens the consequence
-rather than the reading. The engine calls eleven slots on its MenuBar pointer
-at `engine + 0x330` and `+0x14` is not one of them; `FUN_10024ca0` is
-referenced only from the vtable, and `.text` holds no `CALL [reg+0x14]` outside
-the CRT. That the draw runs while the bar is down is inferred from the function
-testing `this+0xbc` and `+0x140` itself, which would be dead code otherwise —
-not from a call site anyone has seen. Skipping is not holding them
+**What calls the draw is not recovered**, and that is what the consequence
+needed. The engine calls eleven slots on its MenuBar pointer at
+`engine + 0x330` — `+0x04`, `+0x08`, `+0x0c`, `+0x1c`, `+0x20`, `+0x24`,
+`+0x28`, `+0x2c`, `+0x30`, `+0x34`, `+0x38`, all of them landing inside the
+vtable, which is what confirms the member — and `+0x14` is not among them.
+`FUN_10024ca0` is referenced only from the vtable slot; the exe's own `.text`
+holds no `CALL dword ptr [reg+0x14]` at all (the eleven that match the byte
+pattern are `[EBP+0x14]` stack arguments in the CRT); the static
+`FILM::MenuBar` at `0x10050790` is referenced only by `_SetMenuBar@4` and the
+CRT's static-init pair; and the frame step `FUN_004253f0` reaches the bar's
+*update* through `FUN_004252e0` without drawing it. So that the draw runs while
+the bar is down is an inference from the function testing `this+0xbc` and
+`+0x140` itself, not a call site anyone has seen.
+
+`DaysEngine` therefore **fades the rate readout with the rest of the strip**,
+against the reading, because the reading's missing step is the one that decides
+it and the game as played shows no such button. The `REPLAYMODE` indicator is
+the single exception, and not on the strength of the same inference: the
+ten-cell slider that sets its transparency is evidence in its own right that it
+is meant to be seen without the bar, since there would be nothing to adjust
+otherwise. Skipping is not holding them
 opaque — they keep whatever they last held. So a gauge raised while the bar is
 up stays on screen at full alpha after the bar has faded away, and one raised
 while the bar is already gone is pinned at nothing and never appears.
