@@ -67,9 +67,17 @@ switch hands it the static object at `DAT_1005b898`, whose static-init thunk
 recovered**.
 
 **`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
-`[FeedTime]`, `[Select1]` and `[Select2]` — so the choice box's two hit maps are
-not named by the INI there, and where it gets them instead is **not recovered**.
-`STARTSCRIPT.INI` adds `[SystemBGM2]` and `[DressBG]` and drops `[TrialDemo]`.
+`[FeedTime]`, `[Select1]` and `[Select2]`. `STARTSCRIPT.INI` adds `[SystemBGM2]`
+and `[DressBG]` and drops `[TrialDemo]`.
+
+**How the Shiny Days choice box finds its hit map is not recovered.** Its
+executable never reads `[Select1]` or `[Select2]` — neither key name appears in
+it — and no Shiny Days binary holds any `System/Select/...cmap` path, though all
+six maps ship in its `System` pack. School Days HQ's executable holds both key
+names *and* all six paths as literals, so the two are not built the same way.
+Checked twice over all three binaries: a section-aware UTF-16 scan and a plain
+`strings` pass, narrow and wide. Until it is found, a box with no key falls back
+to the split-screen layout a box with no map file already got.
 
 **The hit maps are not drawn as precisely.** See the `_CHIP` section.
 

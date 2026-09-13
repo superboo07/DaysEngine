@@ -1467,6 +1467,9 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
         select.layout,
         match select.map_size() {
             Some((w, h)) => format!("{} ({w}x{h})", select.path),
+            None if select.path.is_empty() => {
+                "FILMENGINE.INI names no map for it; splitting the screen".to_string()
+            }
             None => format!("{} is absent; splitting the screen", select.path),
         }
     );

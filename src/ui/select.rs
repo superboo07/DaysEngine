@@ -239,6 +239,17 @@ impl Select {
     /// `[Select1]` and `[Select2]` and hands both to `FUN_0044e100`, which just
     /// stores them. Both shipped values name the `_Full` map and the loaders
     /// rewrite the suffix, so this does the same rewrite on the INI's own value.
+    ///
+    /// **Shiny Days names neither key, and its box's layout is not recovered.**
+    /// Its `FILMENGINE.INI` has no `[Select1]` or `[Select2]`, and no Shiny Days
+    /// binary holds either key name or any `System/Select/...cmap` path —
+    /// checked two ways, a section-aware UTF-16 scan and a plain `strings` pass,
+    /// narrow and wide, over the executable and both modules. School Days HQ's
+    /// executable holds both key names *and* all six map paths as literals; the
+    /// Shiny Days one holds none of them, though the maps themselves ship in its
+    /// `System` pack. So the box is reached some way we have not found, and
+    /// until we do, a box with no key falls back to the same split-screen
+    /// layout a box with no map file gets.
     pub fn load(
         vfs: &Vfs,
         film: &Ini,
@@ -247,9 +258,15 @@ impl Select {
     ) -> Result<Select, Error> {
         let layout = Layout::from_ini(film);
         let key = if choices >= 2 { "Select2" } else { "Select1" };
-        let stem = film
-            .get(key)
-            .ok_or_else(|| Error::MissingAsset(format!("FILMENGINE.INI [{key}]")))?;
+        let Some(stem) = film.get(key) else {
+            log::info!("FILMENGINE.INI names no [{key}]; the choice box will split the screen");
+            return Ok(Select {
+                path: String::new(),
+                layout,
+                choices: choices.clamp(1, 2),
+                map: None,
+            });
+        };
         let path = rewrite(
             stem,
             resolution,
