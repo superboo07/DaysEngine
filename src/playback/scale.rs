@@ -31,7 +31,8 @@
 //! because a cubic is the wrong shape for this art: the game is 800x450 of flat
 //! colour and hard edges, a modern window wants 2.4x of it, and a cubic answers
 //! that by blending everywhere. What you want is the edges kept and only the
-//! edges blended.
+//! edges blended. Below 1:1 it is [`area`] for the same reason — the sharpest
+//! filter that still averages the whole footprint.
 //!
 //! The rest are the Mitchell-Netravali family, whose two parameters this is:
 //!
@@ -64,9 +65,11 @@
 //! taps when upscaling and more when the picture is being shrunk. Horizontal
 //! first into a scratch of f32, then vertical down it.
 //!
-//! Downscaling widens the kernel in source space by the scale factor, so
-//! shrinking averages over every source pixel that lands in the footprint
-//! rather than point-sampling four of them and aliasing.
+//! Shrinking has to average over every source pixel that lands in the
+//! footprint rather than point-sampling four of them and aliasing. The cubics
+//! do that by widening the kernel in source space by the scale factor, which
+//! also widens what it blurs over; the default filter takes [`area`] instead,
+//! whose footprint is the output pixel and nothing more.
 //!
 //! # Speed, and why it still matters here
 //!
@@ -179,7 +182,8 @@ fn to_byte(v: f32) -> u8 {
 /// How the weights along one axis are worked out.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Kernel {
-    /// The band-limited pixel filter, and the default. See [`band_limited`].
+    /// The band-limited pixel filter above 1:1 and the area filter below it,
+    /// and the default. See [`band_limited`] and [`area`].
     #[default]
     Pixel,
     /// Mitchell-Netravali at `(B, C)`. A cubic over four taps: smooth, and on
@@ -244,13 +248,58 @@ fn axis(src: usize, dst: usize, kernel: Kernel) -> Vec<Taps> {
         // The pixel filter is a magnification filter: it decides where inside a
         // source texel the edge between it and its neighbour falls, which is
         // only a question when a source texel covers more than one output
-        // pixel. Shrinking wants the opposite — every source pixel in the
-        // footprint averaged — so that case takes the smooth kernel, which
-        // does that properly.
+        // pixel. Shrinking is the other question — which source pixels the
+        // output pixel is made of — and [`area`] is that one, kept as narrow as
+        // the answer allows.
         Kernel::Pixel if ratio <= 1.0 => band_limited(src, dst, ratio),
-        Kernel::Pixel => mitchell_axis(src, dst, ratio, (1.0, 0.0)),
+        Kernel::Pixel => area(src, dst, ratio),
         Kernel::Mitchell(b, c) => mitchell_axis(src, dst, ratio, (b, c)),
     }
+}
+
+/// The area filter: an output pixel is the average of exactly the source it
+/// covers, end pixels weighted by how much of them is inside.
+///
+/// This is the sharp half of [`Kernel::Pixel`]'s bargain going the other way.
+/// A cubic widened to shrink — which is what [`mitchell_axis`] does, and the
+/// only thing this kernel used to do below 1:1 — reaches `2 * ratio` source
+/// pixels each side, so it mixes four output pixels' worth of source into every
+/// one it writes. At the mild shrinks the UI actually meets that is the whole
+/// of the softness: the 4:3 screens composite an 800x600 layout into a window
+/// 800x452 tall, a ratio of 1.33, where a B-spline gathers over five source
+/// pixels to answer a question a hair over one pixel wide.
+///
+/// The footprint is `ratio` source pixels, so at 1.33 an output pixel is one
+/// source pixel and the slivers of its two neighbours, and nothing further away
+/// reaches it at all. It is still a strict average — every weight positive and
+/// summing to one — so it cannot ring, and it still covers every source pixel
+/// in the footprint, so a one-pixel checkerboard collapses to its mean rather
+/// than aliasing into stripes. As the shrink deepens the box widens with it and
+/// the filter becomes the plain box average that heavy minification wants.
+fn area(src: usize, dst: usize, ratio: f32) -> Vec<Taps> {
+    (0..dst)
+        .map(|out| {
+            // The output pixel's own extent, in source coordinates.
+            let start = out as f32 * ratio;
+            let end = start + ratio;
+            let first = start.floor() as i64;
+            let last = (end.ceil() as i64 - 1).max(first);
+            let mut weights = Vec::with_capacity((last - first + 1) as usize);
+            let mut total = 0.0f32;
+            for i in first..=last {
+                // How much of source pixel `i` lies inside the footprint.
+                let w = (end.min(i as f32 + 1.0) - start.max(i as f32)).max(0.0);
+                weights.push(w);
+                total += w;
+            }
+            if total != 0.0 {
+                for w in &mut weights {
+                    *w /= total;
+                }
+            }
+            clamp_taps(first, weights, src)
+        })
+        .collect()
 }
 
 /// Themaister's band-limited pixel filter, which is what gamescope's
@@ -942,9 +991,8 @@ mod tests {
         }
     }
 
-    /// Downscaling widens the kernel, so shrinking averages rather than
-    /// point-sampling: a one-pixel checkerboard collapses to its mean instead
-    /// of aliasing into stripes.
+    /// Shrinking averages rather than point-sampling: a one-pixel checkerboard
+    /// collapses to its mean instead of aliasing into stripes.
     #[test]
     fn downscaling_averages_instead_of_aliasing() {
         let mut scaler = Scaler::default();
@@ -964,6 +1012,30 @@ mod tests {
                 "pixel {i} came out {} rather than around the mean",
                 px[0]
             );
+        }
+    }
+
+    /// The shrink the 4:3 screens actually take: 800x600 of layout into a
+    /// window 452 tall, a ratio of 4/3. An output pixel there is made of the
+    /// source it covers and no more — the two or three pixels a 1.33-wide box
+    /// touches — where the cubic that used to answer this reached over five,
+    /// which is the softness.
+    #[test]
+    fn a_mild_shrink_reads_only_what_the_output_pixel_covers() {
+        let ratio = 600.0 / 452.0;
+        let taps = axis(600, 452, Kernel::Pixel);
+        for (out, tap) in taps.iter().enumerate() {
+            let (start, end) = (out as f32 * ratio, (out as f32 + 1.0) * ratio);
+            let (first, last) = (start.floor() as usize, end.ceil() as usize);
+            assert!(
+                tap.start >= first && tap.start + tap.weights.len() <= last,
+                "output {out} reads {}..{} for a footprint of {start}..{end}",
+                tap.start,
+                tap.start + tap.weights.len()
+            );
+            let total: f32 = tap.weights.iter().sum();
+            assert!(tap.weights.iter().all(|w| *w >= 0.0), "a negative weight");
+            assert!((total - 1.0).abs() < 1e-4, "weights sum to {total}");
         }
     }
 
