@@ -119,16 +119,17 @@ impl SystemSounds {
         SystemSounds { paths }
     }
 
-    /// Plays one, on the mixer slot the menus own.
+    /// Plays one, on the channel the menus own.
     ///
-    /// Scripts address SE slots 1..=5 and the menus are never up while a script
-    /// is running, so borrowing the last slot costs nothing.
+    /// Not one of the script's five `[PlaySe]` slots: a menu the control bar
+    /// opened is up over a script that is only paused, and its sounds are a
+    /// different object in the original — see [`Mixer::play_system_se`].
     fn play(&self, se: SystemSe, vfs: &Vfs, sounds: &mut Sounds, mixer: &Mixer) {
         let Some(path) = self.paths.get(se.key()) else {
             return;
         };
         if let Some(buffer) = sounds.get(vfs, path) {
-            mixer.play_se(5, buffer);
+            mixer.play_system_se(buffer);
         }
     }
 }
@@ -580,6 +581,15 @@ fn main() -> Result<()> {
             progress.as_mut(),
         )?;
         canvas.window_mut().set_title("DaysEngine")?;
+        // Playback has been left, whichever way. Host `+0x100` (`FUN_0042a500`,
+        // the bar's leave button) and the end of a script both go through
+        // `FUN_00424e20`, which pauses every stream the script owns, and
+        // nothing on the way to the menus resumes them — `FUN_00424eb0`'s six
+        // call sites are all paths back into playback. The playback object is
+        // then handed to `setSystemInit` and torn down, so the pause is the end
+        // of that sound: the title screen is silent but for its own `[TitleBGM]`
+        // rather than carrying the scene's music and voices into it.
+        player.mixer.stop_all();
         // A script that reached its end hands over to the branch graph, which
         // is what the executable's state 4 does. When the graph names nothing
         // — the route ended, or the script was not in it — the session goes
@@ -833,9 +843,9 @@ fn run_menu(
     // place in the executable — `FUN_0041f600`, the same function that reads
     // `[StartScript]`, with one caller — and a screen the control bar opens is
     // the other driver entirely: host `+0xf8` (`FUN_0042a430`) puts the
-    // playback object into its menu layer and touches no audio at all. So the
-    // scene's own BGM plays on underneath, and there is nothing to put back on
-    // the way out.
+    // playback object into its menu layer, over a script whose sound it has
+    // paused, and plays nothing of its own. So that screen is quiet but for its
+    // own clicks, and the scene starts again where it stopped on the way out.
     if entry == MenuEntry::Title {
         play_menu_bgm(player, start.get("TitleBGM"));
     }
@@ -1895,11 +1905,19 @@ fn run_script(
                             bar_state.auto = !bar_state.auto;
                             auto_since = Instant::now();
                         }
+                        // Host `+0xf4` is `FUN_00424f40`, the same
+                        // `FUN_00424e20` / `FUN_00424eb0` pair every other
+                        // suspension of playback uses, so pausing stops the
+                        // script's sound where it stands and un-pausing starts
+                        // it again there rather than a pause's worth of audio
+                        // further on.
                         bar::Act::TogglePause => {
                             if paused {
                                 origin = now;
+                                player.mixer.resume_script();
                             } else {
                                 offset = clock(origin, now, offset, rate);
+                                player.mixer.pause_script();
                             }
                             paused = !paused;
                         }
@@ -1982,13 +2000,17 @@ fn run_script(
                             };
                             // Stop the script clock so playback resumes where
                             // it was, open the menus, then put it back. The
-                            // menus play their own BGM through the same mixer
-                            // and are not on the rate-adjusted stream, so the
-                            // rate comes off for the duration and goes back on
-                            // return — otherwise a menu opened at 24x would be
-                            // silent.
+                            // script's sound stops with the clock: host `+0xf8`
+                            // (`FUN_0042a430`) calls `FUN_00424e20` before it
+                            // switches the playback object into its menu layer,
+                            // and `FUN_00425550` case 8 calls `FUN_00424eb0` on
+                            // the way back. So the scene is held on the frame it
+                            // was interrupted on rather than playing on under a
+                            // screen the player is reading. The menus' own
+                            // sounds are a channel of their own and keep
+                            // sounding, at 1x, whatever speed the bar was at.
                             offset = clock(origin, now, offset, rate);
-                            player.mixer.set_rate(1.0);
+                            player.mixer.pause_script();
                             let outcome = run_menu(
                                 player,
                                 canvas,
@@ -1998,7 +2020,7 @@ fn run_script(
                                 MenuEntry::OverPlayback(mode, kind),
                                 progress.as_deref_mut(),
                             )?;
-                            player.mixer.set_rate(bar_state.rate);
+                            player.mixer.resume_script();
                             // The Option screen can change the display mode,
                             // which moves both the art set the bar draws from
                             // and the rate the window is presented at.

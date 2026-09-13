@@ -12,6 +12,12 @@
 //! Scripts hand `[PlaySe]` slot 5 a `Voice...` path fairly often — the game
 //! reuses the SE mixer for lines that are not lip-synced — so the SE slots are
 //! not special-cased for sound effects.
+//!
+//! Those are the script's channels, and they are the ones
+//! [`Mixer::pause_script`] holds. The menus' own sounds go to a channel beside
+//! them ([`Mixer::play_system_se`]), because in the original they are a
+//! different object: the script's streams are `FILMOBJ::BgmSound`s owned by the
+//! timeline, and a menu that is up over a paused script still clicks.
 
 use crate::media::AudioBuffer;
 use std::sync::{Arc, Mutex};
@@ -45,6 +51,9 @@ struct Voice {
     /// Restart at the end instead of stopping.
     repeat: bool,
     volume: f32,
+    /// Held where it is, neither heard nor advanced. See
+    /// [`Mixer::pause_script`].
+    paused: bool,
 }
 
 impl Voice {
@@ -55,6 +64,7 @@ impl Voice {
             then: None,
             repeat: false,
             volume,
+            paused: false,
         }
     }
 
@@ -91,6 +101,11 @@ impl Voice {
     /// writing anything, which is how a muted-but-running stream stays in step
     /// with the timeline.
     fn mix_into(&mut self, out: &mut [f32], rate: f64, silent: bool) -> bool {
+        // A paused stream is not silence with the clock running: the original
+        // stops the buffer where it stands and starts it again from there.
+        if self.paused {
+            return true;
+        }
         let channels = AudioBuffer::CHANNELS;
         let wanted = out.len() / channels;
 
@@ -147,6 +162,10 @@ pub struct MixerState {
     bgm: Option<Voice>,
     se: [Option<Voice>; SE_SLOTS],
     voice: Option<Voice>,
+    /// The menus' own sound. Outside the script's channels, so pausing the
+    /// script does not silence a menu over it and a script cannot cut a click
+    /// short by reusing a slot.
+    system: Option<Voice>,
     master: Option<f32>,
     /// The playback rate the control bar's speed widgets select, as a
     /// multiplier on the source. `None` is 1x.
@@ -166,6 +185,14 @@ impl MixerState {
 
     fn rate(&self) -> f32 {
         self.rate.unwrap_or(1.0)
+    }
+
+    /// Every channel a script owns: the ones the pause holds.
+    fn script_voices(&mut self) -> impl Iterator<Item = &mut Voice> {
+        self.bgm
+            .iter_mut()
+            .chain(self.voice.iter_mut())
+            .chain(self.se.iter_mut().flatten())
     }
 
     /// Sums every active channel into `out`, which arrives zeroed.
@@ -193,6 +220,13 @@ impl MixerState {
         if let Some(v) = &mut self.voice {
             if !v.mix_into(out, rate, silent) {
                 self.voice = None;
+            }
+        }
+        // The menus are not on the rate-adjusted stream and are never muted by
+        // it: the speed widgets belong to the script.
+        if let Some(v) = &mut self.system {
+            if !v.mix_into(out, 1.0, false) {
+                self.system = None;
             }
         }
 
@@ -235,6 +269,7 @@ impl Mixer {
                     then: Some(looped),
                     repeat: false,
                     volume: 1.0,
+                    paused: false,
                 },
                 None => Voice {
                     repeat: true,
@@ -263,12 +298,63 @@ impl Mixer {
         self.with(|s| s.voice = Some(Voice::once(buffer, 1.0)));
     }
 
-    /// Silences everything. Used when the timeline jumps.
+    /// Plays one of the menus' own sounds, beside the script's channels.
+    pub fn play_system_se(&self, buffer: Arc<AudioBuffer>) {
+        self.with(|s| s.system = Some(Voice::once(buffer, 1.0)));
+    }
+
+    /// Silences the script's channels. Used when the timeline jumps, and when
+    /// playback is left for good.
+    ///
+    /// The menus' own channel is left alone: a click that was still ringing
+    /// when the screen changed rings out, as it does in the original, where it
+    /// belongs to the menu module and not to the timeline being torn down.
     pub fn stop_all(&self) {
         self.with(|s| {
             s.bgm = None;
             s.voice = None;
             s.se = Default::default();
+        });
+    }
+
+    /// Holds every script channel where it stands.
+    ///
+    /// `FUN_00424910`, reached through `FUN_00424e20`, which everything that
+    /// suspends playback calls first: host `+0xf4` (the bar's pause widget,
+    /// `FUN_00424f40`), `+0xf8` (open a menu over the script, `FUN_0042a430`),
+    /// `+0xfc` (skip) and `+0x100` (leave playback, `FUN_0042a500`). It folds
+    /// the frames run so far into the clock's base and then pauses the engine's
+    /// two script streams at `+0x304` and `+0x30c` and, through the timeline
+    /// object at `+0x1e4` (`FUN_0043edd0`), its eight `FILMOBJ::BgmSound` slots
+    /// at `+0x39c`, the one at `+0x3bc`, and the movie. Pausing is
+    /// `FUN_004431e0` -> `FUN_0041a7a0`, which stops the buffer and latches
+    /// `+0x28`; the position is kept.
+    ///
+    /// Nothing here is heard and nothing advances, so a script resumes on the
+    /// frame it was interrupted on rather than a menu's worth of audio later.
+    pub fn pause_script(&self) {
+        self.with(|s| {
+            for v in s.script_voices() {
+                v.paused = true;
+            }
+        });
+    }
+
+    /// Starts the script's channels again where [`Mixer::pause_script`] left
+    /// them.
+    ///
+    /// `FUN_00424a10`, through `FUN_00424eb0`. Its six call sites — Ghidra's
+    /// reference index and a raw scan of `.text` for `E8` displacements
+    /// agree — are all paths back into playback: `FUN_00425550` case 8 (a menu
+    /// the control bar opened was closed), `FUN_00426620` cases 7 and 9,
+    /// `FUN_00426bd0` case 6, `FUN_00425bf0` and `FUN_00424f40`. Leaving
+    /// playback for the title reaches none of them, so the sound stays stopped
+    /// and the title screen is silent but for its own `[TitleBGM]`.
+    pub fn resume_script(&self) {
+        self.with(|s| {
+            for v in s.script_voices() {
+                v.paused = false;
+            }
         });
     }
 
@@ -340,6 +426,43 @@ mod tests {
         let mut out = vec![0.0; 4 * AudioBuffer::CHANNELS];
         m.render(&mut out);
         assert_eq!(left(&out), vec![step(0), step(2), step(4), step(6)]);
+    }
+
+    /// The pause is not silence with the clock running: the stream stands
+    /// still and starts again on the frame it stopped on, because the original
+    /// stops the buffer and keeps its position (`FUN_004431e0` / `FUN_00443340`
+    /// around the `+0x28` latch).
+    #[test]
+    fn a_paused_stream_stands_still_and_goes_on_where_it_stopped() {
+        let m = Mixer::new();
+        m.play_se(1, ramp(16));
+        let mut out = vec![0.0; 2 * AudioBuffer::CHANNELS];
+        m.render(&mut out);
+        assert_eq!(left(&out), vec![step(0), step(1)]);
+
+        m.pause_script();
+        m.render(&mut out);
+        assert_eq!(left(&out), vec![0.0, 0.0]);
+
+        m.resume_script();
+        m.render(&mut out);
+        assert_eq!(left(&out), vec![step(2), step(3)]);
+    }
+
+    /// The menus are not the script. Their sounds are separate objects in the
+    /// original, so a screen over a paused script still clicks — and it clicks
+    /// at 1x, whatever speed the control bar was left at, including the two
+    /// rates that silence the script's own streams.
+    #[test]
+    fn the_menus_sound_over_a_paused_script() {
+        let m = Mixer::new();
+        m.set_rate(24.0);
+        m.play_se(1, buffer(16, 0.5));
+        m.pause_script();
+        m.play_system_se(ramp(16));
+        let mut out = vec![0.0; 2 * AudioBuffer::CHANNELS];
+        m.render(&mut out);
+        assert_eq!(left(&out), vec![step(0), step(1)]);
     }
 
     /// 4x is the last audible rate, and it is audible.

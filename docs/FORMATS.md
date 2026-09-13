@@ -914,9 +914,10 @@ all.
 `FUN_00424f90` does three things in order, and the order is the behaviour.
 Pressing the rate already in force is the one case that does none of them: it
 compares against `engine + 0x530` first and, when they match, writes only the
-lit index at `+0x534`. Otherwise it stops the clock (`FUN_00424910`, which folds
-the frames run so far into the base with `+0x540 = +0x544`), stores the rate as
-a float at `+0x538`, and starts the clock again (`FUN_00424a10`). An index
+lit index at `+0x534`. Otherwise it suspends playback (`FUN_00424910`, which folds
+the frames run so far into the base with `+0x540 = +0x544` and stops the sound
+with it — see below), stores the rate as a float at `+0x538`, and starts it
+again (`FUN_00424a10`). An index
 outside the table is clamped to 1x at index 0 rather than ignored —
 `(param_1 < 0) || (4 < param_1)` stores `0x3f800000` and rewrites the index.
 
@@ -959,6 +960,54 @@ level 2 for 3). Only `+0x30c` is rate-adjusted. **Which of the two is which has
 not been recovered**: nothing that opens them with a path has been found, and
 the `+0x304` that `FUN_00422170` sets up is a different base — that one is
 `base + 0x304` with `base = engine + 0x30`, the choice box.
+
+### Suspending playback stops its sound, and only playback resumes it
+
+`FUN_00424910` and `FUN_00424a10` are a refcounted pair — `InterlockedIncrement`
+and `InterlockedDecrement` on `engine + 0x230`, doing their work on the
+transition to and from 1 — wrapped by `FUN_00424e20` and `FUN_00424eb0`, which
+hold the critical section at `engine + 0x234` and latch `engine + 0x22c`.
+
+`FUN_00424910` pauses **everything the script owns**: the two streams at
+`engine + 0x304` and `+0x30c`, and, through the timeline object at
+`engine + 0x1e4` (`FUN_00431c30` -> `FUN_0043edd0`), its eight
+`FILMOBJ::BgmSound` slots at `+0x39c`, the one at `+0x3bc`, and the movie.
+Pausing one stream is `FUN_00443280` -> `FUN_004431e0`, which sends `0x800b` to
+the buffer and latches the object's `+0x28`; the position is kept, and
+`FUN_00443340` (`0x800c`) starts it again from there. A stream whose start frame
+at `+0x34` is still ahead of the clock is skipped, because it has not begun.
+SomCon stops too (`_SomStop@0`, restored with `_SomMove@4`).
+
+The class name is the constructor's own: `FUN_00442a80` stores
+`FILMOBJ::BgmSound::vftable`, and takes the start frame `+0x34` and end `+0x38`
+as its first two arguments.
+
+**Everything that suspends playback pauses the sound first.** `FUN_00424e20`
+has seven call sites: host `+0xf4` (the bar's pause widget, `FUN_00424f40`),
+`+0xf8` (open a menu over the script, `FUN_0042a430`), `+0xfc` (skip,
+`FUN_0042a4a0`), `+0x100` (leave playback, `FUN_0042a500`), and the three
+engine-side `FUN_004250b0`, `FUN_0042a380` and `FUN_0042a560`.
+
+The speed widgets are the one suspension that does not go through the latching
+wrapper: `+0x8c` (`FUN_00424f90`) calls `FUN_00424910` and `FUN_00424a10`
+directly, around the rate change, so the sound is stopped and started again
+within the one call and the player never hears the gap.
+
+**Nothing on the way out of playback resumes it.** `FUN_00424eb0` has six call
+sites — Ghidra's reference index and a raw scan of `.text` for `E8`
+displacements agree on the same six — and all of them are paths back into
+playback: `FUN_00425550` case 8 (a menu the bar opened was closed),
+`FUN_00426620` cases 7 and 9, `FUN_00426bd0` case 6, `FUN_00425bf0` and
+`FUN_00424f40`. `FUN_0042a500` sets state 5, which is `FUN_00426620` — and its
+case 3 hands the screen to `setSystemInit` and its case 5 releases the module,
+neither resuming anything. So the sound a script was making stops when the
+player leaves it and does not come back; the title screen that follows has only
+its own `[TitleBGM]`.
+
+For a menu the bar opened, the same pause is a pause and not a stop: the script
+is held on the frame it was interrupted on, and case 8 of `FUN_00425550` starts
+it again there. The menu module's own sounds are separate objects and are not
+on the rate-adjusted stream, so they are unaffected by either.
 
 Where the host slots land is the executable's own state machine. `FUN_00427300`
 switches on `engine + 0x220`, which is host `+0x1f4` — an independent
