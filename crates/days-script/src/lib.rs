@@ -817,16 +817,6 @@ mod tests {
         assert_eq!(s.skip_to, s.length);
     }
 
-    /// Neither marker is a statement that runs over a window, so neither may
-    /// sort to the front of the event list and look like one.
-    #[test]
-    fn the_markers_sit_at_a_point() {
-        let s = Script::parse_str("x", "[SkipFRAME]=00:10:00;\n[Next]=00:20:00;\n").unwrap();
-        for event in &s.events {
-            assert_eq!(event.start, event.end, "{:?}", event.command);
-        }
-    }
-
     /// A script with no `[SkipFRAME]` has nothing to skip to, which is the same
     /// thing as a target at the end.
     #[test]

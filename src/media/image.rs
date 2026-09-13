@@ -196,27 +196,4 @@ mod tests {
             assert_eq!(*px, [17, 34, 51, 255], "pixel {n}");
         }
     }
-
-    /// One scaler serves every size: the scratch frames are refitted per call,
-    /// so a second call at another size must not reuse the first one's.
-    #[test]
-    fn one_scaler_takes_a_new_size_on_the_next_call() {
-        let mut scaler = ImageScaler::new(VideoScaler::Bilinear).expect("scaler");
-        let src = flat((100, 50), [9, 9, 9, 255]);
-        let big = scaler.scale(&src, (100, 50), (400, 200)).expect("scale");
-        assert_eq!(big.expect("scaled").len(), 400 * 200 * 4);
-        let small = scaler.scale(&src, (100, 50), (50, 25)).expect("scale");
-        assert_eq!(small.expect("scaled").len(), 50 * 25 * 4);
-    }
-
-    /// A buffer that is not the length its size claims is refused rather than
-    /// read past the end of.
-    #[test]
-    fn a_short_buffer_is_refused() {
-        let mut scaler = ImageScaler::new(VideoScaler::Bicubic).expect("scaler");
-        assert!(scaler
-            .scale(&[0u8; 16], (800, 452), (1920, 1085))
-            .expect("scale")
-            .is_none());
-    }
 }

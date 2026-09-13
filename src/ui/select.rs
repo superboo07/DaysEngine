@@ -44,6 +44,7 @@
 use crate::install::config::{Config, Flag};
 use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
+use crate::playback::text::Geometry;
 use crate::ui::menu::SystemSe;
 use crate::ui::screen::{Error, Resolution};
 use days_script::Frame;
@@ -142,7 +143,28 @@ pub fn advance(english: bool) -> u32 {
 ///
 /// **This engine does not place labels by that formula yet.** It centres each
 /// one in the box the shipped `.CMAP` gives, which is exact data and lines up
-/// with the hit testing, but it is not the original's arithmetic.
+/// with the hit testing, but it is not the original's arithmetic. The *size* is
+/// the formula's — see [`label_scale`]; it is only where the label sits that
+/// comes from the map instead.
+/// Destination height of one choice label, from `FUN_0044ced0`'s
+/// `h = scale * 48.0`.
+///
+/// A label keeps the font's whole 48-pixel cell. A dialogue line does not —
+/// `_DAT_004d6770` gives it 42, so the dialogue is squashed to 42/48 — which is
+/// why the two are not the same size on screen at the same resolution. See
+/// [`crate::playback::text::LINE_HEIGHT`].
+pub const LABEL_HEIGHT: f32 = 48.0;
+
+/// How much a rendered label is scaled by on its way into layout space.
+///
+/// A rendered line is [`crate::playback::text::LINE_PITCH`] tall and its
+/// destination is [`LABEL_HEIGHT`] times the geometry's scale, so the factor is
+/// the geometry's scale and nothing else. Uniform in both axes, because
+/// `FUN_0044ced0` multiplies x and y by the same number.
+pub fn label_scale(geometry: Geometry) -> f32 {
+    geometry.scale * LABEL_HEIGHT / crate::playback::text::LINE_PITCH as f32
+}
+
 pub const ANCHOR_ONE: f64 = 533.4;
 pub const ANCHOR_TWO: [f64; 2] = [266.7, 800.0];
 pub const ANCHOR_ONE_STACKED: f64 = -268.0;

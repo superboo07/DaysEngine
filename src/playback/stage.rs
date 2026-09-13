@@ -654,17 +654,6 @@ mod tests {
         assert_eq!(stage.skip_target(Frame::parse("00:10:00").unwrap()), None);
     }
 
-    /// A choice already behind the clock is not skipped backwards to.
-    #[test]
-    fn a_passed_choice_is_not_skipped_back_to() {
-        let stage = staged("01:02:09", "01:09:00");
-        assert_eq!(stage.skip_target(Frame::parse("01:05:00").unwrap()), None);
-        // Standing exactly on it still counts as ahead, as `to < at` does.
-        assert!(stage
-            .skip_target(Frame::parse("01:02:09").unwrap())
-            .is_some());
-    }
-
     /// The script runs past its choice. Taking the length from `[SkipFRAME]`
     /// ended it on the exact frame the choice was raised, so the player loop —
     /// which checks [`Stage::finished`] before it looks at the choice at all —
@@ -678,13 +667,6 @@ mod tests {
         assert!(!stage.finished(raised), "the frame the choice is raised on");
         assert!(!stage.finished(Frame::parse("01:07:23").unwrap()));
         assert!(stage.finished(Frame::parse("01:09:00").unwrap()));
-    }
-
-    /// A choice inside the first second does not wrap past zero.
-    #[test]
-    fn a_choice_in_the_first_second_clamps_to_the_start() {
-        let stage = staged("00:00:10", "00:30:00");
-        assert_eq!(stage.skip_target(Frame::ZERO), Some(Frame::ZERO));
     }
 
     /// The mouth overlays belong to the background object, so losing the

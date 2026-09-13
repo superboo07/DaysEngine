@@ -2221,7 +2221,14 @@ fn run_script(
                         });
                     }
                     if let Some(cached) = &choice_labels {
-                        let text_scale = scale * 0.5;
+                        // `FUN_0044ced0` gives a label the font's whole
+                        // 48-pixel cell — unlike a dialogue line, which
+                        // `_DAT_004d6770` squashes to 42 — so a rendered label
+                        // goes into layout space at the geometry's own scale.
+                        // `scale` on top of that is only this window's
+                        // letterbox, exactly as for the dialogue above.
+                        let geometry = text::Geometry::native(left_arrangement);
+                        let text_scale = select::label_scale(geometry) * scale;
                         for (index, (w, h, texture)) in cached.drawn.iter().enumerate() {
                             let Some(region) = boxes.get(index) else {
                                 continue;

@@ -9,6 +9,7 @@
 use crate::playback::lipsync;
 use crate::playback::stage::Visual;
 use crate::playback::text;
+use crate::ui::select;
 use days_font::Font;
 
 /// Composites one frame to RGBA at `width` x `height`.
@@ -113,21 +114,28 @@ pub fn frame_rgba_with(
                 (_, false) => (0.25 + 0.5 * index as f32, 0.5),
             };
             let image = text::render_line(font, label, [255, 255, 255], english);
-            let scaled = downscale_half(&image.rgba, image.width, image.height);
-            let (sw, sh) = (image.width / 2, image.height / 2);
-            let x = ((width as f32 * cx) as usize).saturating_sub(sw / 2);
-            let y = ((height as f32 * cy) as usize).saturating_sub(sh / 2);
-            blit(
+            // `FUN_0044ced0`'s `h = scale * 48.0`: a label keeps the font's
+            // whole cell where a dialogue line is squashed to 42 of it, so the
+            // factor into layout space is the geometry's own scale. See
+            // `crate::ui::select::label_scale`.
+            let k = select::label_scale(text::Geometry::native(left_arrangement));
+            let (sw, sh) = (
+                (image.width as f32 * k).round().max(1.0) as usize,
+                (image.height as f32 * k).round().max(1.0) as usize,
+            );
+            let x = width as f32 * cx - sw as f32 / 2.0;
+            let y = height as f32 * cy - sh as f32 / 2.0;
+            blit_stretched(
                 &mut out,
                 width,
                 height,
-                &Surface {
-                    pixels: &scaled,
-                    width: sw,
-                    height: sh,
+                &image,
+                text::Placement {
+                    x,
+                    y,
+                    width: sw as f32,
+                    height: sh as f32,
                 },
-                x,
-                y,
             );
         }
     }
@@ -219,30 +227,6 @@ fn blit(dst: &mut [u8], dst_w: usize, dst_h: usize, src: &Surface<'_>, x0: usize
             dst[d + 3] = 255;
         }
     }
-}
-
-/// Box-filters an RGBA image to half size.
-fn downscale_half(src: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let (nw, nh) = (w / 2, h / 2);
-    let mut out = vec![0u8; nw * nh * 4];
-    for y in 0..nh {
-        for x in 0..nw {
-            let mut acc = [0u32; 4];
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let s = ((y * 2 + dy) * w + (x * 2 + dx)) * 4;
-                    for i in 0..4 {
-                        acc[i] += u32::from(src[s + i]);
-                    }
-                }
-            }
-            let d = (y * nw + x) * 4;
-            for i in 0..4 {
-                out[d + i] = (acc[i] / 4) as u8;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

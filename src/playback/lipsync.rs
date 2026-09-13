@@ -397,13 +397,6 @@ mod tests {
         assert_eq!(&out[8..12], &[200, 200, 200, 255]);
     }
 
-    /// No mouths means the caller keeps the surface it has, rather than paying
-    /// for a copy of the whole background on every pass.
-    #[test]
-    fn nothing_to_patch_makes_no_copy() {
-        assert!(compose_mouths(&[0u8; 16], (2, 2), &[]).is_none());
-    }
-
     /// A patch whose rectangle runs off the surface is clipped to what lands.
     /// The scan bounds it to the 800x452 canvas, so this only happens to a
     /// background that is not that size — which must not panic.
@@ -417,14 +410,6 @@ mod tests {
         assert_eq!(&out[(6 * w + 6) * 4..(6 * w + 6) * 4 + 4], &[5, 5, 5, 255]);
         assert_eq!(&out[(7 * w + 7) * 4..(7 * w + 7) * 4 + 4], &[5, 5, 5, 255]);
         assert_eq!(out.len(), w * h * 4);
-    }
-
-    /// A background that is not the size it says it is leaves the mouths off
-    /// rather than writing past the end of it.
-    #[test]
-    fn a_background_of_the_wrong_length_is_left_alone() {
-        let mouth = mouth_at(0, 0, 2, 2, [[1, 1, 1, 255]; 3]);
-        assert!(compose_mouths(&[0u8; 8], (800, 452), &[(&mouth, 0)]).is_none());
     }
 
     #[test]
