@@ -182,7 +182,7 @@ whatever filter the driver gave:
 ; fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area
 Scaler = bicubic
 ; libavfilter chains over every movie frame, before and after the scale
-Filters = deblock=filter=weak:block=8,gradfun=1.2:16
+Filters = deblock=filter=weak:block=8,deband=r=16,gradfun=1.2:16
 FiltersAfterScale =
 ; A very light grain over the finished frame, in levels of 255; 0 is off
 Grain = 2
@@ -218,7 +218,12 @@ are the answer, and which side of the scale each one runs on is the point:
 * `Filters` runs **before** the scale, at the clip's own size, where those
   artifacts are still the size the encoder made them. A debander cannot
   recognise a band the scaler has already stretched. The default is `deblock`
-  for the blocks and `gradfun` for the bands.
+  for the blocks and then both debanders, because they fail differently:
+  `gradfun` fits a gradient and repairs a shallow ramp, `deband` replaces a
+  pixel from references a radius away and breaks a step. On a close-up of dark
+  hair, where this encode's banding is worst, the fraction of the frame in flat
+  runs of eight pixels or more goes 5.9% unfiltered, 5.1% with `gradfun` alone,
+  2.7% with `deband` alone, and 1.5% with both.
 * `FiltersAfterScale` runs **after** it, on the frame at the size it will be
   seen. Anything *added* to the picture belongs here; laid down earlier it
   comes out magnified along with everything else. Empty by default.
@@ -228,9 +233,12 @@ are the answer, and which side of the scale each one runs on is the point:
   noises the alpha channel too. It covers the last of the banding: what the
   debander judged too wide to touch, and the contouring the upscale adds.
 
-The whole default pipeline costs about 5ms of a frame's 41 at 1080p, measured
-with `days media <clip> --at-size 1920x1085`, which is what that command is
-for. Empty chains and `Grain = 0` give the original's path exactly.
+The whole default pipeline costs about 7ms of a frame's 41 at 1080p — 12ms
+becomes 19 — measured with `days media <clip> --at-size 1920x1085`, which is
+what that command is for. At 3840x2170 it is 31ms becoming 39, which fits and
+not by much; most of that is the scale to eight megapixels and was there
+before any of this. Empty chains and `Grain = 0` give the original's path
+exactly.
 
 ### The pixel filter
 

@@ -118,18 +118,32 @@ impl UiScaler {
 
 /// The chain movie frames go through before they are scaled, by default.
 ///
-/// `deblock` and `gradfun` are the two artifacts the retail encode actually
-/// has, and both are worked out in [`crate::media::filter`]: 8x8 transform
-/// blocks, and gradients quantised into bands. Both are measured in *source*
-/// pixels, which is why this stage is before the scale.
+/// Three filters for the two artifacts the retail encode has — 8x8 transform
+/// blocks, and gradients quantised into bands — both of which are measured in
+/// *source* pixels, which is why this stage runs before the scale. See
+/// [`crate::media::filter`].
 ///
-/// `filter=weak` is the gentlest of `deblock`'s three, and `block=8` is the
-/// transform size WMV3 uses. `gradfun`'s `1.2` is a shade under its default
-/// strength of 1.2 rounded up from nothing — it is the amount of a step it will
-/// smooth, and above about 1.5 it starts eating real detail — over a radius of
-/// 16 pixels, which is the widest band the encoder's quantiser produces at this
-/// bitrate.
-pub const DEFAULT_FILTERS: &str = "deblock=filter=weak:block=8,gradfun=1.2:16";
+/// `deblock` takes the blocks. `filter=weak` is the gentler of its two and
+/// `block=8` is the transform size WMV3 uses, against a default of 16.
+///
+/// `deband` and `gradfun` are both debanders and both are here because they
+/// fail differently, which is measurable. On a close-up of dark hair — where
+/// the banding in this encode is worst, the steps being a level or two apart in
+/// a region the eye is most sensitive in — the fraction of the frame lying in
+/// flat runs of eight pixels or more goes 5.9% unfiltered, 5.1% with `gradfun`
+/// alone, 2.7% with `deband` alone, and 1.5% with both. `gradfun` fits a
+/// gradient and can only move a pixel by its strength, so it repairs a shallow
+/// ramp and leaves a step; `deband` replaces a pixel from references a radius
+/// away when they are all within a threshold of it, so it breaks the step and
+/// leaves the ramp alone.
+///
+/// Both are left at their own defaults — `deband`'s threshold of 0.02 and
+/// radius of 16, `gradfun`'s strength of 1.2 and radius of 16 — because past
+/// them the filters stop repairing and start inventing: at a `deband` threshold
+/// of 0.028 the *strong* edges in the same frame, the ones a picture is made
+/// of, measure 150% of the unfiltered frame's, and at 0.035 they measure 179%.
+/// That is not detail being kept. It is contrast being manufactured.
+pub const DEFAULT_FILTERS: &str = "deblock=filter=weak:block=8,deband=r=16,gradfun=1.2:16";
 
 /// The chain movie frames go through after they are scaled, by default.
 ///

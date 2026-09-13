@@ -113,6 +113,14 @@ impl Graph {
             if building.graph.is_null() {
                 return Err(Error::Alloc("AVFilterGraph"));
             }
+            // One slice per core, for the filters that support slice threading
+            // — `deband` does, `deblock` and `gradfun` do not, and it costs
+            // nothing to ask on their behalf. libavfilter's own default is to
+            // use every core, but it reads this field rather than deciding per
+            // filter, so saying it is what makes it true of a graph we built.
+            (*building.graph).nb_threads = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .min(64) as i32;
 
             let source = filter_by_name(c"buffer")?;
             let sink = filter_by_name(c"buffersink")?;
