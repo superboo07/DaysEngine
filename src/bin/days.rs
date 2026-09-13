@@ -137,6 +137,10 @@ enum Cmd {
         /// Decode a save slot and print what it holds.
         #[arg(long, value_name = "N")]
         slot: Option<u32>,
+        /// Jump to this story point of `--slot`, the way the route map does,
+        /// and report where it puts the player.
+        #[arg(long, value_name = "SP")]
+        story: Option<u32>,
         /// Read every save file, write it back, and check the bytes match.
         #[arg(long)]
         roundtrip: bool,
@@ -404,6 +408,15 @@ struct MenuArgs {
     /// `Opened(Mode(2))`.
     #[arg(long, value_name = "CODE")]
     from_bar: Option<u32>,
+    /// Stand in a playthrough loaded from this slot, so the screens that ask
+    /// what the *run* has done have something to answer from.
+    ///
+    /// The route map is the screen this matters to: its cells are charted from
+    /// the global store but can only be picked where the run's own store
+    /// carries the story point. Pair it with `--from-bar 5`, since the module
+    /// asks that second question only when the control bar opened it.
+    #[arg(long, value_name = "N")]
+    run_from_slot: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -510,10 +523,13 @@ fn main() -> Result<()> {
             all,
             grep,
             slot,
+            story,
             roundtrip,
         } => {
             if roundtrip {
                 cmd_save_roundtrip(&game)?
+            } else if let (Some(n), Some(sp)) = (slot, story) {
+                cmd_save_story(&game, n, sp)?
             } else if let Some(n) = slot {
                 cmd_save_slot(&game, n, all)?
             } else {
@@ -1464,6 +1480,17 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     if args.table {
         let atlas = screen.atlas();
         println!("widget table at DLL offset {:#x}", atlas.offset);
+        // Where the per-region records actually sit. More than one run means
+        // the screen's records are interleaved with other states of the same
+        // widgets, and the alternates below are numbered from the end of the
+        // last of them.
+        for (first, at, count) in &atlas.segments {
+            println!(
+                "  run of {count} from region {} at {at:#x} (record {})",
+                first + 1,
+                (at - atlas.offset) / 24
+            );
+        }
         for (i, wgt) in atlas.widgets.iter().enumerate() {
             println!(
                 "  id {:3}  dst ({:4},{:4}) {:4}x{:<3}  src ({:4},{:4})",
@@ -1885,6 +1912,45 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
         ),
         None => format!("the file is {} bytes, we write {}", a.len(), b.len()),
     }
+}
+
+/// Loads a slot and jumps to one of its story points, as the route map does.
+///
+/// The same two calls the game makes — `Progress::from_slot` then
+/// `Progress::from_story` — so what this reports is where the jump would put
+/// the player, and what it left of the run's history.
+fn cmd_save_story(game: &Path, slot: u32, story: u32) -> Result<()> {
+    use daysengine::install::progress::Progress;
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let film = film_ini(&vfs);
+    let flags = load_flags(game, &vfs);
+    let mut progress = Progress::load(&vfs, &route_dll(game)?, flags)?;
+    if progress.load_from(game, &film, slot).is_none() {
+        println!("slot {slot} is empty");
+        return Ok(());
+    }
+    let before: Vec<String> = progress.marks().map(str::to_owned).collect();
+    println!("slot {slot} carries {} story points", before.len());
+    let Some(script) = progress.from_story(story) else {
+        println!("SP{story:03} is not one of them, so the route map would grey it");
+        return Ok(());
+    };
+    let (route, scene) = progress.position();
+    println!("SP{story:03} plays {script} at ROUTE {route} SCENE {scene}");
+    let after: Vec<String> = progress.marks().map(str::to_owned).collect();
+    println!(
+        "  {} story points left, {} erased: {}",
+        after.len(),
+        before.len() - after.len(),
+        before
+            .iter()
+            .filter(|m| !after.contains(m))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    Ok(())
 }
 
 /// Prints what one save slot holds.
@@ -2362,6 +2428,13 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
         english,
         text_input: film.get_bool("TextInput").unwrap_or(false),
+        run: args.run_from_slot.and_then(|n| {
+            let slot = daysengine::install::save::load_slot(game, &film, n);
+            if slot.is_none() {
+                log::warn!("slot {n} is empty, so there is no run to stand in");
+            }
+            slot.map(|slot| slot.store)
+        }),
     };
 
     if args.check_all {
@@ -2577,6 +2650,34 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 );
             }
             None => println!("    expanded comment: none"),
+        }
+    }
+
+    // The route map's cells are story points, and which of them are charted
+    // and which can be picked is the whole of what the screen decides. Print
+    // them, since neither is visible in a widget count.
+    if menu.mode() == Mode::ROUTEMAP {
+        let (episode, page, chart) = menu.chart();
+        let charted = menu.charted();
+        let pickable = menu.pickable();
+        println!(
+            "  route map, episode {} page {}, {} story points",
+            episode + 1,
+            page + 1,
+            chart.cells
+        );
+        for cell in 0..chart.cells {
+            let story = daysengine::ui::routemap::story(episode, chart.base, cell);
+            println!(
+                "    {:<6} {:<10} {}",
+                daysengine::ui::routemap::story_flag(story),
+                if charted[cell] { "charted" } else { "blank" },
+                if pickable[cell] {
+                    "can be picked"
+                } else {
+                    "not this run"
+                }
+            );
         }
     }
 

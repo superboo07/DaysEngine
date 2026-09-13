@@ -52,6 +52,7 @@ use crate::ui::options;
 use crate::ui::options::Dir;
 use crate::ui::playdata;
 use crate::ui::replay::{self, Scenes};
+use crate::ui::routemap;
 use crate::ui::saveload::{self, Kind, Slots};
 use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
 use days_save::FlagStore;
@@ -92,8 +93,12 @@ impl Mode {
             Mode::OPTION => format!("System/Option/Option_{variant}"),
             Mode::REPLAY => format!("System/Replay/Replay_{variant}"),
             // Episodes 1 and 2 are one page; 3 upwards add a `-N` suffix the
-            // screen pages through, so the variant carries both parts.
-            Mode::ROUTEMAP => format!("System/RouteMap/{variant}/RouteMap{variant}"),
+            // screen pages through, so the variant carries both parts and the
+            // directory is only the first of them.
+            Mode::ROUTEMAP => match variant.split_once('-') {
+                Some((episode, _)) => format!("System/RouteMap/{episode}/RouteMap{variant}"),
+                None => format!("System/RouteMap/{variant}/RouteMap{variant}"),
+            },
             Mode::SOM_CONFIG => "System/Option/Pop_Som".to_string(),
             Mode::REPLAY_POPUP => format!("System/Replay/Pop_Replay_{variant}"),
             Mode::CONFIRM => "System/Exit/Popup".to_string(),
@@ -378,6 +383,12 @@ pub enum Action {
     Display(options::DisplayRequest),
     /// Load a save slot and play what it names.
     Load(u32),
+    /// Jump to a story point the run has passed, from the route map.
+    ///
+    /// `FUN_1000e8b0` hands the host `+0x48(story)` and `+0x4c(8)` — the Load
+    /// screen's own pair, with a number of 100 or more instead of a slot — and
+    /// raises `_GetRouteLoad@0`. See [`crate::ui::routemap`].
+    LoadStory(u32),
     /// Write the player's position to a save slot.
     Save(u32),
     /// Quit the game.
@@ -405,6 +416,14 @@ pub struct Session {
     pub som: options::Som,
     /// What the save/load screen shows for each slot.
     pub slots: Slots,
+    /// The store of the playthrough that is running, when one is.
+    ///
+    /// The route map asks two questions about a story point and this answers
+    /// the second: host `+0x18` against [`Session::flags`] is whether the
+    /// player has ever seen it, and host `+0x10` against this is whether they
+    /// passed it in the run they are in. There is no run from the title, and
+    /// `FUN_1000c740` does not ask there either — see [`crate::ui::routemap`].
+    pub run: Option<FlagStore>,
     /// `FILMENGINE.INI [TextInput]`, which is what host `+0xd8` answers.
     ///
     /// It gates the save row's comment column and the expanded comment behind
@@ -432,6 +451,7 @@ impl Session {
             display: options::Display::default(),
             som: options::Som::default(),
             slots: Slots::default(),
+            run: None,
             english: false,
             text_input: false,
         }
@@ -548,6 +568,10 @@ pub struct Menu {
     view: replay::View,
     /// Which page of the replay grid: `+0x2a4`.
     page: usize,
+    /// Which episode the route map is charting: `MENU::RouteMap` `+0x3d8`.
+    episode: usize,
+    /// Which page of it: `+0x3e0`.
+    map_page: usize,
     /// The scene the replay popup is asking about: `+0x2a8`.
     asked: Option<usize>,
     /// Which job the save/load screen is doing: its `+0x94`, which
@@ -633,7 +657,7 @@ impl Menu {
     ) -> Result<Menu, Error> {
         let tab = options::Tab::DEFAULT;
         let view = replay::View::DEFAULT;
-        let variant = variant_for(&session, mode, tab, view, None);
+        let variant = variant_for(&session, mode, tab, view, None, (0, 0));
         let screen = load_screen(
             vfs,
             dll,
@@ -659,6 +683,8 @@ impl Menu {
             tab,
             view,
             page: 0,
+            episode: 0,
+            map_page: 0,
             asked: None,
             kind,
             thumbnails: None,
@@ -674,7 +700,14 @@ impl Menu {
 
     /// Loads `mode`'s screen into this menu, keeping the session.
     fn enter(&mut self, vfs: &Vfs, dll: &[u8], mode: Mode, return_to: Mode) -> Result<(), Error> {
-        let variant = variant_for(&self.session, mode, self.tab, self.view, self.asked);
+        let variant = variant_for(
+            &self.session,
+            mode,
+            self.tab,
+            self.view,
+            self.asked,
+            (self.episode, self.map_page),
+        );
         let screen = load_screen(
             vfs,
             dll,
@@ -995,6 +1028,17 @@ impl Menu {
             // Every widget, until the confirm popup goes up — which this
             // engine does not raise, so `popup_up` is always false here.
             Mode::SAVELOAD => saveload::enabled(false, widget),
+            Mode::ROUTEMAP => {
+                let page = self.chart_page();
+                routemap::enabled(
+                    self.episode,
+                    self.map_page,
+                    page.cells,
+                    self.session.save.trial,
+                    &self.pickable(),
+                    widget,
+                )
+            }
             _ => true,
         }
     }
@@ -1062,6 +1106,33 @@ impl Menu {
                     ),
                 };
                 base.checked_sub(regions)?.checked_add(slot)
+            }
+            // A cell of the route map paints its own state over the empty
+            // chart in the base art. `FUN_1000ce40` builds the sprite from one
+            // of two bands of the page's record table — `+0x21 + cells + i`
+            // for a story point this run has not passed and `+0x21 + 3 * cells
+            // + i` for one it has — and `FUN_1000c3d0` paints it only where the
+            // global store says the point has ever been seen. The band the
+            // regions themselves matched is the third, `+0x21 + i`, which is
+            // the hover art, so a cell the pointer is on wants its own record
+            // and not an alternate.
+            Mode::ROUTEMAP => {
+                let cells = self.chart_page().cells;
+                let routemap::Act::Cell(cell) = routemap::action(cells, widget) else {
+                    return None;
+                };
+                if !self.charted().get(cell).copied().unwrap_or(false) {
+                    return None;
+                }
+                if self.selection == Some(widget) {
+                    return None;
+                }
+                let extra = if self.pickable().get(cell).copied().unwrap_or(false) {
+                    2 * cells + cell
+                } else {
+                    cell
+                };
+                (extra < self.screen.atlas().extras.len()).then_some(extra)
             }
             _ => None,
         }
@@ -1223,6 +1294,7 @@ impl Menu {
             // clicks rather than stacking another one behind it.
             Mode::SAVELOAD if self.pending_save.is_some() => Ok(Action::Stay),
             Mode::SAVELOAD => self.confirm_saveload(vfs, dll, widget),
+            Mode::ROUTEMAP => self.confirm_routemap(vfs, dll, widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
@@ -1264,9 +1336,158 @@ impl Menu {
                 Ok(Action::Stay)
             }
             saveload::Act::Leave => self.leave(vfs, dll),
-            saveload::Act::RouteMap => self.advance(vfs, dll, Mode::ROUTEMAP),
+            saveload::Act::RouteMap => self.open_routemap(vfs, dll),
             saveload::Act::None => Ok(Action::Stay),
         }
+    }
+
+    /// Which episode and page of the chart the route map is showing, and what
+    /// that page holds.
+    pub fn chart(&self) -> (usize, usize, routemap::Page) {
+        (self.episode, self.map_page, self.chart_page())
+    }
+
+    /// The page of the chart the route map is showing.
+    ///
+    /// An episode can be left parked on a page it does not have — see
+    /// [`routemap::page_for_episode`] — and the original reads its table with
+    /// that index regardless. Here that falls back to the episode's first page,
+    /// which is the page whose art the screen will have loaded.
+    fn chart_page(&self) -> routemap::Page {
+        routemap::page(self.episode, self.map_page)
+            .or_else(|| routemap::page(self.episode, 0))
+            .unwrap_or(routemap::Page { cells: 0, base: 0 })
+    }
+
+    /// Which cells of the page the player may jump to, from `FUN_1000c740`.
+    ///
+    /// The save's own store answers it, and only while a playthrough is
+    /// running: the module computes this half at all only when its `+0x4ec` is
+    /// set, and that member is 1 from `setSystemInit` — the driver over
+    /// playback — and 0 from `_SystemInit@8`, the title-rooted shell.
+    pub fn pickable(&self) -> Vec<bool> {
+        let page = self.chart_page();
+        let Some(run) = self
+            .session
+            .run
+            .as_ref()
+            .filter(|_| self.entry == Entry::Playback)
+        else {
+            return vec![false; page.cells];
+        };
+        (0..page.cells)
+            .map(|cell| {
+                run.flag(&routemap::story_flag(routemap::story(
+                    self.episode,
+                    page.base,
+                    cell,
+                )))
+            })
+            .collect()
+    }
+
+    /// Which cells of the page are drawn at all, from the other half of
+    /// `FUN_1000c740`: the global store, so a story point the player has ever
+    /// reached is charted whether or not this run has passed it.
+    pub fn charted(&self) -> Vec<bool> {
+        let page = self.chart_page();
+        (0..page.cells)
+            .map(|cell| {
+                self.session
+                    .flags
+                    .flag(&routemap::story_flag(routemap::story(
+                        self.episode,
+                        page.base,
+                        cell,
+                    )))
+            })
+            .collect()
+    }
+
+    /// The route map's dispatch, from `FUN_1000e8b0`.
+    ///
+    /// Picking a cell leaves the menus the way the Load screen's rows do, with
+    /// a story number in place of a slot. Everything else moves the chart and
+    /// reloads its art, which is what `FUN_1000d890` does at the end of each
+    /// arm.
+    fn confirm_routemap(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        let page = self.chart_page();
+        let (episode, map_page) = (self.episode, self.map_page);
+        let (episode, map_page) = match routemap::action(page.cells, widget) {
+            // Not a Close like every other screen's. `FUN_1000e8b0` asks the
+            // save/load module whether *it* opened the map — `FUN_10001520`
+            // reads its `+0x1fc`, which `FUN_10014990` raises on the way in —
+            // and answers `+0x4c(5)`, the Load screen, when it did. Its other
+            // branch is `+0x4c(0)`, leave the menus, and **that branch cannot
+            // be taken in the retail build**: the map has no other way in, so
+            // the member is always set while it is up.
+            routemap::Act::Close => {
+                self.kind = Kind::Load;
+                return self.advance(vfs, dll, Mode::SAVELOAD);
+            }
+            routemap::Act::Cell(cell) => {
+                return Ok(Action::LoadStory(routemap::story(episode, page.base, cell)))
+            }
+            routemap::Act::Episode(tab) if tab != episode => {
+                (tab, routemap::page_for_episode(episode, tab, map_page))
+            }
+            routemap::Act::PrevEpisode => routemap::step_back(episode, map_page),
+            routemap::Act::NextEpisode => routemap::step_on(episode, map_page),
+            routemap::Act::PrevPage => (episode, map_page.saturating_sub(1)),
+            routemap::Act::NextPage => (episode, map_page + 1),
+            _ => return Ok(Action::Stay),
+        };
+        self.show_chart(vfs, dll, episode, map_page)
+    }
+
+    /// Moves the chart and loads the art the new page names.
+    ///
+    /// A page whose art will not load leaves the chart where it was rather
+    /// than on a screen it cannot draw, which is the rule every screen here
+    /// follows.
+    fn show_chart(
+        &mut self,
+        vfs: &Vfs,
+        dll: &[u8],
+        episode: usize,
+        map_page: usize,
+    ) -> Result<Action, Error> {
+        let (was_episode, was_page) = (self.episode, self.map_page);
+        self.episode = episode;
+        self.map_page = map_page;
+        let back = self.return_to;
+        match self.enter(vfs, dll, Mode::ROUTEMAP, back) {
+            Ok(()) => Ok(Action::Opened(Mode::ROUTEMAP)),
+            Err(err) => {
+                log::warn!(
+                    "no route map art for episode {} page {}: {err}",
+                    episode + 1,
+                    map_page + 1
+                );
+                self.episode = was_episode;
+                self.map_page = was_page;
+                Ok(Action::Unavailable(Mode::ROUTEMAP))
+            }
+        }
+    }
+
+    /// Opens the route map, as the Load screen's widget `0x15` does.
+    ///
+    /// `FUN_1000e060` puts the chart on the player's own episode and page when
+    /// the screen was opened from inside a playthrough, and leaves it on the
+    /// first of each when it was not — the constructor's zeroes, which the
+    /// title-rooted screen never overwrites.
+    fn open_routemap(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
+        let (episode, page) = match self
+            .session
+            .run
+            .as_ref()
+            .filter(|_| self.entry == Entry::Playback)
+        {
+            Some(run) => routemap::opened_at(run.int("ROUTE"), run.flag("EndClear")),
+            None => (0, 0),
+        };
+        self.show_chart(vfs, dll, episode, page)
     }
 
     /// Opens the save/load screen for one of its two jobs.
@@ -1276,7 +1497,11 @@ impl Menu {
     /// set before the art is chosen.
     pub fn open_saveload(&mut self, vfs: &Vfs, dll: &[u8], kind: Kind) -> Result<Action, Error> {
         self.kind = kind;
-        self.page = 0;
+        // The page is *not* reset. `FUN_100135c0`, the module's open, never
+        // writes `+0x1f0`; the only zero it ever gets is from `FUN_100111f0`,
+        // which one static-init thunk calls at load time. So the page the
+        // player left the list on is the page they come back to, whether they
+        // come back from the route map, from the other job, or from the title.
         self.advance(vfs, dll, Mode::SAVELOAD)
     }
 
@@ -1619,11 +1844,13 @@ fn variant_for(
     tab: options::Tab,
     view: replay::View,
     asked: Option<usize>,
+    chart: (usize, usize),
 ) -> String {
     match mode {
         Mode::TITLE => session.save.title_variant().to_string(),
         Mode::OPTION => tab.variant().to_string(),
         Mode::REPLAY => view.variant().to_string(),
+        Mode::ROUTEMAP => routemap::variant(chart.0, chart.1),
         Mode::REPLAY_POPUP => {
             let choices = asked
                 .and_then(|scene| session.scenes.get(scene))
@@ -2001,29 +2228,43 @@ mod tests {
         let hscene = replay::View::DEFAULT;
 
         assert_eq!(
-            variant_for(&session, Mode::TITLE, def, hscene, None),
+            variant_for(&session, Mode::TITLE, def, hscene, None, (0, 0)),
             "Title_Clear",
             "the title is the one that picks from save state"
         );
         assert_eq!(
-            variant_for(&session, Mode::OPTION, def, hscene, None),
+            variant_for(&session, Mode::OPTION, def, hscene, None, (0, 0)),
             "Def"
         );
         assert_eq!(
-            variant_for(&session, Mode::OPTION, options::Tab::SomCon, hscene, None),
+            variant_for(
+                &session,
+                Mode::OPTION,
+                options::Tab::SomCon,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "SomCon"
         );
         assert_eq!(
-            variant_for(&session, Mode::REPLAY, def, hscene, None),
+            variant_for(&session, Mode::REPLAY, def, hscene, None, (0, 0)),
             "HScene"
         );
         assert_eq!(
-            variant_for(&session, Mode::REPLAY, def, replay::View::PlayData, None),
+            variant_for(
+                &session,
+                Mode::REPLAY,
+                def,
+                replay::View::PlayData,
+                None,
+                (0, 0)
+            ),
             "PlayData"
         );
         // A mode with no remembered state keeps the DLL's own default.
         assert_eq!(
-            variant_for(&session, Mode::ROUTEMAP, def, hscene, None),
+            variant_for(&session, Mode::ROUTEMAP, def, hscene, None, (0, 0)),
             "01"
         );
     }
@@ -2054,16 +2295,16 @@ mod tests {
         let def = options::Tab::DEFAULT;
         let hscene = replay::View::DEFAULT;
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(0)),
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(0), (0, 0)),
             "2"
         );
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(1)),
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(1), (0, 0)),
             "4"
         );
         // With nothing asked, the module's own zeroed member picks the small one.
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, None),
+            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, None, (0, 0)),
             "2"
         );
     }

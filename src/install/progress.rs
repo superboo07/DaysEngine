@@ -373,6 +373,43 @@ impl Progress {
         Some(slot.script)
     }
 
+    /// Jumps to a story point the run has passed, as the route map does.
+    ///
+    /// `FUN_00428400` formats the number into `SP%03d` and hands it to
+    /// `FUN_004331a0`, which finds that mark among the ones the run has
+    /// recorded and restores it through `FUN_00432670`: the mark's own store
+    /// goes to `FUN_00428a20` — the same install a slot's store gets — and its
+    /// script to `FUN_0042a760`, which opens the file. So a jump is a load
+    /// whose state came from memory rather than from a file, and the position
+    /// rides in the store exactly as it does for a slot.
+    ///
+    /// **The marks from the picked one onward are erased.** `FUN_004331a0`
+    /// destroys every entry from the one it found to the end of the map and
+    /// then erases that range, which is right for a rewind: the story points
+    /// after this one have not been reached any more. The map is keyed by the
+    /// `SP%03d` name, and those sort the same way their numbers do.
+    ///
+    /// `None` is a story point this run never passed, which the route map does
+    /// not offer — it greys a cell whose flag the save's store does not carry.
+    pub fn from_story(&mut self, story: u32) -> Option<String> {
+        let name = format!("SP{story:03}");
+        let mark = self.marks.get(&name)?;
+        let script = mark.script.clone();
+        self.stores.save = mark.store.clone();
+        self.marks.split_off(&name);
+        self.stores.choice = -1;
+        self.gauge_raised = false;
+        let (route, scene) = self.position();
+        log::info!("{name} puts the player at ROUTE {route} SCENE {scene}: {script}");
+        Some(script)
+    }
+
+    /// The story points the run has reached, which is what the route map lights
+    /// its cells from.
+    pub fn marks(&self) -> impl Iterator<Item = &str> {
+        self.marks.keys().map(String::as_str)
+    }
+
     /// The chapter the player is in — the `N` the save line spells `第N話`.
     pub fn chapter(&self) -> u32 {
         let (route, _) = self.position();

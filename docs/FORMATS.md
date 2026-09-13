@@ -2171,6 +2171,124 @@ described above.
 
 ---
 
+## The route map — mode 6, `System/RouteMap`
+
+`MENU::RouteMap` charts one episode's story points, opened from the Load
+screen's widget `0x15` and from nowhere else. Fifteen widgets, and the last of
+them are the chart itself:
+
+```text
+0x00 .. 0x05   the six episode tabs
+0x06           close
+0x07  0x08     previous episode, next episode
+0x09  0x0a     previous page, next page
+0x0b ..        the story points of this page, in order
+```
+
+`FUN_1000e8b0` is the dispatch and `FUN_1000e750` the enablement. The page
+buttons are gated by the **episode** and not by the page count, because
+`FUN_1000d890` leaves that count at zero for the two episodes that are a single
+page.
+
+### The chart is `SP%03d`, asked of both stores
+
+`FUN_1000c740` is the whole of what a cell means:
+
+```text
+SP%03d of (episode + 1) * 100 + base + cell
+  host +0x18   the global store   ever seen it     -> the cell is painted
+  host +0x10   the save's store   passed it here   -> the cell can be picked
+```
+
+The second question is asked only when the module's `+0x4ec` is set, and that
+member is the screen's two lives: `_SystemInit@8` case 6 opens it with **0**
+and `setSystemInit` case 6 with **1** — the title-rooted shell and the driver
+that runs over playback. So the route map reached from the title is a chart to
+look at with every cell inert, and the same screen reached from the control bar
+mid-playthrough is how the player jumps back.
+
+`FUN_1000e060` opens it on the player's own episode and page when there is a
+playthrough, from `_GetStory@4` and `_GetRouteMapPage@8`. Both are
+`RouteProcSDHQ.dll` tables over `ROUTE`; eight of the 55 routes answer the
+second by asking `_CheckScript@8` instead, and **`_CheckScript@8` is not
+recovered** — it dispatches to one function per route, 55 of them. Those eight
+open on the episode's first page here. The same call is what `+0x3e4`, the
+"you are here" marker, is computed from, so **that marker is not implemented**.
+
+### The page table
+
+`FUN_1000d890` switches on the episode and the page to set the cell count, the
+base and the art. Every page's record table is `0x21 + 4 * cells` long, which
+is what each row below is checked against.
+
+```text
+ep  page  cells  base  records     art
+ 1    -      4    0     0x31       RouteMap01
+ 2    -      9    0     0x45       RouteMap02
+ 3    1      7    0     0x3d       RouteMap03-1
+ 3    2      4    7     0x31       RouteMap03-2
+ 4    1      8    0     0x41       RouteMap04-1
+ 4    2      8    8     0x41       RouteMap04-2
+ 4    3     15   0x10   0x5d       RouteMap04-3
+ 4    4      4   0x1f   0x31       RouteMap04-4
+ 5    1     11    0     0x4d       RouteMap05-1
+ 5    2     18   0xb    0x69       RouteMap05-2
+ 5    3     19   0x1d   0x6d       RouteMap05-3
+ 5    4      9   0x30   0x45       RouteMap05-4
+ 6    1     11    0     0x4d       RouteMap06-1
+ 6    2      9   0xb    0x45       RouteMap06-2
+ 6    3     13   0x14   0x55       RouteMap06-3
+ 6    4     12   0x21   0x51       RouteMap06-4
+```
+
+Tabbing between the short episodes and the long ones carries the page across
+rather than resetting it, and nothing clamps the result to the episode being
+entered — so episode 1 can be left parked on page 2. That costs nothing because
+the switch ignores the page for the two single-page episodes.
+
+### The four bands of cell records
+
+The records are 33 fixed ones and then four bands of one per cell, and
+`FUN_1000ce40` picks between them:
+
+```text
+0x21 + i               hover      -- and what the hit map's regions match
+0x21 + cells + i       charted, not passed this run
+0x21 + 2 * cells + i   unused by the draw
+0x21 + 3 * cells + i   passed this run, pickable
+```
+
+The hit map's cell regions match the **first** band, so `days_ui`'s atlas
+reports this screen as two runs — records 0..10 for the eleven fixed widgets
+and `0x21 ..` for the cells — and its alternates are numbered from the end of
+the second. A cell the pointer is on therefore wants its own record, and every
+other painted cell wants an alternate.
+
+### Picking a cell
+
+Host `+0x48(story)` and `+0x4c(8)` — the Load screen's own pair with a number
+of 100 or more in place of a slot — and `_GetRouteLoad@0` raised.
+`FUN_00423a70` sends a number that size to `FUN_00428400`, which formats
+`SP%03d` and hands it to `FUN_004331a0`: find that mark among the ones the run
+recorded, restore it through `FUN_00432670` — the mark's store to
+`FUN_00428a20` and its script to `FUN_0042a760`, the same pair a slot's load
+uses — and then **erase every mark from it to the end**, because the story
+points after a rewind have not been reached any more.
+
+The flag is what makes that possible: `FUN_00432850` skips emptying the marks
+while `_GetRouteLoad@0` is set, so the history the jump reads is still there
+when `FUN_00423130` runs. `FUN_00428400` drops the flag once the jump lands.
+
+Close is not the `+0x4c(0)` every other screen leaves with. `FUN_1000e8b0`
+asks the save/load module whether it was the one that opened the map —
+`FUN_10001520` reads its `+0x1fc`, raised by `FUN_10014990` on the way in — and
+answers `+0x4c(5)`, the Load screen, when it was. The other branch **cannot be
+taken in the retail build**: the map has no other way in. The Load screen comes
+back on the page the player left, because `FUN_100135c0` never writes `+0x1f0`
+— the only zero it gets is from the constructor.
+
+---
+
 ## Media
 
 - **Video**: ASF/WMV, codec WMV3 (VC-1 Main), 800x452, 24 fps, ~800 kb/s,

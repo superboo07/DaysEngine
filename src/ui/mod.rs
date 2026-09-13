@@ -19,6 +19,7 @@ pub mod menu;
 pub mod options;
 pub mod playdata;
 pub mod replay;
+pub mod routemap;
 pub mod saveload;
 pub mod screen;
 pub mod select;

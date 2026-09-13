@@ -508,6 +508,17 @@ fn main() -> Result<()> {
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
                 // fresh `searchRoot` on the name.
+                // The route map's cells are inert from the title — the module
+                // computes what can be picked only when a run is in play — so
+                // this arrives from the bar's copy of the screen. It is handled
+                // here too because the outcome is the menus', not playback's.
+                Outcome::LoadStory(story) => {
+                    if let Some(script) = enter_story(&mut player, progress.as_mut(), story) {
+                        next = script;
+                        chained = true;
+                    }
+                    continue;
+                }
                 // A slot that will not read starts nothing, and the menus
                 // keep the screen.
                 Outcome::LoadSlot { slot, recorded } => {
@@ -620,6 +631,17 @@ fn main() -> Result<()> {
         //
         // A load replaces the position outright, so a replay scene that was
         // running ends here rather than carrying its list across.
+        // A story point picked on the route map leaves playback exactly as a
+        // slot does — `+0x48` then `+0x4c(8)` — so it comes back to the same
+        // place and is answered the same way.
+        if let Outcome::LoadStory(story) = outcome {
+            replaying = None;
+            if let Some(script) = enter_story(&mut player, progress.as_mut(), story) {
+                next = script;
+                chained = true;
+                continue;
+            }
+        }
         if let Outcome::LoadSlot { slot, recorded } = outcome {
             replaying = None;
             if let Some(script) = enter_slot(&mut player, progress.as_mut(), slot, recorded) {
@@ -721,6 +743,12 @@ enum Outcome {
     SkipToChoice,
     /// Play a replay scene: the scripts it runs through and how it walks them.
     Replay(replay::Run),
+    /// Jump to a story point of the run, from the route map.
+    ///
+    /// The same leave the load screen's rows make, with a story number rather
+    /// than a slot: `FUN_00423a70` sends a number of 100 or more to
+    /// `FUN_00428400`, which restores the mark the run recorded for it.
+    LoadStory(u32),
     /// Load a save slot and play what it names.
     ///
     /// `recorded` is a row of the replay screen's play-data list rather than
@@ -783,6 +811,24 @@ fn enter_slot(
     }
 }
 
+/// Puts the player at a story point the run has passed, as the route map does.
+///
+/// The jump is a load whose state comes from the run rather than from a file:
+/// `FUN_00428400` restores the mark and opens its script. A story point this
+/// run never passed has no mark, and the route map does not offer one — it
+/// greys any cell the save's store has no flag for — so this is a refusal
+/// that leaves the player where they were.
+fn enter_story(player: &mut Player, progress: Option<&mut Progress>, story: u32) -> Option<String> {
+    player.following_record = false;
+    match progress.and_then(|p| p.from_story(story)) {
+        Some(script) => Some(script.rsplit('/').next().unwrap_or(&script).to_string()),
+        None => {
+            log::warn!("this run never reached SP{story:03}");
+            None
+        }
+    }
+}
+
 /// Loads the picture that goes behind the title.
 ///
 /// This belongs to the engine, not to the menu module: `Title.png` is
@@ -808,7 +854,7 @@ fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
 /// A scene table that cannot be recovered is not fatal: the replay screen shows
 /// an empty grid and says why, which is the same rule every other missing asset
 /// follows.
-fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
+fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progress>) -> Session {
     let scenes = match Scenes::recover(&player.dll) {
         Ok(scenes) => scenes,
         Err(err) => {
@@ -832,6 +878,9 @@ fn build_session(player: &Player, start: &Ini, english: bool) -> Session {
         // The screen reports a slot as present when its file opens, and takes
         // the line it shows from the global store.
         slots: Slots::read(&player.game, player.film, &player.flags, english),
+        // The route map asks this one whether the run has passed a story
+        // point. From the title there is no run and the screen does not ask.
+        run: run.map(|p| p.store().clone()),
     }
 }
 
@@ -869,7 +918,7 @@ fn run_menu(
     // `[UseEnglish]` decides which way round the save line's date reads, and
     // how many characters of it are the chapter.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
-    let session = build_session(player, start, english);
+    let session = build_session(player, start, english, progress.as_deref());
     apply_settings(&session, player.mixer);
     // A bar-opened screen is not a title menu that then navigates: host
     // `+0xf8` puts the playback object straight into its menu layer with that
@@ -992,6 +1041,7 @@ fn run_menu(
                         recorded: false,
                     })
                 }
+                Action::LoadStory(story) => return Ok(Outcome::LoadStory(story)),
                 // Naming the save is what confirms it. The original hands this
                 // to Windows; `run_comment` draws the same dialog out of the
                 // executable's own template. Cancelling calls nothing, so no
