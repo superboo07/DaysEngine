@@ -14,12 +14,20 @@
 //! usually the same folder; but the settings belong to the engine, and looking
 //! for them where the engine is means running from anywhere still finds them.
 //!
-//! It is written exactly once: when [`Settings::load`] finds no file there, it
-//! writes [`template`] — every default, spelled out, with the comment that says
-//! what each one does — so the first thing a player who wants to change
-//! something finds is a file with the knobs already in it rather than a name
-//! from a README they have to type out. Nothing after that touches it; the
-//! values are its own and deleting it restores every default.
+//! The engine keeps it complete, and never keeps it any other way. With no
+//! file there, [`Settings::load`] writes [`template`] — every default, spelled
+//! out, with the comment that says what each one does — so the first thing a
+//! player who wants to change something finds is a file with the knobs already
+//! in it rather than a name from a README they have to type out. With a file
+//! that is missing something, [`top_up`] writes the missing part into it and
+//! leaves the rest exactly as it was: a setting nobody has written down is a
+//! setting nobody can find, and a file from an older build would otherwise
+//! never mention the twenty rebindable actions at all.
+//!
+//! That is the only editing of the file there is. Nothing already in it is
+//! reordered, reworded or re-valued, every value written is the default the
+//! engine was about to use anyway, and deleting the file restores every
+//! default.
 //!
 //! # The format
 //!
@@ -277,6 +285,7 @@ impl Settings {
             Ok(text) => {
                 let settings = Settings::parse(&text);
                 log::info!("{} : {settings:?}", path.display());
+                Settings::top_up_file(&path, &text);
                 settings
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -297,6 +306,11 @@ impl Settings {
     /// unannounced safe, and what
     /// `the_template_parses_to_the_defaults` holds to.
     ///
+    /// This one *replaces*, so it is only ever reached for a file that is not
+    /// there. A file that cannot be read, or that a player has half-edited, is
+    /// theirs; [`top_up`] is what adds to one of those, and it never takes
+    /// anything away.
+    ///
     /// A failure here is a line in the log and nothing else. The engine is
     /// about to run on the defaults either way, and a read-only folder — a
     /// game installed under `Program Files`, an install on a mounted image —
@@ -306,6 +320,42 @@ impl Settings {
             Ok(()) => log::info!("no {}; wrote the defaults there", path.display()),
             Err(err) => log::info!(
                 "no {} and it cannot be created ({err}); using default settings",
+                path.display()
+            ),
+        }
+    }
+
+    /// Writes anything the file does not mention into it, keeping every line
+    /// the player wrote.
+    ///
+    /// A setting nobody has written down is a setting nobody can find. The
+    /// bindings are the case that makes this worth doing — twenty actions
+    /// whose names are the only documentation of what can be rebound, and a
+    /// file written by an older build has none of them — but the rule is the
+    /// same for every key: if the engine reads it, the file says so.
+    ///
+    /// This is the one thing that edits a file the player owns, so it is
+    /// strictly additive. Nothing is reordered, nothing is reworded and no
+    /// value is ever changed; a missing section arrives as the whole commented
+    /// block from [`template`], and a missing key arrives as one line at the
+    /// end of the section it belongs to. Every value written is the default,
+    /// which is what the engine was about to use anyway — so the file after
+    /// this and the file before it mean exactly the same thing, which is what
+    /// makes doing it unannounced safe.
+    ///
+    /// A failure is a line in the log. A read-only install is not a reason to
+    /// refuse to start, and the settings are already in hand.
+    fn top_up_file(path: &std::path::Path, text: &str) {
+        let Some(filled) = top_up(text) else {
+            return;
+        };
+        match std::fs::write(path, filled) {
+            Ok(()) => log::info!(
+                "{} did not mention every setting; wrote the missing ones in",
+                path.display()
+            ),
+            Err(err) => log::info!(
+                "{} is missing settings and cannot be written ({err})",
                 path.display()
             ),
         }
@@ -397,6 +447,131 @@ impl Settings {
             _ => log::warn!("{FILE} line {line}: nothing reads [{section}] {key}"),
         }
     }
+}
+
+/// One `[Section]` of [`template`]: its lowercased name, and every line of it
+/// including the header.
+///
+/// The blocks are read back out of the generated template rather than kept
+/// beside it, so the two cannot drift: whatever `days settings --template`
+/// prints is exactly what a file missing a section is given.
+fn template_blocks() -> Vec<(String, Vec<String>)> {
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    for line in template().lines() {
+        match section_header(line) {
+            Some(name) => blocks.push((name, vec![line.to_string()])),
+            // Everything before the first header is the file's own preamble
+            // and belongs to no section, so it is dropped.
+            None => {
+                if let Some((_, body)) = blocks.last_mut() {
+                    body.push(line.to_string());
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// The lowercased name of a `[Section]` header, or `None` for any other line.
+fn section_header(line: &str) -> Option<String> {
+    let line = line.trim().trim_start_matches('\u{feff}');
+    let name = line.strip_prefix('[')?.strip_suffix(']')?;
+    Some(name.trim().to_ascii_lowercase())
+}
+
+/// The lowercased key a `key = value` line sets, ignoring comments.
+fn setting_key(line: &str) -> Option<String> {
+    let line = line.trim().trim_start_matches('\u{feff}');
+    let line = match line.find([';', '#']) {
+        Some(at) => line[..at].trim(),
+        None => line,
+    };
+    if line.is_empty() || section_header(line).is_some() {
+        return None;
+    }
+    let (key, _) = line.split_once('=')?;
+    Some(key.trim().to_ascii_lowercase())
+}
+
+/// `text` with every setting it does not mention written into it, or `None`
+/// when it already mentions them all.
+///
+/// See [`Settings::top_up_file`] for why this exists and what it promises.
+/// Additive only: existing lines come back untouched and in their own order.
+pub fn top_up(text: &str) -> Option<String> {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    // Where each section the file already has begins, where its content ends,
+    // and which keys it carries. A key before any header belongs to no
+    // section and so matches nothing in the template.
+    struct Present {
+        name: String,
+        /// One past the section's last non-blank line, which is where a
+        /// missing key is inserted — tight against the content rather than
+        /// after the gap before the next header.
+        end: usize,
+        keys: Vec<String>,
+    }
+    let mut present: Vec<Present> = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if let Some(name) = section_header(line) {
+            present.push(Present {
+                name,
+                end: at + 1,
+                keys: Vec::new(),
+            });
+            continue;
+        }
+        let Some(section) = present.last_mut() else {
+            continue;
+        };
+        if !line.trim().is_empty() {
+            section.end = at + 1;
+        }
+        if let Some(key) = setting_key(line) {
+            section.keys.push(key);
+        }
+    }
+
+    // What to add: whole blocks for the sections that are absent, and single
+    // lines for the keys that are not.
+    let mut append: Vec<String> = Vec::new();
+    let mut insert: Vec<(usize, Vec<String>)> = Vec::new();
+    for (name, body) in template_blocks() {
+        let Some(at) = present.iter().position(|p| p.name == name) else {
+            if !append.is_empty() {
+                append.push(String::new());
+            }
+            append.extend(body);
+            continue;
+        };
+        let missing: Vec<String> = body
+            .iter()
+            .filter(|line| setting_key(line).is_some_and(|key| !present[at].keys.contains(&key)))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            insert.push((present[at].end, missing));
+        }
+    }
+    if append.is_empty() && insert.is_empty() {
+        return None;
+    }
+
+    // Back to front, so an insertion does not move the ones still to come.
+    insert.sort_by_key(|(at, _)| *at);
+    for (at, missing) in insert.into_iter().rev() {
+        lines.splice(at..at, missing);
+    }
+    if !append.is_empty() {
+        if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.extend(append);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Some(out)
 }
 
 /// Reads the spellings of yes a person might type.
@@ -519,6 +694,88 @@ pub fn template() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A file from a build that had no bindings gains the whole `[Input]`
+    /// block — with its comments, so the player can see what a trigger looks
+    /// like — and every line they wrote survives, values and all.
+    #[test]
+    fn a_file_without_a_section_gains_the_whole_block() {
+        let theirs = "[Video]\nScaler = lanczos\nFilters =\nFiltersAfterScale =\nGrain = 0\n";
+        let filled = top_up(theirs).expect("the input and rumble sections are missing");
+
+        assert!(
+            filled.starts_with(theirs),
+            "their own lines come back first"
+        );
+        assert!(filled.contains("[Input]"));
+        assert!(filled.contains("[Rumble]"));
+        assert!(
+            filled.contains("; A trigger is a key by SDL's name for it"),
+            "the block arrives commented, not as bare keys"
+        );
+        // Their values are the point: topping up must never reset one.
+        let settings = Settings::parse(&filled);
+        assert_eq!(settings.video_scaler, VideoScaler::Lanczos);
+        assert_eq!(settings.video_grain, 0);
+        assert_eq!(settings.bindings, Bindings::default());
+    }
+
+    /// A section that is present but short gains only the keys it is short
+    /// of, inside its own section rather than appended to the file — a
+    /// `Confirm` line written after `[Rumble]` would set nothing.
+    #[test]
+    fn a_short_section_gains_only_what_it_is_missing_and_keeps_its_own() {
+        let theirs = "[Input]\nConfirm = pad:x\n\n[UI]\nScaler = mitchell\n";
+        let filled = top_up(theirs).expect("nineteen actions are missing");
+
+        let input_at = filled.find("[Input]").unwrap();
+        let ui_at = filled.find("[UI]").unwrap();
+        let cancel_at = filled
+            .find("Cancel")
+            .expect("a missing action was written in");
+        assert!(
+            input_at < cancel_at && cancel_at < ui_at,
+            "the missing keys land inside [Input], not at the end of the file"
+        );
+        assert_eq!(
+            filled.matches("Confirm").count(),
+            1,
+            "no key is written twice"
+        );
+
+        let settings = Settings::parse(&filled);
+        assert_eq!(
+            settings.bindings.triggers(Action::Confirm),
+            [Trigger::Button("x".into())],
+            "their binding is untouched"
+        );
+        assert_eq!(
+            settings.bindings.triggers(Action::Cancel),
+            Bindings::default().triggers(Action::Cancel)
+        );
+        assert_eq!(settings.ui_scaler, UiScaler::Mitchell);
+    }
+
+    /// A file that already says everything is left alone — which is what
+    /// makes topping up on every start safe, and what stops the file growing
+    /// a copy of itself once a run.
+    #[test]
+    fn a_complete_file_is_not_touched() {
+        assert_eq!(top_up(&template()), None);
+        // And the pass that does fill one in is itself complete.
+        let filled = top_up("[Video]\nGrain = 1\n").expect("almost everything is missing");
+        assert_eq!(top_up(&filled), None, "topping up is done in one pass");
+    }
+
+    /// A key commented out is a key the file does not mention, so it comes
+    /// back — a player who deletes a line to get the default gets the line
+    /// that says what the default is.
+    #[test]
+    fn a_commented_out_key_counts_as_missing() {
+        let filled = top_up("[Rumble]\n; Strength = 40\n").expect("Strength is commented out");
+        assert!(filled.contains("\nStrength = 100"));
+        assert!(filled.contains("; Strength = 40"), "their comment survives");
+    }
     use super::*;
 
     /// The defaults are what the engine shipped doing before there was a file

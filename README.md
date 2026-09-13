@@ -198,6 +198,8 @@ PixelPerfect = off
 ; pad button (`pad:a`), or a pad axis pushed one way (`pad:-lefty`).
 Confirm = return, keypad enter, space, pad:a
 Cancel  = escape, pad:b
+; Confirm with nothing focused pauses, so Pause only needs its own button
+Pause   = pad:start
 ; ...and seventeen more; `days settings` lists them all
 
 [Rumble]
@@ -206,8 +208,13 @@ Cancel  = escape, pad:b
 Strength = 100
 ```
 
-A first run writes the file out with every default already filled in, and a
-value it cannot read is a line in the log and nothing more. `days settings
+A first run writes the file out with every default already filled in, and every
+run after that writes in anything the file does not yet mention — a section it
+has never heard of arrives as the whole commented block, a missing key as one
+line inside the section it belongs to. That is additive and only additive:
+nothing is reordered, reworded or re-valued, so a file written by an older build
+gains the twenty rebindable actions without losing a thing. A value it cannot
+read is a line in the log and nothing more. `days settings
 --template` prints the same copy to standard output, and `days settings` says
 which file is in force and what it currently means.
 
@@ -219,8 +226,11 @@ because a game that can only be played with two hands on a keyboard and a mouse
 cannot be played by everyone.
 
 The d-pad or the left stick moves the selection, A confirms, B backs out. During
-playback Start pauses, the shoulders seek, the triggers change speed, and Up (or
-the right stick button) puts the selection on the control bar — a strip the
+playback A pauses: the bar is a strip the pointer hovers rather than something
+that holds a selection, and most of a script has no choice box up, so a confirm
+with nothing to confirm pauses — one rule, and the reason Space has always done
+it. The shoulders seek, the triggers change speed, and Up (or the right stick
+button) puts the selection on the control bar — a strip the
 original can only be reached with a pointer, so without this half of it a
 controller would leave most of the game out of reach. The right stick drives a
 pointer for anything a selection cannot land on.

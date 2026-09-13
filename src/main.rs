@@ -708,7 +708,8 @@ fn main() -> Result<()> {
                 println!("Script: Space pause, Left/Right seek 5s, R restart, Esc quit.");
                 println!("A controller works everywhere: d-pad or left stick to choose, A to");
                 println!("confirm, B to back out, Up for the control bar, right stick for the");
-                println!("pointer. Every binding is in DaysEngine.ini under [Input].");
+                println!("pointer. During playback A pauses, unless the bar has the selection");
+                println!("or a choice is up. Every binding is in DaysEngine.ini under [Input].");
                 return Ok(());
             }
             other if other.starts_with('-') => bail!("unknown option {other}"),
@@ -2511,7 +2512,15 @@ fn run_script(
                 Control::Cancel if answering => answer.cancel = true,
                 Control::Cancel => bar_focus = None,
                 Control::Confirm if answering => answer.confirm = true,
-                Control::Confirm => pressed.extend(bar_focus),
+                // A confirm with nothing to confirm pauses. The bar is a strip
+                // the pointer hovers rather than something that holds a
+                // selection, and most of a script has no choice box up, so
+                // without this the confirm button is dead for most of the
+                // game — and pausing is what Space has always done here.
+                Control::Confirm => match bar_focus {
+                    Some(widget) => pressed.push(widget),
+                    None => pressed.push(bar::widget::PAUSE),
+                },
                 Control::Up if answering => answer.prev = true,
                 Control::Down if answering => answer.next = true,
                 // Up reaches for the bar, which is where the bar is: a strip
@@ -2556,11 +2565,10 @@ fn run_script(
                 // The rest are the bar's own widgets, pressed by number. The
                 // bar decides whether each is live, plays the click and
                 // dispatches, exactly as it does for a click on it.
-                // Space is bound to Confirm and to Pause, because that is
-                // what the two loops did separately before there was one
-                // table. A confirm something took — a choice box, or the
-                // selection sitting on a bar widget — is not also a pause.
-                Control::Pause if !answering && !focused => pressed.push(bar::widget::PAUSE),
+                // Asked for directly, so it pauses whatever else is on
+                // screen — unlike the confirm above, which only reaches this
+                // when nothing else takes it.
+                Control::Pause => pressed.push(bar::widget::PAUSE),
                 Control::Auto => pressed.push(bar::widget::AUTO),
                 Control::Restart => pressed.push(bar::widget::RESTART),
                 Control::SkipToChoice => pressed.push(bar::widget::SKIP),

@@ -61,12 +61,25 @@ pub enum Action {
     /// Move the selection right, or seek forward. See [`Action::Left`].
     Right,
     /// Activate what is selected.
+    ///
+    /// During playback there is often nothing selected: the control bar is a
+    /// strip the pointer hovers, not something that holds a selection of its
+    /// own, and most of a script has no choice box up. **With nothing to
+    /// confirm, this pauses** — which is what Space has always done here, and
+    /// what stops the face button under your thumb being dead for most of the
+    /// game. See [`Action::Pause`], which is the same thing asked for
+    /// directly.
     Confirm,
     /// Back out. The menus' cancel; the choice box's refusal.
     Cancel,
     /// Close the game. Bound to Escape during playback, as it always was.
     Quit,
     /// Pause or resume playback. The control bar's widget 1.
+    ///
+    /// Bound only to a dedicated button, because [`Action::Confirm`] already
+    /// reaches this whenever nothing else takes it. Unlike that fall-through
+    /// this one always pauses, selection or choice box notwithstanding: a
+    /// player who bound a key to "pause" asked for pause.
     Pause,
     /// Jump five seconds back.
     SeekBack,
@@ -285,10 +298,11 @@ impl Default for Bindings {
     /// Escape backs out of a menu and closes the game during playback, Space
     /// pauses, left and right seek five seconds and R restarts.
     ///
-    /// Space is on both `Confirm` and `Pause` on purpose, because that is what
-    /// the two loops did separately. The playback loop resolves the collision
-    /// the way a player expects: a confirm that something takes — a choice box
-    /// is up, or the bar has the selection — is not also a pause.
+    /// Space pausing is not a second binding, and neither is A. It is
+    /// [`Action::Confirm`]'s own fall-through: with nothing focused there is
+    /// nothing to confirm, and a confirm with nothing to confirm pauses. One
+    /// rule covers both, and it is why [`Action::Pause`] needs only the
+    /// dedicated button for a player who wants one.
     ///
     /// The controller half is the layout every console reader uses: the face
     /// button under your thumb confirms, the one right of it goes back, the
@@ -304,7 +318,7 @@ impl Default for Bindings {
                 Action::Confirm => &["return", "keypad enter", "space", "pad:a"],
                 Action::Cancel => &["escape", "pad:b"],
                 Action::Quit => &["escape"],
-                Action::Pause => &["space", "pad:start"],
+                Action::Pause => &["pad:start"],
                 Action::SeekBack => &["pad:leftshoulder"],
                 Action::SeekForward => &["pad:rightshoulder"],
                 Action::Restart => &["r"],
