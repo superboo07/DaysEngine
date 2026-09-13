@@ -6,6 +6,7 @@
 //! regression in timing, fades or text layout shows up as an image diff rather
 //! than as "it looked wrong when I ran it".
 
+use crate::playback::lipsync;
 use crate::playback::stage::Visual;
 use crate::playback::text;
 use days_font::Font;
@@ -50,35 +51,23 @@ pub fn frame_rgba_with(
             0,
         );
     } else if let Some(still) = visual.still {
+        // The mouths go into the background's own surface first, exactly as
+        // `FUN_00444b80` writes them into the original's, and the patched
+        // surface is what gets composited. See
+        // [`crate::playback::lipsync::compose_mouths`].
+        let patched =
+            lipsync::compose_mouths(&still.rgba, (still.width, still.height), &visual.mouths);
         blit(
             &mut out,
             width,
             height,
             &Surface {
-                pixels: &still.rgba,
+                pixels: patched.as_deref().unwrap_or(&still.rgba),
                 width: still.width as usize,
                 height: still.height as usize,
             },
             0,
             0,
-        );
-    }
-
-    // Mouth patches go over the background and under everything else, because
-    // the engine writes them straight into the background's own surface
-    // (`FUN_00444b80`) before the frame is composited.
-    for (mouth, index) in &visual.mouths {
-        blit(
-            &mut out,
-            width,
-            height,
-            &Surface {
-                pixels: mouth.image(*index),
-                width: mouth.width,
-                height: mouth.height,
-            },
-            mouth.x,
-            mouth.y,
         );
     }
 

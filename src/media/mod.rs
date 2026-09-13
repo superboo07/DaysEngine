@@ -20,9 +20,11 @@ use std::ffi::c_int;
 mod io;
 
 pub mod audio;
+pub mod image;
 pub mod video;
 
 pub use audio::{decode_audio, AudioBuffer};
+pub use image::ImageScaler;
 pub use video::{VideoDecoder, VideoFrame, VideoScaler};
 
 /// Mixer sample rate, from `Ini/DX8SOUND.INI` (`SamplePerSec`).

@@ -18,6 +18,8 @@ use daysengine::install::progress::Progress;
 use daysengine::install::save::FlagStore;
 use daysengine::install::vfs::Vfs;
 use daysengine::media::AudioBuffer;
+use daysengine::media::ImageScaler;
+use daysengine::playback::lipsync::compose_mouths;
 use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::comment;
 use daysengine::ui::ending;
@@ -27,7 +29,7 @@ use daysengine::ui::replay::Scenes;
 use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
 use daysengine::ui::select::{self, Choice, Input, Select};
-use daysengine::{install::ini::Ini, playback::scale, playback::text, Mixer, Stage};
+use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
@@ -172,15 +174,19 @@ struct MovieFrame<'r> {
     texture: Texture<'r>,
 }
 
-/// One mouth patch's texture, and which patch and image it holds.
+/// The background texture, and everything that decided the pixels in it.
 ///
-/// A mouth flaps at its voice's envelope, a few times a second; without this
-/// the patch went up to the GPU on every pass round the loop instead.
-struct MouthPatch<'r> {
-    /// Patch rectangle and which of the three images — the whole of what
-    /// decides the pixels.
-    key: (usize, usize, usize, usize, usize),
-    size: (usize, usize),
+/// The mouth patches are part of the key because they are part of the image:
+/// they are written into the background's own surface before it is scaled, the
+/// way `FUN_00444b80` writes them into the original's, so a mouth changing
+/// image means a new background. Everything else about a still changes rarely —
+/// a background lasts seconds — and a mouth flaps eight times a second, which
+/// is still far short of once a pass.
+struct StillFrame<'r> {
+    path: String,
+    size: (u32, u32),
+    /// Each patch rectangle and which of the three images it is showing.
+    mouths: Vec<(usize, usize, usize, usize, usize)>,
     texture: Texture<'r>,
 }
 
@@ -1520,15 +1526,19 @@ fn run_script(
 ) -> Result<Outcome> {
     player.mixer.stop_all();
 
-    let mut still_texture: Option<(String, (u32, u32), Texture)> = None;
+    // The background as it will be shown: mouth patches already in it, scaled
+    // to the window. Keyed by everything that decides those pixels, so a pass
+    // that changes none of them reuses the texture.
+    let mut still_texture: Option<StillFrame<'_>> = None;
     let mut movie_texture: Option<MovieFrame<'_>> = None;
-    let mut scaler = scale::Scaler::default();
+    // Stills go through libswscale, the same scaler and the same filter a movie
+    // frame goes through — they are two ways of filling the same 800x452 stage,
+    // and a still that went through a different filter did not match the clip
+    // it cut to. See `daysengine::media::ImageScaler`.
+    let mut scaler = ImageScaler::new(player.settings.video_scaler)
+        .context("building the still-image scaler")?;
     // The wrapped lines and a texture each, cached on the script's own line.
     let mut text_texture: Option<DialogueBlock<'_>> = None;
-    // One patch per mouth on screen at once, which is all but always exactly
-    // one. Mouths are tens of pixels across and change three times a second, so
-    // rebuilding the texture per pass would be pure churn.
-    let mut mouth_patches: Vec<MouthPatch<'_>> = Vec::new();
     let mut choice_labels: Option<ChoiceLabels<'_>> = None;
 
     let mut stage = Stage::new(script);
@@ -1833,7 +1843,6 @@ fn run_script(
                             // Every cached texture belonged to the menu's
                             // renderer; drop them so playback rebuilds.
                             movie_texture = None;
-                            mouth_patches.clear();
                             choice_labels = None;
                             bar_texture = None;
                             still_texture = None;
@@ -1970,76 +1979,56 @@ fn run_script(
                     .map_err(|e| anyhow::anyhow!("drawing movie: {e}"))?;
             }
         } else if let Some(still) = visual.still {
-            // Resampled to the window here, the same as a menu composite is,
-            // unless whole-number scaling is on — then it goes up at its own
-            // size for the blit to multiply. Rebuilt when the background
-            // changes or when the size it was built for does.
+            // Scaled to the window here, unless whole-number scaling is on —
+            // then it goes up at its own size for the blit to multiply. Rebuilt
+            // when the background changes, when a mouth moves, or when the size
+            // it was built for does.
             let at = if whole {
                 (still.width, still.height)
             } else {
                 window_px
             };
-            let stale = still_texture
-                .as_ref()
-                .is_none_or(|(path, size, _)| path != &still.path || *size != at);
+            let mouths: Vec<_> = visual
+                .mouths
+                .iter()
+                .map(|(m, index)| (m.x, m.y, m.width, m.height, *index))
+                .collect();
+            let stale = still_texture.as_ref().is_none_or(|held| {
+                held.path != still.path || held.size != at || held.mouths != mouths
+            });
             if stale {
-                let src = (still.width as usize, still.height as usize);
-                let (w, h, rgba) =
-                    match scaler.resample(&still.rgba, src, (at.0 as usize, at.1 as usize)) {
-                        Some(scaled) => (at.0, at.1, scaled),
-                        None => (still.width, still.height, still.rgba.as_slice()),
-                    };
+                // The mouths go into the background's own surface first, at the
+                // background's own size. That is what the original does — a
+                // straight `memcpy` into the surface in `FUN_00444b80`, before
+                // anything composites or scales it — and doing it in this order
+                // is what keeps the patch on the same pixel grid as the face
+                // around it. Scaling the two separately put the patch on a grid
+                // of its own, a fraction of a pixel out at 1:1 and a visible
+                // step once the window was any bigger.
+                let src = (still.width, still.height);
+                let patched = compose_mouths(&still.rgba, src, &visual.mouths);
+                let base = patched.as_deref().unwrap_or(&still.rgba);
+                let scaled = scaler
+                    .scale(base, src, at)
+                    .context("scaling the background")?;
+                let (w, h, rgba) = match &scaled {
+                    Some(pixels) => (at.0, at.1, pixels.as_slice()),
+                    None => (still.width, still.height, base),
+                };
                 let mut texture = new_texture(creator, w, h, art)?;
                 texture.update(None, rgba, w as usize * 4)?;
-                still_texture = Some((still.path.clone(), at, texture));
+                still_texture = Some(StillFrame {
+                    path: still.path.clone(),
+                    size: at,
+                    mouths,
+                    texture,
+                });
             }
-            if let Some((_, _, texture)) = &still_texture {
+            if let Some(held) = &still_texture {
                 canvas
-                    .copy(texture, None, dst)
+                    .copy(&held.texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing background: {e}"))?;
             }
-        }
-
-        // Mouth patches, over the background and under the fade, matching the
-        // order the engine composites them in. One texture per patch, kept
-        // until the patch or the image it shows changes.
-        mouth_patches.truncate(visual.mouths.len());
-        for (slot, (mouth, index)) in visual.mouths.iter().enumerate() {
-            let key = (mouth.x, mouth.y, mouth.width, mouth.height, *index);
-            let size = (mouth.width, mouth.height);
-            if mouth_patches.get(slot).is_none_or(|p| p.size != size) {
-                let mut texture =
-                    new_texture(creator, mouth.width as u32, mouth.height as u32, art)?;
-                texture.set_blend_mode(BlendMode::Blend);
-                let patch = MouthPatch {
-                    // Not `key`: the upload below is what makes it true.
-                    key: (0, 0, 0, 0, usize::MAX),
-                    size,
-                    texture,
-                };
-                match mouth_patches.get_mut(slot) {
-                    Some(slot) => *slot = patch,
-                    None => mouth_patches.push(patch),
-                }
-            }
-            let Some(patch) = mouth_patches.get_mut(slot) else {
-                continue;
-            };
-            if patch.key != key {
-                patch
-                    .texture
-                    .update(None, mouth.image(*index), mouth.width * 4)?;
-                patch.key = key;
-            }
-            let at = FRect::new(
-                dst.x + mouth.x as f32 * scale,
-                dst.y + mouth.y as f32 * scale,
-                mouth.width as f32 * scale,
-                mouth.height as f32 * scale,
-            );
-            canvas
-                .copy(&patch.texture, None, at)
-                .map_err(|e| anyhow::anyhow!("drawing mouth: {e}"))?;
         }
 
         if let Some(([r, g, b], opacity)) = visual.fade {

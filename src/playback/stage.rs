@@ -310,8 +310,9 @@ impl Stage {
                     current: None,
                     path: path.clone(),
                 });
-                // A movie covers the whole frame, so any still under it is done.
-                self.still = None;
+                // A movie covers the whole frame, so the still under it is
+                // done.
+                self.drop_background();
             }
             Command::CreateBg { kind, path } => {
                 if kind != "BGS" {
@@ -411,6 +412,24 @@ impl Stage {
             Command::SkipFrame | Command::Next => {}
         }
         Ok(())
+    }
+
+    /// Drops the background and everything loaded onto it.
+    ///
+    /// The mouth overlays are part of the background object, not a layer over
+    /// it: `FUN_004453e0` fills the `FILMOBJ::ImageChar`'s own slots, so
+    /// destroying the background destroys them. `FILMOBJ::MovieChar` carries
+    /// ten slots of its own at `+0xe4` and nothing in the retail install fills
+    /// those — no `MovieNN` pack holds a single `.A`/`.B`/`.C` overlay — so a
+    /// movie has no mouths, rather than inheriting the last background's.
+    ///
+    /// Keeping them is what stamped the previous background's mouth over the
+    /// movie, in the same place on every frame of it. 483 of the shipped
+    /// scripts start a movie while a tagged line is still speaking, so it was
+    /// not a corner.
+    fn drop_background(&mut self) {
+        self.still = None;
+        self.mouths.clear();
     }
 
     /// Loads the mouth set for `tag` on the current background, once.
@@ -575,6 +594,30 @@ mod tests {
         assert_eq!(f.opacity(Frame(0)), 0.0);
         assert_eq!(f.opacity(Frame(10)), 1.0);
         assert_eq!(f.opacity(Frame(50)), 1.0);
+    }
+
+    /// The mouth overlays belong to the background object, so losing the
+    /// background loses them. This is the step `[PlayMovie]` takes; a movie
+    /// that inherited them drew the last background's mouth over itself.
+    #[test]
+    fn dropping_the_background_drops_its_mouths() {
+        let mut stage = Stage::new(Script::default());
+        stage.still = Some(Still {
+            path: "Event00/x".into(),
+            width: 800,
+            height: 452,
+            rgba: vec![0u8; 800 * 452 * 4],
+        });
+        stage.mouths.insert("mak".into(), None);
+        stage.mouths.insert("sek".into(), None);
+
+        stage.drop_background();
+
+        assert!(stage.still.is_none());
+        assert!(
+            stage.mouths.is_empty(),
+            "a movie must not inherit the background's mouths"
+        );
     }
 
     /// A zero-length fade is instant, not a divide by zero.

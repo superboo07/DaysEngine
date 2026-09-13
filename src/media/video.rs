@@ -440,7 +440,7 @@ impl VideoDecoder {
 ///
 /// The returned context is owned by the caller and must be freed with
 /// `sws_freeContext`.
-unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsContext, Error> {
+pub(super) unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsContext, Error> {
     // SAFETY: the context is freed on the one path that does not return it,
     // and both options below are ones swscale defines on its own context.
     unsafe {
@@ -473,7 +473,7 @@ unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsContext, Error>
 ///
 /// The returned frame is owned by the caller and must be freed with
 /// `av_frame_free`.
-unsafe fn new_rgba_frame(size: (u32, u32)) -> Result<*mut ffi::AVFrame, Error> {
+pub(super) unsafe fn new_rgba_frame(size: (u32, u32)) -> Result<*mut ffi::AVFrame, Error> {
     // SAFETY: the frame is freed on every path that does not return it.
     unsafe {
         let mut frame = ffi::av_frame_alloc();

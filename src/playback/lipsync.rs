@@ -193,6 +193,51 @@ fn crop(rgba: &[u8], x: usize, y: usize, width: usize, height: usize) -> Vec<u8>
     out
 }
 
+/// Writes mouth patches into a copy of a background surface.
+///
+/// `FUN_00444b80` copies the patch rectangle straight into the background
+/// object's own surface — a `memcpy`, not an alpha blend — and does it before
+/// anything composites or scales that surface. Both halves of that matter:
+///
+/// * **A copy, not a blend.** The shipped overlays have binary alpha and a
+///   solid opaque rectangle, so for them the two agree; doing what the engine
+///   does means they agree for anything else the packs hold too.
+/// * **Before the scale.** The patch and the face around it then go through one
+///   filter on one grid. Scaling them separately and placing the smaller one by
+///   arithmetic gives the patch a grid of its own, which is a fraction of a
+///   pixel out at 1:1 and a visible step at anything larger.
+///
+/// Returns `None` when there is nothing to patch, so the caller can keep using
+/// the surface it already has. A patch that would fall outside `size` is
+/// clipped rather than dropped: only the rows and columns that land are
+/// written.
+pub fn compose_mouths(
+    rgba: &[u8],
+    size: (u32, u32),
+    mouths: &[(&Mouth, usize)],
+) -> Option<Vec<u8>> {
+    if mouths.is_empty() {
+        return None;
+    }
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    if rgba.len() != width * height * 4 {
+        log::warn!("background is not {width}x{height}; the mouths are left off it");
+        return None;
+    }
+    let mut out = rgba.to_vec();
+    let stride = width * 4;
+    for (mouth, index) in mouths {
+        let image = mouth.image(*index);
+        let columns = mouth.width.min(width.saturating_sub(mouth.x));
+        for row in 0..mouth.height.min(height.saturating_sub(mouth.y)) {
+            let from = row * mouth.width * 4;
+            let to = (mouth.y + row) * stride + mouth.x * 4;
+            out[to..to + columns * 4].copy_from_slice(&image[from..from + columns * 4]);
+        }
+    }
+    Some(out)
+}
+
 /// Per-frame "is this clip making a sound" flags for one voice line.
 ///
 /// The retail engine builds this while the clip decodes (`FUN_0041ba90`): it
@@ -290,6 +335,96 @@ mod tests {
             patch_rect(&canvas_with(392, 160, 48, 43)),
             Some((392, 160, 48, 43))
         );
+    }
+
+    /// Builds a `Mouth` directly, standing in for one loaded off the packs.
+    fn mouth_at(x: usize, y: usize, w: usize, h: usize, colours: [[u8; 4]; 3]) -> Mouth {
+        let fill = |c: [u8; 4]| c.iter().copied().cycle().take(w * h * 4).collect();
+        Mouth {
+            x,
+            y,
+            width: w,
+            height: h,
+            images: [fill(colours[0]), fill(colours[1]), fill(colours[2])],
+        }
+    }
+
+    /// The patch is copied, not blended, and it lands on exactly the rectangle
+    /// the scan found — every pixel inside it is the overlay's and every pixel
+    /// outside is the background's.
+    #[test]
+    fn a_mouth_is_copied_onto_its_own_rectangle() {
+        let (w, h) = (40usize, 20usize);
+        let background: Vec<u8> = [1u8, 2, 3, 255]
+            .iter()
+            .copied()
+            .cycle()
+            .take(w * h * 4)
+            .collect();
+        let mouth = mouth_at(5, 4, 6, 3, [[9, 9, 9, 255], [8, 8, 8, 255], [7, 7, 7, 255]]);
+        let out = compose_mouths(&background, (w as u32, h as u32), &[(&mouth, 1)])
+            .expect("a mouth to patch");
+        for y in 0..h {
+            for x in 0..w {
+                let px = &out[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                let inside = (5..11).contains(&x) && (4..7).contains(&y);
+                let want: [u8; 4] = if inside {
+                    [8, 8, 8, 255]
+                } else {
+                    [1, 2, 3, 255]
+                };
+                assert_eq!(px, want, "at ({x}, {y})");
+            }
+        }
+    }
+
+    /// A half-transparent overlay pixel still replaces the background outright.
+    /// `FUN_00444b80` is a `memcpy`; blending instead would tint the patch with
+    /// whatever the face underneath happens to be.
+    #[test]
+    fn a_mouth_replaces_rather_than_blends() {
+        let (w, h) = (4usize, 4usize);
+        let background: Vec<u8> = [200u8, 200, 200, 255]
+            .iter()
+            .copied()
+            .cycle()
+            .take(w * h * 4)
+            .collect();
+        let mouth = mouth_at(0, 0, 2, 2, [[0, 0, 0, 128]; 3]);
+        let out = compose_mouths(&background, (w as u32, h as u32), &[(&mouth, 0)])
+            .expect("a mouth to patch");
+        assert_eq!(&out[0..4], &[0, 0, 0, 128]);
+        assert_eq!(&out[8..12], &[200, 200, 200, 255]);
+    }
+
+    /// No mouths means the caller keeps the surface it has, rather than paying
+    /// for a copy of the whole background on every pass.
+    #[test]
+    fn nothing_to_patch_makes_no_copy() {
+        assert!(compose_mouths(&[0u8; 16], (2, 2), &[]).is_none());
+    }
+
+    /// A patch whose rectangle runs off the surface is clipped to what lands.
+    /// The scan bounds it to the 800x452 canvas, so this only happens to a
+    /// background that is not that size — which must not panic.
+    #[test]
+    fn a_patch_running_off_the_surface_is_clipped() {
+        let (w, h) = (8usize, 8usize);
+        let background = vec![0u8; w * h * 4];
+        let mouth = mouth_at(6, 6, 4, 4, [[5, 5, 5, 255]; 3]);
+        let out = compose_mouths(&background, (w as u32, h as u32), &[(&mouth, 0)])
+            .expect("a mouth to patch");
+        assert_eq!(&out[(6 * w + 6) * 4..(6 * w + 6) * 4 + 4], &[5, 5, 5, 255]);
+        assert_eq!(&out[(7 * w + 7) * 4..(7 * w + 7) * 4 + 4], &[5, 5, 5, 255]);
+        assert_eq!(out.len(), w * h * 4);
+    }
+
+    /// A background that is not the size it says it is leaves the mouths off
+    /// rather than writing past the end of it.
+    #[test]
+    fn a_background_of_the_wrong_length_is_left_alone() {
+        let mouth = mouth_at(0, 0, 2, 2, [[1, 1, 1, 255]; 3]);
+        assert!(compose_mouths(&[0u8; 8], (800, 452), &[(&mouth, 0)]).is_none());
     }
 
     #[test]

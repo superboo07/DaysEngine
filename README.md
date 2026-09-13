@@ -194,10 +194,14 @@ a line in the log and nothing more. `days settings --template` prints a
 commented copy to start from, and `days settings` says which file is in force
 and what it currently means.
 
-The two scalers are separate because the two jobs are. A movie frame is scaled
-by libswscale inside the colour conversion it already goes through, so the
-filter costs only its own width; the game's own art goes through the engine's
-resampler in `playback::scale`. A libavfilter graph — a debander before the
+The two scalers are separate because the two jobs are. `[Video] Scaler` is the
+picture — movie frames *and* still backgrounds, both through libswscale. A
+movie frame is scaled inside the colour conversion it already goes through, so
+the filter costs only its own width, and a still goes through the same library
+with the same filter: the two are ways of filling the same 800x452 stage, and a
+still that was filtered differently did not match the clip it cut to.
+`[UI] Scaler` is the menus and the control bar, which go through the engine's
+own resampler in `playback::scale`. A libavfilter graph — a debander before the
 scale, say — is **not implemented**; the decoder is where it would go.
 
 ### The pixel filter

@@ -31,6 +31,12 @@
 //! Scaler = bspline
 //! ```
 //!
+//! `[Video] Scaler` is the picture: movie frames and still backgrounds alike,
+//! both through libswscale. They are two ways of filling the same 800x452
+//! stage, and a still that went through a different filter did not match the
+//! clip it cut to. `[UI] Scaler` is the menus and the control bar, which are
+//! art of a different kind and go through this engine's own kernel.
+//!
 //! Section and key names are case-insensitive, `;` and `#` start a comment, and
 //! an unknown key or an unreadable value is a warning and nothing more: a
 //! settings file should never be the reason the game will not start.

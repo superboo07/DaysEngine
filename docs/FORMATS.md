@@ -143,6 +143,13 @@ constructed at `FUN_00443900`), and the rules are:
   the current `BGS<n>` object with the statement's speaker tag; its `[CreateBG]`
   arm walks the live voice list and registers every tag already speaking on the
   new background, which is what carries a mouth across a background change.
+- **Ownership.** The three images are loaded onto the background object's own
+  slots, so they live and die with it. `FILMOBJ::MovieChar` carries ten slots of
+  its own at `+0xe4` (`FUN_0044a2c0`) and nothing in the retail install fills
+  them: no `MovieNN` pack holds a single `.A`/`.B`/`.C` overlay. A movie
+  therefore has no mouths — it does not inherit the background's, and a player
+  who sees one over a movie is looking at a bug. 483 of the shipped scripts
+  start a movie while a tagged line is still speaking, so the case is common.
 - **Path.** `FUN_004453e0` (slot `+0x90`) appends the tag to the background's
   own path, then `FUN_00444f70` appends `.A`, `.B` or `.C` and `.png` (literals
   at `0x004d5268`, `0x004d5270`, `0x004d5278`). The tag goes on exactly as the
@@ -154,7 +161,10 @@ constructed at `FUN_00443900`), and the rules are:
   and not as a bounding box: it takes the first opaque pixel in raster order as
   the corner, counts the opaque pixels on that row for the width, and counts how
   far that column stays opaque for the height. `FUN_00444b80` then copies that
-  rectangle into the background's surface with `memcpy` — no alpha blending.
+  rectangle into the background's surface with `memcpy` — no alpha blending —
+  and it does so *into that surface*, before anything composites or scales it.
+  The patch and the face around it are one image from then on, which is what
+  keeps them on one pixel grid however large the window is.
   Both only work because the shipped overlays are a solid opaque rectangle on a
   transparent canvas, which the real files confirm: the scan yields exactly
   x=392 y=160 48x43 for `00-00-A02-001BMAK`, matching the true opaque region,
