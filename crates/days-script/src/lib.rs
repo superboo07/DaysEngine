@@ -280,7 +280,9 @@ impl Script {
                 continue;
             };
             let args: Vec<&str> = split_fields(body);
-            let event = parse_command(line, command, &args)?;
+            let Some(event) = parse_command(line, command, &args)? else {
+                continue;
+            };
             match event.command {
                 Command::Next => length = event.start,
                 Command::SkipFrame => skip_to = event.start,
@@ -397,7 +399,15 @@ fn split_statement(stmt: &str) -> Option<(&str, &str)> {
     Some((&rest[..close], &rest[close + 2..]))
 }
 
-fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Error> {
+/// Parses one statement, or `None` for one the engine itself drops.
+///
+/// A statement the original refuses is not a broken script. `FUN_0042d8c0`
+/// checks each command's field count before it reads any of them and, when it
+/// does not match, bumps a counter and moves to the next statement — so a
+/// malformed statement costs its own line and nothing else. Refusing the whole
+/// script over one would make four Shiny Days scenes unplayable over four
+/// scripter typos.
+fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Option<Event>, Error> {
     let arity = |want: &'static str| Error::Arity {
         line,
         command: command.to_string(),
@@ -415,7 +425,7 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
         // both sit at a point: giving either a zero start would sort it to the
         // front of the event list and make it look like a statement that runs
         // from the beginning.
-        return Ok(Event {
+        return Ok(Some(Event {
             start: at,
             end: at,
             command: if command == "SkipFRAME" {
@@ -423,7 +433,35 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
             } else {
                 Command::Next
             },
-        });
+        }));
+    }
+
+    // `[PrintText]` is the one command the original sizes exactly rather than
+    // by a minimum: `FUN_0042d8c0` takes its field count, compares it to four —
+    // start, speaker, text, end — and skips the statement when it differs,
+    // before reading any field. The check belongs here for the same reason,
+    // ahead of the timecodes: two of the four Shiny Days statements it rescues
+    // would otherwise fail converting a field that is not a timecode at all.
+    //
+    // The comparison here is `< 4`, not `!= 4`, and the difference is a claim
+    // we cannot make. The original counts fields in **its** tokenisation, and
+    // whether that keeps an empty one is **not recovered**; ours keeps them, so
+    // `03-KB-D10` line 29, which has a stray empty field after the dialogue,
+    // reaches us as five. Under `< 4` the two readings cannot disagree on
+    // anything in either install: every statement they would judge differently
+    // has more than four fields, and every malformed one has fewer.
+    //
+    // The four that have fewer are all Shiny Days. `03-32-A29` and `Z2-21-A18`
+    // each have a line whose speaker and text were typed into one field with a
+    // comma between them, `03-3K-G34` one whose end timecode is stuck to the
+    // end of the text with no tab, and `04-K2-A00` one written with spaces
+    // throughout. All four are dropped and the scenes play without that line.
+    if command == "PrintText" && args.len() < 4 {
+        log::warn!(
+            "line {line}: [PrintText] has {} fields, fewer than 4; dropping the statement",
+            args.len()
+        );
+        return Ok(None);
     }
 
     if args.len() < 2 {
@@ -456,13 +494,17 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
     let flag = |v: &str| !matches!(v.trim(), "" | "0");
 
     let command = match command {
-        "PrintText" => {
-            need(2, "a speaker and a line of text")?;
-            Command::PrintText {
-                speaker: field(0).to_string(),
-                text: field(1).to_string(),
-            }
-        }
+        "PrintText" => Command::PrintText {
+            speaker: field(0).to_string(),
+            text: field(1).to_string(),
+        },
+        // Shiny Days' ambient bed. Recognised so it is not reported as a gap in
+        // our vocabulary, and dropped because acting on it would be a guess:
+        // the arm runs behind a gate — host vtable slot `+0x130`, or the film
+        // object's `+0x320` — whose meaning is **not recovered**. See
+        // `docs/FORMATS.md`. Until it is, a looping bed we started where the
+        // original stayed silent would be worse than silence.
+        "PlayES" => return Ok(None),
         "PlayVoice" => {
             need(1, "a voice path")?;
             Command::PlayVoice {
@@ -548,19 +590,15 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Event, Err
             // An unknown command is a gap in our vocabulary, not bad data. Log
             // it loudly and drop the statement rather than refusing the script.
             log::warn!("line {line}: unknown command [{other}]; ignoring");
-            return Ok(Event {
-                start,
-                end,
-                command: Command::MoveSom { intensity: 0 },
-            });
+            return Ok(None);
         }
     };
 
-    Ok(Event {
+    Ok(Some(Event {
         start,
         end,
         command,
-    })
+    }))
 }
 
 /// Choice labels are wrapped in single quotes in the script.
@@ -893,5 +931,45 @@ mod tests {
         }
         let s = Script::parse("t", &bytes).unwrap();
         assert_eq!(s.events[0].command, Command::Next);
+    }
+
+    /// `FUN_0042d8c0` requires `[PrintText]` to have exactly four fields and
+    /// drops the statement otherwise. These are the four shapes the Shiny Days
+    /// scripts actually get that wrong in; each costs its own line and nothing
+    /// else.
+    #[test]
+    fn a_print_text_without_four_fields_costs_only_its_own_line() {
+        let script = Script::parse_str(
+            "quirks",
+            "[PrintText]=00:00:06\tSetsuna, That'll be 1280 yen.\t00:03:06;\n\n\
+             [PrintText]=02:03:20\tKokoro\tTell my mom next time.02:11:23;\n\n\
+             [PrintText]=01:08:02 Manami Her demands are simple. 01:12:05;\n\n\
+             [PrintText]=00:00:00\tMakoto\tThis one is fine.\t00:02:00;\n\n\
+             [Next]=00:10:00;",
+        )
+        .unwrap();
+        let lines: Vec<&Command> = script
+            .events
+            .iter()
+            .map(|e| &e.command)
+            .filter(|c| matches!(c, Command::PrintText { .. }))
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(lines[0], Command::PrintText { speaker, .. } if speaker == "Makoto"));
+        assert_eq!(script.length, Frame::parse("00:10:00").unwrap());
+    }
+
+    /// Shiny Days' `[PlayES]` is recognised rather than reported as an unknown
+    /// command, and carries no event, because the gate it runs behind is not
+    /// recovered.
+    #[test]
+    fn play_es_is_recognised_and_carries_nothing() {
+        let script = Script::parse_str(
+            "es",
+            "[PlayES]=00:00:00\tGenSe/gaya/GAYA_ekimae_asa\t00:21:05;\n\n[Next]=00:21:05;",
+        )
+        .unwrap();
+        assert_eq!(script.events.len(), 1);
+        assert!(matches!(script.events[0].command, Command::Next));
     }
 }

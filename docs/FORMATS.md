@@ -6,6 +6,73 @@ was derived by inspecting a retail install; no game data is reproduced.
 Sizes below are from the English School Days HQ release (`SCHOOLDAYS HQ.exe`,
 Aug 2012): 30 packs, 69,936 entries, ~12 GB.
 
+Where a second FILMEngine title differs, it is noted against the section it
+belongs to. The one examined so far is the English **Shiny Days** release
+(`SHINYDAYS.exe`, `SysMenuSD.dll` and `RouteProcSD.dll`, Dec 2015): 27 packs,
+2,587 scripts, 103 routes, 2,301 scenes. See *Other titles on this engine*
+below for what is shared and what is not.
+
+---
+
+## Other titles on this engine
+
+The engine is the same code with a different set of screens. What that means in
+practice, from the Shiny Days install:
+
+**Shared without change.** The `.GPK` container and its `CODE`/`CIPHERCODE`
+key, the `.ORS` timeline dialect, `.CMAP` hit maps at the same four sizes, the
+`_CHIP` widget table's six-float records, `FONTDATA.DAT`, `GlobalFlag.DAT`, the
+`.INI` dialect, and the branch graph's tables in the route module. All of these
+read correctly on Shiny Days with no format work at all.
+
+**The three binaries are named differently.** `SHINYDAYS.exe`, `SysMenuSD.dll`,
+`RouteProcSD.dll` against School Days HQ's `SCHOOLDAYS HQ.exe`,
+`SysMenuSDHQ.dll`, `RouteProcSDHQ.dll`. Nothing should match on those names;
+see `src/install/binaries.rs` for the export sets that identify each module
+instead.
+
+**The module interfaces are supersets.** `SysMenuSD.dll` exports everything
+`SysMenuSDHQ.dll` does plus `_GetBGMVolume@0` and `_GetSEVolume@0`;
+`RouteProcSD.dll` adds `_ChangeSubtitle@4`, `_CheckEndRollSelect@8`,
+`_CheckEndRollView@4` and `_CheckUniformBlock@4`. Neither drops anything.
+
+**`lua5.1.dll` ships beside the game and nothing uses it.** Not in the import
+directory of the executable or either module, and the string `lua` does not
+appear in any of the three. Checked two ways — the import tables and a raw
+string scan of all three files — so no Lua interpreter is needed.
+
+**The screens are a different generation.** Both modules' screen paths are
+UTF-16 literals in `.rdata`, so the full inventory of each is readable from the
+module itself. Shiny Days consolidates:
+
+| School Days HQ | Shiny Days |
+| --- | --- |
+| `Title/Title`, `Title_Clear`, `Title_AC` | `Title/Title`, `Title/Clear/Title_Clear` — no all-clear title at all |
+| `Option/Option_%s` — three tab hit maps | `Option/OptionBase` — one hit map, 4 regions, with `Default/`, `Sound/` and `Somcon/` art under it |
+| `Replay/Replay_%s` — two hit maps | `Replay/ReplayBase` — one hit map, 3 regions, with `HScene/` and `PlayData/` art under it |
+| `RouteMap/%02d/RouteMap%s` — 16 hit maps | `RouteMap/RouteMap` — one |
+| popups beside their screens | popups under a `Popup/` directory |
+| — | `DressSelect/DressSelect` and its `Popup/Popup_Select`, which School Days HQ has no equivalent of |
+
+**There is a menu mode School Days HQ does not have.** `_SystemInit@8` in
+`SysMenuSD.dll` switches the same mode integers onto the same screens —
+2 title, 3 save/load, 4 option, 5 replay, 6 route map, 7 SOM config, 8 replay
+popup, -1 confirm — and adds **mode 9**. Mode 9 is the dress-select screen: the
+switch hands it the static object at `DAT_1005b898`, whose static-init thunk
+`FUN_10048860` calls the constructor `FUN_1000c470`, which installs
+`MENU::DressSelect::vftable`. `getNextMode` reaches mode 1 (play) or -1
+(confirm) from it. It is almost certainly what `RouteProcSD.dll`'s
+`_CheckUniformBlock@4` and `STARTSCRIPT.INI`'s new `[DressBG]` key
+(`System/DressSelect/sentakuBG_03.wmv`) serve, but that link is **not
+recovered**.
+
+**`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
+`[FeedTime]`, `[Select1]` and `[Select2]` — so the choice box's two hit maps are
+not named by the INI there, and where it gets them instead is **not recovered**.
+`STARTSCRIPT.INI` adds `[SystemBGM2]` and `[DressBG]` and drops `[TrialDemo]`.
+
+**The hit maps are not drawn as precisely.** See the `_CHIP` section.
+
 ---
 
 ## `.GPK` — STKFile0 archive
@@ -47,7 +114,9 @@ Timecodes are `MM:SS:FF` at **24 fps** — confirmed against the movies, which a
 24 fps, and against `[Next]` totals. Files are UTF-8 (English) or UTF-16LE
 with a BOM (Japanese); `FILMENGINE.INI [UnicodeFile]` selects this.
 
-Exactly 14 commands exist across all 1,857 scripts:
+Exactly 14 commands exist across all 1,857 School Days HQ scripts. Shiny Days'
+2,587 scripts use the same dialect and add one, `PlayES`; see *Shiny Days'
+fifteenth command* below.
 
 | Command | Arguments after start timecode | Count |
 |---|---|---|
@@ -97,6 +166,36 @@ Notes:
   the English ones use ruby**. Everything else is wrapped by the engine; see
   *Dialogue layout* below.
 
+### Shiny Days' fifteenth command
+
+`[PlayES]=<start>\t<path>\t<end>;` — an ambient bed, three fields, in 2,811
+statements across 2,232 of the 2,587 scripts. `FUN_0042b770` in `SHINYDAYS.exe` is the arm, and it differs from
+`PlaySe` in three ways that matter:
+
+- it takes **exactly three** arguments and refuses the statement otherwise,
+  reading the path from index 1 and the end timecode from the last index rather
+  than a fixed one,
+- the sound goes to **one dedicated slot**, `this + 0x330`, with its path kept
+  beside it at `this + 0x334`, rather than onto the list of nine at
+  `this + 0x39c` that `PlaySe` pushes to — so a second `PlayES` replaces the
+  first,
+- it opens **looping**: `FUN_00431170(obj, path, NULL, 1)`, against the `0` a
+  four-argument `PlaySe` passes.
+
+It is also **gated**, and that gate is **not recovered**. The arm runs only when
+host vtable slot `+0x130` returns 1 or the film object's `+0x320` is 1. Slot
+`+0x130` of the concrete host vtable at `0x0048e50c` is `FUN_0041da70`, which
+returns the member at `+0x228` of the host subobject and nothing more; which of
+the several writes to that offset is the one that matters has not been traced,
+so what the gate asks is unknown. Until it is, the command's meaning is
+incomplete and the engine does not act on it.
+
+(The host vtable anchor: `0x0048e50c` is stored into `[reg+0x2c]` by
+`FUN_0041d6c0`, is preceded in `.rdata` by an RTTI pointer, and runs 93 code
+pointers. The abstract base's vtable at `0x0048e234` is installed the same way
+at `0x0041d69c` and its slot `+0x130` is `purecall`, which is what tells the
+two apart.)
+
 ### Retail data quirks the parser must absorb
 
 All 1,857 scripts parse once these are handled. Each was found by running the
@@ -106,6 +205,7 @@ parser over the real packs, not by reading the format spec:
 |---|---|
 | `05-KC-F00` line 241 | A **semicolon inside dialogue** (`I know; I am, too.`). Statements have no escaping, so a `;` only terminates when the next non-whitespace character is `[` or the file ends. |
 | `05-KI-OP1` | Written with **`, ` separators instead of tabs**, plus a stray whitespace-only ` ;` statement. Fall back to comma splitting only when a statement contains no tab, so commas in ordinary dialogue stay literal. |
+| Shiny Days `03-32-A29`, `Z2-21-A18`, `03-3K-G34`, `04-K2-A00` | One `[PrintText]` each with **too few fields** — speaker and text typed into one field with a comma between them, an end timecode stuck to the text with no tab, and one statement written with spaces throughout. `FUN_0042d8c0` compares each `[PrintText]`'s field count to four before reading any field and skips the statement when it differs, so these cost their own line and nothing else. Refusing the script would make four scenes unplayable over four typos. |
 | `03-KB-D10` line 29 | A `PrintText` with a **trailing empty field**. |
 | `05-SE-C08` line 81, and 129 others | `PlayVoice` with **empty male-voice and tag fields** but the tabs still written. Fields must be read by position with defaults, not matched against an exact arity. |
 | `01-00-E01` | Two timecodes with a **frame field of 26** in a 24 fps script. Fold the overflow in rather than rejecting. |
@@ -315,6 +415,16 @@ and per record calls a destination-rect setter with
 `(dst_x, dst_y + letterbox, width, height) * scale` and a source-rect setter
 with `(src_x, src_y, width, height)`. Destination and source share one size, so
 a chip sprite is never scaled relative to its widget.
+
+**A hit map need not agree with its table to the pixel.** Every School Days HQ
+box reproduces its record's first four floats exactly. Shiny Days' `TITLE` boxes
+do not: they sit one pixel left of the record that draws them, `x = 635` against
+`x = 636`, and three of the five a pixel up as well. Nothing in the shipped code
+reconciles the two — `FUN_1002f550` in `SysMenuSD.dll` reaches the title's two
+tables by address, `DAT_10058580` for `Title` and `DAT_10058628` for
+`Title_Clear`, seven records each — so the hit maps are free to be approximate.
+Finding a table by the boxes it reproduces therefore has to tolerate a pixel;
+see `crates/days-ui/src/atlas.rs`.
 
 Records after the per-region run are alternate states — disabled art, alternate
 captions — reached by fixed address from code, so how many there are and what
