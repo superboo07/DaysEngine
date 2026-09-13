@@ -333,7 +333,7 @@ impl Column {
     /// The x origins are `FUN_10011ec0`'s own pen starts — 0, `0x400` and 0 —
     /// and the widths are `_DAT_1003b138` (a `flds`, so 548.0f) and
     /// `_DAT_1003b110` (986.0f).
-    const fn surface_span(self) -> (f32, f32) {
+    pub const fn surface_span(self) -> (f32, f32) {
         match self {
             Column::When => (0.0, 548.0),
             Column::Chapter => (1024.0, 548.0),
@@ -378,7 +378,7 @@ impl Column {
     /// all `faddl` so all doubles; the English shifts are `_DAT_1003b140`
     /// (5.0f) and `_DAT_1003b13c` (15.0f), and the comment has none here —
     /// it is centred instead, in [`comment_centre`].
-    const fn dest_x(self, english: bool) -> f32 {
+    pub const fn dest_x(self, english: bool) -> f32 {
         let shift = if english { 1.0 } else { 0.0 };
         match self {
             Column::When => 1.0 + 5.0 * shift,
@@ -513,11 +513,11 @@ const TIP_LINE_HEIGHT: f32 = 32.0;
 /// How many rows of the list the panel's record spans, `_DAT_1003b0f8` — an
 /// `fdivl`, so the double 3.0. The record is about three rows tall and the
 /// panel is that divided by the lines it needs.
-const PANEL_ROWS: f32 = 3.0;
+pub const PANEL_ROWS: f32 = 3.0;
 
 /// The last row whose panel can open downwards, from `FUN_10012900`'s
 /// `param_1 < 8` test.
-const LAST_ROW_OPENING_DOWN: usize = 7;
+pub const LAST_ROW_OPENING_DOWN: usize = 7;
 
 /// Splits a comment the way `FUN_10012900` splits it.
 ///
@@ -820,7 +820,7 @@ impl Rows {
 /// already produces exactly those two planes when asked for white, and already
 /// combines glyphs with `max` for the same reason, so the line goes in as one
 /// piece.
-fn draw_line(
+pub(crate) fn draw_line(
     surface: &mut days_ui::Image,
     font: &days_font::Font,
     text: &str,

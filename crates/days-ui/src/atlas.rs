@@ -70,12 +70,16 @@
 //! is a fact about the screen and twelve would be a sign the search is fitting
 //! noise.
 //!
-//! # Some screens still have no table
+//! # Some screens' rows cannot be found by their boxes
 //!
-//! `SAVELOAD` and `REPLAY_PLAYDATA` lay their slot rows out with a loop at
-//! runtime — ten rows at a 33px pitch — so those rects exist nowhere in the
-//! binary. Both need their layout reproduced in code; the search says so rather
-//! than guessing.
+//! `SAVELOAD` and `REPLAY_PLAYDATA` both list ten slot rows, and both have a
+//! record for every one of them — the save/load screen's at `DAT_1004b048`, the
+//! play-data list's at `DAT_1004c430` — but the search cannot reach them from
+//! the hit map. A row is two hit regions, each covering half of it, while its
+//! record is the row entire, so no box reproduces a record and no run anchors.
+//! [`table_at`] is the other way in: it anchors a table on records whose
+//! **index** is known from the code that reads them, and the caller indexes the
+//! rest itself.
 //!
 //! # Native resolution
 //!
@@ -338,6 +342,58 @@ fn longest_run(dll: &[u8], boxes: &[Rect], from: usize) -> Option<(usize, usize)
         }
     }
     best
+}
+
+/// Finds a record table by boxes it must reproduce at fixed relative indices.
+///
+/// [`find`] walks a screen's regions in order and takes whatever run of records
+/// reproduces them, which is all a screen with one run per region needs. A
+/// screen whose rows are laid out from records the hit map does not reproduce
+/// needs the other half: the **index** of each record is known from the code
+/// that reads it, and the table has to be anchored well enough for those
+/// indices to mean something.
+///
+/// `anchors` are `(record index, the box that record must account for)` pairs.
+/// The return is the byte offset of record 0, or `None` when no position in the
+/// image satisfies every pair. Read records out of it with [`record_at`].
+///
+/// The **first** anchor is matched exactly, because it is the byte pattern the
+/// search scans for; the rest are matched the way [`find`] matches a run, so a
+/// region whose box is a pixel wider than the sprite it belongs to still
+/// anchors. Pass a region with an exact record first — a caption or a button
+/// the art does not bleed past.
+///
+/// A caller that passes one anchor learns nothing a byte search would not tell
+/// it; the point is passing enough of them that the position is unambiguous.
+/// `REPLAY_PLAYDATA` shares its first seven records with `REPLAY_HSCENE` byte
+/// for byte, so its tabs alone match both tables and the page buttons are what
+/// tell them apart.
+pub fn table_at(dll: &[u8], anchors: &[(usize, Rect)]) -> Option<usize> {
+    let (first, anchor) = *anchors.first()?;
+    let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
+        .iter()
+        .flat_map(|v| (*v as f32).to_le_bytes())
+        .collect();
+
+    let mut at = 0usize;
+    while let Some(found) = find_bytes(dll, &needle, at) {
+        at = found + 4;
+        let Some(base) = found.checked_sub(first * RECORD) else {
+            continue;
+        };
+        if anchors
+            .iter()
+            .all(|(index, want)| record_at(dll, base, *index).is_some_and(|w| fits(&w.dst, want)))
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// One record of a table whose base offset is already known.
+pub fn record_at(dll: &[u8], base: usize, index: usize) -> Option<Widget> {
+    record(dll, base.checked_add(index.checked_mul(RECORD)?)?)
 }
 
 /// Whether a record's rect can be the sprite for a region with this box.

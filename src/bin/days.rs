@@ -2290,7 +2290,7 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
         );
         // A choice box settles before the script ends, so the answer is given
         // first and the transition taken after.
-        progress.decide(answers.next().unwrap_or(-1));
+        progress.decide(answers.next().unwrap_or(-1), true);
         match progress.advance() {
             Some(next) => played = next,
             None => {

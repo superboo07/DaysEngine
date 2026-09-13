@@ -35,6 +35,8 @@
 
 use crate::install::vfs::Vfs;
 use crate::playback::scale::Scaler;
+use crate::ui::playdata;
+use crate::ui::replay;
 use days_ui::atlas::{self, Atlas, Widget};
 use days_ui::cmap::Cmap;
 use days_ui::Image;
@@ -240,8 +242,27 @@ impl Screen {
         let letterbox = (f64::from(display.height()) - f64::from(native.height()) * scale) / 2.0;
         let display_size = (display.width(), display.height());
 
-        let atlas = atlas::find(dll, native.all_bounds(), (chip.width, chip.height))
+        let mut atlas = atlas::find(dll, native.all_bounds(), (chip.width, chip.height))
             .map_err(|_| Error::NoAtlasFor(path.to_string()))?;
+
+        // The play-data list's rows are laid out from records its hit map does
+        // not reproduce, so the generic search extrapolates them and lands on
+        // the page buttons' alternate states. `playdata::relocate` puts them
+        // back from the indices the shipped code reads; a screen whose table
+        // will not anchor has no list to draw, so it is refused rather than
+        // drawn from the wrong offsets.
+        let stem = path.to_ascii_lowercase();
+        if stem.ends_with("replay_playdata")
+            && !playdata::relocate(&mut atlas, dll, native.all_bounds())
+        {
+            return Err(Error::NoAtlasFor(path.to_string()));
+        }
+        // The grid needs only the second half of that: its own widgets are
+        // placed, but the records marking the tab and page it is on are not
+        // where the generic search reads alternates from.
+        if stem.ends_with("replay_hscene") {
+            replay::place_alternates(&mut atlas, dll, native.all_bounds());
+        }
 
         // The base art covers the whole screen, so resampling it is the most
         // expensive thing a composite does — and it is the same work every

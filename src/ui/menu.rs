@@ -27,7 +27,8 @@
 //! where that screen's behaviour lives: the title's in [`Menu::confirm`], the
 //! Option screen's in [`crate::ui::options`], the replay grid's and its popup's
 //! in [`crate::ui::replay`] and the save/load screen's in
-//! [`crate::ui::saveload`]. `Replay_PlayData` has none yet.
+//! [`crate::ui::saveload`], and `Replay_PlayData` the same rows again
+//! through [`crate::ui::playdata`].
 //!
 //! A few screens also draw things that are not widget states. Those whose
 //! source is the same size as their destination go through `Menu::sprites` —
@@ -49,6 +50,7 @@ use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
 use crate::ui::options;
 use crate::ui::options::Dir;
+use crate::ui::playdata;
 use crate::ui::replay::{self, Scenes};
 use crate::ui::saveload::{self, Kind, Slots};
 use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
@@ -345,6 +347,16 @@ pub enum Action {
     /// one each time a script ends, and walks the scene's own list by a step
     /// index at `+0x2ac`, following the scene's branch table where it has one.
     PlayReplay(replay::Run),
+    /// Play a save slot back following the answers it recorded.
+    ///
+    /// A row of the replay screen's play-data list. `FUN_1001dfe0` hands the
+    /// host three things for it — `+0x48(slot)`, which is the same load the
+    /// save/load screen asks for, then `+0x94(1)`, and then `+0x4c(8)` to
+    /// leave. `+0x94` raises the flag `+0x98` reports, and `FUN_00431740`
+    /// reads that flag at every choice box: a box nobody answers resolves to
+    /// `FUN_00428a80`, the answer the slot recorded at that script, and the
+    /// moment the player answers one themselves the flag comes back down.
+    PlayRecorded(u32),
     /// A setting changed. The engine should re-read the volumes it mixes with.
     ///
     /// The DLL writes each setting through to the config object as it happens,
@@ -685,20 +697,49 @@ impl Menu {
         self.refresh();
         Ok(())
     }
+}
 
+/// Which of the two screens that list the player's slots is showing.
+///
+/// The save/load screen and the replay screen's play-data list read the same
+/// hundred slots through the same host call, and both rasterise a page of them
+/// into one off-screen surface. What differs is the records and three details
+/// [`crate::ui::playdata`] sets out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum List {
+    SaveLoad,
+    PlayData,
+}
+
+impl Menu {
     /// Rasterises the save/load screen's rows for the page it is showing.
     ///
     /// Rebuilt on entering the screen and on turning a page, which is when the
     /// shipped `FUN_10011ec0` runs: the surface holds one page at a time.
     pub fn load_rows(&mut self) {
         self.rows = None;
-        if self.mode != Mode::SAVELOAD {
-            return;
-        }
+        let list = match self.mode {
+            Mode::SAVELOAD => List::SaveLoad,
+            Mode::REPLAY if self.view == replay::View::PlayData => List::PlayData,
+            _ => return,
+        };
         let Some(font) = &self.font else {
-            log::warn!("no font, so the save/load rows stay empty");
+            log::warn!("no font, so the slot rows stay empty");
             return;
         };
+        if list == List::PlayData {
+            let hovered = self.selection.and_then(playdata::tooltip_row);
+            self.rows = Some(playdata::render(
+                font,
+                &self.session.slots,
+                self.page,
+                &self.screen.atlas().widgets,
+                self.session.text_input,
+                hovered,
+            ));
+            self.dirty = true;
+            return;
+        }
         // The selection is what opens the expanded comment, so this is rebuilt
         // on every hover — which is what the shipped screen does: its
         // `FUN_10012900` re-runs the whole row rasterising before laying the
@@ -976,6 +1017,22 @@ impl Menu {
         let regions = self.states.len();
         match self.mode {
             Mode::TITLE if widget == 2 && !self.session.save.replay_unlocked() => Some(0),
+            // Both replay views mark the tab and the page you are on, which no
+            // resting/active pair can say. An index past the alternates the
+            // screen actually placed draws nothing: see
+            // [`replay::place_alternates`] for when that happens.
+            Mode::REPLAY => {
+                let selected = self.selection == Some(widget);
+                let extra = match self.view {
+                    replay::View::HScene => {
+                        replay::extra_for(widget, self.view, self.page, selected)
+                    }
+                    replay::View::PlayData => {
+                        playdata::extra_for(widget, self.view, self.page, selected)
+                    }
+                }?;
+                (extra < self.screen.atlas().extras.len()).then_some(extra)
+            }
             Mode::OPTION => {
                 if !options::shows_current_value(
                     self.tab,
@@ -1020,6 +1077,7 @@ impl Menu {
         let selection = self.selection?;
         match self.mode {
             Mode::SAVELOAD => saveload::highlight(self.kind, selection),
+            Mode::REPLAY if self.view == replay::View::PlayData => playdata::highlight(selection),
             _ => Some(selection),
         }
     }
@@ -1158,6 +1216,7 @@ impl Menu {
             Mode::REPLAY if self.view == replay::View::HScene => {
                 self.confirm_replay(vfs, dll, widget)
             }
+            Mode::REPLAY => self.confirm_playdata(vfs, dll, widget),
             Mode::REPLAY_POPUP => Ok(self.confirm_replay_popup(widget)),
             // `FUN_10014910` answers false for every widget while `+0x98` is
             // set, so a save that has been taken and not yet written swallows
@@ -1352,6 +1411,42 @@ impl Menu {
         }
     }
 
+    /// The play-data list's dispatch, from `FUN_1001dfe0`.
+    ///
+    /// A row whose slot has no file does nothing, which is the shipped
+    /// `+0x17c + row * 4` test; every widget stays live either way.
+    fn confirm_playdata(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        match playdata::action(widget) {
+            playdata::Act::View(next) => {
+                if next == self.view {
+                    return Ok(Action::Stay);
+                }
+                self.view = next;
+                self.page = 0;
+                self.reopen(vfs, dll, Mode::REPLAY)
+            }
+            playdata::Act::Back => self.advance(vfs, dll, Mode::CONFIRM),
+            playdata::Act::Page(page) => {
+                if page == self.page {
+                    return Ok(Action::Stay);
+                }
+                self.page = page;
+                self.selection = None;
+                self.refresh();
+                Ok(Action::Sound(SystemSe::Click))
+            }
+            playdata::Act::Row(row) => {
+                let slot = saveload::slot_of(self.page, row);
+                Ok(if self.session.slots.filled(slot) {
+                    Action::PlayRecorded(slot)
+                } else {
+                    Action::Stay
+                })
+            }
+            playdata::Act::None => Ok(Action::Stay),
+        }
+    }
+
     /// The replay popup's dispatch: pick a version and play it.
     fn confirm_replay_popup(&mut self, widget: usize) -> Action {
         let Some(scene) = self.asked.and_then(|s| self.session.scenes.get(s)) else {
@@ -1490,10 +1585,10 @@ impl Menu {
         let was = (self.mode, self.variant.clone());
         match self.enter(vfs, dll, next, return_to) {
             Ok(()) => Ok(Action::Opened(next)),
-            // Two screens lay their rows out with a runtime loop instead of a
-            // table, so the atlas search correctly refuses them and they cannot
-            // be drawn yet. Staying put is the right answer: an unbuilt screen
-            // should leave the player on a working menu, not end the session.
+            // A screen whose art, hit map or widget table will not read
+            // cannot be drawn. Staying put is the right answer: a screen this
+            // engine cannot build should leave the player on a working menu,
+            // not end the session.
             Err(err) => {
                 log::warn!("cannot open menu mode {}: {err}", next.0);
                 // Put back whatever the failed load replaced. This cannot fail:

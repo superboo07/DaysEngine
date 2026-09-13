@@ -9,6 +9,9 @@
 //! 1  Replay_PlayData   33 widgets   the play-data list
 //! ```
 //!
+//! This module is the grid. The list is [`crate::ui::playdata`], which is the
+//! save/load screen's rows over again — see there.
+//!
 //! Widgets 0 and 1 are the two tab headers and widget 2 is the back button on
 //! both. On the thumbnail screen widgets 3 to 6 are the four page buttons and
 //! widgets 7 to 18 are the twelve thumbnails, which is [`HSCENE_PER_PAGE`] ×
@@ -128,6 +131,80 @@ impl View {
             _ => None,
         }
     }
+}
+
+/// Where the grid's "this is where you are" records are.
+///
+/// `FUN_1001a8b0` binds the four page buttons' resting sprites to records 7 to
+/// 0xa, `+0x160` to record `view + 3` and `+0x164` to record
+/// `view + 5` — the tab of the view showing, and the same tab with the pointer
+/// on it. `FUN_1001c1f0` binds `+0x124` to record `page + 0xb` and `+0x150` to
+/// record `page + 0xf`, the same pair for the page button. Record `0x13` is the
+/// first thumbnail, which is a widget rather than an alternate, so the
+/// alternates are records 3 to 0x12.
+const PAGE_RECORD: usize = 7;
+const TAB_CURRENT: usize = 3;
+const TAB_SELECTED: usize = 5;
+const PAGE_CURRENT: usize = 0xb;
+const PAGE_SELECTED: usize = 0xf;
+const ALTERNATES: usize = TAB_CURRENT;
+const THUMBNAIL_RECORD: usize = 0x13;
+
+/// Points an atlas's alternate records at the grid's own.
+///
+/// The generic search reads them off the end of whatever segment it last
+/// matched, which is not where this screen's are; and the grid's first seven
+/// records are byte for byte the play-data list's, so the tabs alone do not say
+/// which of the two tables was found. The four page buttons do — the list has
+/// ten, at different x — so the anchor is all seven boxes at their own indices.
+///
+/// On failure the alternates are **cleared** rather than left as they were: an
+/// index into a run this screen does not own would draw a sprite from another
+/// screen's table, and no mark at all is the better wrong answer.
+pub fn place_alternates(atlas: &mut days_ui::Atlas, dll: &[u8], boxes: &[days_ui::Rect]) {
+    let anchors: Option<Vec<(usize, days_ui::Rect)>> = (0..3)
+        .map(|i| Some((i, *boxes.get(i)?)))
+        .chain(
+            (0..HSCENE_PAGES)
+                .map(|page| Some((PAGE_RECORD + page, *boxes.get(HSCENE_FIRST_PAGE + page)?))),
+        )
+        .collect();
+    let placed = anchors
+        .as_deref()
+        .and_then(|anchors| days_ui::atlas::table_at(dll, anchors))
+        .and_then(|base| {
+            (ALTERNATES..THUMBNAIL_RECORD)
+                .map(|index| days_ui::atlas::record_at(dll, base, index))
+                .collect::<Option<Vec<_>>>()
+        });
+    match placed {
+        Some(extras) => atlas.extras = extras,
+        None => {
+            log::warn!("no record table in the DLL marks the replay grid's tab and page");
+            atlas.extras.clear();
+        }
+    }
+}
+
+/// Which alternate record a widget draws instead of its resting or active one,
+/// from `FUN_1001a460`.
+///
+/// The tab of the view showing and the button of the page showing, each with a
+/// second form for the pointer being on it. The answer indexes the run
+/// [`place_alternates`] built.
+pub fn extra_for(widget: usize, view: View, page: usize, selected: bool) -> Option<usize> {
+    let record = if View::from_widget(widget) == Some(view) {
+        widget + if selected { TAB_SELECTED } else { TAB_CURRENT }
+    } else if widget == HSCENE_FIRST_PAGE + page && page < HSCENE_PAGES {
+        page + if selected {
+            PAGE_SELECTED
+        } else {
+            PAGE_CURRENT
+        }
+    } else {
+        return None;
+    };
+    record.checked_sub(ALTERNATES)
 }
 
 /// The sprite sheet a page of thumbnails is cut from.

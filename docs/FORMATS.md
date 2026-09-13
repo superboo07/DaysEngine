@@ -702,8 +702,55 @@ widgets 7 and 18 fall through every arm. Until that reads consistently the grid
 gets a plain walk over its widgets rather than a table that looks recovered and
 is not.
 
-`Replay_PlayData` is not implemented: its rows are laid out by a runtime loop,
-so the atlas search correctly refuses the screen.
+`Replay_PlayData` is the save/load list over again. `FUN_1001b6d0` asks the host
+`+0x9c` — `FUN_0042a980`, the very call the save/load screen uses — for each
+slot of the page, so the rows are the player's own hundred save slots, ten to a
+page over ten pages, `page * 10 + row`. The three columns are the timestamp, the
+chapter and the comment, rasterised into one 2048x1024 surface and cut by a
+sprite each, and the comment column is gated on host `+0xd8`
+(`FILMENGINE.INI [TextInput]`). Every layout constant is the same global the
+save/load screen reads, at the same width.
+
+Its records are the same table the grid's are, at `DAT_1004c430`:
+
+| records | what |
+| --- | --- |
+| 0 .. 2 | the two tab headers and CLOSE |
+| 3 .. 6 | the tabs marking the view showing, and that with the pointer on it |
+| 7 .. 16 | the ten page buttons |
+| 17 .. 36 | the page button marking the page showing, and that with the pointer on it |
+| 37 .. 46 | the row bars, 799x31 — the highlight, and where the timestamp and chapter go |
+| 47 .. 56 | the comment column, 472x97 — three rows tall because it doubles as the expanded comment's panel |
+
+The hit map reproduces none of the row records: a row is two hit regions, the
+left band (widgets 3 to 0xc) and the comment band (widgets 0x17 to 0x20), each
+half the width of the record. So the table is anchored on the thirteen records
+that *are* reproduced — the three at the top and the ten page buttons — at their
+own indices, and the rows are read off from there. The tabs alone will not do
+it: `REPLAY_PLAYDATA` and `REPLAY_HSCENE` share their first seven records byte
+for byte and sit back to back in `.data`.
+
+Either band picks the same row (`FUN_1001dfe0`) and lights the same full-width
+bar (`FUN_1001a670`); only the comment band raises the expanded comment
+(`FUN_1001a060` calls `FUN_1001bc80(this, selection - 0x17)`). Nothing on the
+screen is ever greyed out — `FUN_1001dd80` answers true for every widget — and a
+row whose slot has no file simply does nothing.
+
+Three things it does **not** do that the save/load screen does: `FUN_1001c850`,
+`FUN_1001b6d0` and `FUN_1001bc80` never ask host `+0x5c`, so no column is
+shifted for English, no comment is centred, and every column is cut at twenty
+characters. It also rasterises two pixels above where it cuts — the pen is
+`row * 0x30` and `row * 0x30 + 0x200` while the sprites cut at `row * 48 + 2`
+and `row * 48 + 514`.
+
+Picking a row hands the host `+0x48(slot)` — the same load the save/load screen
+asks for — then `+0x94(1)` and `+0x4c(8)`. `+0x94` (`FUN_0042bf10`) raises the
+flag `+0x98` reports, and `FUN_00431740` reads it at every choice box: a box
+nobody answers takes `FUN_00428a80`, the answer that slot recorded at the script
+in play, and the moment the player answers one themselves `+0x94(0)` puts the
+flag down. The same flag gates the write — `FUN_00428a50` runs only with it
+clear — so a followed playthrough does not overwrite the recording it is
+reading. That is what "replay data" means: play a save back by its own answers.
 
 See `daysengine::replay`.
 

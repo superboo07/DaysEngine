@@ -184,7 +184,12 @@ impl Progress {
     /// before the script has ended — so the deltas land here and not when the
     /// transition is taken. `_SetFeeling@8` works the destination out for
     /// itself rather than being told it, and most scenes credit nothing.
-    pub fn decide(&mut self, choice: i32) {
+    ///
+    /// `record` is false while the play-data list is following a slot's own
+    /// answers: `FUN_00431740` calls `FUN_00428a50` — the write — only when
+    /// host `+0x98` is clear, so a followed playthrough credits its deltas
+    /// without writing over the recording it is reading.
+    pub fn decide(&mut self, choice: i32, record: bool) {
         self.stores.choice = choice;
         let (route, scene) = self.position();
         // The engine records the answer against the script it was asked at,
@@ -192,6 +197,7 @@ impl Progress {
         if let Some(here) = self
             .routes
             .script(route.max(0) as usize, scene.max(0) as usize)
+            .filter(|_| record)
         {
             self.choices.insert(here.to_owned(), choice);
         }
@@ -208,6 +214,20 @@ impl Progress {
             self.gauge_raised = true;
         }
         log::info!("choice {choice} credits the deltas of {script}");
+    }
+
+    /// The answer the slot recorded at the script now playing, if it has one.
+    ///
+    /// `FUN_00428a80` looks the current script's name up in the same store
+    /// [`Progress::decide`] writes — the executable's `+0xac`, keyed by host
+    /// `+0x1a4`, the script in play. The play-data list is what reads it back:
+    /// a choice box that nobody answers resolves to this instead of to -1.
+    pub fn recorded_choice(&self) -> Option<i32> {
+        let (route, scene) = self.position();
+        let here = self
+            .routes
+            .script(route.max(0) as usize, scene.max(0) as usize)?;
+        self.choices.get(here).copied()
     }
 
     /// Runs the branch graph and moves to whatever it names.

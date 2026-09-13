@@ -17,6 +17,7 @@ pub mod comment;
 pub mod ending;
 pub mod menu;
 pub mod options;
+pub mod playdata;
 pub mod replay;
 pub mod saveload;
 pub mod screen;

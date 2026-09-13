@@ -217,6 +217,14 @@ struct Player<'a> {
     /// `Config.DAT`'s `TypeMiniNote`, which picks the 1024x576 art over the
     /// 1280x720 art when full screen. Host `+0xc8`, via `DAT_0050b314`.
     mini_note: bool,
+    /// Whether a choice box nobody answers should take the answer the loaded
+    /// slot recorded, which is what the replay screen's play-data list starts.
+    ///
+    /// The film object's `+0x1e0`: host `+0x94` raises it (`FUN_0042bf10`) and
+    /// `+0x98` reports it. `FUN_00431740` reads it at every box — an unanswered
+    /// one resolves to `FUN_00428a80`, the recorded answer, and the moment the
+    /// player answers one themselves it comes back down.
+    following_record: bool,
     /// The index the last choice box settled on, which is what a replay's
     /// branch table is read by. The film object's `+0x1f8`: `FUN_004388c0`
     /// sets it to -2 once, when the object is constructed, and only a settling
@@ -371,6 +379,7 @@ fn main() -> Result<()> {
         mini_note: boot_config
             .get("TypeMiniNote")
             .is_some_and(|v| v.trim() != "0"),
+        following_record: false,
         last_choice: replay::NO_CHOICE,
         // Started only while the save-comment dialog is up, so ordinary key
         // presses stay key presses everywhere else.
@@ -481,23 +490,32 @@ fn main() -> Result<()> {
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
                 // fresh `searchRoot` on the name.
-                Outcome::LoadSlot(slot) => match progress
-                    .as_mut()
-                    .and_then(|p| p.load_from(&game, &film, slot))
-                {
-                    Some(script) => {
-                        next = script.rsplit('/').next().unwrap_or(&script).to_string();
-                        chained = true;
-                        continue;
+                // A row of the play-data list is the same load with the
+                // recorded answers followed: `FUN_1001dfe0` hands the host
+                // `+0x48(slot)`, `+0x94(1)` and then `+0x4c(8)`.
+                Outcome::LoadSlot { slot, recorded } => {
+                    player.following_record = recorded;
+                    match progress
+                        .as_mut()
+                        .and_then(|p| p.load_from(&game, &film, slot))
+                    {
+                        Some(script) => {
+                            next = script.rsplit('/').next().unwrap_or(&script).to_string();
+                            if player.following_record {
+                                log::info!("playing slot {slot} back by its own answers");
+                            }
+                            chained = true;
+                            continue;
+                        }
+                        None => {
+                            log::warn!("slot {slot} would not load");
+                            player.following_record = false;
+                            continue;
+                        }
                     }
-                    None => {
-                        log::warn!("slot {slot} would not load");
-                        continue;
-                    }
-                },
-                // There is nothing to save from the title — the player has no
-                // position — so this only happens from playback, where the
-                // save is taken before the menus open.
+                } // There is nothing to save from the title — the player has no
+                  // position — so this only happens from playback, where the
+                  // save is taken before the menus open.
             }
         }
         if !chained {
@@ -659,7 +677,11 @@ enum Outcome {
     /// Play a replay scene: the scripts it runs through and how it walks them.
     Replay(replay::Run),
     /// Load a save slot and play what it names.
-    LoadSlot(u32),
+    ///
+    /// `recorded` is a row of the replay screen's play-data list rather than
+    /// the load screen: the same load, plus the slot's own answers followed.
+    /// See [`Player::following_record`].
+    LoadSlot { slot: u32, recorded: bool },
     /// Close the game.
     Quit,
 }
@@ -875,7 +897,18 @@ fn run_menu(
             match action {
                 Action::Play => return Ok(Outcome::Play),
                 Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
-                Action::Load(slot) => return Ok(Outcome::LoadSlot(slot)),
+                Action::PlayRecorded(slot) => {
+                    return Ok(Outcome::LoadSlot {
+                        slot,
+                        recorded: true,
+                    })
+                }
+                Action::Load(slot) => {
+                    return Ok(Outcome::LoadSlot {
+                        slot,
+                        recorded: false,
+                    })
+                }
                 // Naming the save is what confirms it. The original hands this
                 // to Windows; `run_comment` draws the same dialog out of the
                 // executable's own template. Cancelling calls nothing, so no
@@ -2022,6 +2055,41 @@ fn run_script(
                 // source of the same range does the same job.
                 (Instant::now().elapsed().subsec_nanos() as usize ^ at.0 as usize) % n.max(1)
             });
+            // `FUN_00431740` settles the answer before it picks the sound, and
+            // two of the things it does there are the play-data list's.
+            //
+            // While host `+0x98` is up — the list started this playthrough to
+            // follow a slot's own answers — a box **nobody answered** takes
+            // `FUN_00428a80`, the answer that slot recorded at this script, and
+            // then rings as whatever that answer is rather than as a cancel.
+            // And the moment the player answers a box themselves the flag comes
+            // down (`+0x94(0)`), which is why following stops the first time
+            // they disagree with the recording. The flag is also what gates the
+            // write: `FUN_00428a50` runs only with it clear, so a followed
+            // playthrough does not overwrite the recording it is reading.
+            let mut event = event;
+            if let select::Event::Decided(index, _) = event {
+                if player.following_record {
+                    if index < 0 {
+                        if let Some(answer) =
+                            progress.as_deref().and_then(Progress::recorded_choice)
+                        {
+                            log::info!("the slot recorded {answer} here, so that is the answer");
+                            event = select::Event::Decided(
+                                answer,
+                                if answer < 0 {
+                                    SystemSe::Cancel
+                                } else {
+                                    SystemSe::Select
+                                },
+                            );
+                        }
+                    } else {
+                        log::info!("the player answered, so the recording is no longer followed");
+                        player.following_record = false;
+                    }
+                }
+            }
             match event {
                 select::Event::Raised(se) | select::Event::Decided(_, se) => {
                     player
@@ -2063,7 +2131,7 @@ fn run_script(
                         log::info!("choice decided: {index}");
                         player.last_choice = index;
                         if let Some(p) = progress.as_deref_mut() {
-                            p.decide(index);
+                            p.decide(index, !player.following_record);
                         }
                     }
                 }
