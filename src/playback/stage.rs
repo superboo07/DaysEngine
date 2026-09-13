@@ -237,8 +237,11 @@ impl Stage {
     /// `[SkipFRAME]` frame) against its end (`FUN_004315a0`, the `[Next]`
     /// frame): equal means the script has no choice to skip to, and a target
     /// already behind the clock means the choice has been passed. Either way
-    /// the engine takes the other branch, seeks to the end and loads the next
-    /// script.
+    /// this answers `None`, and the button's other half takes over — case 7,
+    /// which loads the following scripts one after another and passes over
+    /// every one whose two frames also match, until it reaches one that raises
+    /// a choice and plays that from its start. The engine's loop is the outer
+    /// one in `main.rs`; this method is only the within-script half.
     ///
     /// Otherwise it seeks to the target **less one second** — `iVar6 -
     /// DAT_0050c468`, and `DAT_0050c468` is `0x18`, set at `0x0044a623` — so

@@ -226,7 +226,8 @@ impl Seek {
     /// Widget 4's code, reached only after host `+0x12c(1)`.
     ///
     /// The only code that is not "this script is over": `FUN_00425bf0`'s case 2
-    /// routes it to case 6, which jumps to the choice this script raises. See
+    /// routes it to case 6, which jumps to the choice this script raises — or,
+    /// when it raises none, chases one across the scripts that follow. See
     /// [`crate::playback::stage::Stage::skip_target`].
     pub const SKIP: Seek = Seek(5);
 }

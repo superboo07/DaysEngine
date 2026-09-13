@@ -430,6 +430,10 @@ fn main() -> Result<()> {
     // for ordinary playback. The original keeps the same pair on the replay
     // module: the scene at `+0x2a8` and the step at `+0x2ac`.
     let mut replaying: Option<(Vec<String>, usize)> = None;
+    // Set while the skip button is still looking for a choice, which makes the
+    // loop below pass over scripts that raise none instead of playing them.
+    let mut chasing_choice = false;
+    let mut passed_over = 0usize;
     loop {
         if menus && !chained {
             // The menus reached from here are the whole screen. The control
@@ -445,7 +449,7 @@ fn main() -> Result<()> {
                 progress.as_mut(),
             )? {
                 Outcome::Quit => break,
-                Outcome::Play | Outcome::Finished => next = wanted.clone(),
+                Outcome::Play | Outcome::Finished | Outcome::SkipToChoice => next = wanted.clone(),
                 // A replay names its own script, which the DLL's table spells
                 // as a path; `find_script` wants the trailing name.
                 // A scene is a sequence, not one script. `FUN_1001f270` starts
@@ -497,6 +501,38 @@ fn main() -> Result<()> {
             script.length,
             script.length.as_seconds()
         );
+        // Still chasing a choice: a script that raises none is passed over
+        // without being played, and the graph is asked for the one after it.
+        // Bounded because the route graph is the player's own data and a cycle
+        // in it must cost a log line, not the session.
+        if chasing_choice {
+            if script.skip_to < script.length {
+                log::info!("the skip found a choice in {name}");
+                chasing_choice = false;
+            } else if passed_over >= MAX_SCRIPTS_PASSED_OVER {
+                log::warn!(
+                    "the skip passed over {passed_over} scripts without finding a choice; \
+                     playing {name} rather than chasing further"
+                );
+                chasing_choice = false;
+                passed_over = 0;
+            } else if let Some(after) = progress.as_mut().and_then(Progress::advance) {
+                passed_over += 1;
+                log::info!("the skip passes over {name}, which raises no choice");
+                next = after.rsplit('/').next().unwrap_or(&after).to_string();
+                chained = true;
+                continue;
+            } else {
+                // The route ended. There is no choice ahead, so this is where
+                // the chase stops: play what the graph last named.
+                log::info!("the skip reached the end of the route without a choice");
+                chasing_choice = false;
+                passed_over = 0;
+            }
+        }
+        if !chasing_choice {
+            passed_over = 0;
+        }
         canvas
             .window_mut()
             .set_title(&format!("DaysEngine — {name}"))?;
@@ -514,7 +550,20 @@ fn main() -> Result<()> {
         // is what the executable's state 4 does. When the graph names nothing
         // — the route ended, or the script was not in it — the session goes
         // back to the title, as the game does. Quitting ends it either way.
-        if outcome == Outcome::Finished {
+        // The skip button chases a choice across scripts: `FUN_00425bf0`'s
+        // case 7 loads the next script and, when that one's `[SkipFRAME]`
+        // equals its `[Next]`, stays in case 7 and loads the one after it. So
+        // the chase passes over whole scripts without playing them until it
+        // reaches one that raises a choice, and plays that from its start —
+        // `FUN_00431250(next, +0x53c + 1)`, the script's own beginning, not
+        // the choice's frame.
+        //
+        // Case 7 is only ever reached from case 6, so this chaining is the
+        // skip and nothing else: an ordinary end-of-script does not do it.
+        // Cleared here and set only on a chain step below, so a chase that
+        // runs out of route cannot leak into whatever is played next.
+        chasing_choice = false;
+        if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
             // A replay walks the scene's own list. `FUN_1001ee20`'s `default`
             // arm is `step + 1`, which is every scene without a branch table —
             // see `daysengine::ui::replay` for which twelve have one and what
@@ -537,11 +586,14 @@ fn main() -> Result<()> {
             if let Some(script) = progress.as_mut().and_then(Progress::advance) {
                 next = script.rsplit('/').next().unwrap_or(&script).to_string();
                 chained = true;
+                // A replay never reaches here — it returned above — so this is
+                // ordinary playback, where a skip keeps chasing.
+                chasing_choice = outcome == Outcome::SkipToChoice;
                 continue;
             }
         }
         // Anything else leaving playback ends the replay too.
-        if outcome != Outcome::Finished {
+        if outcome != Outcome::Finished && outcome != Outcome::SkipToChoice {
             replaying = None;
         }
         if outcome == Outcome::Quit || !menus {
@@ -567,6 +619,14 @@ enum MenuEntry {
     OverPlayback(Mode, saveload::Kind),
 }
 
+/// How many scripts a skip will pass over before giving up and playing one.
+///
+/// The chase has a natural end — the route graph runs out — but the graph comes
+/// out of the player's own `RouteProcSDHQ.dll`, and a cycle in it would
+/// otherwise spin here forever. The longest retail route is 116 scripts, so
+/// this is well clear of anything the real data asks for.
+const MAX_SCRIPTS_PASSED_OVER: usize = 512;
+
 /// Why a loop gave up control.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
@@ -574,6 +634,12 @@ enum Outcome {
     Play,
     /// The script reached its end, so the branch graph decides what follows.
     Finished,
+    /// The skip button was pressed and this script had no choice ahead of the
+    /// clock. Like [`Outcome::Finished`], except the chain keeps going — past
+    /// whole scripts, without playing them — until it reaches one that raises
+    /// a choice. `FUN_00425bf0`'s case 7 looping on itself; see
+    /// [`daysengine::playback::stage::Stage::skip_target`].
+    SkipToChoice,
     /// Play a replay scene: the sequence of scripts it runs through.
     Replay(Vec<String>),
     /// Load a save slot and play what it names.
@@ -1783,15 +1849,15 @@ fn run_script(
                         // state `+0xfc(5)` selects, and it is the only seek
                         // that is not "this script is over" — see
                         // `Stage::skip_target` for the rule and the landing
-                        // frame. With nothing to skip to it falls through to
-                        // the same end-of-script path as the rest.
+                        // frame. With nothing to skip to here, the chase moves
+                        // on to the scripts after this one.
                         bar::Act::Seek(code) if code == bar::Seek::SKIP => match skip_target {
                             Some(to) => {
                                 log::info!("skipping from {at} to the choice at {to}");
                                 offset = to;
                                 origin = now;
                             }
-                            None => return Ok(Outcome::Finished),
+                            None => return Ok(Outcome::SkipToChoice),
                         },
                         // Everything past a restart lands in the executable's
                         // state 4, which is the "this script is finished" path:

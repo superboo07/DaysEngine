@@ -756,13 +756,33 @@ Case 6 compares two members of the timeline object:
 | `+0x22c` | `FUN_004315c0` | `[SkipFRAME]` in `FUN_0043b640` | the skip target |
 | `+0x21c` | `FUN_004315a0` | `[Exit]` / `[Next]` in `FUN_0043b640` | the end of the script |
 
-If the target equals the end, or is already behind the clock (`+0x208`), there
-is nothing to skip to: it seeks to the end and falls through to state 7, which
-asks `_GetNextScriptFile@12` for what follows. Otherwise it seeks to
-**`+0x22c` less `DAT_0050c468`** — `0x18`, 24, set at `0x0044a623` — clears the
-skip flag with `+0x12c(0)` and carries on playing. So the button lands one
-second *before* the target, and the run-up plays rather than the box appearing
-out of a cut.
+If the target is ahead of the clock (`+0x208`) and not equal to the end, it
+seeks to **`+0x22c` less `DAT_0050c468`** — `0x18`, 24, set at `0x0044a623` —
+clears the skip flag with `+0x12c(0)` and carries on playing. So the button
+lands one second *before* the choice, and the run-up plays rather than the box
+appearing out of a cut.
+
+Otherwise there is nothing to skip to in this script, and it seeks to the end
+and falls into **state 7** — which is the other half of the button, and is
+reachable from nowhere but case 6, so this chaining is the skip and never an
+ordinary end of script. State 7 asks `_GetNextScriptFile@12` for what follows
+and loads it, then compares the **new** script's `+0x22c` and `+0x21c`:
+
+- they differ — the new script raises a choice — so it positions at
+  `+0x53c + 1`, the new script's own start, clears the skip flag, sets
+  `+0x5ca` (which suppresses the intro effect in case 4 and routes case 0 to
+  case 2) and goes to state 4. The script plays from its beginning, *not* from
+  its choice.
+- they are equal — no choice there either — and nothing assigns `+0x224`, so
+  the state stays 7 and the next iteration loads the script after it.
+
+So the button chases a choice across scripts, passing over whole ones without
+playing them. In chapter 1 a press during the opening runs `00-00-A00` →
+`A01` → `A02` and stops at `A03`, the first of route 0's 21 scenes that raises
+one.
+
+The chase is gated by host `+0x88` (`FUN_00427490`): when that answers 0 the
+new script is played whether or not it has a choice.
 
 The target is the choice. Across all 1,857 retail scripts, `[SkipFRAME]` equals
 `[Next]` in the 1,570 that raise no choice, and in all 287 that do it is exactly
