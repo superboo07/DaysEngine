@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
+use daysengine::install::binaries::Binaries;
 use daysengine::install::binding::{Action as Control, Bindings, Sign, Trigger};
 use daysengine::install::config::{Channel, Config, Flag};
 use daysengine::install::engine::Settings;
@@ -635,12 +636,14 @@ struct Player<'a> {
     mixer: &'a Mixer,
     sounds: Sounds,
     system_se: SystemSounds,
-    /// The user's own `SysMenuSDHQ.dll`, which holds every widget table.
+    /// The user's own menu module, which holds every widget table.
     dll: Vec<u8>,
     /// What the player has unlocked, out of their `Save/GlobalFlag.DAT`.
     flags: FlagStore,
     /// The install root, which is where `Config.DAT` is written back.
     game: PathBuf,
+    /// The game executable, which is where the comment dialog template lives.
+    executable: PathBuf,
     /// `FILMENGINE.INI`, which names the choice box's hit maps among much else.
     film: &'a Ini,
     /// SDL's text input, which is what carries an IME into the save-comment
@@ -737,6 +740,9 @@ fn main() -> Result<()> {
         None => discover_game_dir()?,
     };
     let vfs = Vfs::mount(&game)?;
+    // Which files the three shipped binaries are, found by what they export
+    // rather than by name: the titles on this engine spell them differently.
+    let binaries = Binaries::find(&game, vfs.executable());
     log::info!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
     let start = Ini::parse_bytes(&vfs.read_path("Ini/STARTSCRIPT.INI")?);
@@ -830,6 +836,7 @@ fn main() -> Result<()> {
         pads,
         controls,
         game: game.clone(),
+        executable: vfs.executable().to_path_buf(),
         display: Display {
             wide: boot_config
                 .get("DisplayType")
@@ -855,18 +862,9 @@ fn main() -> Result<()> {
         film: &film,
         system_se: SystemSounds::from_ini(&film),
         flags: daysengine::install::save::load_flags(&game, &film),
-        // The widget tables are only needed for menus. A missing DLL is not
+        // The widget tables are only needed for menus. A missing module is not
         // fatal to playing a script, so this is reported and left empty.
-        dll: match std::fs::read(game.join("SysMenuSDHQ.dll")) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                log::warn!(
-                    "reading {}: {err} — the menus need it and will be skipped",
-                    game.join("SysMenuSDHQ.dll").display()
-                );
-                Vec::new()
-            }
-        },
+        dll: binaries.menu_bytes(),
     };
 
     if player.display.full_screen {
@@ -886,13 +884,12 @@ fn main() -> Result<()> {
         && start.get("StartMode").unwrap_or("Title") == "Title"
         && !player.dll.is_empty();
 
-    // The branch graph, out of the player's own `RouteProcSDHQ.dll`. Without
+    // The branch graph, out of the player's own route module. Without
     // it a script plays and stops, which is what the engine did before the
     // route system was recovered — so a missing or unreadable DLL is a warning
     // and not a refusal to start.
-    let mut progress = match std::fs::read(game.join("RouteProcSDHQ.dll"))
+    let mut progress = match Progress::load(&vfs, &binaries.route_bytes(), player.flags.clone())
         .map_err(|e| e.to_string())
-        .and_then(|dll| Progress::load(&vfs, &dll, player.flags.clone()).map_err(|e| e.to_string()))
     {
         Ok(p) => Some(p),
         Err(err) => {
@@ -1180,7 +1177,7 @@ enum MenuEntry {
 /// How many scripts a skip will pass over before giving up and playing one.
 ///
 /// The chase has a natural end — the route graph runs out — but the graph comes
-/// out of the player's own `RouteProcSDHQ.dll`, and a cycle in it would
+/// out of the player's own route module, and a cycle in it would
 /// otherwise spin here forever. The longest retail route is 116 scripts, so
 /// this is well clear of anything the real data asks for.
 const MAX_SCRIPTS_PASSED_OVER: usize = 512;
@@ -1826,7 +1823,7 @@ fn run_comment(
     existing: &str,
 ) -> Result<Option<String>> {
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
-    let exe = match std::fs::read(player.game.join("SCHOOLDAYS HQ.exe")) {
+    let exe = match std::fs::read(&player.executable) {
         Ok(bytes) => bytes,
         Err(err) => {
             log::warn!("cannot read the executable for the comment dialog: {err}");

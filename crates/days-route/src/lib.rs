@@ -74,7 +74,7 @@
 #![forbid(unsafe_code)]
 
 pub mod graph;
-mod pe;
+pub mod pe;
 mod walk;
 mod x86;
 

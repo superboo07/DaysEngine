@@ -34,8 +34,8 @@ pub enum Error {
     NoPacksDir(PathBuf),
     #[error("no .GPK archives in {0}")]
     NoPacks(PathBuf),
-    #[error("no game executable with a CIPHERCODE resource in {0}")]
-    NoExecutable(PathBuf),
+    #[error(transparent)]
+    Binaries(#[from] super::binaries::Error),
     #[error("asset not found: {0}")]
     NotFound(String),
     #[error(transparent)]
@@ -78,7 +78,7 @@ impl Vfs {
     /// The decryption key is recovered from the game executable found in `root`.
     pub fn mount(root: impl AsRef<Path>) -> Result<Self, Error> {
         let root = root.as_ref().to_path_buf();
-        let executable = find_executable(&root)?;
+        let executable = super::binaries::find_executable(&root)?;
         let key = Key::from_executable(&executable)?;
 
         let mut paths = pack_paths(&root)?;
@@ -291,32 +291,6 @@ fn pack_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
         return Err(Error::NoPacks(dir));
     }
     Ok(out)
-}
-
-/// Finds the game executable by looking for one carrying the archive key.
-///
-/// Matching on the retail filename alone breaks on localised and repackaged
-/// installs, which rename it.
-fn find_executable(root: &Path) -> Result<PathBuf, Error> {
-    let preferred = root.join("SCHOOLDAYS HQ.exe");
-    if preferred.is_file() && Key::from_executable(&preferred).is_ok() {
-        return Ok(preferred);
-    }
-    let read = std::fs::read_dir(root).map_err(|source| Error::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-            && Key::from_executable(&path).is_ok()
-        {
-            return Ok(path);
-        }
-    }
-    Err(Error::NoExecutable(root.to_path_buf()))
 }
 
 #[cfg(test)]

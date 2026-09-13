@@ -13,6 +13,7 @@
 //! never had to make, and [`binding`] is the part of it that says which key or
 //! which controller button does what.
 
+pub mod binaries;
 pub mod binding;
 pub mod clock;
 pub mod config;

@@ -140,10 +140,11 @@ impl Template {
 
     /// Reads a dialog resource out of the executable beside the game.
     ///
-    /// The comment dialog lives in `SCHOOLDAYS HQ.exe`; nothing in the packs
-    /// carries it.
+    /// The comment dialog is a resource in the game executable; nothing in the
+    /// packs carries it.
     pub fn from_game(game: &Path, id: u16) -> Result<Template, Error> {
-        let path = game.join("SCHOOLDAYS HQ.exe");
+        let path = crate::install::binaries::find_executable(game)
+            .map_err(|_| Error::NotPe("no game executable in the install"))?;
         let bytes = std::fs::read(&path).map_err(|_| Error::NotPe("cannot read the executable"))?;
         Template::find(&bytes, id)
     }

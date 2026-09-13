@@ -8,13 +8,15 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use days_gpk::{Archive, Key};
+use daysengine::install::binaries::{self, Binaries};
 use daysengine::ui::ending;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "days", about = "Inspect a School Days HQ installation")]
 struct Cli {
-    /// Game directory (the one containing "SCHOOLDAYS HQ.exe").
+    /// Game directory: the one holding `Packs`, the game executable and the
+    /// menu and route modules.
     ///
     /// Defaults to wherever this binary lives, so dropping it into the game
     /// folder and running it works with no arguments.
@@ -104,7 +106,7 @@ enum Cmd {
     ///
     /// The screen is drawn exactly as the game draws it: base art from the
     /// packs, widget sprites from the `_CHIP` sheet, positioned by the table in
-    /// the user's own SysMenuSDHQ.dll. `--active` selects widgets by 1-based
+    /// the user's own menu module. `--active` selects widgets by 1-based
     /// region ID, matching the `.CMAP`.
     Ui(UiArgs),
     /// Drive the menu state machine without a display.
@@ -168,7 +170,7 @@ enum Cmd {
         #[arg(long)]
         roundtrip: bool,
     },
-    /// Print the replay scene table recovered from the user's SysMenuSDHQ.dll.
+    /// Print the replay scene table recovered from the user's own menu module.
     ///
     /// The forty-one scenes, which page each sits on, the save flag that
     /// unlocks it and the script a click starts. With no save data to hand it
@@ -194,7 +196,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         text: String,
     },
-    /// Print the branch graph recovered from the user's RouteProcSDHQ.dll.
+    /// Print the branch graph recovered from the user's own route module.
     ///
     /// The 55 routes and their script-name tables, and the two affection
     /// tables that go with them. With a script named, says where it sits in
@@ -458,7 +460,7 @@ fn main() -> Result<()> {
         Some(dir) => dir,
         None => discover_game_dir()?,
     };
-    let exe = find_executable(&game)?;
+    let exe = binaries::find_executable(&game)?;
     let key = Key::from_executable(&exe)
         .with_context(|| format!("recovering archive key from {}", exe.display()))?;
 
@@ -1116,13 +1118,24 @@ fn cmd_render(
 /// Like the archive key, this comes out of the user's own install at runtime;
 /// none of it is embedded here.
 fn system_menu_dll(game: &Path) -> Result<Vec<u8>> {
-    let path = game.join("SysMenuSDHQ.dll");
+    let path = Binaries::discover(game)?
+        .menu
+        .with_context(|| no_module(game, &binaries::MENU_EXPORTS))?;
     std::fs::read(&path).with_context(|| {
         format!(
             "reading {} — the UI widget tables live in it",
             path.display()
         )
     })
+}
+
+/// The message for an install with no module exporting what we need.
+fn no_module(game: &Path, exports: &[&str]) -> String {
+    format!(
+        "no .dll in {} exports {}",
+        game.display(),
+        exports.join(" and ")
+    )
 }
 
 /// Reads `FILMENGINE.INI` out of the packs, or an empty one with a warning.
@@ -1794,31 +1807,6 @@ fn pack_name(p: &Path) -> String {
     p.file_stem().unwrap_or_default().to_string_lossy().into()
 }
 
-/// Locates the game executable. The retail name has a space in it, and localised
-/// or repackaged installs vary, so fall back to any `.exe` carrying the key.
-fn find_executable(dir: &Path) -> Result<PathBuf> {
-    let preferred = dir.join("SCHOOLDAYS HQ.exe");
-    if preferred.is_file() {
-        return Ok(preferred);
-    }
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading game directory {}", dir.display()))?
-    {
-        let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-            && Key::from_executable(&path).is_ok()
-        {
-            return Ok(path);
-        }
-    }
-    bail!(
-        "no game executable with a CIPHERCODE resource found in {}",
-        dir.display()
-    )
-}
-
 fn packs(dir: &Path) -> Result<Vec<PathBuf>> {
     let packs_dir = dir.join("Packs");
     let mut out = Vec::new();
@@ -1973,7 +1961,7 @@ fn cmd_save_roundtrip(game: &Path) -> Result<()> {
     // tripped through `Progress`, and the original game still has to read it.
     let mut through = 0;
     let mut lost = 0;
-    if let Ok(dll) = std::fs::read(game.join("RouteProcSDHQ.dll")) {
+    if let Ok(dll) = route_dll(game) {
         let global = load_flags(game, &vfs);
         if let Ok(mut progress) = daysengine::install::progress::Progress::load(&vfs, &dll, global)
         {
@@ -2911,7 +2899,7 @@ fn cmd_dialog(game: &Path, id: Option<&str>, out: Option<&Path>, text: &str) -> 
 
     if let Some(out) = out {
         use daysengine::ui::comment::{base_units, Comment};
-        let exe = std::fs::read(game.join("SCHOOLDAYS HQ.exe"))?;
+        let exe = std::fs::read(Binaries::discover(game)?.executable)?;
         let bytes = vfs
             .read_path("System/System/FONTDATA_ENG.DAT")
             .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?;
@@ -2930,10 +2918,11 @@ fn cmd_dialog(game: &Path, id: Option<&str>, out: Option<&Path>, text: &str) -> 
     Ok(())
 }
 
-/// Reads `RouteProcSDHQ.dll`, which owns every branching decision the game
-/// makes.
+/// Reads the route module, which owns every branching decision the game makes.
 fn route_dll(game: &Path) -> Result<Vec<u8>> {
-    let path = game.join("RouteProcSDHQ.dll");
+    let path = Binaries::discover(game)?
+        .route
+        .with_context(|| no_module(game, &binaries::ROUTE_EXPORTS))?;
     std::fs::read(&path).with_context(|| {
         format!(
             "reading {} — the branch graph's script tables live in it",
