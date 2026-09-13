@@ -300,6 +300,39 @@ impl Progress {
         }
     }
 
+    /// Clears the save state, the way the start of a film run does.
+    ///
+    /// A run is a thread — `FUN_00427850` begins one on `FUN_00427780` — and
+    /// it opens with `FUN_00423130`, which empties both halves of the save
+    /// state: the store at `engine + 0x40` through `FUN_0045f690`, and the
+    /// marks and recorded choices at `engine + 0xac` through `FUN_00432850`.
+    /// `FUN_00423a70` then calls `_ZeroReset@4`, which walks the counter names
+    /// the `FeelingScript.ini` head declares setting each to 0, and finishes
+    /// with `ROUTE` and `SCENE` in `FUN_10006660`.
+    ///
+    /// So nothing one playthrough sets reaches the next: a New Game after a
+    /// finished route starts with that route's gate flags down, and the five
+    /// counters present and zero rather than absent. The player's own saves
+    /// show the seeding — every slot the original wrote carries `000` and
+    /// `003` and `004` at zero.
+    ///
+    /// The global store is untouched. It is the other store, and everything
+    /// the player has unlocked is meant to outlive a run.
+    ///
+    /// Loading does not need this: `FUN_004336c0` empties the same two halves
+    /// again — host `+0x28` for the store — before it reads the slot, so what
+    /// the slot carries is the whole of the state either way.
+    pub fn film_start(&mut self) {
+        self.stores.save = FlagStore::default();
+        self.marks.clear();
+        self.choices.clear();
+        self.stores.choice = -1;
+        self.gauge_raised = false;
+        feeling::zero_reset(&mut self.stores.save, self.deltas.names());
+        self.stores.save.set_int(ROUTE, 0);
+        self.stores.save.set_int(SCENE, 0);
+    }
+
     /// Puts a slot back, as loading one does.
     ///
     /// **The position comes out of the store, not out of the script name.**
@@ -344,6 +377,11 @@ impl Progress {
     pub fn chapter(&self) -> u32 {
         let (route, _) = self.position();
         self.machine.chapter(route.max(0) as usize).unwrap_or(1)
+    }
+
+    /// The save's own store, which is the whole of a slot's state.
+    pub fn store(&self) -> &days_save::FlagStore {
+        &self.stores.save
     }
 
     /// The global store, which is what the save screen's display lines and

@@ -468,7 +468,16 @@ fn main() -> Result<()> {
                 progress.as_mut(),
             )? {
                 Outcome::Quit => break,
-                Outcome::Play | Outcome::Finished | Outcome::SkipToChoice => next = wanted.clone(),
+                // Leaving the menus for a script is a film run starting, and
+                // a run starts from nothing: see `Progress::film_start`. A New
+                // Game after a finished route must not inherit that route's
+                // flags, and this is where the original drops them.
+                Outcome::Play | Outcome::Finished | Outcome::SkipToChoice => {
+                    next = wanted.clone();
+                    if let Some(p) = progress.as_mut() {
+                        p.film_start();
+                    }
+                }
                 // A replay names its own script, which the DLL's table spells
                 // as a path; `find_script` wants the trailing name.
                 // A scene is a sequence, not one script. `FUN_1001f270` starts
@@ -489,6 +498,12 @@ fn main() -> Result<()> {
                         }
                     );
                     replaying = Some((run, 0));
+                    // A replay is a film run like any other — it reaches
+                    // playback through the same mode — so it starts from
+                    // nothing too, and leaves nothing behind when it ends.
+                    if let Some(p) = progress.as_mut() {
+                        p.film_start();
+                    }
                 }
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a

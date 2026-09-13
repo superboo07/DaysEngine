@@ -515,7 +515,7 @@ fn main() -> Result<()> {
             if roundtrip {
                 cmd_save_roundtrip(&game)?
             } else if let Some(n) = slot {
-                cmd_save_slot(&game, n)?
+                cmd_save_slot(&game, n, all)?
             } else {
                 cmd_save(&game, all, grep.as_deref())?
             }
@@ -1888,7 +1888,11 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
 }
 
 /// Prints what one save slot holds.
-fn cmd_save_slot(game: &Path, n: u32) -> Result<()> {
+///
+/// `all` prints the store entry by entry rather than only the counters, which
+/// is what says whether a name is in the store at all — a distinction the
+/// getters hide, since a name that is not there reads as zero.
+fn cmd_save_slot(game: &Path, n: u32, all: bool) -> Result<()> {
     use daysengine::install::save::{load_slot, slot_keys, slot_path, Value};
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -1923,9 +1927,15 @@ fn cmd_save_slot(game: &Path, n: u32) -> Result<()> {
         _ => println!("  position   ROUTE/SCENE are not in the store"),
     }
     println!("  store      {} entries", slot.store.len());
-    for name in ["001", "002", "000", "003", "004"] {
-        if let Some(v) = int(name) {
-            println!("      {name} = {v}");
+    if all {
+        for (name, value) in slot.store.iter() {
+            println!("      {name} = {value:?}");
+        }
+    } else {
+        for name in ["001", "002", "000", "003", "004"] {
+            if let Some(v) = int(name) {
+                println!("      {name} = {v}");
+            }
         }
     }
     println!(
@@ -2683,10 +2693,22 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
         .collect::<std::result::Result<_, _>>()
         .context("--choices takes a comma-separated list of numbers")?;
 
+    // A walk starts where a film run starts, so the store carries what
+    // `_ZeroReset@4` seeds and nothing else. See `Progress::film_start`.
+    progress.film_start();
     if !progress.enter(from) {
         println!("{from} is in no route table, so nothing follows it");
         return Ok(());
     }
+    println!(
+        "the store a film run starts with: {}",
+        progress
+            .store()
+            .iter()
+            .map(|(name, value)| format!("{name}={value:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let mut answers = answers.into_iter();
     let mut played = from.to_string();
     for step in 0..steps {

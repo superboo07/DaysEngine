@@ -267,8 +267,11 @@ fn apply(store: &mut FlagStore, deltas: &Deltas, script: &str, sign: i32) -> boo
     gauge
 }
 
-/// Sets every counter the table head names to zero, as `_ZeroReset@4` does at
-/// the start of a new game.
+/// Sets every counter the table head names to zero, as `_ZeroReset@4` does.
+///
+/// It runs at the start of every film run, not only a new game, and it also
+/// zeroes `ROUTE` and `SCENE` — see [`crate::install::progress::Progress::film_start`],
+/// which is the whole of that reset.
 pub fn zero_reset(store: &mut FlagStore, names: &[String]) {
     for name in names {
         store.set_int(name, 0);

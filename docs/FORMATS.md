@@ -1139,16 +1139,36 @@ route tables are unique, so a name resolves to exactly one scene, and every one
 of a player's slots round-trips through `Progress` byte for byte with the
 position taken from the store.
 
-One difference from a snapshot is worth writing down: `FUN_0045fcd0` **merges**.
-It walks the slot's map and calls `FUN_004603f0` — find-or-insert — for each
-name, so a name the live store holds and the slot does not **survives the
-load**. The counters are exempt because `_ZeroReset@4` runs first, at the top
-of `FUN_00423a70`, zeroing every name the `FeelingScript.ini` head declares.
-The marks and the recorded choices are not merged but emptied, by
-`FUN_00432850` -> `FUN_00432870`, and even that is conditional: it skips the
-clear when `_GetRouteLoad@0` is non-zero. **What raises `_GetRouteLoad@0` has
-not been recovered** — it is a `RouteProcSDHQ.dll` export and that DLL is not
-in the Ghidra project.
+`FUN_0045fcd0`, which is how that map goes in, is a **merge** — it walks the
+slot's entries and calls `FUN_004603f0`, find-or-insert, for each — but the
+load is still a replacement, because `FUN_004336c0` empties the destination
+first. Its two opening calls are `FUN_00432850`, which empties the marks and
+the recorded choices at `engine + 0xac`, and host `+0x28` — `FUN_004289b0`,
+which is `FUN_0045f690` on `engine + 0x40`, the store. Nothing of the
+playthrough that was running reaches the loaded one.
+
+### A film run starts from nothing
+
+The same two halves are emptied at the start of every run, by `FUN_00423130`:
+`FUN_0045f690` on the store and `FUN_00432850` on the marks. `FUN_00423a70`
+then calls `_ZeroReset@4`, which walks the counter names the
+`FeelingScript.ini` head declares — `FUN_10006150` is what filled that list,
+from `_LoadInitScript@4`, once per process — setting each to zero, and finishes
+with `ROUTE` and `SCENE` in `FUN_10006660`.
+
+So a New Game after a finished route starts with that route's gate flags down,
+and its first save carries the five counters at zero rather than not carrying
+them at all. The player's own slots show it: every one the original wrote has
+`000`, `003` and `004` present and zero.
+
+`FUN_00432850` -> `FUN_00432870` skips its clear when `_GetRouteLoad@0` is set,
+and the one thing that sets it is the route map: `FUN_1000e8b0`, picking a
+story point, hands host `+0x48` an index of `(chapter + 1) * 100 + row` and
+raises the flag. That index is the `>= 100` arm of `FUN_00423a70`'s dispatch —
+`FUN_00428400`, the third loader — so jumping to a story point keeps the marks
+and the recorded choices that a plain load replaces. `_GetRouteLoad@0` and
+`_ResetRouteLoad@0` are `SysMenuSDHQ.dll` exports over one word,
+`DAT_1004e7c0 + 0x4e8`.
 
 ### The bar is a drop-down, and translucent
 
