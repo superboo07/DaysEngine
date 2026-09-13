@@ -158,7 +158,12 @@ enum Cmd {
     /// ten settings the Option screen loads, with the volume levels worked
     /// through the DLL's own attenuation formula, and every other key the file
     /// carries.
-    Config,
+    Config {
+        /// Read the file, write it back, and check the retail reader would
+        /// still take it.
+        #[arg(long)]
+        roundtrip: bool,
+    },
     /// Print the replay scene table recovered from the user's SysMenuSDHQ.dll.
     ///
     /// The forty-one scenes, which page each sits on, the save flag that
@@ -515,7 +520,7 @@ fn main() -> Result<()> {
                 cmd_save(&game, all, grep.as_deref())?
             }
         }
-        Cmd::Config => cmd_config(&game)?,
+        Cmd::Config { roundtrip } => cmd_config(&game, roundtrip)?,
         Cmd::Dialog { id, out, text } => cmd_dialog(&game, id.as_deref(), out.as_deref(), &text)?,
         Cmd::Replay { unlocked } => cmd_replay(&game, unlocked)?,
         Cmd::Route {
@@ -2001,12 +2006,15 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 }
 
 /// Prints the player's settings the way the Option screen reads them.
-fn cmd_config(game: &Path) -> Result<()> {
+fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
     use daysengine::install::config::{Channel, Config, Flag};
 
     let path = Config::path(game);
     let config = Config::load(game);
     println!("{}", path.display());
+    if roundtrip {
+        return config_roundtrip(&path, &config);
+    }
     println!();
     println!("volumes (level, then the attenuation the DLL's formula gives):");
     for channel in Channel::ALL {
@@ -2047,6 +2055,147 @@ fn cmd_config(game: &Path) -> Result<()> {
         if note { "1024x576 art" } else { "1280x720 art" },
     );
     Ok(())
+}
+
+/// Checks that a settings file we write is one the retail game still reads.
+///
+/// The retail reader is `FUN_0046c520`, and what it will take is narrow: it
+/// reads the whole file into a **1024-byte** buffer, checks four bytes of
+/// magic, and hands the rest to `FUN_0046c310`, one `inflate` with `Z_FINISH`
+/// into another 1024-byte buffer that then becomes a C string. So the file and
+/// the text both have to fit, the stream has to finish in that one pass, and
+/// every key has to be findable as `[Key]="` from position 0 — the getters'
+/// search is `wcsstr` (`FUN_0046e330`).
+///
+/// The one difference this is allowed to report is a dropped fragment. The
+/// retail writer replaces a key's line with a run of characters the length of
+/// the *new* line rather than up to the newline, so a shorter value leaves the
+/// tail of the old one behind and a longer one eats the next line's `[`. Those
+/// fragments are unreachable for a reader that looks for `[Key]="`, and this
+/// engine drops them instead of carrying them forward.
+fn config_roundtrip(path: &Path, config: &daysengine::install::config::Config) -> Result<()> {
+    use daysengine::install::config::{Config, MAGIC};
+
+    /// Both of the retail reader's stack buffers.
+    const BUFFER: usize = 1024;
+
+    let original =
+        std::fs::read(path).with_context(|| format!("{} cannot be read", path.display()))?;
+    let before = inflate_config(&original)?;
+    let ours = config.encode();
+    let after = inflate_config(&ours)?;
+
+    println!();
+    println!(
+        "  read back      {} bytes in, {} bytes out",
+        original.len(),
+        ours.len()
+    );
+    let mut bad = 0;
+    let mut check = |what: &str, ok: bool, note: String| {
+        println!(
+            "  {:<14} {}  {note}",
+            what,
+            if ok { "ok  " } else { "FAIL" }
+        );
+        if !ok {
+            bad += 1;
+        }
+    };
+    check(
+        "file size",
+        ours.len() <= BUFFER,
+        format!("{} of the reader's {BUFFER}-byte read buffer", ours.len()),
+    );
+    check(
+        "magic",
+        ours.starts_with(&MAGIC),
+        format!("{:?}", String::from_utf8_lossy(&ours[..ours.len().min(4)])),
+    );
+    // A text that exactly fills the buffer leaves no room for the terminator
+    // the reader relies on, so the limit is one short of it.
+    check(
+        "text size",
+        after.len() < BUFFER,
+        format!(
+            "{} of the reader's {BUFFER}-byte inflate buffer",
+            after.len()
+        ),
+    );
+    check(
+        "no NUL",
+        !after.contains('\0'),
+        "the reader stops the text at the first one".to_string(),
+    );
+
+    // Every key the file carries has to survive, whoever wrote the file.
+    let reread = Config::parse(&ours).context("our own file will not parse")?;
+    let mut lost = Vec::new();
+    for (key, value) in config.entries() {
+        match reread.get(key) {
+            Some(back) if back == value => {}
+            _ => lost.push(key.clone()),
+        }
+        if !find_key(&after, key).is_some_and(|v| v == value) {
+            lost.push(format!("{key} (as the retail reader finds it)"));
+        }
+    }
+    check(
+        "keys",
+        lost.is_empty(),
+        if lost.is_empty() {
+            format!("all {} come back", config.entries().len())
+        } else {
+            format!("lost {}", lost.join(", "))
+        },
+    );
+
+    // What the file lost, which should only ever be the retail writer's own
+    // unreachable fragments.
+    let dropped: Vec<&str> = before
+        .lines()
+        .filter(|line| !line.is_empty() && !after.lines().any(|ours| ours == *line))
+        .collect();
+    if dropped.is_empty() {
+        println!("  lines          ok    every line of the original is still there");
+    } else {
+        println!(
+            "  lines          note  dropped {} line(s) the retail reader could",
+            dropped.len()
+        );
+        println!("                       not have found anyway:");
+        for line in dropped {
+            println!("                         {line:?}");
+        }
+    }
+
+    println!();
+    if bad == 0 {
+        println!("the retail reader would take this file");
+    } else {
+        bail!("{bad} check(s) failed: the retail game would not read this file");
+    }
+    Ok(())
+}
+
+/// The container, decoded the way `FUN_0046c520` decodes it.
+fn inflate_config(bytes: &[u8]) -> Result<String> {
+    use daysengine::install::config::MAGIC;
+
+    let body = bytes
+        .strip_prefix(&MAGIC)
+        .context("not a Config.DAT: the magic is wrong")?;
+    let text = miniz_oxide::inflate::decompress_to_vec_zlib(body)
+        .map_err(|e| anyhow::anyhow!("the deflate stream will not inflate: {e}"))?;
+    Ok(String::from_utf8_lossy(&text).into_owned())
+}
+
+/// `[Key]="` by `wcsstr`, then to the first `"` or `,` — `FUN_0046e330` and
+/// `FUN_0046dfb0`, which is how every retail getter finds a value.
+fn find_key<'t>(text: &'t str, key: &str) -> Option<&'t str> {
+    let at = text.find(&format!("[{key}]=\""))? + key.len() + 4;
+    let rest = &text[at..];
+    Some(&rest[..rest.find(['"', ','])?])
 }
 
 /// Prints the replay scene table recovered from the user's own menu DLL.

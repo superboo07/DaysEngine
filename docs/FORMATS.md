@@ -1406,15 +1406,59 @@ engine INI with a banner line:
 The `Config` class in the executable writes every scalar with `%d` or `%f`
 (`FUN_0046cd30` and its neighbours, reached from `FUN_0046c520`, the one
 function that references the banner). The values it is handed are Windows
-`VARIANT`s, so **a true bool is written as `-1`** and a bool read back is true
-when the stored integer is non-zero — a reader that accepted only `1` could
-never read what this writer produces. `Config`'s own getters are **not
-recovered**; that rule comes from the writer.
+`VARIANT`s, so **a true bool is written as `-1`**.
 
-The shipped writer appends rather than rewriting in place, so a key can appear
-twice with the live value second, and two lines in the retail file are missing
-their opening bracket (`MenVoice]="1"`). Dropping malformed lines and taking
-the last occurrence leaves each key exactly once.
+The getters are the class's vtable at `0x004d73d0`:
+
+| Slot | Getter | Reads |
+|---|---|---|
+| `+0xc` | `FUN_0046c9e0` | a string, through `FUN_0046e2c0` |
+| `+0x10` | `FUN_0046ca70` | a bool, through `FUN_0046e080` |
+| `+0x14` | `FUN_0046cae0` | an int, through `FUN_0046e140` |
+| `+0x18` | `FUN_0046cb50` | a float, through `FUN_0046e200` |
+
+All four format `[Key]="` and hand it to a helper that does three things:
+**`wcsstr`** for the key (`FUN_0046e330`), so **the first occurrence wins**;
+`FUN_0046dfb0` to take the characters from just past the key to the first `"`
+**or `,`**, so a comma ends a value as surely as the quote does; and
+`VariantChangeType` into `VT_BOOL`, `VT_I4` or `VT_R4`
+(`FUN_0046de00`/`FUN_0046de90`/`FUN_0046df20`). **A bool is therefore true when
+the number is non-zero**, which is how `-1` reads as true.
+
+Two edges follow from that conversion. Each getter returns the variant's field
+whether or not `VariantChangeType` succeeded, and the variant was
+`VariantInit`ed, so a key that is **present but does not convert reads as zero,
+not as the caller's default** — only a missing key gets the default. OLE's full
+string grammar (locale words like `True`, thousands separators, a fraction
+rounded into an integer) is reachable through `VariantChangeType` but nothing
+the engine or the menus write uses it, and `daysengine` does not reproduce it.
+
+The setters use `basic_string::find` (`FUN_0046d510`) rather than `wcsstr`, but
+on the same literal and also from position 0: a hit is replaced through
+`FUN_0046d190`, a miss is appended.
+
+That replace is where the retail file's broken lines come from. It overwrites a
+run of characters **the length of the new line**, not up to the newline, so a
+value that shrinks leaves the tail of the old line behind and one that grows
+eats the next line's `[`. A retail file in this install carries both spellings:
+`MenVoice]="1"` at the position the old line held and `[MenVoice]="-1"`
+appended at the end, because once its bracket was eaten the find stopped seeing
+it. A fragment with no `[` can never be found again, so dropping malformed
+lines and taking the first occurrence leaves each key exactly once and agrees
+with the retail reader.
+
+**The retail reader's limits are hard ones.** `FUN_0046c520` reads the whole
+file into a 1024-byte stack buffer, checks the four magic bytes, and calls
+`FUN_0046c310(buffer + 4, length - 4, out, 1024)` — `inflateInit_` against zlib
+`"1.2.7"` with `windowBits` 15, one `inflate` with `Z_FINISH`, `inflateEnd` —
+and the out buffer becomes a C string. Those three are zlib's own, not a
+lookalike: `FUN_004a2370` is the one function in the image that references
+`"incorrect header check"`, `"invalid block type"`, `"invalid stored block
+lengths"` and `"unknown compression method"`, and `FUN_004a2350` is a one-line
+`inflateInit2_(strm, 15, version, size)`. So the file must fit in 1024 bytes, the inflated text must
+fit with room for its terminator, the stream must finish in that single pass,
+and a NUL anywhere in the text ends it. `days config --roundtrip` checks a file
+this engine writes against all of that.
 
 The ten settings the Option screen loads, with the defaults it passes the
 getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):

@@ -23,19 +23,41 @@
 //! [TextView]="-1"
 //! ```
 //!
-//! # Why a bool is `-1`
+//! # Why a bool is `-1`, and how one is read back
 //!
-//! `Config`'s writer in the executable formats every scalar with `%d`
-//! (`FUN_0046cd30` and its neighbours) and the values it is handed are Windows
-//! `VARIANT`s, so a true bool arrives as `VARIANT_TRUE` and prints as `-1`.
-//! **A bool is therefore true when the stored integer is non-zero**, not when
-//! it is `1`: a reader that accepted only `1` could never read back what this
-//! writer produces. That reasoning is from the writer — `Config`'s getters
-//! themselves are **not recovered**, so `1` is accepted as true as well, which
-//! costs nothing and matches the one shipped file that contains both spellings.
+//! `Config`'s writer formats every scalar with `%d` (`FUN_0046cd30` and its
+//! neighbours) and the values it is handed are Windows `VARIANT`s, so a true
+//! bool arrives as `VARIANT_TRUE` and prints as `-1`.
+//!
+//! The getters are the other half, and they are the class's vtable at
+//! `0x004d73d0`: slot `+0xc` a string, `+0x10` a bool, `+0x14` an int, `+0x18`
+//! a float. Each formats `[Key]="`, finds it in the text with `wcsstr`
+//! (`FUN_0046e330` — so **the first occurrence wins**), takes the characters
+//! from there to the first `"` or `,` (`FUN_0046dfb0`), and converts them with
+//! `VariantChangeType` into `VT_BOOL`, `VT_I4` or `VT_R4`
+//! (`FUN_0046de00`/`de90`/`df20`). **So a bool is true when the number is
+//! non-zero**, which is why `-1` reads as true and `1` does too.
+//!
+//! Two edges come out of that and are easy to get wrong. A key that is missing
+//! gives the caller's default, but a key that is *present* and does not convert
+//! gives **zero**, because the conversion fails and the getter returns the
+//! variant it initialised rather than the default. And a comma ends a value as
+//! surely as the closing quote does.
 //!
 //! This is why the settings do not go through [`crate::install::ini::Ini`], whose
 //! `get_bool` is `value == "1"` because that is right for the packs' own INIs.
+//!
+//! # The reader will only take so much
+//!
+//! `FUN_0046c520` reads the whole file into a **1024-byte** stack buffer,
+//! compares four bytes against `DFLT`, and calls
+//! `FUN_0046c310(file + 4, length - 4, out, 1024)`: `inflateInit_` against zlib
+//! `1.2.7` with `windowBits` 15, one `inflate` with `Z_FINISH`, `inflateEnd`.
+//! The out buffer then becomes a C string. So the file has to fit in 1024
+//! bytes, the inflated text has to fit with room for its terminator, the stream
+//! has to finish in that single pass, and a NUL anywhere ends the text.
+//! `days config --roundtrip` checks a file this engine writes against all of
+//! it.
 //!
 //! # Keys, defaults and ranges
 //!
@@ -254,10 +276,11 @@ impl Config {
     /// Parses the inflated body.
     ///
     /// Lines that are not `[Key]="value"` are dropped, which is what handles
-    /// the banner — and also the half-overwritten lines the shipped writer
-    /// leaves behind. A real file in the retail install ends with
-    /// `MenVoice]="1"` on one line and `[MenVoice]="-1"` on another; skipping
-    /// the one missing its bracket leaves each key exactly once.
+    /// the banner — and also the broken lines the shipped writer leaves
+    /// behind. A real file in the retail install has `MenVoice]="1"` on one
+    /// line and `[MenVoice]="-1"` on another; skipping the one missing its
+    /// bracket leaves each key exactly once, and is what the retail reader
+    /// does too, since it looks a key up as the literal `[Key]="`.
     pub fn parse_text(text: &str) -> Config {
         let mut entries = Vec::new();
         for line in text.lines() {
@@ -269,13 +292,14 @@ impl Config {
                 continue;
             };
             let key = rest[..close].trim().to_string();
-            let value = rest[close + 2..]
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .trim_matches('"')
-                .to_string();
-            entries.push((key, value));
+            // `FUN_0046dfb0` takes the text from just past the key to the
+            // first `"` **or `,`** — a comma ends a value as surely as the
+            // closing quote does. The opening quote is the last character of
+            // the `[Key]="` the search matched, so it is skipped, not trimmed.
+            let after = rest[close + 2..].trim_start();
+            let body = after.strip_prefix('"').unwrap_or(after);
+            let end = body.find(['"', ',']).unwrap_or(body.len());
+            entries.push((key, body[..end].to_string()));
         }
         Config {
             entries,
@@ -288,27 +312,37 @@ impl Config {
         self.dirty
     }
 
+    /// Every entry, in file order.
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.entries
+    }
+
     /// The raw text for a key, case-insensitively.
     ///
-    /// The last occurrence wins. The shipped writer appends rather than
-    /// rewriting in place, so a key really can appear twice with the live value
-    /// second — the opposite of [`crate::install::ini::Ini`], where the packs' INIs list
-    /// alternatives first-best.
+    /// **The first occurrence wins.** Every getter on the `Config` vtable at
+    /// `0x004d73d0` — `FUN_0046c9e0` for a string at slot `+0xc`, `FUN_0046ca70`
+    /// for a bool at `+0x10`, `FUN_0046cae0` for an int at `+0x14`,
+    /// `FUN_0046cb50` for a float at `+0x18` — formats `[Key]="` and hands it
+    /// to a helper whose search is `FUN_0046e330`, and `FUN_0046e330` is
+    /// `wcsstr`. Reading the last one instead would make this engine and the
+    /// retail game disagree about the same file.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries
             .iter()
-            .rev()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.as_str())
     }
 
     /// Replaces a key's value, or appends it if it is not there yet.
+    ///
+    /// The first occurrence again, and appending only when there is none, which
+    /// is what `FUN_0046cd30` does: find, then either `FUN_0046d190` over the
+    /// hit or `+=` on the end.
     pub fn set(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         match self
             .entries
             .iter_mut()
-            .rev()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
         {
             Some(slot) => {
@@ -323,15 +357,36 @@ impl Config {
     }
 
     /// A stored integer, or `None` when the key is absent or not a number.
+    ///
+    /// The retail getter has no third answer: see [`Config::int_or`], which is
+    /// the one that matches it.
     pub fn int(&self, key: &str) -> Option<i32> {
         self.get(key)?.trim().parse().ok()
     }
 
-    /// A stored bool: true when the integer is non-zero. See the module docs
-    /// for why `-1` is the usual spelling of true.
+    /// An integer the way `FUN_0046cae0` reads one.
+    ///
+    /// A key that is not there at all gives the caller's default, and a key
+    /// that is there gives whatever `VariantChangeType(.., VT_I4)` makes of the
+    /// text — which for text that is not a number at all is **zero, not the
+    /// default**, because the conversion fails and leaves the freshly
+    /// initialised variant. The two are only the same when the default is zero.
+    pub fn int_or(&self, key: &str, default: i32) -> i32 {
+        match self.get(key) {
+            Some(text) => variant_i4(text),
+            None => default,
+        }
+    }
+
+    /// A stored bool, the way `FUN_0046ca70` reads one.
+    ///
+    /// The text goes through `VariantChangeType(.., VT_BOOL)`, so a number is
+    /// true when it is non-zero — which is why `-1`, the way the writer spells
+    /// true, reads as true. Text that is not a number converts to false rather
+    /// than to the default; only an absent key gets the default.
     pub fn flag(&self, flag: Flag) -> bool {
-        match self.int(flag.key()) {
-            Some(v) => v != 0,
+        match self.get(flag.key()) {
+            Some(text) => variant_bool(text),
             None => flag.default_value(),
         }
     }
@@ -343,8 +398,7 @@ impl Config {
 
     /// A volume, clamped into the range the DLL enforces.
     pub fn volume(&self, channel: Channel) -> i32 {
-        self.int(channel.key())
-            .unwrap_or(DEFAULT_VOLUME)
+        self.int_or(channel.key(), DEFAULT_VOLUME)
             .clamp(0, MAX_VOLUME)
     }
 
@@ -354,10 +408,14 @@ impl Config {
     }
 
     /// `MasterVolume`, the per-step factor the level is multiplied by.
+    ///
+    /// `FUN_0046cb50`, so `VT_R4` and the same rule as the other two: absent
+    /// gives the default, present but unconvertible gives zero.
     pub fn master_volume(&self) -> f32 {
-        self.get("MasterVolume")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_MASTER_VOLUME)
+        match self.get("MasterVolume") {
+            Some(text) => variant_r4(text),
+            None => DEFAULT_MASTER_VOLUME,
+        }
     }
 
     /// The attenuation in decibels a channel's level works out to.
@@ -429,6 +487,33 @@ impl Config {
         log::info!("wrote {}", path.display());
         Ok(())
     }
+}
+
+/// The `VariantChangeType` conversions the three getters end in.
+///
+/// `FUN_0046de00`, `FUN_0046de90` and `FUN_0046df20` each wrap the text in a
+/// `BSTR` variant, `VariantInit` a second one, call `VariantChangeType` into
+/// `VT_BOOL`, `VT_I4` or `VT_R4`, and return that variant's field **whether or
+/// not the call succeeded**. A failed conversion therefore reads back as the
+/// zero the variant was initialised to.
+///
+/// What is modelled here is the part these files exercise: a decimal number,
+/// with an optional sign, converts to its value, and text that is not a number
+/// converts to zero. OLE's full string grammar — locale words like `True`,
+/// thousands separators, a fraction rounded into an integer — is **not
+/// reproduced**, because nothing the engine or the menus write uses it.
+fn variant_i4(text: &str) -> i32 {
+    text.trim().parse().unwrap_or(0)
+}
+
+/// `VT_BOOL`: a non-zero number is true. See [`variant_i4`] for the limits.
+fn variant_bool(text: &str) -> bool {
+    variant_r4(text) != 0.0
+}
+
+/// `VT_R4`. See [`variant_i4`] for the limits.
+fn variant_r4(text: &str) -> f32 {
+    text.trim().parse().unwrap_or(0.0)
 }
 
 /// Decibels to a linear amplitude, clamped to unity.
@@ -514,12 +599,37 @@ mod tests {
         assert_eq!(empty.master_volume(), DEFAULT_MASTER_VOLUME);
     }
 
-    /// The last occurrence wins: the shipped writer appends rather than editing
-    /// in place, so the live value is the later one.
+    /// A key that is present but does not convert reads as zero, not as the
+    /// default: `VariantChangeType` fails and the getter returns the variant it
+    /// initialised anyway. Only a missing key gets the default.
     #[test]
-    fn a_repeated_key_takes_its_last_value() {
+    fn an_unconvertible_value_is_zero_and_not_the_default() {
+        let config = Config::parse_text("[AutoDraw]=\"yes\"\n[BgmVolume]=\"loud\"\n");
+        assert!(
+            Flag::AutoDraw.default_value(),
+            "the default this has to differ from"
+        );
+        assert!(!config.flag(Flag::AutoDraw));
+        assert_eq!(config.volume(Channel::Bgm), 0);
+        // Absent is the other case, and that one does take the default.
+        let empty = Config::default();
+        assert!(empty.flag(Flag::AutoDraw));
+        assert_eq!(empty.volume(Channel::Bgm), DEFAULT_VOLUME);
+    }
+
+    /// `FUN_0046dfb0` stops at the first `"` **or** `,`.
+    #[test]
+    fn a_comma_ends_a_value_as_the_quote_does() {
+        let config = Config::parse_text("[BgmVolume]=\"7,8\"\n");
+        assert_eq!(config.get("BgmVolume"), Some("7"));
+    }
+
+    /// The first occurrence wins, because the retail reader searches from the
+    /// start of the text and stops at the first hit.
+    #[test]
+    fn a_repeated_key_takes_its_first_value() {
         let config = Config::parse_text("[BgmVolume]=\"3\"\n[BgmVolume]=\"9\"\n");
-        assert_eq!(config.volume(Channel::Bgm), 9);
+        assert_eq!(config.volume(Channel::Bgm), 3);
     }
 
     #[test]
