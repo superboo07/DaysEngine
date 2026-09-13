@@ -319,9 +319,9 @@ struct UiArgs {
     /// Report the recovered widget table instead of drawing.
     #[arg(long)]
     table: bool,
-    /// Resample the composite to this window size, e.g. "1920x1080", the way
-    /// the player's window does. This is the pass a change of `[UI] Scaler`
-    /// shows up in.
+    /// Composite at this window size, e.g. "1920x1080", the way the player's
+    /// window does rather than at the hit map's own size. This is the pass a
+    /// change of `[UI] Scaler` shows up in.
     #[arg(long, value_name = "WxH")]
     at_size: Option<String>,
     /// PNG to write.
@@ -331,6 +331,10 @@ struct UiArgs {
 
 #[derive(clap::Args)]
 struct MenuArgs {
+    /// Composite and hit-test at this window size, e.g. "1920x1080", the way
+    /// the player's window does rather than at the hit map's own size.
+    #[arg(long, value_name = "WxH")]
+    at_size: Option<String>,
     /// Events to replay, comma separated: `down`, `up`, `left`, `right`,
     /// `enter`, `esc`, `at:X:Y` to point at a pixel, and `click:X:Y` to point
     /// and confirm.
@@ -1154,8 +1158,14 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
-    let screen =
+    let mut screen =
         Screen::load_with_base(&vfs, &dll, &args.screen, args.base.as_deref(), resolution)?;
+    // Composite at a window's size rather than the hit map's, the way the
+    // player's does. This is the pass a change of `[UI] Scaler` shows up in.
+    if let Some(size) = &args.at_size {
+        let (w, h) = parse_size(size)?;
+        screen.fit_to(w, h);
+    }
 
     let (w, h) = screen.size();
     println!(
@@ -1228,23 +1238,13 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     if let Some(path) = &args.out {
         let backdrop = backdrop.as_ref().map(|b| screen.to_display(b));
         let image = screen.compose_over(backdrop.as_ref(), &states);
-        match &args.at_size {
-            Some(size) => {
-                let (w, h) = parse_size(size)?;
-                let src = (image.width as usize, image.height as usize);
-                let dst = (w as usize, h as usize);
-                let mut scaler = daysengine::playback::scale::Scaler::new(src, dst);
-                match scaler.resample(&image.rgba, src, dst) {
-                    Some(scaled) => write_png(path, scaled, w, h)?,
-                    None => write_png(path, &image.rgba, image.width, image.height)?,
-                }
-                println!("wrote {} at {w}x{h}", path.display());
-            }
-            None => {
-                write_png(path, &image.rgba, image.width, image.height)?;
-                println!("wrote {}", path.display());
-            }
-        }
+        write_png(path, &image.rgba, image.width, image.height)?;
+        println!(
+            "wrote {} at {}x{}",
+            path.display(),
+            image.width,
+            image.height
+        );
     }
     Ok(())
 }
@@ -1948,6 +1948,14 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 .with_context(|| format!("opening menu mode {} over playback", mode.0))?
         }
     };
+    // Composite and hit-test at a window's size rather than the hit map's, the
+    // way the player's does. `at:X:Y` is then in that same space.
+    if let Some(size) = &args.at_size {
+        let (w, h) = parse_size(size)?;
+        menu.set_output_size(w, h);
+        let (w, h) = menu.screen().size();
+        println!("driving at {w}x{h}");
+    }
     println!(
         "mode {} ({}) — {} widgets, entry {:?}",
         menu.mode().0,

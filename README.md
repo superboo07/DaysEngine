@@ -216,6 +216,13 @@ wherever rounding puts it — so it works at **any** scale, with no border and n
 stair-stepping. `playback::scale::band_limited` has the derivation, and a test
 checks it against the shader's own formula.
 
+It runs **once**. A screen is composited straight at the size the window will
+show it — `Screen::fit_to` — and not into its hit map's size and then again onto
+the window, because filtering twice band-limits the edges onto one grid and then
+re-bands them onto another, which is exactly the artefact this filter exists to
+avoid. `days ui --at-size 1920x1080` and `days menu --at-size 1920x1080`
+composite and hit-test the way the player's window does.
+
 ### Pixel-perfect
 
 The game is authored at 800x450 and ships nothing larger, so on a modern window

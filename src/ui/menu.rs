@@ -785,6 +785,15 @@ impl Menu {
         self.rows.as_ref()
     }
 
+    /// Composites at `width` x `height` from here on. See [`Screen::fit_to`].
+    ///
+    /// Marks the frame dirty, because the one already composed is the wrong
+    /// size now.
+    pub fn set_output_size(&mut self, width: u32, height: u32) {
+        self.screen.fit_to(width, height);
+        self.dirty = true;
+    }
+
     pub fn screen(&self) -> &Screen {
         &self.screen
     }

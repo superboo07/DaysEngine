@@ -693,8 +693,6 @@ fn run_menu(
     play_menu_bgm(player, start.get("TitleBGM"));
 
     let mut texture: Option<Texture> = None;
-    // Cached resampling weights, rebuilt when the window changes size.
-    let mut scaler = scale::Scaler::default();
     // The slot the player picked on the save screen, waiting for the
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
@@ -813,7 +811,9 @@ fn run_menu(
                     // showing has to be reloaded at the new size.
                     menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
                     menu.session_mut().display = player.display;
-                    under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
+                    // A reloaded screen composites at its hit map's size until
+                    // it is told otherwise, so make the next pass tell it.
+                    size = (0, 0);
                     // Full screen can land the window on a panel that refreshes
                     // at another rate.
                     cadence = Cadence::new(canvas);
@@ -912,20 +912,29 @@ fn run_menu(
             texture = None;
         }
 
-        // The screen's own size, and the rectangle it lands in.
-        let (screen_w, screen_h) = menu.screen().size();
-        let dst = letterbox(canvas, screen_w, screen_h, whole);
-        // What to upload. Fitting the window means resampling to it here, on
-        // the CPU, rather than letting the driver stretch it — see
-        // `daysengine::playback::scale`. Whole-number scaling means not
-        // resampling at all: the composite goes up at its own size and the blit
-        // below turns each of its pixels into the same square block.
+        // Where the screen lands, and then the screen composited at exactly
+        // that size — one pass from the 800x450 art to the pixels the player
+        // sees, rather than one into the hit map's size and another onto the
+        // window. See `Screen::fit_to`.
+        //
+        // Whole-number scaling is the exception: there the composite stays at
+        // its own size and the blit below multiplies each of its pixels into
+        // the same square block, which is a scaling no filter is involved in.
+        let (map_w, map_h) = menu.screen().map_size();
+        let dst = letterbox(canvas, map_w, map_h, whole);
         let at = if whole {
-            (screen_w, screen_h)
+            (map_w, map_h)
         } else {
             (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32)
         };
-        if menu.dirty() || texture.is_none() || at != size {
+        if at != size {
+            menu.set_output_size(at.0, at.1);
+            // The backdrop is scaled into the screen's space, so it follows.
+            under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
+            size = at;
+            texture = None;
+        }
+        if menu.dirty() || texture.is_none() {
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
             let image = menu.compose(
@@ -933,15 +942,8 @@ fn run_menu(
                     .then_some(under.as_ref())
                     .flatten(),
             );
-            let src = (image.width as usize, image.height as usize);
-            let want = (at.0 as usize, at.1 as usize);
-            let (w, h, rgba) = match scaler.resample(&image.rgba, src, want) {
-                Some(scaled) => (at.0, at.1, scaled),
-                None => (image.width, image.height, image.rgba.as_slice()),
-            };
-            size = at;
-            let mut new = new_texture(creator, w, h, art_sampling(whole))?;
-            new.update(None, rgba, w as usize * 4)?;
+            let mut new = new_texture(creator, image.width, image.height, art_sampling(whole))?;
+            new.update(None, &image.rgba, image.width as usize * 4)?;
             texture = Some(new);
         }
 
@@ -1415,8 +1417,11 @@ fn to_screen(
     x: f32,
     y: f32,
 ) -> Option<(u32, u32)> {
+    // The rectangle follows the hit map's aspect; the point is handed on in the
+    // space the screen composites at, which is what `Screen::hit` expects.
+    let (map_w, map_h) = menu.screen().map_size();
+    let dst = letterbox(canvas, map_w, map_h, whole);
     let (w, h) = menu.screen().size();
-    let dst = letterbox(canvas, w, h, whole);
     let sx = (x - dst.x) / dst.w * w as f32;
     let sy = (y - dst.y) / dst.h * h as f32;
     (sx >= 0.0 && sy >= 0.0 && sx < w as f32 && sy < h as f32).then_some((sx as u32, sy as u32))

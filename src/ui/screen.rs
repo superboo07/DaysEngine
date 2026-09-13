@@ -17,6 +17,12 @@
 //! scaled, and both the scale factor and the letterbox offset are recovered by
 //! comparing the two maps:
 //!
+//! A screen composites at its hit map's size by default and at whatever
+//! [`Screen::fit_to`] is given otherwise — which is how the engine draws one
+//! pass from the 800x450 art straight to the pixels the player sees, rather
+//! than into the map's size and again onto the window. Hit testing always asks
+//! the map, at the map's own size; see [`Screen::hit`].
+//!
 //! ```text
 //! scale     = display_map.width / native_map.width
 //! letterbox = (display_map.height - native_map.height * scale) / 2
@@ -149,7 +155,9 @@ pub struct Screen {
     /// Logical path stem, e.g. `System/Title/Title`.
     pub path: String,
     pub resolution: Resolution,
-    /// Base art, already resampled into display space.
+    /// Base art as it was decoded, in the native 800x450 layout.
+    native_base: Image,
+    /// Base art resampled into output space, which is what gets composited.
     base: Image,
     chip: Image,
     /// Hit map at `resolution`.
@@ -158,6 +166,12 @@ pub struct Screen {
     scale: f64,
     /// Vertical offset in display pixels, non-zero only when letterboxed.
     letterbox: f64,
+    /// The size this screen composites at, and the scale and offset that go
+    /// with it. Equal to the display map's until [`Screen::fit_to`] says
+    /// otherwise — see there for why a caller would.
+    out: (u32, u32),
+    out_scale: f64,
+    out_letterbox: f64,
     atlas: Atlas,
 }
 
@@ -224,35 +238,87 @@ impl Screen {
 
         let scale = f64::from(display.width()) / f64::from(native.width());
         let letterbox = (f64::from(display.height()) - f64::from(native.height()) * scale) / 2.0;
+        let display_size = (display.width(), display.height());
 
         let atlas = atlas::find(dll, native.all_bounds(), (chip.width, chip.height))
             .map_err(|_| Error::NoAtlasFor(path.to_string()))?;
 
         // The base art covers the whole screen, so resampling it is the most
         // expensive thing a composite does — and it is the same work every
-        // time, because only the sprites over it change. Done once, here.
+        // time, because only the sprites over it change. Done once here, and
+        // again only when `fit_to` moves the size it is wanted at.
         let size = scaled_size(&native_base, scale);
         let base = resampled(
             &native_base,
             (0, 0, native_base.width, native_base.height),
             size,
         )
-        .unwrap_or(native_base);
+        .unwrap_or_else(|| native_base.clone());
 
         Ok(Screen {
             path: path.to_string(),
             resolution,
+            native_base,
             base,
             chip,
             display,
             scale,
             letterbox,
+            out: (display_size.0, display_size.1),
+            out_scale: scale,
+            out_letterbox: letterbox,
             atlas,
         })
     }
 
+    /// The size this screen composites at.
     pub fn size(&self) -> (u32, u32) {
+        self.out
+    }
+
+    /// The hit map's own size, which is the shape the screen is drawn in
+    /// whatever it is composited at.
+    pub fn map_size(&self) -> (u32, u32) {
         (self.display.width(), self.display.height())
+    }
+
+    /// Composites at `width` x `height` instead of the hit map's own size.
+    ///
+    /// The art is authored once, at 800x450, and everything larger is that art
+    /// scaled. Compositing into the hit map's size and *then* scaling the
+    /// result onto the window means filtering it twice — and for the filter
+    /// that is the default, [`crate::playback::scale::Kernel::Pixel`], twice is
+    /// worse than a blur: it band-limits the edges onto the 1280-wide grid and
+    /// then again onto the window's, so they land on neither cleanly. One pass,
+    /// straight to the size it will be seen at, is the whole point.
+    ///
+    /// Output space is display space scaled uniformly, so nothing about the
+    /// layout changes — only how many pixels it is drawn with. Hit testing is
+    /// unaffected: [`Screen::hit`] still asks the display map, at the map's own
+    /// size, having scaled the point back into it.
+    ///
+    /// A size that is not this screen's aspect takes the width and keeps the
+    /// aspect, because a stretched UI is never what was meant.
+    pub fn fit_to(&mut self, width: u32, height: u32) {
+        let (display_w, display_h) = (self.display.width(), self.display.height());
+        if width == 0 || height == 0 || display_w == 0 || display_h == 0 {
+            return;
+        }
+        let k = f64::from(width) / f64::from(display_w);
+        let out = (width, (f64::from(display_h) * k).round().max(1.0) as u32);
+        if out == self.out {
+            return;
+        }
+        self.out = out;
+        self.out_scale = self.scale * k;
+        self.out_letterbox = self.letterbox * k;
+        let size = scaled_size(&self.native_base, self.out_scale);
+        self.base = resampled(
+            &self.native_base,
+            (0, 0, self.native_base.width, self.native_base.height),
+            size,
+        )
+        .unwrap_or_else(|| self.native_base.clone());
     }
 
     pub fn scale(&self) -> f64 {
@@ -283,6 +349,10 @@ impl Screen {
     /// map screens are not rectangular, and the bounding boxes the atlas is
     /// keyed by would claim pixels that belong to nothing.
     pub fn hit(&self, x: u32, y: u32) -> Option<usize> {
+        // The point arrives in output space; the map is at its own size.
+        let back = f64::from(self.display.width()) / f64::from(self.out.0.max(1));
+        let x = (f64::from(x) * back) as u32;
+        let y = (f64::from(y) * back) as u32;
         let id = self.display.region_at(x, y);
         if id == 0 {
             return None;
@@ -302,27 +372,27 @@ impl Screen {
     pub fn place_layout(&self, rect: (f32, f32, f32, f32)) -> (i64, i64, u32, u32) {
         let (x, y, w, h) = rect;
         (
-            (f64::from(x) * self.scale).round() as i64,
-            (f64::from(y) * self.scale + self.letterbox).round() as i64,
-            (f64::from(w) * self.scale).round().max(1.0) as u32,
-            (f64::from(h) * self.scale).round().max(1.0) as u32,
+            (f64::from(x) * self.out_scale).round() as i64,
+            (f64::from(y) * self.out_scale + self.out_letterbox).round() as i64,
+            (f64::from(w) * self.out_scale).round().max(1.0) as u32,
+            (f64::from(h) * self.out_scale).round().max(1.0) as u32,
         )
     }
 
     fn place(&self, w: &Widget) -> (i64, i64, u32, u32) {
         let round = |v: f64| v.round();
         (
-            round(f64::from(w.dst.x) * self.scale) as i64,
-            round(f64::from(w.dst.y) * self.scale + self.letterbox) as i64,
-            round(f64::from(w.dst.width) * self.scale).max(1.0) as u32,
-            round(f64::from(w.dst.height) * self.scale).max(1.0) as u32,
+            round(f64::from(w.dst.x) * self.out_scale) as i64,
+            round(f64::from(w.dst.y) * self.out_scale + self.out_letterbox) as i64,
+            round(f64::from(w.dst.width) * self.out_scale).max(1.0) as u32,
+            round(f64::from(w.dst.height) * self.out_scale).max(1.0) as u32,
         )
     }
 
     /// Resamples a whole image that is authored in native layout space into
     /// this screen's display space. See [`resampled`].
     pub fn to_display(&self, img: &Image) -> Image {
-        let size = scaled_size(img, self.scale);
+        let size = scaled_size(img, self.out_scale);
         resampled(img, (0, 0, img.width, img.height), size).unwrap_or_else(|| img.clone())
     }
 
@@ -332,7 +402,7 @@ impl Screen {
         out.blit_scaled(
             img,
             (0, 0, img.width, img.height),
-            (0, self.letterbox.round() as i64, img.width, img.height),
+            (0, self.out_letterbox.round() as i64, img.width, img.height),
         );
     }
 
