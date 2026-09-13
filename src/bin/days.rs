@@ -681,12 +681,13 @@ fn cmd_settings(template: bool) {
         print!("{}", engine::template());
         return;
     }
+    // Loaded first: a first run has no file, and loading is what writes one.
+    let settings = Settings::load();
     match Settings::path() {
         Some(path) if path.is_file() => println!("{}", path.display()),
         Some(path) => println!("{} (absent; these are the defaults)", path.display()),
         None => println!("(cannot find this binary's own directory)"),
     }
-    let settings = Settings::load();
     println!("  [Video] Scaler       = {:?}", settings.video_scaler);
     println!("  [UI]    PixelPerfect = {}", settings.pixel_perfect());
     if settings.pixel_perfect() {
@@ -695,7 +696,8 @@ fn cmd_settings(template: bool) {
         println!("          Scaler       = {:?}", settings.ui_scaler);
     }
     println!(
-        "\nWrite a file to start from with: days settings --template > {}",
+        "\nA file of the defaults is written beside the binary on its first run. \
+         Print one with: days settings --template > {}",
         engine::FILE
     );
 }

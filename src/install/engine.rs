@@ -13,8 +13,13 @@
 //! are what the player drops into their install, so in practice the two are
 //! usually the same folder; but the settings belong to the engine, and looking
 //! for them where the engine is means running from anywhere still finds them.
-//! The file is optional and never written: with no file at all, every value
-//! below is its default.
+//!
+//! It is written exactly once: when [`Settings::load`] finds no file there, it
+//! writes [`template`] — every default, spelled out, with the comment that says
+//! what each one does — so the first thing a player who wants to change
+//! something finds is a file with the knobs already in it rather than a name
+//! from a README they have to type out. Nothing after that touches it; the
+//! values are its own and deleting it restores every default.
 //!
 //! # The format
 //!
@@ -147,10 +152,15 @@ impl Settings {
 pub const FILE: &str = "DaysEngine.ini";
 
 impl Settings {
-    /// Loads the settings from beside the running executable.
+    /// Loads the settings from beside the running executable, writing the
+    /// defaults out when there is no file there yet.
     ///
     /// Absent, unreadable, or unparseable all come to the same thing: the
-    /// defaults, and a line in the log saying so.
+    /// defaults, and a line in the log saying so. Absent is the one that also
+    /// leaves a file behind — see [`Settings::write_template`], and note that
+    /// it is only ever the *absent* case. A file that cannot be read or that a
+    /// player has half-edited is theirs, and overwriting it would throw away
+    /// the very thing they were editing.
     pub fn load() -> Settings {
         let Some(path) = Settings::path() else {
             log::info!("cannot find this binary's own directory; using default settings");
@@ -163,13 +173,34 @@ impl Settings {
                 settings
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                log::info!("no {}; using default settings", path.display());
+                Settings::write_template(&path);
                 Settings::default()
             }
             Err(err) => {
                 log::warn!("reading {}: {err}; using default settings", path.display());
                 Settings::default()
             }
+        }
+    }
+
+    /// Writes [`template`] to `path`, for the player to edit.
+    ///
+    /// Every value in it is the default, so the file this leaves behind and no
+    /// file at all mean exactly the same thing — which is what makes writing it
+    /// unannounced safe, and what
+    /// `the_template_parses_to_the_defaults` holds to.
+    ///
+    /// A failure here is a line in the log and nothing else. The engine is
+    /// about to run on the defaults either way, and a read-only folder — a
+    /// game installed under `Program Files`, an install on a mounted image —
+    /// is not a reason to refuse to start.
+    fn write_template(path: &std::path::Path) {
+        match std::fs::write(path, template()) {
+            Ok(()) => log::info!("no {}; wrote the defaults there", path.display()),
+            Err(err) => log::info!(
+                "no {} and it cannot be created ({err}); using default settings",
+                path.display()
+            ),
         }
     }
 
@@ -252,7 +283,8 @@ pub fn template() -> String {
         "; {FILE} — DaysEngine's own settings. Not the game's: nothing in here\n\
          ; comes from your install, and deleting this file restores every default.\n\
          ;\n\
-         ; This one sits beside the daysengine binary.\n\
+         ; This one sits beside the daysengine binary, with every default\n\
+         ; already filled in.\n\
          \n\
          [Video]\n\
          ; How a movie frame is scaled to the window. libswscale's filters:\n\
@@ -353,7 +385,9 @@ mod tests {
         }
     }
 
-    /// The template is a file this parser reads back to the defaults it claims.
+    /// The template is a file this parser reads back to the defaults it claims
+    /// — which is what lets [`Settings::load`] write it out on a first run
+    /// without changing how the engine behaves.
     #[test]
     fn the_template_parses_to_the_defaults() {
         assert_eq!(Settings::parse(&template()), Settings::default());
