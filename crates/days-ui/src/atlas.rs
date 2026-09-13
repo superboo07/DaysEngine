@@ -52,6 +52,25 @@
 //! tolerated is a weak match: below the threshold we report that the table was
 //! not found rather than drawing sprites from the wrong offsets.
 //!
+//! # A hit map need not agree with the table to the pixel
+//!
+//! School Days HQ's maps do: every run there anchors on a box that reproduces a
+//! record's first four floats byte for byte. Shiny Days' do not. Its `TITLE`
+//! regions each sit one pixel left of the sprite they select — boxes at
+//! `x = 635` against records at `x = 636`, and three of the five a pixel up as
+//! well — so no box anywhere reproduces a record and an exact anchor finds
+//! nothing at all.
+//!
+//! Nothing is recoverable about that: the shipped code never matches a box to a
+//! record. It reaches each table by hardcoded address, so the hit maps are free
+//! to be as approximate as whoever drew them left them, and the search by
+//! content is ours rather than theirs. So it anchors twice: once requiring the
+//! box exactly, which is what School Days HQ needs and leaves its results
+//! byte-identical, and then, only if that found nothing, allowing each edge to
+//! be off by [`SLOP`] pixels. A whole run of records landing within a pixel of
+//! a whole run of regions, in order, at a 24-byte stride, is not something
+//! unrelated float data does.
+//!
 //! # A table is not always one run
 //!
 //! `TITLE` and the three `OPTION` screens keep one record per region, in region
@@ -175,6 +194,15 @@ fn record(dll: &[u8], at: usize) -> Option<Widget> {
     })
 }
 
+/// How far a record's rect may sit from a region's bounding box and still
+/// anchor a run, once an exact anchor has been looked for and not found.
+///
+/// One pixel. That is what Shiny Days' hit maps are out by, and it is small
+/// enough that a near match is still a statement about the bytes: a record has
+/// to be within a pixel on all four edges, and its neighbours within a pixel of
+/// the neighbouring regions, before the run is taken.
+pub const SLOP: u32 = 1;
+
 /// Fewest exactly-matching regions that will be believed, for screens with
 /// enough regions to make a coincidence conceivable.
 const MIN_MATCHES: usize = 3;
@@ -206,6 +234,16 @@ const MIN_SEGMENT_REGIONS: usize = 3;
 /// `MENUBAR`), in region-ID order. `chip` is the `_CHIP` sheet's size, used to
 /// bound the trailing alternate-state records.
 pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error> {
+    match find_within(dll, boxes, chip, 0) {
+        Ok(atlas) => Ok(atlas),
+        Err(_) => find_within(dll, boxes, chip, SLOP),
+    }
+}
+
+/// [`find`], with how far a box may sit from a record and still anchor a run.
+///
+/// `slop` of zero is the exact search; see [`SLOP`] for why there is another.
+fn find_within(dll: &[u8], boxes: &[Rect], chip: (u32, u32), slop: u32) -> Result<Atlas, Error> {
     if boxes.is_empty() {
         return Err(Error::NoAtlas);
     }
@@ -216,7 +254,7 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
     let mut segments: Vec<(usize, usize, usize)> = Vec::new();
     let mut at = 0usize;
     while at < boxes.len() {
-        let Some((offset, len)) = longest_run(dll, boxes, at) else {
+        let Some((offset, len)) = longest_run(dll, boxes, at, slop) else {
             // No record anywhere reproduces this region's box. That is a region
             // laid out at runtime; skip it and look for the next segment.
             at += 1;
@@ -274,9 +312,18 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
         .zip(boxes)
         .filter(|(w, want)| w.dst == **want)
         .count();
+    // The gate counts what the search was allowed to accept. With no slop that
+    // is the exact matches and nothing changes; with slop it has to be the near
+    // ones, or a screen whose every box is a pixel out would be found and then
+    // refused for not being exact.
+    let credited = widgets
+        .iter()
+        .zip(boxes)
+        .filter(|(w, want)| near(&w.dst, want, slop))
+        .count();
     let longest = segments.iter().map(|&(_, _, len)| len).max().unwrap_or(0);
-    let believable = matched * 2 >= boxes.len() || longest >= MIN_LONG_RUN;
-    if matched < MIN_MATCHES.min(boxes.len()) || !believable {
+    let believable = credited * 2 >= boxes.len() || longest >= MIN_LONG_RUN;
+    if credited < MIN_MATCHES.min(boxes.len()) || !believable {
         return Err(Error::NoAtlas);
     }
 
@@ -311,28 +358,18 @@ pub fn find(dll: &[u8], boxes: &[Rect], chip: (u32, u32)) -> Result<Atlas, Error
 /// this region's when its rect is the box exactly, or when the box merely
 /// contains it — a hit map's region can be clipped by a neighbour, or run wider
 /// than the sprite it belongs to, and neither means the record is the wrong one.
-/// The run is anchored on an exact match so that a containment rule can never
-/// start one.
-fn longest_run(dll: &[u8], boxes: &[Rect], from: usize) -> Option<(usize, usize)> {
+/// The run is anchored on a match no looser than `slop` so that a containment
+/// rule can never start one.
+fn longest_run(dll: &[u8], boxes: &[Rect], from: usize, slop: u32) -> Option<(usize, usize)> {
     let anchor = boxes[from];
-    let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
-        .iter()
-        .flat_map(|v| (*v as f32).to_le_bytes())
-        .collect();
-
     let mut best: Option<(usize, usize)> = None;
-    let mut at = 0usize;
-    while let Some(found) = find_bytes(dll, &needle, at) {
-        at = found + 4;
-        if record(dll, found).is_none() {
-            continue;
-        }
+    for found in anchors(dll, &anchor, slop) {
         let mut len = 1usize;
         while from + len < boxes.len() {
             let Some(w) = record(dll, found + len * RECORD) else {
                 break;
             };
-            if !fits(&w.dst, &boxes[from + len]) {
+            if !(fits(&w.dst, &boxes[from + len]) || near(&w.dst, &boxes[from + len], slop)) {
                 break;
             }
             len += 1;
@@ -342,6 +379,43 @@ fn longest_run(dll: &[u8], boxes: &[Rect], from: usize) -> Option<(usize, usize)
         }
     }
     best
+}
+
+/// Every offset in the image holding a record that could be `anchor`'s.
+///
+/// With no slop this is a byte search for the box's own four floats, which is
+/// both the cheapest way to do it and the only way that can start a run. With
+/// slop there is no byte pattern to search for, so every aligned offset is read
+/// as a record and kept when its rect lands within `slop` of the box on all
+/// four edges.
+fn anchors(dll: &[u8], anchor: &Rect, slop: u32) -> Vec<usize> {
+    if slop == 0 {
+        let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
+            .iter()
+            .flat_map(|v| (*v as f32).to_le_bytes())
+            .collect();
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while let Some(found) = find_bytes(dll, &needle, at) {
+            at = found + 4;
+            if record(dll, found).is_some() {
+                out.push(found);
+            }
+        }
+        return out;
+    }
+    (0..dll.len().saturating_sub(RECORD - 1))
+        .step_by(4)
+        .filter(|&at| record(dll, at).is_some_and(|w| near(&w.dst, anchor, slop)))
+        .collect()
+}
+
+/// Whether a record's rect is within `slop` pixels of a box on all four edges.
+fn near(rect: &Rect, box_: &Rect, slop: u32) -> bool {
+    rect.x.abs_diff(box_.x) <= slop
+        && rect.y.abs_diff(box_.y) <= slop
+        && rect.width.abs_diff(box_.width) <= slop
+        && rect.height.abs_diff(box_.height) <= slop
 }
 
 /// Finds a record table by boxes it must reproduce at fixed relative indices.
@@ -452,6 +526,63 @@ mod tests {
         assert_eq!(a.offset, 64);
         assert_eq!(a.widgets.len(), 2);
         assert_eq!((a.widgets[1].src_x, a.widgets[1].src_y), (32, 1));
+    }
+
+    /// Shiny Days' `TITLE` regions all sit a pixel left of the records they
+    /// select, and three of the five a pixel up as well, so an exact anchor
+    /// finds nothing anywhere in the image. The slop pass is what reaches the
+    /// table; these are that screen's five boxes and records.
+    #[test]
+    fn a_hit_map_a_pixel_out_still_reaches_its_table() {
+        let mut dll = vec![0xaau8; 64];
+        for (y, src_y) in [
+            (233.0, 1.0),
+            (268.0, 30.0),
+            (301.0, 59.0),
+            (337.0, 88.0),
+            (373.0, 117.0),
+        ] {
+            dll.extend(rec([636.0, y, 165.0, 28.0, 1.0, src_y]));
+        }
+        dll.extend(vec![0u8; 32]);
+        let a = find(
+            &dll,
+            &boxes(&[
+                [635, 232, 165, 28],
+                [635, 267, 165, 28],
+                [635, 301, 165, 28],
+                [635, 336, 165, 28],
+                [635, 372, 165, 28],
+            ]),
+            (512, 256),
+        )
+        .unwrap();
+        assert_eq!(a.offset, 64);
+        // The table is what drawing uses, not the box it was reached through.
+        assert_eq!(a.widgets[0].dst.x, 636);
+        assert_eq!(a.widgets[4].src_y, 117);
+        // Nothing was exact, which is the whole point of the screen.
+        assert_eq!(a.matched, 0);
+    }
+
+    /// Two pixels is not a pixel: the slop is a tolerance for a hand-drawn hit
+    /// map, not a licence to match whatever is nearby.
+    #[test]
+    fn a_hit_map_further_out_than_the_slop_finds_nothing() {
+        let mut dll = vec![0xaau8; 64];
+        for y in [233.0f32, 268.0, 301.0] {
+            dll.extend(rec([636.0, y, 165.0, 28.0, 1.0, y]));
+        }
+        assert!(find(
+            &dll,
+            &boxes(&[
+                [633, 232, 165, 28],
+                [633, 267, 165, 28],
+                [633, 301, 165, 28]
+            ]),
+            (512, 256),
+        )
+        .is_err());
     }
 
     #[test]
