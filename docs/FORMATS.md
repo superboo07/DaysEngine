@@ -110,6 +110,20 @@ config object — the field `FUN_10006ce0` loads from and `FUN_10006e40` saves t
 the `MenVoice` key of `Config.DAT`, and that the Option screen's widgets 10 and
 11 set.
 
+**The refusal is not final, and the question is asked per tick, not per
+statement.** `FUN_0044e800` returns without latching the object's started flag
+at `+0x29`, and `FUN_0043c900` — the per-frame walk over the live voice list —
+hands every object that has not latched to `FUN_0044e8d0`, which calls back
+into `FUN_0044e800` for as long as the frame is at or past the object's start
+(`+0x34`). So a male line the option refuses is offered again on every frame of
+its window, and turning `MenVoice` back on part-way through starts the clip
+**from its beginning** at that frame. Only the window closing ends it.
+
+That is also why the setting takes hold immediately rather than at the next
+script: `FUN_10008260`'s widgets 10 and 11 write `+0xa8` — the very member
+`GetMenVoice` returns — before they store the key, so the next frame's poll
+sees the new value whether or not the file has been flushed.
+
 The data agrees: across all 1,857 scripts the flag is 1 for `mak` (9,848 lines)
 and `tai`, and 0 for `sek`, `kot`, `hik` and the rest. A handful of tags carry
 both values, `xxx` narration most of all.

@@ -962,6 +962,12 @@ fn cmd_render(
 
     let mixer = daysengine::Mixer::new();
     let mut stage = daysengine::Stage::new(script);
+    // The player's `MenVoice`, because a refused male line drives no mouth:
+    // the option moves the picture as well as the sound.
+    {
+        use daysengine::install::config::{Config, Flag};
+        stage.set_men_voice(Config::load(game).flag(Flag::MenVoice));
+    }
     std::fs::create_dir_all(out)?;
 
     // Two answers only the install can give: the choice box's axis, and

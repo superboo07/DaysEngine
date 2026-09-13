@@ -126,10 +126,21 @@ pub struct Stage {
     /// line against them by tag (`FUN_004448f0`), so a tag has one line at a
     /// time.
     voices: BTreeMap<String, VoiceLine>,
-    /// The player's `MenVoice` option. `FUN_0044e800` drops a clip whose
-    /// `[PlayVoice]` male-voice flag is set when this is off; the option's
-    /// default is on.
+    /// The player's `MenVoice` option. `FUN_0044e800` refuses to start a clip
+    /// whose `[PlayVoice]` male-voice flag is set when this is off; the
+    /// option's default is on.
     men_voice: bool,
+    /// Male voice lines that `men_voice` has refused so far, still inside
+    /// their window and still being offered.
+    ///
+    /// The refusal is not final. `FUN_0044e800` returns **without latching**
+    /// the object's started flag at `+0x29`, and `FUN_0043c900` walks the live
+    /// voice list once per frame calling `FUN_0044e8d0` on every object that
+    /// has not latched — so the question is re-asked on every tick of the
+    /// line's window, and the clip starts from its beginning the moment the
+    /// player turns the option back on. Dropping the statement where it fired
+    /// would make the option take hold only from the following line.
+    held_voices: Vec<HeldVoice>,
     /// Mouth art for the current background, by tag. A `None` is a tag this
     /// background has no complete set for — the engine caches that rejection
     /// per background too, and re-checking it every frame would mean three
@@ -152,6 +163,44 @@ pub struct Stage {
     video_size: Option<(u32, u32)>,
 }
 
+/// What this tick does with a held male voice line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The option is back on and the window is still open: start the clip,
+    /// from its beginning.
+    Start,
+    /// Still refused, and still worth asking again next tick.
+    Hold,
+    /// The window has run out; the line never plays.
+    Expire,
+}
+
+/// One tick's verdict on a held line.
+///
+/// There is no latch on a refusal — `FUN_0044e800` leaves `+0x29` alone when
+/// `GetMenVoice` says no — so the only thing that ends a held line is its
+/// window closing, and the only thing that starts it is the option coming
+/// back on.
+fn held_verdict(at: Frame, end: Frame, men_voice: bool) -> Held {
+    if at >= end {
+        Held::Expire
+    } else if men_voice {
+        Held::Start
+    } else {
+        Held::Hold
+    }
+}
+
+/// A male voice line the `MenVoice` option has refused so far, kept for the
+/// rest of its window in case the option comes back on. See
+/// [`Stage::held_voices`].
+struct HeldVoice {
+    path: String,
+    tag: String,
+    start: Frame,
+    end: Frame,
+}
+
 /// A voice line that may be flapping a mouth.
 struct VoiceLine {
     start: Frame,
@@ -169,6 +218,7 @@ impl Stage {
             fade: None,
             audio_cache: HashMap::new(),
             men_voice: true,
+            held_voices: Vec::new(),
             voices: BTreeMap::new(),
             mouths: BTreeMap::new(),
             video_scaler: crate::media::VideoScaler::default(),
@@ -257,6 +307,12 @@ impl Stage {
     }
 
     /// Sets the player's `MenVoice` option, which gates male voice clips.
+    ///
+    /// Nothing starts here. The original asks the option afresh on the next
+    /// tick rather than acting when it changes — `FUN_0043c900` polls, the
+    /// Option screen only writes the member the `GetMenVoice` export reads
+    /// (`FUN_10008260` widgets 10 and 11 store `+0xa8`) — so a line this turns
+    /// back on begins on the following frame, out of [`Stage::seek_to`].
     pub fn set_men_voice(&mut self, on: bool) {
         self.men_voice = on;
     }
@@ -337,8 +393,41 @@ impl Stage {
             }
         }
 
+        // Then the male lines a closed `MenVoice` has been refusing, which the
+        // original re-offers on every tick rather than on the statement.
+        self.release_held_voices(target, vfs, mixer);
+
         self.played = Some(target);
         Ok(())
+    }
+
+    /// Offers every held male voice line again, and forgets the ones whose
+    /// window has run out.
+    ///
+    /// One tick of `FUN_0043c900`'s walk over the live voice list: an object
+    /// that has not latched is passed to `FUN_0044e8d0` again, which reaches
+    /// `FUN_0044e800` and re-asks `GetMenVoice`. A line released late still
+    /// starts at the top of its clip — `FUN_0044e800` plays it from the
+    /// beginning — so the mouth it drives runs from the frame it actually
+    /// started, not from the statement's.
+    fn release_held_voices(&mut self, at: Frame, vfs: &Vfs, mixer: &Mixer) {
+        if self.held_voices.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.held_voices);
+        for line in held {
+            match held_verdict(at, line.end, self.men_voice) {
+                Held::Expire => continue,
+                Held::Hold => self.held_voices.push(line),
+                Held::Start => {
+                    let span = line.end.0.saturating_sub(line.start.0);
+                    let end = Frame(at.0.saturating_add(span));
+                    if let Err(err) = self.start_voice(&line.path, &line.tag, at, end, vfs, mixer) {
+                        log::warn!("{}: {err:#}", self.script.name);
+                    }
+                }
+            }
+        }
     }
 
     fn reset(&mut self, mixer: &Mixer) {
@@ -348,7 +437,36 @@ impl Stage {
         self.fade = None;
         self.played = None;
         self.voices.clear();
+        self.held_voices.clear();
         self.mouths.clear();
+    }
+
+    /// Starts a voice clip: the tail of `FUN_0044e800`, past the `MenVoice`
+    /// question. `start` and `end` are the window the mouth is driven over,
+    /// which is the statement's for a line that starts on time.
+    fn start_voice(
+        &mut self,
+        path: &str,
+        tag: &str,
+        start: Frame,
+        end: Frame,
+        vfs: &Vfs,
+        mixer: &Mixer,
+    ) -> Result<()> {
+        let buffer = self.audio_by_path(vfs, path)?;
+        if !tag.is_empty() {
+            self.voices.insert(
+                tag.to_string(),
+                VoiceLine {
+                    start,
+                    end,
+                    envelope: Envelope::from_audio(&buffer),
+                },
+            );
+            self.load_mouth(vfs, tag);
+        }
+        mixer.play_voice(buffer);
+        Ok(())
     }
 
     fn dispatch(
@@ -424,25 +542,21 @@ impl Stage {
                 men_voice,
                 tag,
             } => {
-                let buffer = self.audio_by_path(vfs, path)?;
                 // `FUN_0044e800` asks the menu DLL's `GetMenVoice` export and
-                // returns without playing when the option is off. The clip is
-                // dropped outright, so there is no mouth to drive either.
+                // returns without playing when the option is off — and without
+                // latching, so the clip is held rather than dropped and every
+                // later tick of its window offers it again. See
+                // [`Stage::held_voices`].
                 if *men_voice && !self.men_voice {
+                    self.held_voices.push(HeldVoice {
+                        path: path.clone(),
+                        tag: tag.clone(),
+                        start,
+                        end,
+                    });
                     return Ok(());
                 }
-                if !tag.is_empty() {
-                    self.voices.insert(
-                        tag.clone(),
-                        VoiceLine {
-                            start,
-                            end,
-                            envelope: Envelope::from_audio(&buffer),
-                        },
-                    );
-                    self.load_mouth(vfs, tag);
-                }
-                mixer.play_voice(buffer);
+                self.start_voice(path, tag, start, end, vfs, mixer)?;
             }
             Command::BlackFade(direction) => {
                 self.fade = Some(FadeState {
@@ -743,6 +857,26 @@ mod tests {
             direction: Fade::Out,
         };
         assert_eq!(f.opacity(Frame(7)), 1.0);
+    }
+
+    /// A male line refused by `MenVoice` is held, not dropped: `FUN_0044e800`
+    /// returns without latching `+0x29`, so `FUN_0043c900`'s per-frame walk
+    /// offers it again on every tick of its window. Turning the option back on
+    /// part-way through starts it; letting the window run out is the only thing
+    /// that ends it.
+    #[test]
+    fn a_refused_male_line_is_re_offered_until_its_window_runs_out() {
+        let end = Frame::parse("00:02:00").unwrap();
+        let inside = Frame::parse("00:01:12").unwrap();
+
+        assert_eq!(held_verdict(inside, end, false), Held::Hold);
+        assert_eq!(held_verdict(inside, end, true), Held::Start);
+        assert_eq!(held_verdict(end, end, false), Held::Expire);
+        assert_eq!(
+            held_verdict(end, end, true),
+            Held::Expire,
+            "the option coming back on after the window does not resurrect it"
+        );
     }
 
     #[test]

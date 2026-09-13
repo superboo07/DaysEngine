@@ -1816,13 +1816,11 @@ fn run_script(
     // Whole-number scaling, and what it means for how the art is sampled.
     let whole = player.whole_pixels();
     let art = art_sampling(whole);
-    let config = Config::load(&player.game);
+    let mut config = Config::load(&player.game);
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
     // `[LeftArrangement]` picks per-line centring or a left-aligned block.
     let left_arrangement = player.film.get_bool("LeftArrangement").unwrap_or(false);
-    // Male voice lines are dropped when the player has turned `MenVoice` off.
-    stage.set_men_voice(config.flag(Flag::MenVoice));
 
     // The control bar and the choice box both come out of the install, and a
     // missing one has to leave playback alone: this is the UI over a movie, not
@@ -1952,6 +1950,13 @@ fn run_script(
         let window_px = (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32);
         stage.set_video_size(window_px.0, window_px.1);
 
+        // Male voice lines are refused while `MenVoice` is off, and the
+        // original asks it per tick rather than per statement: `FUN_0043c900`
+        // walks the live voice list every frame and `FUN_0044e800` calls
+        // `GetMenVoice` on every clip that has not started yet. So the option
+        // is handed over here, on the tick, and a line the player turns back on
+        // part-way through starts then. See `Stage::set_men_voice`.
+        stage.set_men_voice(config.flag(Flag::MenVoice));
         stage.seek_to(at, player.vfs, player.mixer)?;
         let visual = stage.visual_at(at);
 
@@ -2133,6 +2138,15 @@ fn run_script(
                                 progress.as_deref_mut(),
                             )?;
                             player.mixer.resume_script();
+                            // The Sound tab may have moved `MenVoice`, which
+                            // the loop hands to the stage on its next tick.
+                            // Re-reading the file lands on the same value at
+                            // the same frame as the original does: the DLL
+                            // writes the member `GetMenVoice` reads the moment
+                            // the widget is pressed (`FUN_10008260`, widgets 10
+                            // and 11), the close button flushes it, and the
+                            // script clock is stopped for all of it.
+                            config = Config::load(&player.game);
                             // The Option screen can change the display mode,
                             // which moves both the art set the bar draws from
                             // and the rate the window is presented at.
