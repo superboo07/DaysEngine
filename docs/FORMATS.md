@@ -1246,6 +1246,45 @@ number. Index 3 of that function is a fixed level of 2, used when muted.
 `Format`, `WindowWidth`, `WindowHeight`, `DisplayType`, `TypeMiniNote`,
 `WindowMode`, `UseAgate` and `Wheel` are written back untouched by the Option
 screen, which asks the host about the display rather than reading them here.
+The host is the executable, and it reads and writes the display ones itself.
+
+### The display keys, read and written by the executable
+
+`Config.DAT` is the only loose settings file an install has — there is no
+separate graphics `.INI` — and the executable holds it as the object at
+`0050b160`, whose getters are `FUN_0046cae0` (int) and `FUN_0046ca70` (bool)
+and whose setters are `FUN_0046cea0` (int) and `FUN_0046cd30` (bool).
+
+`FUN_0040cbb0` reads them at startup:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `DisplayType` | the value already held | `0` selects an 800x600 back buffer, `1` an 800x450 one — 4:3 versus wide |
+| `WindowMode` | `0` | the window style, below |
+| `TypeMiniNote` | `0` | forces the 1024x576 art |
+| `WindowWidth` / `WindowHeight` | globals at `0050b294` / `0050b2f8`, **not recovered** | overwritten outright by `DisplayType`: `0` forces 800x600 and `1` forces 800x450 |
+| `WindowPosX` / `WindowPosY` | `0x7fffffff` | where a windowed run reopens |
+| `Format` | `0x16` | the D3D surface format |
+| `DXDeviceNo` | `0` | which adapter |
+
+`WindowMode`'s polarity comes from `FUN_0040db00`, which is the one function
+that sets the window style and which all three of its callers
+(`FUN_0040dce0`, `FUN_0040ddc0`, `FUN_0040f000`) hand the live `WindowMode`
+value: **`1` gives `WS_POPUP | WS_VISIBLE` at `HWND_TOPMOST` over the
+monitor's own rectangle — full screen — and anything else gives the captioned
+`0x90ca0000` window at the saved `WindowPosX`/`WindowPosY`.** That same
+function stores its argument back under `WindowMode` before applying it.
+
+`FUN_0040c700` writes `Format`, `WindowWidth`, `WindowHeight`, `DisplayType`
+and `TypeMiniNote` back once the device has taken the mode, so the two keys a
+player can change from the Option screen are stored as the change is applied
+and the file is flushed when the screen closes.
+
+`FUN_0040cbb0` can also change `DisplayType` and `TypeMiniNote` on its own: a
+monitor whose aspect falls between the two constants at `004d0c28` and
+`004d0c30` (the values themselves are **not recovered**) and whose height is
+under `0x500` is forced to `1` for both. This engine does not do that — it
+takes the panel as it finds it — which is a deliberate departure, not a gap.
 
 See `daysengine::config`.
 

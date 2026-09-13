@@ -560,6 +560,10 @@ pub struct Menu {
     /// tick commits, re-rasterises the rows and clears it, which is why saving
     /// leaves the player on the save screen rather than closing it.
     pending_save: Option<(u32, String)>,
+    /// How much larger than its hit map this menu composites, so that the
+    /// screens loaded by [`Menu::enter`] keep the size the caller asked for.
+    /// See [`Menu::set_output_size`].
+    out_scale: f64,
 }
 
 impl Menu {
@@ -650,6 +654,7 @@ impl Menu {
             font: load_font(vfs),
             rows: None,
             pending_save: None,
+            out_scale: 1.0,
         };
         menu.load_thumbnails(vfs, dll);
         menu.refresh();
@@ -672,6 +677,7 @@ impl Menu {
         )?;
         self.states = vec![WidgetState::Resting; screen.widget_count()];
         self.screen = screen;
+        self.refit();
         self.mode = mode;
         self.variant = variant;
         self.return_to = return_to;
@@ -787,11 +793,38 @@ impl Menu {
 
     /// Composites at `width` x `height` from here on. See [`Screen::fit_to`].
     ///
-    /// Marks the frame dirty, because the one already composed is the wrong
-    /// size now.
+    /// What is remembered is the *factor*, not the size: every screen carries
+    /// its own hit map — `MENUBAR`'s is 800x75 where the title's is 1280x720 —
+    /// so a width that fits one screen means nothing to the next. The factor
+    /// means the same thing to all of them, and it is what [`Menu::enter`]
+    /// re-applies to the screen it loads.
+    ///
+    /// Marks the frame dirty when the size really moves, because the one
+    /// already composed is the wrong size then. A call that asks for the size
+    /// the screen is already at changes nothing, so that a caller can hand this
+    /// the size it wants every pass without recomposing every pass.
     pub fn set_output_size(&mut self, width: u32, height: u32) {
+        let (map_w, _) = self.screen.map_size();
+        if map_w != 0 && width != 0 {
+            self.out_scale = f64::from(width) / f64::from(map_w);
+        }
+        let was = self.screen.size();
         self.screen.fit_to(width, height);
-        self.dirty = true;
+        self.dirty |= self.screen.size() != was;
+    }
+
+    /// Puts the menu's output scale on the screen that is loaded.
+    ///
+    /// A freshly loaded [`Screen`] composites at its hit map's size, so without
+    /// this every navigation would silently drop back to it — and the caller,
+    /// having asked once, has no reason to ask again.
+    fn refit(&mut self) {
+        if self.out_scale == 1.0 {
+            return;
+        }
+        let (map_w, map_h) = self.screen.map_size();
+        let at = |v: u32| (f64::from(v) * self.out_scale).round().max(1.0) as u32;
+        self.screen.fit_to(at(map_w), at(map_h));
     }
 
     pub fn screen(&self) -> &Screen {

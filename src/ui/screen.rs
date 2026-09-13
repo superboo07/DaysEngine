@@ -325,6 +325,30 @@ impl Screen {
         self.scale
     }
 
+    /// How much larger than its hit map this screen composites.
+    ///
+    /// 1.0 until [`Screen::fit_to`] has said otherwise, and after that the
+    /// factor everything on the screen is magnified by.
+    pub fn output_scale(&self) -> f64 {
+        let w = self.display.width();
+        if w == 0 {
+            1.0
+        } else {
+            f64::from(self.out.0) / f64::from(w)
+        }
+    }
+
+    /// Scales an image authored in the hit map's space into output space.
+    ///
+    /// For an overlay that is not part of the screen but is drawn over it: the
+    /// save-comment dialog is composited into the same image, so it has to be
+    /// magnified by the same factor or it shrinks away as the window grows.
+    /// Filtered the way the screen's own art is — see [`resampled`].
+    pub fn to_output(&self, img: &Image) -> Image {
+        let size = scaled_size(img, self.output_scale());
+        resampled(img, (0, 0, img.width, img.height), size).unwrap_or_else(|| img.clone())
+    }
+
     pub fn letterbox(&self) -> f64 {
         self.letterbox
     }

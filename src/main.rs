@@ -333,11 +333,17 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
 
     // The display mode the player left the game in. `Config.DAT` carries all
-    // three keys the original reads: `DisplayType` is the aspect, `WindowMode`
-    // is windowed versus full screen, and `TypeMiniNote` picks the 1024x576 art
-    // over the 1280x720 art. The engine starts windowed whatever `WindowMode`
-    // says, because a window is the safe thing to open on somebody else's
-    // desktop; the Option screen is one click away.
+    // three keys the original reads, and `FUN_0040cbb0` is where it reads them:
+    // `DisplayType` is the aspect — 0 gives the 4:3 800x600 back buffer, 1 the
+    // 800x450 wide one — `WindowMode` is windowed versus full screen, and
+    // `TypeMiniNote` picks the 1024x576 art over the 1280x720 art.
+    //
+    // `WindowMode` is the argument `FUN_0040db00` is called with by all three
+    // of its callers, and that function is the one that sets the window style:
+    // 1 gives `WS_POPUP | WS_VISIBLE` at `HWND_TOPMOST` over the monitor's own
+    // rectangle, anything else the captioned window at the saved
+    // `WindowPosX`/`WindowPosY`. So 1 is full screen and 0 is windowed, and
+    // the game reopens in whichever the player left it in.
     let boot_config = Config::load(&game);
     let mut player = Player {
         settings,
@@ -346,7 +352,9 @@ fn main() -> Result<()> {
             wide: boot_config
                 .get("DisplayType")
                 .is_none_or(|v| v.trim() != "0"),
-            full_screen: false,
+            full_screen: boot_config
+                .get("WindowMode")
+                .is_some_and(|v| v.trim() == "1"),
         },
         mini_note: boot_config
             .get("TypeMiniNote")
@@ -374,6 +382,16 @@ fn main() -> Result<()> {
             }
         },
     };
+
+    if player.display.full_screen {
+        // `Config.DAT` said full screen. A refusal is not fatal — the window is
+        // already open and playable — so it is logged and the player is left
+        // windowed, with the setting corrected to match what they can see.
+        if let Err(err) = canvas.window_mut().set_fullscreen(true) {
+            log::warn!("could not reopen full screen: {err}");
+            player.display.full_screen = false;
+        }
+    }
 
     // A named script is the development path: play it and stop. Otherwise the
     // game's own start mode decides, and the title screen owns the session.
@@ -696,7 +714,6 @@ fn run_menu(
     // The slot the player picked on the save screen, waiting for the
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
-    let mut size = (0, 0);
     // Whole-number scaling, which decides both where the screen lands and how
     // it gets there.
     let whole = player.whole_pixels();
@@ -794,26 +811,27 @@ fn run_menu(
                         _ => texture = None,
                     }
                 }
-                // Still to build: the Option screen really does ask for a
-                // window size and a full-screen toggle, and the player should
-                // get them. The DLL only records the request — who acts on it
-                // is **not recovered** — so what the engine does with it is the
-                // engine's to decide, and right now it decides nothing. Logged
-                // so the gap is visible rather than silent. See
-                // `daysengine::ui::options::DisplayRequest`.
-                // `FUN_004279e0` and `FUN_00427a90` are the original's two
-                // appliers: each polls the flag the Def tab raised, changes the
-                // mode once and clears it. This does the same on arrival, which
-                // from the player's side is the same thing.
+                // The Def tab does not change the display itself: it raises a
+                // flag and the executable acts on it. `FUN_004279e0` polls
+                // `GetFullFlag`, flips full screen to the opposite of what
+                // `FUN_0040e830` reports and clears the flag with
+                // `SetFullFlag(0)`; `FUN_00427a90` does the same pair for
+                // `GetWideFlag`. Acting on arrival instead of polling reaches
+                // the same place, because the flag is raised and cleared
+                // without anything else getting a look in between.
+                //
+                // See `daysengine::ui::options::DisplayRequest`.
                 Action::Display(request) => {
                     apply_display(player, canvas, request)?;
+                    // Into the settings, where the Option screen's close button
+                    // will flush them — the same two steps the original takes,
+                    // `FUN_0040db00` and `FUN_0040c700` storing the keys as the
+                    // mode is applied and the close flushing the file.
+                    remember_display(&mut menu.session_mut().config, player.display);
                     // Every screen's art is chosen by the mode, so whatever is
                     // showing has to be reloaded at the new size.
                     menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
                     menu.session_mut().display = player.display;
-                    // A reloaded screen composites at its hit map's size until
-                    // it is told otherwise, so make the next pass tell it.
-                    size = (0, 0);
                     // Full screen can land the window on a panel that refreshes
                     // at another rate.
                     cadence = Cadence::new(canvas);
@@ -927,11 +945,17 @@ fn run_menu(
         } else {
             (dst.w.round().max(1.0) as u32, dst.h.round().max(1.0) as u32)
         };
-        if at != size {
+        // Asked of the screen itself rather than remembered, because the size
+        // moves when the screen does: `Menu::enter` loads a brand-new `Screen`
+        // on every navigation and a new one composites at its hit map's size
+        // until it is told otherwise. A remembered width does not change when
+        // the screen swaps, so coming back to the title from the Option screen
+        // left the title compositing at 1280x720 while the backdrop under it
+        // was still sized for the window.
+        if at.0 != menu.screen().size().0 {
             menu.set_output_size(at.0, at.1);
             // The backdrop is scaled into the screen's space, so it follows.
             under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
-            size = at;
             texture = None;
         }
         if menu.dirty() || texture.is_none() {
@@ -1010,6 +1034,7 @@ fn comment_loop(
 ) -> Result<Option<String>> {
     let mut texture: Option<Texture> = None;
     let mut size = (0u32, 0u32);
+    let mut placed: Option<Placed> = None;
     let mut dirty = true;
     let whole = player.whole_pixels();
 
@@ -1083,7 +1108,7 @@ fn comment_loop(
                     ..
                 } => {
                     dirty = true;
-                    match to_dialog(canvas, size, dialog, base, whole, x, y) {
+                    match to_dialog(canvas, size, placed, whole, x, y) {
                         Some(at) => dialog.click(at, base),
                         None => comment::Act::None,
                     }
@@ -1099,7 +1124,15 @@ fn comment_loop(
 
         if dirty || texture.is_none() {
             let mut image = menu.compose(None);
-            let over = dialog.compose_image(player.font, base);
+            // The menu under it is composited straight at the size the window
+            // will show — see `Screen::fit_to` — so the dialog is magnified by
+            // the same factor. Drawn at its own pixel size it would keep
+            // shrinking as the window grew, which is not what the screen it
+            // sits on does.
+            let scale = menu.screen().output_scale();
+            let over = menu
+                .screen()
+                .to_output(&dialog.compose_image(player.font, base));
             // `WM_INITDIALOG` centres the dialog on the game window, so this
             // does too.
             let (w, h) = (over.width, over.height);
@@ -1108,6 +1141,13 @@ fn comment_loop(
                 (image.height as i64 - h as i64) / 2,
             );
             image.blit_scaled(&over, (0, 0, w, h), (at.0, at.1, w, h));
+            // Written where it was drawn, so `to_dialog` cannot disagree with
+            // the blit above about where the dialog is.
+            placed = Some(Placed {
+                at,
+                size: (w, h),
+                scale,
+            });
             size = (image.width, image.height);
             let mut new = new_texture(creator, image.width, image.height, art_sampling(whole))?;
             new.update(None, &image.rgba, image.width as usize * 4)?;
@@ -1127,27 +1167,51 @@ fn comment_loop(
     }
 }
 
+/// Where the save-comment dialog was last drawn in the composite, and by how
+/// much it was magnified to get there.
+///
+/// Recorded by the pass that draws it and read by [`to_dialog`], because a hit
+/// test that recomputes the placement is a hit test that can disagree with the
+/// blit.
+#[derive(Clone, Copy)]
+struct Placed {
+    /// Top-left in composite pixels.
+    at: (i64, i64),
+    /// Size in composite pixels.
+    size: (u32, u32),
+    /// Composite pixels per dialog pixel.
+    scale: f64,
+}
+
 /// Maps a window pixel to the dialog's own space, or `None` outside it.
 fn to_dialog(
     canvas: &Canvas<Window>,
     size: (u32, u32),
-    dialog: &comment::Comment,
-    base: (i32, i32),
+    placed: Option<Placed>,
     whole: bool,
     x: f32,
     y: f32,
 ) -> Option<(i32, i32)> {
-    if size.0 == 0 || size.1 == 0 {
+    in_dialog(
+        letterbox(canvas, size.0, size.1, whole),
+        size,
+        placed?,
+        x,
+        y,
+    )
+}
+
+/// [`to_dialog`] once the window rectangle is known, which is the part a test
+/// can reach without an SDL window.
+fn in_dialog(dst: FRect, size: (u32, u32), placed: Placed, x: f32, y: f32) -> Option<(i32, i32)> {
+    if size.0 == 0 || size.1 == 0 || dst.w <= 0.0 || dst.h <= 0.0 || placed.scale <= 0.0 {
         return None;
     }
-    let dst = letterbox(canvas, size.0, size.1, whole);
-    let sx = (x - dst.x) / dst.w * size.0 as f32;
-    let sy = (y - dst.y) / dst.h * size.1 as f32;
-    let (w, h) = dialog.size(base);
-    let ox = (size.0 as f32 - w as f32) / 2.0;
-    let oy = (size.1 as f32 - h as f32) / 2.0;
-    let (dx, dy) = (sx - ox, sy - oy);
-    (dx >= 0.0 && dy >= 0.0 && dx < w as f32 && dy < h as f32).then_some((dx as i32, dy as i32))
+    let sx = f64::from((x - dst.x) / dst.w) * f64::from(size.0);
+    let sy = f64::from((y - dst.y) / dst.h) * f64::from(size.1);
+    let (dx, dy) = (sx - placed.at.0 as f64, sy - placed.at.1 as f64);
+    (dx >= 0.0 && dy >= 0.0 && dx < f64::from(placed.size.0) && dy < f64::from(placed.size.1))
+        .then(|| ((dx / placed.scale) as i32, (dy / placed.scale) as i32))
 }
 
 /// Activates the menu's selection, playing the confirm sound when it takes.
@@ -1227,6 +1291,23 @@ fn apply_display(
         player.resolution().name()
     );
     Ok(())
+}
+
+/// Writes the display mode into the settings, so the game reopens in it.
+///
+/// The original stores the same two keys as it applies a mode: `FUN_0040db00`
+/// sets `WindowMode` to the argument it is switching to, and `FUN_0040c700`
+/// writes `Format`, `WindowWidth`, `WindowHeight`, `DisplayType` and
+/// `TypeMiniNote` back once the device has taken the mode. Only the two the
+/// Option screen can ask for are written here: this engine picks its own window
+/// size and surface format, and `TypeMiniNote` has no widget behind it.
+///
+/// `DisplayType` is 1 for wide and 0 for 4:3, from the back-buffer sizes
+/// `FUN_0040cbb0` chooses between; `WindowMode` is 1 for full screen, from the
+/// window style `FUN_0040db00` sets for each.
+fn remember_display(config: &mut Config, display: Display) {
+    config.set("DisplayType", if display.wide { "1" } else { "0" });
+    config.set("WindowMode", if display.full_screen { "1" } else { "0" });
 }
 
 /// The display's presentation grid: when each refresh is, and which one a pass
@@ -2328,5 +2409,93 @@ mod tests {
         let dst = bar_strip(FRect::new(4.0, 8.0, 100.0, 50.0), (0, 10));
         assert_eq!(dst.w, 100.0);
         assert!(dst.h.is_finite(), "{dst:?}");
+    }
+
+    /// The dialog is magnified with the screen under it, and a click has to
+    /// follow it there: the composite is the window's size, so the dialog is
+    /// drawn at that same magnification and a window pixel divides back by it
+    /// to reach the dialog's own space. Drawing and hit testing read the one
+    /// `Placed` the drawing pass wrote, which is what keeps them together.
+    #[test]
+    fn a_click_lands_where_the_magnified_dialog_was_drawn() {
+        // A 200x100 dialog at 3x, centred in a 1920x1080 composite shown
+        // one-to-one in the window.
+        let placed = Placed {
+            at: (660, 390),
+            size: (600, 300),
+            scale: 3.0,
+        };
+        let dst = FRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let size = (1920, 1080);
+        // The dialog's top-left three window pixels in, which is its own
+        // pixel (1, 1) at this magnification.
+        assert_eq!(in_dialog(dst, size, placed, 663.0, 393.0), Some((1, 1)));
+        // The dialog's own centre, whatever it was magnified by.
+        assert_eq!(in_dialog(dst, size, placed, 960.0, 540.0), Some((100, 50)));
+        // Just outside each edge.
+        assert_eq!(in_dialog(dst, size, placed, 659.0, 540.0), None);
+        assert_eq!(in_dialog(dst, size, placed, 1260.0, 540.0), None);
+        assert_eq!(in_dialog(dst, size, placed, 960.0, 389.0), None);
+        assert_eq!(in_dialog(dst, size, placed, 960.0, 690.0), None);
+    }
+
+    /// The same click through a letterboxed window: the composite is scaled
+    /// into `dst` first, and only then measured against where the dialog sits
+    /// inside it.
+    #[test]
+    fn a_letterboxed_window_still_finds_the_dialog() {
+        let placed = Placed {
+            at: (660, 390),
+            size: (600, 300),
+            scale: 3.0,
+        };
+        // Half size, offset — the composite's centre is the rectangle's.
+        let dst = FRect::new(100.0, 60.0, 960.0, 540.0);
+        assert_eq!(
+            in_dialog(dst, (1920, 1080), placed, 100.0 + 480.0, 60.0 + 270.0),
+            Some((100, 50))
+        );
+    }
+
+    /// The mode the player chose goes into the settings in the spelling the
+    /// game's own reader expects, so that `Config.DAT` still means the same
+    /// thing to `SCHOOLDAYS HQ.exe`: `FUN_0040cbb0` takes `DisplayType` 0 as
+    /// 4:3, and `FUN_0040db00` takes `WindowMode` 1 as full screen.
+    #[test]
+    fn the_display_mode_is_written_the_way_the_game_reads_it() {
+        let mut config = Config::default();
+        for (wide, full, display_type, window_mode) in [
+            (false, false, "0", "0"),
+            (true, false, "1", "0"),
+            (false, true, "0", "1"),
+            (true, true, "1", "1"),
+        ] {
+            remember_display(
+                &mut config,
+                Display {
+                    wide,
+                    full_screen: full,
+                },
+            );
+            assert_eq!(config.get("DisplayType"), Some(display_type));
+            assert_eq!(config.get("WindowMode"), Some(window_mode));
+        }
+    }
+
+    /// Writing the mode marks the settings dirty, because that is what the
+    /// Option screen's close button flushes — a display change that left the
+    /// config clean was written nowhere and lost on exit.
+    #[test]
+    fn changing_the_display_mode_asks_for_a_flush() {
+        let mut config = Config::parse_text("[WindowMode]=\"0\"\n");
+        assert!(!config.dirty(), "a freshly read file is not dirty");
+        remember_display(
+            &mut config,
+            Display {
+                wide: true,
+                full_screen: true,
+            },
+        );
+        assert!(config.dirty());
     }
 }

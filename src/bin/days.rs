@@ -1748,6 +1748,28 @@ fn cmd_config(game: &Path) -> Result<()> {
     for flag in Flag::ALL {
         println!("  {:<12} {}", flag.key(), config.flag(flag));
     }
+    println!();
+    // The three the engine reads at startup, which is where the game reopens
+    // in whatever the player left it in. `FUN_0040cbb0` reads all three;
+    // `DisplayType` 0 is the 4:3 back buffer and 1 the wide one, `WindowMode`
+    // 1 is the full-screen window style `FUN_0040db00` sets.
+    println!("display:");
+    let show = |key: &str, meaning: &str| {
+        println!(
+            "  {:<12} {:<6} {meaning}",
+            key,
+            config.get(key).unwrap_or("(absent)")
+        );
+    };
+    let wide = config.get("DisplayType").is_none_or(|v| v.trim() != "0");
+    show("DisplayType", if wide { "wide" } else { "4:3" });
+    let full = config.get("WindowMode").is_some_and(|v| v.trim() == "1");
+    show("WindowMode", if full { "full screen" } else { "windowed" });
+    let note = config.get("TypeMiniNote").is_some_and(|v| v.trim() != "0");
+    show(
+        "TypeMiniNote",
+        if note { "1024x576 art" } else { "1280x720 art" },
+    );
     Ok(())
 }
 
