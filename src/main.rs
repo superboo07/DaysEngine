@@ -25,7 +25,7 @@ use daysengine::ui::comment;
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
 use daysengine::ui::options::{self, Dir, Display, Som};
-use daysengine::ui::replay::Scenes;
+use daysengine::ui::replay::{self, Scenes};
 use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
 use daysengine::ui::select::{self, Choice, Input, Select};
@@ -217,6 +217,12 @@ struct Player<'a> {
     /// `Config.DAT`'s `TypeMiniNote`, which picks the 1024x576 art over the
     /// 1280x720 art when full screen. Host `+0xc8`, via `DAT_0050b314`.
     mini_note: bool,
+    /// The index the last choice box settled on, which is what a replay's
+    /// branch table is read by. The film object's `+0x1f8`: `FUN_004388c0`
+    /// sets it to -2 once, when the object is constructed, and only a settling
+    /// choice box writes it after that — so it outlives the script it was made
+    /// in, and lives as long as the session does.
+    last_choice: i32,
 }
 
 impl Player<'_> {
@@ -365,6 +371,7 @@ fn main() -> Result<()> {
         mini_note: boot_config
             .get("TypeMiniNote")
             .is_some_and(|v| v.trim() != "0"),
+        last_choice: replay::NO_CHOICE,
         // Started only while the save-comment dialog is up, so ordinary key
         // presses stay key presses everywhere else.
         text_input: video.text_input(),
@@ -429,7 +436,7 @@ fn main() -> Result<()> {
     // The replay scene being played and how far through its list, or `None`
     // for ordinary playback. The original keeps the same pair on the replay
     // module: the scene at `+0x2a8` and the step at `+0x2ac`.
-    let mut replaying: Option<(Vec<String>, usize)> = None;
+    let mut replaying: Option<(replay::Run, usize)> = None;
     // Set while the skip button is still looking for a choice, which makes the
     // loop below pass over scripts that raise none instead of playing them.
     let mut chasing_choice = false;
@@ -456,13 +463,20 @@ fn main() -> Result<()> {
                 // it at step 0 and `FUN_1001f0d0` is asked for the next one
                 // each time a script ends, so the whole list is carried and
                 // walked here rather than the first of it being played alone.
-                Outcome::Replay(scripts) => {
-                    let Some(first) = scripts.first() else {
+                Outcome::Replay(run) => {
+                    let Some(first) = run.script(0) else {
                         continue;
                     };
                     next = first.rsplit('/').next().unwrap_or(first).to_string();
-                    log::info!("replaying {next}, {} script(s) in the scene", scripts.len());
-                    replaying = Some((scripts, 0));
+                    log::info!(
+                        "replaying {next}, {} script(s) in the scene, {}",
+                        run.scripts.len(),
+                        match &run.branch {
+                            Some(table) => format!("branching over {} steps", table.len()),
+                            None => "played in order".to_string(),
+                        }
+                    );
+                    replaying = Some((run, 0));
                 }
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
@@ -564,13 +578,15 @@ fn main() -> Result<()> {
         // runs out of route cannot leak into whatever is played next.
         chasing_choice = false;
         if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
-            // A replay walks the scene's own list. `FUN_1001ee20`'s `default`
-            // arm is `step + 1`, which is every scene without a branch table —
-            // see `daysengine::ui::replay` for which twelve have one and what
-            // is still missing to follow them.
-            if let Some((scripts, step)) = &mut replaying {
-                *step += 1;
-                if let Some(script) = scripts.get(*step) {
+            // A replay walks the scene's own list, by its branch table where it
+            // has one and straight down the list where it does not —
+            // `FUN_1001ee20`'s `default` arm. The column is the choice the
+            // player last answered, which the original keeps for the life of
+            // the film object and so outlives the script it was made in.
+            if let Some((run, step)) = &mut replaying {
+                if let Some(next_step) = run.next(*step, player.last_choice) {
+                    *step = next_step;
+                    let script = run.script(*step).unwrap_or_default();
                     next = script.rsplit('/').next().unwrap_or(script).to_string();
                     log::info!("replay step {step}: {next}");
                     chained = true;
@@ -640,8 +656,8 @@ enum Outcome {
     /// a choice. `FUN_00425bf0`'s case 7 looping on itself; see
     /// [`daysengine::playback::stage::Stage::skip_target`].
     SkipToChoice,
-    /// Play a replay scene: the sequence of scripts it runs through.
-    Replay(Vec<String>),
+    /// Play a replay scene: the scripts it runs through and how it walks them.
+    Replay(replay::Run),
     /// Load a save slot and play what it names.
     LoadSlot(u32),
     /// Close the game.
@@ -2045,6 +2061,7 @@ fn run_script(
                         // `FUN_00431740` calls `_SetFeeling@8(host, 1)` right
                         // after storing the index.
                         log::info!("choice decided: {index}");
+                        player.last_choice = index;
                         if let Some(p) = progress.as_deref_mut() {
                             p.decide(index);
                         }

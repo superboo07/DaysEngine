@@ -1834,6 +1834,7 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
                     .join(" -> ")
             );
         }
+        print_branch("        ", scene.branch.as_ref(), &scene.scripts);
         for choice in &scene.choices {
             println!(
                 "        version {:<14} {}  {}",
@@ -1855,11 +1856,45 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
                         .join(" -> ")
                 );
             }
+            print_branch(
+                "                                       ",
+                choice.branch.as_ref(),
+                &choice.scripts,
+            );
         }
     }
     println!();
     println!("{open} of {} unlocked by this save", scenes.len());
     Ok(())
+}
+
+/// Prints the branch table a scene or one of its versions walks.
+///
+/// A row is the three next steps a step can lead to — the first for a player
+/// who has answered no choice box, the other two for the two answers — and a
+/// step past the end of the list is where the scene stops.
+fn print_branch(indent: &str, branch: Option<&daysengine::ui::replay::Branch>, scripts: &[String]) {
+    let Some(table) = branch else {
+        return;
+    };
+    let name = |step: i32| match usize::try_from(step)
+        .ok()
+        .and_then(|step| scripts.get(step))
+    {
+        Some(script) => script.rsplit('/').next().unwrap_or(script).to_string(),
+        None => "end".to_string(),
+    };
+    println!("{indent}branch  none / first / second");
+    for (step, row) in table.iter().enumerate() {
+        println!(
+            "{indent}  {:<14} {}",
+            name(step as i32),
+            row.iter()
+                .map(|next| name(*next))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        );
+    }
 }
 
 /// Drives the menu state machine and reports where each event lands.
@@ -2067,11 +2102,15 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 println!("  (would quit)");
                 break;
             }
-            Action::PlayReplay(script) => {
+            Action::PlayReplay(run) => {
                 println!(
-                    "  (would replay {} script(s): {})",
-                    script.len(),
-                    script.join(", ")
+                    "  (would replay {} script(s): {}{})",
+                    run.scripts.len(),
+                    run.scripts.join(", "),
+                    match &run.branch {
+                        Some(table) => format!("; branching over {} steps", table.len()),
+                        None => String::new(),
+                    }
                 );
                 break;
             }

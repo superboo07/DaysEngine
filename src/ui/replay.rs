@@ -28,17 +28,19 @@
 //! # What a click plays
 //!
 //! `FUN_1001de10` turns a thumbnail into a scene index — `page * 12 + widget -
-//! 7` — and hands the scene's **first** script to the host. A scene's list can
-//! hold up to six, and the rest are the steps after it: the engine asks the
-//! module for the next one through `FUN_1001f0d0`, which walks a per-scene
-//! branch table by the choice the player made during playback.
+//! 7` — and hands the scene's **first** script to the host. The rest of the
+//! list is the steps after it — up to nine for a scene and sixteen for a
+//! version of one — and the engine asks the module for each in turn through
+//! `FUN_1001f0d0`, which walks the scene's branch table by the choice the
+//! player last made during playback.
 //!
 //! # How a scene walks
 //!
 //! `FUN_1001f270` starts a scene at step 0 (`+0x2ac`), and each time a script
 //! ends `FUN_1001f0d0` is asked for the next one. It calls `FUN_1001ee20` for
 //! the next **step index** and looks the name up in the scene's list, returning
-//! an empty string when the index is -1, which is the chain ending.
+//! an empty string when the index is -1 and when the name it lands on is the
+//! list's NULL terminator — either way, the chain ending.
 //!
 //! `FUN_1001ee20` is where the branch lives:
 //!
@@ -53,12 +55,25 @@
 //! }
 //! ```
 //!
-//! A row is three `i32` next-step indices, one per choice, and -1 ends the
-//! scene. Scene 11 has four such tables, one per version, picked by `+0x2b4`.
+//! A row is three `i32` next-step indices, one per column. Scene 11 has four
+//! such tables, one per version, picked by `+0x2b4`. See [`Run::next`] for the
+//! walk and [`column`] for where the choice comes from.
 //!
-//! **The `default` arm is the common case, and it is what this engine does**:
-//! step + 1 until the list runs out. Every scene without a table chains exactly
-//! as the original does.
+//! # Finding the branch tables
+//!
+//! A branch table is a run of small integers, and the image is full of those:
+//! unlike every other table here, it cannot be found by its own contents. What
+//! is distinctive is **the code that reads it**. `FUN_1001ee20` is a dense MSVC
+//! switch whose arms are all the same five instructions — read `+0x2ac`,
+//! multiply by twelve, index by four, load from a fixed address — which is the
+//! branch rule itself, written in instructions. [`branch_switches`] scans the
+//! image for a switch of that shape and takes the addresses out of its arms.
+//!
+//! Against the retail DLL exactly one switch matches, and it yields the eleven
+//! scenes and scene 11's four version tables that the decompile shows. Each
+//! table is then read as one row per script in the scene's list and refused
+//! unless every entry is a step that list has — a check all fourteen pass, and
+//! one whose lengths land exactly on the next table or the padding before it.
 //!
 //! # The three scenes that ask first
 //!
@@ -67,19 +82,9 @@
 //! versions of the scene, each with its own save flag. Whichever the player
 //! picks, `FUN_1001f270` sets the step index to zero and plays element zero of
 //! that version's script list — and element zero is the same script in every
-//! version, so **the choice does not change what starts**. It selects a branch
-//! for later, in the eleven scenes that have a table.
-//!
-//! # Still to build
-//!
-//! Those eleven branch on the player's choice and this engine walks them
-//! linearly instead. The tables are real, they are `i32` triples in the DLL's
-//! `.data`, and `FUN_1001ee20` reads them — but **finding them in the user's
-//! own DLL is not recovered**. Every other table here is located by its content:
-//! the widget boxes by their rectangles, the scene names by their spelling, the
-//! thumbnail run by being the twelve boxes twice over. A run of small integers
-//! has no such shape, so there is nothing to match on yet and nothing is
-//! guessed. Until there is, a branching scene plays its steps in order.
+//! version, so **the choice does not change what starts**. Scene 11 is the one
+//! whose versions then walk different tables; 22 and 30 have no table at all
+//! and differ only in the list the version names.
 
 use days_save::FlagStore;
 
@@ -141,6 +146,9 @@ pub struct Choice {
     pub flag: String,
     /// The scripts for this version. Only the first is ever started.
     pub scripts: Vec<String>,
+    /// The branch table this version walks, or `None` to walk straight down
+    /// the list. Only scene 11 has one per version.
+    pub branch: Option<Branch>,
 }
 
 /// One replay scene.
@@ -154,6 +162,10 @@ pub struct Scene {
     pub scripts: Vec<String>,
     /// The versions to choose between, or empty for a scene that just plays.
     pub choices: Vec<Choice>,
+    /// The branch table this scene walks, or `None` to walk straight down the
+    /// list. A scene whose versions each have their own table keeps `None`
+    /// here and carries them on the [`Choice`]s.
+    pub branch: Option<Branch>,
 }
 
 impl Scene {
@@ -168,6 +180,91 @@ impl Scene {
     /// Whether picking a version is required before anything plays.
     pub fn asks(&self) -> bool {
         !self.choices.is_empty()
+    }
+
+    /// What a click on this scene plays, for a scene that asks nothing.
+    pub fn run(&self) -> Run {
+        Run {
+            scripts: self.scripts.clone(),
+            branch: self.branch.clone(),
+        }
+    }
+}
+
+/// A scene's branch table: one row per step, three next-step indices a row.
+///
+/// `FUN_1001ee20` indexes it `step * 0xc + column * 4` — twelve bytes a row and
+/// four a column — so a row is three `i32`s. The column is the choice the
+/// player last made and the value is the step to play next, where -1 or an
+/// index past the end of the scene's list ends the scene.
+pub type Branch = Vec<[i32; 3]>;
+
+/// A replay scene in flight: the scripts it plays and how it walks them.
+///
+/// The original keeps the same pair on the replay module — the scene at
+/// `+0x2a8` and the step at `+0x2ac` — and asks `FUN_1001f0d0` for the next
+/// script each time one ends. This is what that asking needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Run {
+    /// The scene's scripts, indexed by step.
+    pub scripts: Vec<String>,
+    /// Its branch table, or `None` for the thirty scenes that have none.
+    pub branch: Option<Branch>,
+}
+
+impl Run {
+    /// The script a step plays.
+    pub fn script(&self, step: usize) -> Option<&str> {
+        self.scripts.get(step).map(String::as_str)
+    }
+
+    /// The step after `step`, or `None` when the scene ends.
+    ///
+    /// `FUN_1001f0d0` calls `FUN_1001ee20(this, 1, 0)`, which is the branch
+    /// arm: a scene with a table reads `table[step][column]` and every other
+    /// scene takes the `default` arm, `step + 1`. Either way the answer ends
+    /// the scene when it is -1, and `FUN_1001f0d0` ends it too when the name it
+    /// looks up is the list's NULL terminator — which is what an index equal to
+    /// the list's length is.
+    pub fn next(&self, step: usize, choice: i32) -> Option<usize> {
+        let next = match self.branch.as_ref().and_then(|table| table.get(step)) {
+            Some(row) => *row.get(column(choice))?,
+            None => i32::try_from(step).ok()?.checked_add(1)?,
+        };
+        let next = usize::try_from(next).ok()?;
+        (next < self.scripts.len()).then_some(next)
+    }
+}
+
+/// What the last-choice value is before any choice box has settled.
+///
+/// `FUN_004388c0` writes it into the film object's `+0x1f8` when the object is
+/// constructed, and nothing puts it back.
+pub const NO_CHOICE: i32 = -2;
+
+/// The column of a branch row the player's last choice selects.
+///
+/// `FUN_1001ee20` asks the host for it through vtable slot `+0x4`
+/// (`FUN_0042c080`), which reads the film object's `+0x1f8`: `-2` until a
+/// choice box has ever settled, and after that the index it settled on, which
+/// is `-1` when the box was dismissed or ran out of time. The DLL maps `-2` to
+/// column 0 and everything else to `choice + 1`, so a dismissed box and one
+/// that was never raised share column 0.
+///
+/// `+0x1f8` is written in exactly two places — `FUN_004388c0` sets it to `-2`
+/// once, when the film object is constructed, and `FUN_0043f330` stores the
+/// settled index — so the value outlives the script it was made in and the
+/// scene that reads it. A scene's first step is therefore walked by whatever
+/// the player last answered, which may have been several scripts ago.
+///
+/// The choice box raises two options, so the column is one of the three the row
+/// has; a wider one would read off the end of the row and is refused rather
+/// than folded back in.
+fn column(choice: i32) -> usize {
+    if choice < 0 {
+        0
+    } else {
+        choice as usize + 1
     }
 }
 
@@ -262,6 +359,7 @@ impl Scenes {
                 flag,
                 scripts,
                 choices: Vec::new(),
+                branch: None,
             })
             .collect();
 
@@ -287,6 +385,7 @@ impl Scenes {
                 .unwrap_or_default();
             attach_versions(&mut scenes, &groups, &lists);
         }
+        attach_branches(&mut scenes, &image);
 
         log::info!(
             "recovered {} replay scenes, {} of which ask which version to play",
@@ -429,9 +528,12 @@ pub fn popup_enabled(scene: &Scene, choice: usize, flags: &FlagStore) -> bool {
 ///
 /// The step index is set to zero first, so this is element zero of the chosen
 /// version's list — the same script whichever version is picked.
-pub fn popup_action(scene: &Scene, choice: usize) -> Option<&[String]> {
-    let scripts = &scene.choices.get(choice)?.scripts;
-    (!scripts.is_empty()).then_some(scripts.as_slice())
+pub fn popup_action(scene: &Scene, choice: usize) -> Option<Run> {
+    let picked = scene.choices.get(choice)?;
+    (!picked.scripts.is_empty()).then(|| Run {
+        scripts: picked.scripts.clone(),
+        branch: picked.branch.clone(),
+    })
 }
 
 /// The grid's thumbnails, cut from one page's `Replay_Thm%02d.png`.
@@ -583,6 +685,7 @@ fn attach_versions(scenes: &mut [Scene], groups: &[(usize, usize)], lists: &[Vec
                 .map(|flag| Choice {
                     flag,
                     scripts: Vec::new(),
+                    branch: None,
                 })
                 .collect();
             continue;
@@ -602,6 +705,7 @@ fn attach_versions(scenes: &mut [Scene], groups: &[(usize, usize)], lists: &[Vec
                 .map(|flag| Choice {
                     flag,
                     scripts: Vec::new(),
+                    branch: None,
                 })
                 .collect();
             continue;
@@ -609,8 +713,303 @@ fn attach_versions(scenes: &mut [Scene], groups: &[(usize, usize)], lists: &[Vec
         scene.choices = flags
             .into_iter()
             .zip(slice.iter().cloned())
-            .map(|(flag, scripts)| Choice { flag, scripts })
+            .map(|(flag, scripts)| Choice {
+                flag,
+                scripts,
+                branch: None,
+            })
             .collect();
+    }
+}
+
+/// Where a scene gets its next step, as `FUN_1001ee20`'s switch has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Switch {
+    /// One table for the whole scene.
+    Table(u32),
+    /// A table per version, chosen by the version index at `+0x2b4`. Only
+    /// scene 11 reaches this arm.
+    Versions(Vec<Option<u32>>),
+}
+
+/// Attaches the branch table each scene walks.
+///
+/// A table that does not read as one for its scene is dropped with a warning
+/// and that scene walks straight down its list, which is what every scene
+/// without a table does anyway.
+fn attach_branches(scenes: &mut [Scene], image: &Image) {
+    let switches = branch_switches(image);
+    log::info!(
+        "recovered branch tables for {} of {} replay scenes",
+        switches.len(),
+        scenes.len()
+    );
+    for (index, switch) in switches {
+        let Some(scene) = scenes.get_mut(index) else {
+            log::warn!("a branch table names scene {index}, which is not in the scene table");
+            continue;
+        };
+        match switch {
+            Switch::Table(va) => {
+                scene.branch = read_branch(image, va, scene.scripts.len());
+                if scene.branch.is_none() {
+                    log::warn!(
+                        "the branch table for {} does not describe its {} steps; \
+                         it will play them in order",
+                        scene.flag,
+                        scene.scripts.len()
+                    );
+                }
+            }
+            Switch::Versions(vas) => {
+                for (version, va) in vas.into_iter().enumerate() {
+                    let Some(choice) = scene.choices.get_mut(version) else {
+                        log::warn!(
+                            "{} has a branch table for version {version}, which it does not have",
+                            scene.flag
+                        );
+                        continue;
+                    };
+                    choice.branch = va.and_then(|va| read_branch(image, va, choice.scripts.len()));
+                    if choice.branch.is_none() {
+                        log::warn!(
+                            "the branch table for {} does not describe its {} steps; \
+                             it will play them in order",
+                            choice.flag,
+                            choice.scripts.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reads `steps` rows of three next-step indices, checking each against the
+/// list it walks.
+///
+/// The check is what makes the address believable: a row's entries are step
+/// numbers in the scene's own list, so every one of them has to be -1, a step
+/// the list has, or the one past its end that `FUN_1001f0d0` reads as the
+/// list's NULL terminator. Against the retail DLL all fourteen tables pass, and
+/// each one's length — the scene's script count — lands exactly on the next
+/// table or on the alignment padding before it.
+fn read_branch(image: &Image, va: u32, steps: usize) -> Option<Branch> {
+    if steps == 0 {
+        return None;
+    }
+    let mut table = Branch::with_capacity(steps);
+    for step in 0..steps {
+        let mut row = [0i32; 3];
+        for (column, slot) in row.iter_mut().enumerate() {
+            let at = va.checked_add(((step * 3 + column) * 4) as u32)?;
+            let value = image.dword(at)? as i32;
+            if value < -1 || value > steps as i32 {
+                return None;
+            }
+            *slot = value;
+        }
+        table.push(row);
+    }
+    Some(table)
+}
+
+/// Finds `FUN_1001ee20`'s switch in the image and reads the table address out
+/// of every arm of it.
+///
+/// This is the one table in this module that is not found by its own contents,
+/// because it has none to be found by: a branch table is a run of small
+/// integers, and the image is full of those. What is distinctive is the code
+/// that reads it. `FUN_1001ee20` is a dense MSVC switch — a byte map from scene
+/// index to case, and a table of case addresses — whose arms are all the same
+/// five instructions:
+///
+/// ```text
+/// MOV  r1, [EBP+this]
+/// MOV  r2, [r1 + 0x2ac]          the step index
+/// IMUL r2, r2, 0xc               twelve bytes a row
+/// MOV  r3, [EBP+column]
+/// MOV  r4, [r2 + r3*4 + table]   four bytes a column
+/// ```
+///
+/// So the scan looks for a switch whose arms read `+0x2ac`, multiply it by
+/// twelve and index by four — which is the branch rule itself, written in
+/// instructions — and takes the addresses out of them. Scene 11's arm is a
+/// second switch on the version at `+0x2b4` whose own arms have the same shape.
+///
+/// Against the retail DLL exactly one switch in the whole image matches, and it
+/// yields the eleven scenes and the four version tables the decompile shows.
+/// Nothing here is an address, and a build whose code does not match this
+/// simply recovers no tables and plays every scene in order.
+fn branch_switches(image: &Image) -> std::collections::BTreeMap<usize, Switch> {
+    let mut best = std::collections::BTreeMap::new();
+    for code in image.raw_sections() {
+        for at in 0..code.len() {
+            let Some(found) = read_switch(image, &code[at..]) else {
+                continue;
+            };
+            if found.len() > best.len() {
+                best = found;
+            }
+        }
+    }
+    best
+}
+
+/// Reads one dense switch and every branch-table arm of it, or `None` when the
+/// bytes are not that switch.
+fn read_switch(image: &Image, at: &[u8]) -> Option<std::collections::BTreeMap<usize, Switch>> {
+    let code = &mut Code::new(at);
+    // SUB r, bias / MOV [EBP+d], r / CMP [EBP+d], bound / JA default
+    code.lit(&[0x83])?;
+    code.range(0xe8, 0xef)?;
+    let bias = usize::from(code.byte()?);
+    code.lit(&[0x89])?;
+    code.range(0x40, 0x7f)?;
+    code.byte()?;
+    code.lit(&[0x83, 0x7d])?;
+    code.byte()?;
+    let bound = usize::from(code.byte()?);
+    code.above()?;
+    // MOVZX ECX, byte [EAX + map] / JMP [ECX*4 + jump]
+    code.frame()?;
+    code.lit(&[0x0f, 0xb6, 0x88])?;
+    let map = image.slice(code.dword()?, bound + 1)?;
+    code.lit(&[0xff, 0x24, 0x8d])?;
+    let jump = code.dword()?;
+
+    let arms: Vec<u32> = (0..=usize::from(*map.iter().max()?))
+        .map(|case| image.dword(jump.checked_add((case * 4) as u32)?))
+        .collect::<Option<_>>()?;
+    let mut out = std::collections::BTreeMap::new();
+    for (index, case) in map.iter().enumerate() {
+        let Some(arm) = arms.get(usize::from(*case)).and_then(|va| image.code(*va)) else {
+            continue;
+        };
+        let switch = match read_arm(arm) {
+            Some(va) => Switch::Table(va),
+            None => match read_versions(image, arm) {
+                Some(vas) => Switch::Versions(vas),
+                // The `default` arm, `step + 1`, which every other scene takes.
+                None => continue,
+            },
+        };
+        out.insert(index + bias, switch);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The table address one arm of the switch reads, or `None` when the arm is not
+/// a branch read at all.
+fn read_arm(at: &[u8]) -> Option<u32> {
+    let code = &mut Code::new(at);
+    code.frame()?;
+    code.member(0x2ac)?;
+    // IMUL r, r, 0xc
+    code.lit(&[0x6b])?;
+    code.range(0xc0, 0xff)?;
+    code.lit(&[0x0c])?;
+    code.frame()?;
+    // MOV r, [base + index*4 + disp32]
+    code.lit(&[0x8b])?;
+    code.one_of(&[0x84, 0x8c, 0x94, 0x9c, 0xa4, 0xac, 0xb4, 0xbc])?;
+    code.range(0x80, 0xbf)?;
+    code.dword()
+}
+
+/// The per-version tables of the arm that switches on `+0x2b4`, for the one
+/// scene whose versions each walk their own.
+fn read_versions(image: &Image, at: &[u8]) -> Option<Vec<Option<u32>>> {
+    let code = &mut Code::new(at);
+    code.frame()?;
+    code.member(0x2b4)?;
+    code.lit(&[0x89])?;
+    code.range(0x40, 0x7f)?;
+    code.byte()?;
+    code.lit(&[0x83, 0x7d])?;
+    code.byte()?;
+    let bound = usize::from(code.byte()?);
+    code.above()?;
+    code.frame()?;
+    // JMP [r*4 + jump], with no byte map: the version indexes the arms directly.
+    code.lit(&[0xff, 0x24])?;
+    code.one_of(&[0x85, 0x8d, 0x95, 0x9d, 0xa5, 0xad, 0xb5, 0xbd])?;
+    let jump = code.dword()?;
+    Some(
+        (0..=bound)
+            .map(|version| {
+                let va = image.dword(jump.checked_add((version * 4) as u32)?)?;
+                read_arm(image.code(va)?)
+            })
+            .collect(),
+    )
+}
+
+/// A cursor over instruction bytes, for matching one shape against them.
+///
+/// Every method consumes what it matched and gives `None` when it does not
+/// match, so an arm reads as the instructions it is.
+struct Code<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Code<'a> {
+    fn new(bytes: &'a [u8]) -> Code<'a> {
+        Code { bytes, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let got = self.bytes.get(self.at..self.at + n)?;
+        self.at += n;
+        Some(got)
+    }
+
+    fn lit(&mut self, want: &[u8]) -> Option<()> {
+        (self.take(want.len())? == want).then_some(())
+    }
+
+    fn one_of(&mut self, want: &[u8]) -> Option<u8> {
+        let got = self.byte()?;
+        want.contains(&got).then_some(got)
+    }
+
+    fn range(&mut self, low: u8, high: u8) -> Option<u8> {
+        let got = self.byte()?;
+        (low..=high).contains(&got).then_some(got)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn dword(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    /// `JA rel`, in either encoding.
+    fn above(&mut self) -> Option<()> {
+        match self.one_of(&[0x77, 0x0f])? {
+            0x77 => self.byte().map(|_| ()),
+            _ => {
+                self.lit(&[0x87])?;
+                self.dword().map(|_| ())
+            }
+        }
+    }
+
+    /// `MOV r, [EBP+d]` — a frame slot into a register.
+    fn frame(&mut self) -> Option<()> {
+        self.lit(&[0x8b])?;
+        self.one_of(&[0x45, 0x4d, 0x55])?;
+        self.byte().map(|_| ())
+    }
+
+    /// `MOV r, [r + offset]` — a member of the replay module.
+    fn member(&mut self, offset: u32) -> Option<()> {
+        self.lit(&[0x8b])?;
+        self.range(0x80, 0xbf)?;
+        self.lit(&offset.to_le_bytes())
     }
 }
 
@@ -661,6 +1060,42 @@ impl<'a> Image<'a> {
         self.sections.iter().find_map(|&(sva, _, raw, raw_size)| {
             (rva >= sva && rva < sva + raw_size).then(|| (rva - sva + raw) as usize)
         })
+    }
+
+    /// The `len` bytes at a virtual address, if the file carries them.
+    fn slice(&self, va: u32, len: usize) -> Option<&'a [u8]> {
+        let at = self.offset(va)?;
+        self.bytes.get(at..at + len)
+    }
+
+    /// The little-endian 32-bit word at a virtual address.
+    fn dword(&self, va: u32) -> Option<u32> {
+        u32le(self.bytes, self.offset(va)?)
+    }
+
+    /// Everything from a virtual address to the end of its section, which is
+    /// as far as one instruction sequence can run.
+    fn code(&self, va: u32) -> Option<&'a [u8]> {
+        let rva = va.checked_sub(self.base)?;
+        self.sections.iter().find_map(|&(sva, _, raw, raw_size)| {
+            (rva >= sva && rva < sva + raw_size)
+                .then(|| {
+                    self.bytes
+                        .get((rva - sva + raw) as usize..(raw + raw_size) as usize)
+                })
+                .flatten()
+        })
+    }
+
+    /// The bytes of each section the file carries, for scanning.
+    fn raw_sections(&self) -> impl Iterator<Item = &'a [u8]> {
+        self.sections
+            .iter()
+            .filter_map(|&(_, _, raw, raw_size)| {
+                self.bytes.get(raw as usize..(raw + raw_size) as usize)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Whether an address lands in a section's zero-filled tail — past the
@@ -820,6 +1255,7 @@ mod tests {
             flag: flag.to_string(),
             scripts: scripts.iter().map(|s| s.to_string()).collect(),
             choices: Vec::new(),
+            branch: None,
         }
     }
 
@@ -841,8 +1277,10 @@ mod tests {
                 .map(|k| Choice {
                     flag: format!("REP03_KB_N00{}", (b'A' + k) as char),
                     scripts: vec!["03/03-KB-N00".to_string()],
+                    branch: None,
                 })
                 .collect(),
+            branch: None,
         };
         Scenes::from_scenes(scenes)
     }
@@ -962,10 +1400,43 @@ mod tests {
         // for later, not a different opening — so what differs between them is
         // the rest of the list, and the popup hands back the whole list.
         for choice in 0..scene.choices.len() {
-            let scripts = popup_action(scene, choice).expect("every version plays something");
-            assert_eq!(scripts.first().map(String::as_str), Some("03/03-KB-N00"));
+            let run = popup_action(scene, choice).expect("every version plays something");
+            assert_eq!(run.script(0), Some("03/03-KB-N00"));
         }
         assert_eq!(popup_action(scene, 9), None);
+    }
+
+    /// `FUN_1001ee20` + `FUN_1001f0d0`: the column is the last choice, the
+    /// `default` arm is `step + 1`, and both -1 and the index that lands on the
+    /// list's NULL terminator end the scene.
+    #[test]
+    fn a_scene_walks_its_branch_table_by_the_last_choice() {
+        let scripts: Vec<String> = (0..4).map(|i| format!("05/05-KC-D{i:02}")).collect();
+        // Scene 36's shape: the first step fans out three ways and every other
+        // step stops. The last row ends on -1 rather than on the terminator, so
+        // both endings are walked.
+        let run = Run {
+            scripts,
+            branch: Some(vec![[1, 2, 3], [4, 0, 0], [4, 0, 0], [-1, 0, 0]]),
+        };
+        assert_eq!(run.next(0, NO_CHOICE), Some(1));
+        assert_eq!(run.next(0, -1), Some(1));
+        assert_eq!(run.next(0, 0), Some(2));
+        assert_eq!(run.next(0, 1), Some(3));
+        assert_eq!(run.next(2, NO_CHOICE), None);
+        assert_eq!(run.next(3, NO_CHOICE), None);
+        // A choice wider than the row would read off the end of it.
+        assert_eq!(run.next(0, 2), None);
+
+        // No table is the `default` arm: straight down the list, whatever the
+        // player last answered, and it stops when the list runs out.
+        let plain = Run {
+            branch: None,
+            ..run
+        };
+        assert_eq!(plain.next(0, 1), Some(1));
+        assert_eq!(plain.next(2, 0), Some(3));
+        assert_eq!(plain.next(3, 0), None);
     }
 
     #[test]

@@ -343,9 +343,8 @@ pub enum Action {
     ///
     /// The whole list, not just the first: `FUN_1001f0d0` is asked for the next
     /// one each time a script ends, and walks the scene's own list by a step
-    /// index at `+0x2ac`. See [`crate::ui::replay`] for how far that is
-    /// recovered.
-    PlayReplay(Vec<String>),
+    /// index at `+0x2ac`, following the scene's branch table where it has one.
+    PlayReplay(replay::Run),
     /// A setting changed. The engine should re-read the volumes it mixes with.
     ///
     /// The DLL writes each setting through to the config object as it happens,
@@ -1342,9 +1341,7 @@ impl Menu {
                 Ok(Action::Sound(SystemSe::Click))
             }
             replay::Act::Play { scene, .. } => Ok(match self.session.scenes.get(scene) {
-                Some(scene) if !scene.scripts.is_empty() => {
-                    Action::PlayReplay(scene.scripts.clone())
-                }
+                Some(scene) if !scene.scripts.is_empty() => Action::PlayReplay(scene.run()),
                 _ => Action::Stay,
             }),
             replay::Act::Ask { scene } => {
@@ -1361,7 +1358,7 @@ impl Menu {
             return Action::Stay;
         };
         match replay::popup_action(scene, widget) {
-            Some(scripts) => Action::PlayReplay(scripts.to_vec()),
+            Some(run) => Action::PlayReplay(run),
             None => Action::Stay,
         }
     }
@@ -1947,8 +1944,10 @@ mod tests {
                 .map(|k| replay::Choice {
                     flag: format!("REP04_C1_A00{}", (b'A' + k) as char),
                     scripts: vec!["04/04-C1-A00".to_string()],
+                    branch: None,
                 })
                 .collect(),
+            branch: None,
         };
         let mut four = two.clone();
         four.choices.extend(two.choices.clone());

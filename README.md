@@ -43,7 +43,7 @@ Early. What works today:
 | UI rendering — replay play-data list | Not started — choosing it leaves the menu where it was |
 | UI input handling / screen state machine | **Works** — title, settings and replay are live: pointer and keyboard, each screen's own widget-to-action table out of the DLL, both popups, and the mode graph out of `SystemInit` |
 | Settings | **Works** — `Config.DAT` is read and written back, volumes reach the mixer, and the Option screen's three tabs drive it |
-| Replay | **Works** — the 41 scenes, their unlock flags and their scripts are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it. Chained replay playback is not implemented |
+| Replay | **Works** — the 41 scenes, their unlock flags, their scripts and the branch tables eleven of them walk are recovered from the user's own `SysMenuSDHQ.dll`; picking one plays it through, following the player's choices |
 | In-game control bar | **Works** — a drop-down over the top 75 pixels, translucent over the frame, ramping in over 300ms and out over 1000ms exactly as the original does; all 25 widgets, their enabled rules, their resting and hover art and their captions, out of the DLL's own dispatch; pause, the auto flag and restart act; the five rate buttons set the rate the bar draws but do not yet fast-forward, because the decoders run at their own rate and scaling only the timeline would run it ahead of the audio. The buttons that move to the next script hand over to the branch graph; which menu each one opens is not recovered. `days bar` prints the table |
 | Choice boxes (`[SetSELECT]`) | **Works** — raised and decided on the script clock, so an ignored choice still times out; the shipped hit maps where they exist and the game's own screen split where they do not, pointer and keyboard, and a random pick while skipping, as the original does. `days select` prints the map and metrics |
 | Subtitles | **Works, the game's own way** — broken by `FUN_0043f600` (62 columns, word-wrapped at spaces, English only, `\n` as a hard break, ruby marks recognised), spaced by the recovered pitch and kerning table rather than by measuring the glyph, and placed by `FUN_0044bf30`: centred on each line's own width, anchored to the bottom, at the per-resolution scale, with `[LeftArrangement]` switching to a left-aligned block. The speaker name is not drawn, because the original never hands it to the text layer, and the whole block is behind the `TextView` setting |
@@ -139,7 +139,7 @@ days menu -e "down,down,enter" -o /tmp/menu.png    # drive the menus headlessly
 days config                          # the player's settings, as the Option screen reads them
 days settings                        # DaysEngine's own settings, and where they come from
 days media Movie00/00-00/00-00-A00/00-00-A00-001 --at-size 1920x1085  # can this machine hold 24 fps?
-days replay                          # the replay scene table, and what the save has unlocked
+days replay                          # the replay scene table, its branch tables, and what the save has unlocked
 days save --slot 0                   # decode a save slot: position, story points, choices
 days save --roundtrip                # read every save file, write it back, compare bytes
 days dialog -o /tmp/dlg.png          # the save-comment dialog, from the exe's own template

@@ -625,18 +625,68 @@ the version run are adjacent in `.data` and read as one.
 
 Clicking a thumbnail hands the scene's **first** script to the host (`+0xa4`).
 The rest of a list are the steps after it, fetched by `FUN_1001f0d0`, which
-walks a per-scene branch table (`FUN_1001ee20`, tables from `DAT_1004bc58`
-onwards) by a choice the player makes during playback. **Chained replay
-playback is not implemented**; nothing about those branch tables beyond their
-existence is recovered.
+asks `FUN_1001ee20` for the next step index and reads the name out of the
+scene's list, ending the scene on -1 and on the list's NULL terminator.
+
+`FUN_1001ee20` is the branch:
+
+```text
+column = host->+0x4()                      // the choice made in playback
+column = (column == -2) ? 0 : column + 1
+switch (scene at +0x2a8) {
+  case 1, 6, 7, 10, 11, 12, 16, 25, 28, 29, 36:
+      next = table[step * 3 + column]      // 0xc bytes a row, three wide
+  default:
+      next = step + 1                      // straight down the list
+}
+```
+
+Eleven scenes have a table; scene 11 has four, one per version, picked by the
+version index at `+0x2b4`. A table is one row per script in the scene's list and
+a row is three `i32` step indices — column 0 for a player who has answered no
+choice box, columns 1 and 2 for the two answers.
+
+The column comes from the host's vtable slot `+0x4` (`FUN_0042c080`), which
+reads the film object's `+0x1f8` through `FUN_0042c0c0`. That member is written
+in exactly two places in the executable: `FUN_004388c0` sets it to -2 when the
+film object is constructed, and `FUN_0043f330` stores the index a choice box
+settled on — -1 when the box was dismissed or ran out of time (`FUN_00431740`
+resolves it). Nothing puts it back, so **the value outlives the script it was
+made in and the scene that reads it**: a replay's first step is walked by
+whatever the player last answered, possibly long before the replay started. Both
+writes were found by a byte scan of `.text` for stores at displacement `0x1f8`;
+the other hits belong to other classes.
+
+A branch table is a run of small integers and cannot be found by its contents
+the way the runs above are. It is found by the code that reads it: `FUN_1001ee20`
+is a dense MSVC switch — a byte map from scene index to case, a table of case
+addresses — whose arms are all the same five instructions.
+
+```text
+MOV  r1, [EBP+this]
+MOV  r2, [r1 + 0x2ac]          the step index
+IMUL r2, r2, 0xc               twelve bytes a row
+MOV  r3, [EBP+column]
+MOV  r4, [r2 + r3*4 + table]   four bytes a column
+```
+
+The engine scans the image for a switch of that shape and takes the table
+address out of each arm; scene 11's arm is a second switch on `+0x2b4` whose own
+arms have the same shape. Exactly one switch in the retail DLL matches, and it
+yields the eleven scenes and the four version tables the decompile shows. Each
+table is then read as one row per script and refused unless every entry is -1, a
+step its list has, or the one past the end that reads as the list's NULL
+terminator — all fourteen pass, and each one's length lands exactly on the next
+table or on the alignment padding before it.
 
 Scenes 11, 22 and 30 raise `Pop_Replay` instead (`FUN_10001830`, which sets
 `+0xc8` and `+0xc4` on the popup singleton). `+0xc8` picks `Pop_Replay_2` or
 `Pop_Replay_4` — two or four versions. A version is pickable only once its own
 flag is set (`FUN_100195d0`), and picking one sets the step index to zero and
 plays element zero of its list (`FUN_1001f270`) — which is the **same script in
-every version**, so the choice cannot change what starts. It selects a branch
-for later.
+every version**, so the choice cannot change what starts. For scene 11 it
+selects which of four branch tables the rest of the scene walks; scenes 22 and
+30 have no table and differ only in the list the version names.
 
 The thumbnails themselves come from `System/Replay/Replay_Thm%02d.png`, one
 sheet per page, page number plus one (`FUN_1001b3f0`). A second record table
