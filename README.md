@@ -181,6 +181,11 @@ whatever filter the driver gave:
 [Video]
 ; fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area
 Scaler = bicubic
+; libavfilter chains over every movie frame, before and after the scale
+Filters = deblock=filter=weak:block=8,gradfun=1.2:16
+FiltersAfterScale =
+; A very light grain over the finished frame, in levels of 255; 0 is off
+Grain = 2
 
 [UI]
 ; pixel (the default), bspline, mitchell, catmull_rom
@@ -189,10 +194,10 @@ Scaler = pixel
 PixelPerfect = off
 ```
 
-The file is optional, never written by the game, and a value it cannot read is
-a line in the log and nothing more. `days settings --template` prints a
-commented copy to start from, and `days settings` says which file is in force
-and what it currently means.
+A first run writes the file out with every default already filled in, and a
+value it cannot read is a line in the log and nothing more. `days settings
+--template` prints the same copy to standard output, and `days settings` says
+which file is in force and what it currently means.
 
 The two scalers are separate because the two jobs are. `[Video] Scaler` is the
 picture — movie frames *and* still backgrounds, both through libswscale. A
@@ -201,8 +206,31 @@ the filter costs only its own width, and a still goes through the same library
 with the same filter: the two are ways of filling the same 800x452 stage, and a
 still that was filtered differently did not match the clip it cut to.
 `[UI] Scaler` is the menus and the control bar, which go through the engine's
-own resampler in `playback::scale`. A libavfilter graph — a debander before the
-scale, say — is **not implemented**; the decoder is where it would go.
+own resampler in `playback::scale`.
+
+### Filtering the movies
+
+The movies are WMV3 at 800x452 and about 3 Mbit/s, and on a modern window every
+frame is blown up more than twice — the 8x8 transform blocks and the banded
+gradients the encoder left come up with it. Two libavfilter chains and a dither
+are the answer, and which side of the scale each one runs on is the point:
+
+* `Filters` runs **before** the scale, at the clip's own size, where those
+  artifacts are still the size the encoder made them. A debander cannot
+  recognise a band the scaler has already stretched. The default is `deblock`
+  for the blocks and `gradfun` for the bands.
+* `FiltersAfterScale` runs **after** it, on the frame at the size it will be
+  seen. Anything *added* to the picture belongs here; laid down earlier it
+  comes out magnified along with everything else. Empty by default.
+* `Grain` is a very light neutral dither over the finished frame — the engine's
+  own, because libavfilter's `noise` on a packed RGBA frame means a conversion
+  to planar and back, gives each colour an independent pattern, and with `alls`
+  noises the alpha channel too. It covers the last of the banding: what the
+  debander judged too wide to touch, and the contouring the upscale adds.
+
+The whole default pipeline costs about 5ms of a frame's 41 at 1080p, measured
+with `days media <clip> --at-size 1920x1085`, which is what that command is
+for. Empty chains and `Grain = 0` give the original's path exactly.
 
 ### The pixel filter
 

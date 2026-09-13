@@ -724,12 +724,23 @@ fn cmd_media(
         println!("video {}x{}", decoder.width(), decoder.height());
         if let Some(size) = at_size {
             // The engine's own settings, so this measures what the player gets
-            // rather than what the defaults would give.
-            let scaler = daysengine::install::engine::Settings::load().video_scaler;
-            decoder.set_scaler(scaler)?;
+            // rather than what the defaults would give — the filter chains and
+            // the grain included, since they are most of what a frame costs
+            // now and this is where that is measured.
+            let settings = daysengine::install::engine::Settings::load();
+            decoder.set_scaler(settings.video_scaler)?;
+            decoder.set_filters(&settings.video_filters);
+            decoder.set_post_filters(&settings.video_filters_after);
+            decoder.set_grain(settings.video_grain);
             let (w, h) = parse_size(size)?;
             decoder.set_output_size(w, h)?;
-            println!("decoding at {w}x{h} with {scaler:?}");
+            println!("decoding at {w}x{h} with {:?}", settings.video_scaler);
+            let (before, after) = decoder.filters();
+            println!("  before the scale: {before:?}");
+            println!(
+                "  after the scale:  {after:?}, grain {}",
+                settings.video_grain
+            );
         }
         let mut frames = 0usize;
         let mut last = 0.0;

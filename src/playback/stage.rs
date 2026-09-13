@@ -137,6 +137,11 @@ pub struct Stage {
     mouths: BTreeMap<String, Option<Mouth>>,
     /// The filter movie frames are scaled with, from `DaysEngine.ini`.
     video_scaler: crate::media::VideoScaler,
+    /// What movie frames are put through on either side of that scale, and the
+    /// grain laid over the result — all three from `DaysEngine.ini`. See
+    /// [`crate::media::filter`] and [`crate::media::grain`].
+    video_filters: (String, String),
+    video_grain: u8,
     /// The size movie frames are wanted at, or `None` for the clip's own.
     ///
     /// The window is almost never 800x452, and a frame has to be scaled to it
@@ -167,6 +172,8 @@ impl Stage {
             voices: BTreeMap::new(),
             mouths: BTreeMap::new(),
             video_scaler: crate::media::VideoScaler::default(),
+            video_filters: (String::new(), String::new()),
+            video_grain: 0,
             video_size: None,
         }
     }
@@ -203,11 +210,44 @@ impl Stage {
         }
     }
 
+    /// Chooses what movie frames are filtered with before and after the scale,
+    /// and how much grain goes over the result, applying it to whatever is
+    /// playing and to every clip this stage opens afterwards.
+    ///
+    /// Nothing here can fail: a chain libavfilter will not build is reported by
+    /// the decoder and then not used. See [`VideoDecoder::set_filters`].
+    pub fn set_video_filters(&mut self, before: &str, after: &str, grain: u8) {
+        if (before, after, grain)
+            == (
+                &*self.video_filters.0,
+                &*self.video_filters.1,
+                self.video_grain,
+            )
+        {
+            return;
+        }
+        before.clone_into(&mut self.video_filters.0);
+        after.clone_into(&mut self.video_filters.1);
+        self.video_grain = grain;
+        if let Some(movie) = &mut self.movie {
+            Stage::filter_video(&self.video_filters, grain, &mut movie.decoder);
+        }
+    }
+
+    /// Puts one clip's filtering in place. Shared by the setter above and by
+    /// every clip this stage opens.
+    fn filter_video(filters: &(String, String), grain: u8, decoder: &mut VideoDecoder) {
+        decoder.set_filters(&filters.0);
+        decoder.set_post_filters(&filters.1);
+        decoder.set_grain(grain);
+    }
+
     /// Puts this stage's video settings on a freshly opened clip.
     fn size_video(&self, decoder: &mut VideoDecoder, path: &str) {
         if let Err(err) = decoder.set_scaler(self.video_scaler) {
             log::warn!("{path}: cannot scale with {:?}: {err}", self.video_scaler);
         }
+        Stage::filter_video(&self.video_filters, self.video_grain, decoder);
         let Some((width, height)) = self.video_size else {
             return;
         };

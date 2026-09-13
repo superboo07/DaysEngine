@@ -1684,6 +1684,11 @@ fn run_script(
 
     let mut stage = Stage::new(script);
     stage.set_video_scaler(player.settings.video_scaler);
+    stage.set_video_filters(
+        &player.settings.video_filters,
+        &player.settings.video_filters_after,
+        player.settings.video_grain,
+    );
     // Whole-number scaling, and what it means for how the art is sampled.
     let whole = player.whole_pixels();
     let art = art_sampling(whole);

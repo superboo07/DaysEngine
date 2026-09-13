@@ -46,15 +46,18 @@
 //! an unknown key or an unreadable value is a warning and nothing more: a
 //! settings file should never be the reason the game will not start.
 //!
-//! # Not here yet
+//! # Filtering
 //!
-//! A libavfilter graph — a debander before the scale, say. The decoder ties its
-//! scaler to the frame it is converting ([`crate::media::VideoDecoder`]) and a
-//! filtergraph would sit between the two, so it wants a `Filters` key in
-//! `[Video]` and a graph built alongside the scaler. **That is not
-//! implemented**, and there is no key for it rather than a key that quietly
-//! does nothing.
-
+//! `[Video] Filters` and `[Video] FiltersAfterScale` are libavfilter chains in
+//! `ffmpeg -vf` syntax, run on either side of that scale, and `[Video] Grain`
+//! is the dither laid over the result. What they are for and why there are two
+//! of them is [`crate::media::filter`] and [`crate::media::grain`]; the short
+//! of it is that repairing the encode belongs before the scale, where the
+//! artifacts are still the size the encoder made them, and anything added to
+//! the picture belongs after it, at the size it will be seen.
+//!
+//! An empty chain is no graph at all, which is the original's path exactly.
+//!
 pub use crate::media::VideoScaler;
 pub use crate::playback::scale::Kernel;
 use std::path::PathBuf;
@@ -113,14 +116,69 @@ impl UiScaler {
     const NAMES: &'static str = "pixel, bspline, mitchell, catmull_rom";
 }
 
+/// The chain movie frames go through before they are scaled, by default.
+///
+/// `deblock` and `gradfun` are the two artifacts the retail encode actually
+/// has, and both are worked out in [`crate::media::filter`]: 8x8 transform
+/// blocks, and gradients quantised into bands. Both are measured in *source*
+/// pixels, which is why this stage is before the scale.
+///
+/// `filter=weak` is the gentlest of `deblock`'s three, and `block=8` is the
+/// transform size WMV3 uses. `gradfun`'s `1.2` is a shade under its default
+/// strength of 1.2 rounded up from nothing — it is the amount of a step it will
+/// smooth, and above about 1.5 it starts eating real detail — over a radius of
+/// 16 pixels, which is the widest band the encoder's quantiser produces at this
+/// bitrate.
+pub const DEFAULT_FILTERS: &str = "deblock=filter=weak:block=8,gradfun=1.2:16";
+
+/// The chain movie frames go through after they are scaled, by default.
+///
+/// Empty. The stage exists — it is where anything *added* to the picture
+/// belongs, rather than anything repaired in it — but the one thing the engine
+/// adds by default is the grain, and that is [`DEFAULT_GRAIN`] rather than a
+/// filter: see [`crate::media::grain`] for the three measured reasons
+/// libavfilter's `noise` is the wrong tool on a packed RGBA frame.
+pub const DEFAULT_FILTERS_AFTER: &str = "";
+
+/// The amplitude of the grain laid over the finished frame, by default.
+///
+/// Levels of 255, and deliberately at the bottom of the range: enough to break
+/// a step between two flat areas into noise, not enough to be seen as grain on
+/// a still frame. [`crate::media::grain`] is what it is for and
+/// `[Video] Grain = 0` turns it off.
+pub const DEFAULT_GRAIN: u8 = 2;
+
 /// Everything `DaysEngine.ini` can say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Not `Copy`, because two of these are filter chains and a chain is a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub video_scaler: VideoScaler,
+    /// libavfilter chain applied to each movie frame before it is scaled to
+    /// the window, empty for none. See [`crate::media::filter`].
+    pub video_filters: String,
+    /// libavfilter chain applied after the scale, in RGBA at the window's size.
+    pub video_filters_after: String,
+    /// Amplitude of the grain laid over the finished frame, in levels of 255.
+    /// See [`crate::media::grain`].
+    pub video_grain: u8,
     pub ui_scaler: UiScaler,
     /// Draw the game at a whole-number multiple of its own size. See
     /// [`Settings::pixel_perfect`].
     pub pixel_perfect: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            video_scaler: VideoScaler::default(),
+            video_filters: DEFAULT_FILTERS.to_string(),
+            video_filters_after: DEFAULT_FILTERS_AFTER.to_string(),
+            video_grain: DEFAULT_GRAIN,
+            ui_scaler: UiScaler::default(),
+            pixel_perfect: false,
+        }
+    }
 }
 
 impl Settings {
@@ -250,6 +308,18 @@ impl Settings {
                     VideoScaler::NAMES
                 ),
             },
+            // A chain is free text — libavfilter is the only thing that can say
+            // whether it is valid, and it says so when the graph is built. An
+            // empty value is the way to ask for no filtering at all.
+            ("video", "filters") => value.clone_into(&mut self.video_filters),
+            ("video", "filtersafterscale") => value.clone_into(&mut self.video_filters_after),
+            ("video", "grain") => match value.trim().parse::<u8>() {
+                Ok(amount) if amount <= crate::media::grain::MAX => self.video_grain = amount,
+                _ => log::warn!(
+                    "{FILE} line {line}: {value:?} is not a grain amplitude; 0 to {}",
+                    crate::media::grain::MAX
+                ),
+            },
             ("ui", "pixelperfect") => match parse_bool(value) {
                 Some(on) => self.pixel_perfect = on,
                 None => log::warn!("{FILE} line {line}: {value:?} is not on or off"),
@@ -292,6 +362,29 @@ pub fn template() -> String {
          ; The original left this to Direct3D's bilinear; bicubic is sharper.\n\
          Scaler = bicubic\n\
          \n\
+         ; libavfilter chains, `ffmpeg -vf` syntax, run over every movie frame.\n\
+         ; Empty means no filtering at all, which is what the original did.\n\
+         ;\n\
+         ; The movies are 800x452 at about 3 Mbit/s, and on a modern window\n\
+         ; every frame is blown up more than twice: the 8x8 blocks and the\n\
+         ; banded gradients the encoder left come up with it.\n\
+         ;\n\
+         ; Filters runs before the scale, where those artifacts are still the\n\
+         ; size the encoder made them, so this is where repair goes.\n\
+         Filters = {}\n\
+         \n\
+         ; FiltersAfterScale runs after it, on the frame at the size it will\n\
+         ; be seen, which is where anything *added* to the picture belongs —\n\
+         ; laid down before an upscale it comes out magnified with everything\n\
+         ; else. Empty by default.\n\
+         FiltersAfterScale = {}\n\
+         \n\
+         ; A very light grain over the finished frame, in levels of 255, 0 to\n\
+         ; {}. It covers the last of the banding: what the debander judged too\n\
+         ; wide to touch, and the contouring the upscale adds by interpolating\n\
+         ; between levels that were already quantised. 0 turns it off.\n\
+         Grain = {}\n\
+         \n\
          [UI]\n\
          ; Draw the game at a whole-number multiple of its own 800x450 and put\n\
          ; a border around the rest, so every pixel of the art becomes an exact\n\
@@ -305,6 +398,10 @@ pub fn template() -> String {
          ; family, softest first.\n\
          Scaler = pixel\n",
         VideoScaler::NAMES,
+        DEFAULT_FILTERS,
+        DEFAULT_FILTERS_AFTER,
+        crate::media::grain::MAX,
+        DEFAULT_GRAIN,
         UiScaler::NAMES,
     )
 }

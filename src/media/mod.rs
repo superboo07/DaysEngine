@@ -20,6 +20,8 @@ use std::ffi::c_int;
 mod io;
 
 pub mod audio;
+pub mod filter;
+pub mod grain;
 pub mod image;
 pub mod video;
 
@@ -42,6 +44,8 @@ pub enum Error {
     NoDecoder(String),
     #[error("out of memory allocating {0}")]
     Alloc(&'static str),
+    #[error("{0}")]
+    Filter(String),
 }
 
 impl Error {
