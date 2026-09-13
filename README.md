@@ -233,12 +233,12 @@ are the answer, and which side of the scale each one runs on is the point:
   noises the alpha channel too. It covers the last of the banding: what the
   debander judged too wide to touch, and the contouring the upscale adds.
 
-The whole default pipeline costs about 7ms of a frame's 41 at 1080p — 12ms
-becomes 19 — measured with `days media <clip> --at-size 1920x1085`, which is
-what that command is for. At 3840x2170 it is 31ms becoming 39, which fits and
-not by much; most of that is the scale to eight megapixels and was there
-before any of this. Empty chains and `Grain = 0` give the original's path
-exactly.
+1080p is the size this is built for, and there the whole default pipeline is
+about 7ms of a frame's 41: 10.4ms a frame becomes 18.5, measured with `days
+media <clip> --at-size 1920x1085`, which is what that command is for. Above
+that it is the scale itself that costs, not the filtering — 31ms of the 41 at
+3840x2170 before a filter runs at all. Empty chains and `Grain = 0` give the
+original's path exactly.
 
 ### The pixel filter
 

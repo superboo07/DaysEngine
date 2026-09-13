@@ -115,7 +115,8 @@ impl Grain {
     ///
     /// # Speed
     ///
-    /// This runs over every byte of a frame that may be 4K, inside the 41
+    /// This runs over every byte of a frame — two megapixels at 1080p, which
+    /// is the size this engine is expected to run at — inside the 41
     /// milliseconds the frame has, so the shape of the inner loop is the whole
     /// of the design — and the shape that matters is **flat bytes**. Both
     /// formulations that treat a pixel as a pixel — a modulo and a
@@ -130,9 +131,9 @@ impl Grain {
     /// instruction, and it is exactly the clamp that is wanted at both ends.
     ///
     /// The rest is threads. A band of rows is written by one worker and read by
-    /// nobody, so they need nothing from each other; at 4K, where this writes
-    /// eight megabytes a frame and the frame has nothing to spare, that is 8ms
-    /// becoming 1.7.
+    /// nobody, so they need nothing from each other: 2.5ms becomes 1.25 at
+    /// 1080p, and 8ms becomes 1.7 at 4K, which nothing here is aiming at but
+    /// which is where a pass over every byte stops being free.
     pub fn apply(&mut self, rgba: &mut [u8], width: usize, frame: u64) {
         if !self.is_visible() || width == 0 {
             return;
@@ -145,8 +146,7 @@ impl Grain {
         let rotated = &self.rotated;
         let stride = width * 4;
         // A band of rows is written by one thread and read by nobody, so the
-        // whole of the synchronisation is handing them out. At 4K this is eight
-        // megabytes a frame and the difference between 8ms and 2.
+        // whole of the synchronisation is handing them out.
         let rows = rgba.len() / stride.max(1);
         let workers = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)

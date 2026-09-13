@@ -8,9 +8,10 @@
 //! 8x8 transform blocks become 19-pixel squares, and the gradients the encoder
 //! quantised into three or four steps become three or four visible bands. Both
 //! are already in the file — nothing here can put back what the encoder threw
-//! away — but both are also exactly what libavfilter's `deblock` and `gradfun`
-//! are for, and they cost a fraction of a millisecond on a frame that has 41 of
-//! them.
+//! away — but both are also exactly what libavfilter's `deblock`, `deband` and
+//! `gradfun` are for. The default chain measures 5.5ms of a frame's 41 at
+//! 1080p, which is the size this engine is expected to run at, and it is spent
+//! on the clip's own 800x452 rather than on the window — see below.
 //!
 //! This is not a recovered behaviour and does not pretend to be. The original
 //! handed its decoded frames straight to Direct3D; there was no filter and no
