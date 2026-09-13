@@ -45,25 +45,28 @@
 //! does nothing.
 
 pub use crate::media::VideoScaler;
+pub use crate::playback::scale::Kernel;
 use std::path::PathBuf;
 
 /// How the game's own art — menus, still backgrounds — is scaled.
 ///
-/// These are the Mitchell-Netravali family, which is one kernel with two
-/// parameters; see [`crate::playback::scale`].
+/// The default is [`UiScaler::Pixel`], the band-limited pixel filter. The rest
+/// are the Mitchell-Netravali family, one kernel with two parameters. See
+/// [`crate::playback::scale`] for both.
 ///
-/// There is no unfiltered option, unlike [`VideoScaler`], and the reason is
-/// that it could not be honoured. UI art is scaled twice — once from the native
-/// 800x450 layout into the display map's space, and again from there onto the
-/// window, the second time by the GPU. Turning the first one off would leave
-/// the second, so "nearest" would not come out nearest. What it would come out
-/// is the stepped look this engine had before it filtered the art at all, which
-/// is the bug that started this.
+/// There is no unfiltered option. Nearest neighbour at a scale that is not a
+/// whole number lands some source pixels on two output pixels and some on
+/// three, which is the stepped look this engine had before it filtered the art
+/// at all. If whole pixels are what you want, ask for them: that is
+/// [`Settings::pixel_perfect`], and it is a different thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UiScaler {
-    /// The default. `B = 1, C = 0`: the smoothest of the family, and the only
-    /// one that cannot ring, because its kernel never goes negative.
+    /// The default: crisp at any scale, without a border and without stepping.
+    /// See [`crate::playback::scale::band_limited`].
     #[default]
+    Pixel,
+    /// `B = 1, C = 0`: the smoothest of the family, and the only one that
+    /// cannot ring, because its kernel never goes negative.
     BSpline,
     /// `B = 1/3, C = 1/3`: Mitchell's own compromise, sharper than the spline
     /// and with very little ringing.
@@ -74,18 +77,20 @@ pub enum UiScaler {
 }
 
 impl UiScaler {
-    /// The `(B, C)` this is, in the Mitchell-Netravali family.
-    pub fn mitchell(self) -> (f32, f32) {
+    /// The kernel this names.
+    pub fn kernel(self) -> Kernel {
         match self {
-            UiScaler::BSpline => (1.0, 0.0),
-            UiScaler::Mitchell => (1.0 / 3.0, 1.0 / 3.0),
-            UiScaler::CatmullRom => (0.0, 0.5),
+            UiScaler::Pixel => Kernel::Pixel,
+            UiScaler::BSpline => Kernel::B_SPLINE,
+            UiScaler::Mitchell => Kernel::MITCHELL,
+            UiScaler::CatmullRom => Kernel::CATMULL_ROM,
         }
     }
 
     fn parse(name: &str) -> Option<UiScaler> {
         Some(
             match name.trim().to_ascii_lowercase().replace(['_', '-'], "") {
+                n if n == "pixel" || n == "bandlimited" || n == "sharp" => UiScaler::Pixel,
                 n if n == "bspline" || n == "spline" || n == "cubic" => UiScaler::BSpline,
                 n if n == "mitchell" => UiScaler::Mitchell,
                 n if n == "catmullrom" || n == "catmull" => UiScaler::CatmullRom,
@@ -94,7 +99,7 @@ impl UiScaler {
         )
     }
 
-    const NAMES: &'static str = "bspline, mitchell, catmull_rom";
+    const NAMES: &'static str = "pixel, bspline, mitchell, catmull_rom";
 }
 
 /// Everything `DaysEngine.ini` can say.
@@ -257,8 +262,10 @@ pub fn template() -> String {
          \n\
          ; How the art is scaled when PixelPerfect is off:\n\
          ;   {}\n\
-         ; One cubic family, softest first.\n\
-         Scaler = bspline\n",
+         ; `pixel` is the band-limited pixel filter, crisp at any scale, which\n\
+         ; is what gamescope's PIXEL filter does. The rest are one cubic\n\
+         ; family, softest first.\n\
+         Scaler = pixel\n",
         VideoScaler::NAMES,
         UiScaler::NAMES,
     )
@@ -274,7 +281,7 @@ mod tests {
     fn no_file_means_the_engine_defaults() {
         let settings = Settings::parse("");
         assert_eq!(settings.video_scaler, VideoScaler::Bicubic);
-        assert_eq!(settings.ui_scaler, UiScaler::BSpline);
+        assert_eq!(settings.ui_scaler, UiScaler::Pixel);
         assert!(!settings.pixel_perfect());
     }
 
@@ -319,7 +326,7 @@ mod tests {
     fn a_value_that_makes_no_sense_keeps_the_default() {
         let settings = Settings::parse("[Video]\nScaler = magic\n[UI]\nScaler = \n");
         assert_eq!(settings.video_scaler, VideoScaler::Bicubic);
-        assert_eq!(settings.ui_scaler, UiScaler::BSpline);
+        assert_eq!(settings.ui_scaler, UiScaler::Pixel);
     }
 
     /// Every name the template offers is one the parser takes: the two lists
@@ -346,12 +353,15 @@ mod tests {
         assert_eq!(Settings::parse(&template()), Settings::default());
     }
 
-    /// `B = 1, C = 0` is the B-spline and `B = 0, C = 1/2` is Catmull-Rom,
-    /// which is what [`crate::playback::scale`] is handed.
+    /// Each name hands [`crate::playback::scale`] the kernel it claims.
     #[test]
-    fn the_ui_kernels_are_the_family_they_claim() {
-        assert_eq!(UiScaler::BSpline.mitchell(), (1.0, 0.0));
-        assert_eq!(UiScaler::CatmullRom.mitchell(), (0.0, 0.5));
-        assert_eq!(UiScaler::Mitchell.mitchell(), (1.0 / 3.0, 1.0 / 3.0));
+    fn the_ui_scalers_name_the_kernels_they_claim() {
+        assert_eq!(UiScaler::Pixel.kernel(), Kernel::Pixel);
+        assert_eq!(UiScaler::BSpline.kernel(), Kernel::Mitchell(1.0, 0.0));
+        assert_eq!(UiScaler::CatmullRom.kernel(), Kernel::Mitchell(0.0, 0.5));
+        assert_eq!(
+            UiScaler::Mitchell.kernel(),
+            Kernel::Mitchell(1.0 / 3.0, 1.0 / 3.0)
+        );
     }
 }

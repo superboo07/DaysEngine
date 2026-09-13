@@ -287,7 +287,7 @@ fn main() -> Result<()> {
     // beside this binary. The UI kernel is fixed here, before a single screen
     // is composed, because every scaler built afterwards reads it.
     let settings = Settings::load();
-    daysengine::playback::scale::set_kernel(settings.ui_scaler.mitchell());
+    daysengine::playback::scale::set_kernel(settings.ui_scaler.kernel());
 
     let sdl = sdl3::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video: {e}"))?;

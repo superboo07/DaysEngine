@@ -319,6 +319,11 @@ struct UiArgs {
     /// Report the recovered widget table instead of drawing.
     #[arg(long)]
     table: bool,
+    /// Resample the composite to this window size, e.g. "1920x1080", the way
+    /// the player's window does. This is the pass a change of `[UI] Scaler`
+    /// shows up in.
+    #[arg(long, value_name = "WxH")]
+    at_size: Option<String>,
     /// PNG to write.
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
@@ -385,7 +390,7 @@ fn main() -> Result<()> {
     daysengine::playback::scale::set_kernel(
         daysengine::install::engine::Settings::load()
             .ui_scaler
-            .mitchell(),
+            .kernel(),
     );
 
     let game = match cli.game {
@@ -1223,8 +1228,23 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     if let Some(path) = &args.out {
         let backdrop = backdrop.as_ref().map(|b| screen.to_display(b));
         let image = screen.compose_over(backdrop.as_ref(), &states);
-        write_png(path, &image.rgba, image.width, image.height)?;
-        println!("wrote {}", path.display());
+        match &args.at_size {
+            Some(size) => {
+                let (w, h) = parse_size(size)?;
+                let src = (image.width as usize, image.height as usize);
+                let dst = (w as usize, h as usize);
+                let mut scaler = daysengine::playback::scale::Scaler::new(src, dst);
+                match scaler.resample(&image.rgba, src, dst) {
+                    Some(scaled) => write_png(path, scaled, w, h)?,
+                    None => write_png(path, &image.rgba, image.width, image.height)?,
+                }
+                println!("wrote {} at {w}x{h}", path.display());
+            }
+            None => {
+                write_png(path, &image.rgba, image.width, image.height)?;
+                println!("wrote {}", path.display());
+            }
+        }
     }
     Ok(())
 }

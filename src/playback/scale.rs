@@ -21,11 +21,19 @@
 //! What is recovered is that the art is *filtered*, and that its edges are
 //! clamped. This module is both of those; only the kernel is ours.
 //!
-//! # The filter
+//! # The kernels
 //!
-//! The Mitchell-Netravali family, whose two parameters are `DaysEngine.ini`'s
-//! `[UI] Scaler` (see [`crate::install::engine::UiScaler`]) and which defaults
-//! to [`B_SPLINE`]:
+//! Which one is `DaysEngine.ini`'s `[UI] Scaler`; see
+//! [`crate::install::engine::UiScaler`].
+//!
+//! The default is [`Kernel::Pixel`], the band-limited pixel filter — see
+//! [`band_limited`], which is where the interesting one is explained. It exists
+//! because a cubic is the wrong shape for this art: the game is 800x450 of flat
+//! colour and hard edges, a modern window wants 2.4x of it, and a cubic answers
+//! that by blending everywhere. What you want is the edges kept and only the
+//! edges blended.
+//!
+//! The rest are the Mitchell-Netravali family, whose two parameters this is:
 //!
 //! ```text
 //!            (12 - 9B - 6C)|x|^3 + (-18 + 12B + 6C)|x|^2 + (6 - 2B)
@@ -37,16 +45,16 @@
 //!                                     6
 //! ```
 //!
-//! At `B = 1, C = 0` that is the cubic B-spline, the smoothest member: its
+//! [`Kernel::B_SPLINE`] is `B = 1, C = 0`, the smoothest member: its
 //! kernel is everywhere non-negative, so the result cannot overshoot and there
 //! is no ringing or haloing at all. The cost is softness — a B-spline does not
 //! interpolate, it approximates, so even a 1:1 pass would blur if it were
 //! allowed to run. [`Scaler::resample`] returns the source untouched when
 //! nothing needs scaling, so that never happens.
 //!
-//! Mitchell's own `B = C = 1/3` and Catmull-Rom's `B = 0, C = 1/2` are sharper
-//! and do undershoot; [`to_byte`] clamps, so a player who asks for one of them
-//! gets the ringing and not a wrapped byte.
+//! [`Kernel::MITCHELL`] (`B = C = 1/3`) and [`Kernel::CATMULL_ROM`]
+//! (`B = 0, C = 1/2`) are sharper and do undershoot; [`to_byte`] clamps, so a
+//! player who asks for one of them gets the ringing and not a wrapped byte.
 //!
 //! # How it runs
 //!
@@ -139,8 +147,8 @@ pub struct Scaler {
     /// The finished frame, kept between calls so a 4K one is not reallocated
     /// and rezeroed on every frame of every movie.
     out: Vec<u8>,
-    /// The `(B, C)` the weights were built at, so a refit keeps it.
-    mitchell: (f32, f32),
+    /// The kernel the weights were built with, so a refit keeps it.
+    kernel: Kernel,
 }
 
 /// Turns one filtered f32 channel into the byte that goes on screen.
@@ -168,8 +176,27 @@ fn to_byte(v: f32) -> u8 {
     (v.clamp(0.0, 255.0) + BIAS).to_bits() as u8
 }
 
-/// `B = 1, C = 0`: the cubic B-spline, and the default.
-pub const B_SPLINE: (f32, f32) = (1.0, 0.0);
+/// How the weights along one axis are worked out.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Kernel {
+    /// The band-limited pixel filter, and the default. See [`band_limited`].
+    #[default]
+    Pixel,
+    /// Mitchell-Netravali at `(B, C)`. A cubic over four taps: smooth, and on
+    /// art that is mostly flat colour with hard edges, smooth is the problem.
+    Mitchell(f32, f32),
+}
+
+impl Kernel {
+    /// `B = 1, C = 0`: the cubic B-spline, the smoothest of the family and the
+    /// only one that cannot ring.
+    pub const B_SPLINE: Kernel = Kernel::Mitchell(1.0, 0.0);
+    /// `B = C = 1/3`: Mitchell's own compromise.
+    pub const MITCHELL: Kernel = Kernel::Mitchell(1.0 / 3.0, 1.0 / 3.0);
+    /// `B = 0, C = 1/2`: the sharpest of the family, and the only one that
+    /// interpolates.
+    pub const CATMULL_ROM: Kernel = Kernel::Mitchell(0.0, 0.5);
+}
 
 /// The kernel every scaler built from here on uses.
 ///
@@ -178,22 +205,22 @@ pub const B_SPLINE: (f32, f32) = (1.0, 0.0);
 /// every `Screen::load` in the engine would be churn for a knob that cannot
 /// change while the game is running. `OnceLock` is what makes "once" true — a
 /// second call is ignored rather than racing a scaler that is mid-frame.
-static KERNEL: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+static KERNEL: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
 
 /// Sets the kernel, once, for every [`Scaler`] built afterwards.
 ///
 /// Returns whether this call is the one that set it.
-pub fn set_kernel(mitchell: (f32, f32)) -> bool {
-    KERNEL.set(mitchell).is_ok()
+pub fn set_kernel(kernel: Kernel) -> bool {
+    KERNEL.set(kernel).is_ok()
 }
 
-/// The kernel in force. [`B_SPLINE`] until something says otherwise.
-pub fn kernel_in_force() -> (f32, f32) {
-    KERNEL.get().copied().unwrap_or(B_SPLINE)
+/// The kernel in force. [`Kernel::Pixel`] until something says otherwise.
+pub fn kernel_in_force() -> Kernel {
+    KERNEL.get().copied().unwrap_or(Kernel::Pixel)
 }
 
 /// The Mitchell-Netravali kernel at `(b, c)`.
-fn kernel(x: f32, (b, c): (f32, f32)) -> f32 {
+fn mitchell(x: f32, (b, c): (f32, f32)) -> f32 {
     let x = x.abs();
     let (x2, x3) = (x * x, x * x * x);
     if x < 1.0 {
@@ -211,12 +238,89 @@ fn kernel(x: f32, (b, c): (f32, f32)) -> f32 {
 }
 
 /// Builds one axis' worth of taps.
+fn axis(src: usize, dst: usize, kernel: Kernel) -> Vec<Taps> {
+    let ratio = src as f32 / dst as f32;
+    match kernel {
+        // The pixel filter is a magnification filter: it decides where inside a
+        // source texel the edge between it and its neighbour falls, which is
+        // only a question when a source texel covers more than one output
+        // pixel. Shrinking wants the opposite — every source pixel in the
+        // footprint averaged — so that case takes the smooth kernel, which
+        // does that properly.
+        Kernel::Pixel if ratio <= 1.0 => band_limited(src, dst, ratio),
+        Kernel::Pixel => mitchell_axis(src, dst, ratio, (1.0, 0.0)),
+        Kernel::Mitchell(b, c) => mitchell_axis(src, dst, ratio, (b, c)),
+    }
+}
+
+/// Themaister's band-limited pixel filter, which is what gamescope's
+/// `GamescopeUpscaleFilter::PIXEL` is — `sampleBandLimited` in its
+/// `src/shaders/composite.h`:
+///
+/// ```text
+/// vec2 pixel = uv * size - 0.5;
+/// vec2 base_pixel = floor(pixel);
+/// vec2 phase = pixel - base_pixel;
+/// vec2 shift = 0.5 + 0.5 * sin(PI_half * clamp((phase - 0.5) / min(extent, 0.25), -1, 1));
+/// uv = (base_pixel + 0.5 + shift) * inv_size;
+/// return sampleRegular(samp, uv);      // an ordinary bilinear fetch
+/// ```
+///
+/// # What it does
+///
+/// A bilinear fetch ramps from one texel to the next across the whole texel,
+/// which is why it blurs: at 2.4x, most output pixels land somewhere in the
+/// ramp and get a mixture rather than a colour. This warps the phase so the
+/// ramp happens over a *narrow band* instead — `extent` texels wide, which is
+/// about one output pixel — and the rest of the texel is flat. So the inside of
+/// a source pixel comes out exactly its own colour, and only the boundary
+/// between two of them is blended, over roughly the one output pixel that
+/// straddles it.
+///
+/// That is the whole trick: crisp like point sampling, but with the edge
+/// band-limited to the output grid instead of falling wherever rounding puts
+/// it, so it works at **any** scale and not only whole-number ones. No border,
+/// no stair-stepping, no blur.
+///
+/// The sine is the ramp's shape — an S-curve, so the transition has no corners
+/// of its own to alias on.
+///
+/// # As taps
+///
+/// `uv` lands between texel `base` and texel `base + 1` at fraction `shift`, so
+/// a bilinear fetch there is exactly two taps weighted `1 - shift` and `shift`.
+/// Separable, and it drops into the same machinery the cubics use — at two taps
+/// an axis rather than four.
+fn band_limited(src: usize, dst: usize, ratio: f32) -> Vec<Taps> {
+    /// gamescope caps the band at a quarter of a texel — the width it would
+    /// have at 4x — rather than letting it widen as the scale falls. Its
+    /// comment says why: 2x gives a band a whole output pixel wide, and that
+    /// measured blurry on Cave Story at 480p to 800p.
+    const MAX_EXTENT: f32 = 0.25;
+    /// And a floor, so the divide below cannot blow up.
+    const MIN_EXTENT: f32 = 1.0 / 256.0;
+
+    // Source texels per output pixel, which is what gamescope passes as
+    // `extent`: `max(texSize / output_res, 1/256)`.
+    let extent = ratio.clamp(MIN_EXTENT, MAX_EXTENT);
+    (0..dst)
+        .map(|out| {
+            let centre = (out as f32 + 0.5) * ratio - 0.5;
+            let base = centre.floor();
+            let phase = centre - base;
+            let ramp = ((phase - 0.5) / extent).clamp(-1.0, 1.0);
+            let shift = 0.5 + 0.5 * (std::f32::consts::FRAC_PI_2 * ramp).sin();
+            clamp_taps(base as i64, vec![1.0 - shift, shift], src)
+        })
+        .collect()
+}
+
+/// A cubic of the Mitchell-Netravali family.
 ///
 /// `support` is the kernel's radius in source pixels: 2 when upscaling, and
 /// widened by the shrink factor when downscaling so the footprint covers every
 /// source pixel that contributes.
-fn axis(src: usize, dst: usize, mitchell: (f32, f32)) -> Vec<Taps> {
-    let ratio = src as f32 / dst as f32;
+fn mitchell_axis(src: usize, dst: usize, ratio: f32, params: (f32, f32)) -> Vec<Taps> {
     let filter_scale = ratio.max(1.0);
     let support = 2.0 * filter_scale;
     (0..dst)
@@ -228,52 +332,58 @@ fn axis(src: usize, dst: usize, mitchell: (f32, f32)) -> Vec<Taps> {
             let mut weights = Vec::with_capacity((last - first + 1).max(1) as usize);
             let mut total = 0.0f32;
             for i in first..=last {
-                let w = kernel((i as f32 - centre) / filter_scale, mitchell);
+                let w = mitchell((i as f32 - centre) / filter_scale, params);
                 weights.push(w);
                 total += w;
-            }
-            // Clamp the footprint to the edges by folding the out-of-range
-            // weight onto the nearest real pixel, which is what makes an edge
-            // pixel keep its own colour instead of fading toward nothing.
-            let mut start = first;
-            while start < 0 && weights.len() > 1 {
-                let w = weights.remove(0);
-                weights[0] += w;
-                start += 1;
-            }
-            let mut end = start + weights.len() as i64 - 1;
-            while end > src as i64 - 1 && weights.len() > 1 {
-                let w = weights.pop().unwrap_or(0.0);
-                if let Some(back) = weights.last_mut() {
-                    *back += w;
-                }
-                end -= 1;
             }
             if total != 0.0 {
                 for w in &mut weights {
                     *w /= total;
                 }
             }
-            // A tap at exactly the kernel's radius has weight zero, which
-            // happens whenever an output pixel's centre lands on a source
-            // pixel's. Dropping those is not just saved work: it is what makes
-            // every upscaled output pixel exactly four taps, which is the case
-            // the passes have a fast path for.
-            while weights.len() > 1 && weights[0] == 0.0 {
-                weights.remove(0);
-                start += 1;
-            }
-            while weights.len() > 1 && weights[weights.len() - 1] == 0.0 {
-                weights.pop();
-            }
-            // The folding above already pulls the footprint inside the
-            // image except in the degenerate one-tap case. Bringing it into
-            // range here means the passes can index the row directly instead
-            // of clamping on every tap.
-            let start = start.clamp(0, (src as i64 - weights.len() as i64).max(0)) as usize;
-            Taps { start, weights }
+            clamp_taps(first, weights, src)
         })
         .collect()
+}
+
+/// Folds a footprint that hangs off the image back inside it, drops the taps
+/// that contribute nothing, and normalises the result into a [`Taps`].
+///
+/// Folding rather than discarding is what makes an edge pixel keep its own
+/// colour instead of fading towards nothing — it is the same thing
+/// `D3DSAMP_ADDRESSU`/`V` set to `D3DTADDRESS_CLAMP` does on the original, and
+/// what `sampleBandLimited`'s caller relies on for the same reason.
+///
+/// Dropping zero weights is not just saved work: it is what makes every
+/// upscaled output pixel of a cubic exactly four taps, and of the pixel filter
+/// exactly two, which are the cases the passes have fast paths for.
+fn clamp_taps(first: i64, mut weights: Vec<f32>, src: usize) -> Taps {
+    let mut start = first;
+    while start < 0 && weights.len() > 1 {
+        let w = weights.remove(0);
+        weights[0] += w;
+        start += 1;
+    }
+    let mut end = start + weights.len() as i64 - 1;
+    while end > src as i64 - 1 && weights.len() > 1 {
+        let w = weights.pop().unwrap_or(0.0);
+        if let Some(back) = weights.last_mut() {
+            *back += w;
+        }
+        end -= 1;
+    }
+    while weights.len() > 1 && weights[0] == 0.0 {
+        weights.remove(0);
+        start += 1;
+    }
+    while weights.len() > 1 && weights[weights.len() - 1] == 0.0 {
+        weights.pop();
+    }
+    // The folding above already pulls the footprint inside the image except in
+    // the degenerate one-tap case. Bringing it into range here means the passes
+    // can index the row directly instead of clamping on every tap.
+    let start = start.clamp(0, (src as i64 - weights.len() as i64).max(0)) as usize;
+    Taps { start, weights }
 }
 
 /// The most source rows any one band reads.
@@ -306,16 +416,16 @@ impl Scaler {
 
     /// Builds the weights and buffers for one source and destination size, with
     /// a kernel of its own rather than the one [`kernel_in_force`] gives.
-    pub fn with_kernel(src: (usize, usize), dst: (usize, usize), mitchell: (f32, f32)) -> Scaler {
-        let vertical = axis(src.1, dst.1, mitchell);
+    pub fn with_kernel(src: (usize, usize), dst: (usize, usize), kernel: Kernel) -> Scaler {
+        let vertical = axis(src.1, dst.1, kernel);
         let rows = band_rows(&vertical);
         let workers = workers(vertical.len().div_ceil(BAND).max(1));
         Scaler {
             src,
             dst,
-            horizontal: axis(src.0, dst.0, mitchell),
+            horizontal: axis(src.0, dst.0, kernel),
             band_rows: rows,
-            mitchell,
+            kernel,
             scratch: vec![0.0; workers * rows * dst.0 * 4],
             out: vec![0; dst.0 * dst.1 * 4],
             vertical,
@@ -328,12 +438,12 @@ impl Scaler {
         if self.src != src || self.dst != dst {
             // The kernel travels with the scaler: one built for a sharper
             // filter stays sharp when the window changes size.
-            let mitchell = if self.horizontal.is_empty() {
+            let kernel = if self.horizontal.is_empty() {
                 kernel_in_force()
             } else {
-                self.mitchell
+                self.kernel
             };
-            *self = Scaler::with_kernel(src, dst, mitchell);
+            *self = Scaler::with_kernel(src, dst, kernel);
         }
     }
 
@@ -545,13 +655,16 @@ mod tests {
     /// sub-pixel offset, the four taps sum to 1, so a flat field stays flat.
     #[test]
     fn the_kernel_sums_to_one_at_every_offset() {
-        for mitchell in [B_SPLINE, (1.0 / 3.0, 1.0 / 3.0), (0.0, 0.5)] {
+        for kernel in [Kernel::B_SPLINE, Kernel::MITCHELL, Kernel::CATMULL_ROM] {
             for step in 0..64 {
                 let frac = step as f32 / 64.0;
-                let sum: f32 = (-1..=2).map(|i| kernel(i as f32 - frac, mitchell)).sum();
+                let Kernel::Mitchell(b, c) = kernel else {
+                    continue;
+                };
+                let sum: f32 = (-1..=2).map(|i| mitchell(i as f32 - frac, (b, c))).sum();
                 assert!(
                     (sum - 1.0).abs() < 1e-5,
-                    "{mitchell:?} at offset {frac} summed to {sum}"
+                    "{kernel:?} at offset {frac} summed to {sum}"
                 );
             }
         }
@@ -566,13 +679,13 @@ mod tests {
         let mut sharper_dips = false;
         for step in -300..=300 {
             let x = step as f32 / 100.0;
-            let spline = kernel(x, B_SPLINE);
+            let spline = mitchell(x, (1.0, 0.0));
             // Not `>= 0.0`: written in the family's general form, the tail
             // lands a rounding step below zero just inside `|x| = 2`, where
             // the weight is zero anyway. A ringing kernel undershoots by
             // percents, which is what the comparison below catches.
             assert!(spline > -1e-6, "k({x}) = {spline}");
-            sharper_dips |= kernel(x, (0.0, 0.5)) < -0.01;
+            sharper_dips |= mitchell(x, (0.0, 0.5)) < -0.01;
         }
         assert!(sharper_dips, "Catmull-Rom is supposed to undershoot");
     }
@@ -581,14 +694,14 @@ mod tests {
     /// less of the dark side's weight into the light one.
     #[test]
     fn a_sharper_kernel_keeps_the_edge_tighter() {
-        let spread = |mitchell| {
+        let spread = |kernel| {
             let (w, h) = (8usize, 1usize);
             let mut src = vec![0u8; w * h * 4];
             for (x, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let v = if x < w / 2 { 0 } else { 255 };
                 *px = [v, v, v, 255];
             }
-            let mut scaler = Scaler::with_kernel((w, h), (64, 1), mitchell);
+            let mut scaler = Scaler::with_kernel((w, h), (64, 1), kernel);
             let out = scaler.resample(&src, (w, h), (64, 1)).expect("scales");
             // How many output pixels are neither black nor white: the ramp.
             out.as_chunks::<4>()
@@ -598,10 +711,10 @@ mod tests {
                 .count()
         };
         assert!(
-            spread((0.0, 0.5)) < spread(B_SPLINE),
+            spread(Kernel::CATMULL_ROM) < spread(Kernel::B_SPLINE),
             "Catmull-Rom {} vs B-spline {}",
-            spread((0.0, 0.5)),
-            spread(B_SPLINE)
+            spread(Kernel::CATMULL_ROM),
+            spread(Kernel::B_SPLINE)
         );
     }
 
@@ -621,6 +734,91 @@ mod tests {
         assert_eq!(to_byte(1.5), 2);
     }
 
+    /// The pixel filter, against the shader it is taken from.
+    ///
+    /// gamescope's `sampleBandLimited` warps the phase and then does a bilinear
+    /// fetch; this does the same warp and emits the two taps that fetch is. The
+    /// weights here are computed the shader's way, independently of the code
+    /// under test, and have to come out the same.
+    #[test]
+    fn the_pixel_filter_is_the_shader_it_came_from() {
+        let (src, dst) = (800usize, 1920usize);
+        let ratio = src as f32 / dst as f32;
+        let extent = ratio.clamp(1.0 / 256.0, 0.25);
+        let taps = axis(src, dst, Kernel::Pixel);
+        for (out, taps) in taps.iter().enumerate() {
+            // uv * size - 0.5, with uv the centre of this output pixel.
+            let pixel = (out as f32 + 0.5) * ratio - 0.5;
+            let base_pixel = pixel.floor();
+            let phase = pixel - base_pixel;
+            let shift = 0.5
+                + 0.5
+                    * (std::f32::consts::FRAC_PI_2 * ((phase - 0.5) / extent).clamp(-1.0, 1.0))
+                        .sin();
+            // A bilinear fetch at `base_pixel + 0.5 + shift` reads texels
+            // `base_pixel` and `base_pixel + 1` weighted `1 - shift` and
+            // `shift`. A weight of zero is trimmed rather than carried, so
+            // compare what each texel ends up with and not the list itself.
+            let weight = |texel: usize| {
+                texel
+                    .checked_sub(taps.start)
+                    .and_then(|i| taps.weights.get(i))
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            // Both ends of the image are the sampler's business rather than
+            // the filter's: a footprint that hangs off the edge has its weight
+            // folded onto the last real texel, which is `D3DTADDRESS_CLAMP`
+            // and what the shader's own sampler does. Compare the interior.
+            if base_pixel < 0.0 || base_pixel as usize + 1 >= src {
+                continue;
+            }
+            let base = base_pixel as usize;
+            for (texel, want) in [(base, 1.0 - shift), (base + 1, shift)] {
+                assert!(
+                    (weight(texel) - want).abs() < 1e-5,
+                    "output {out}, texel {texel}: {} want {want}",
+                    weight(texel)
+                );
+            }
+        }
+    }
+
+    /// What the warp buys: the inside of a source texel comes out its own
+    /// colour, and only the boundary between two of them is blended. A cubic
+    /// blends everywhere, which is the softness.
+    #[test]
+    fn the_pixel_filter_keeps_a_texel_flat_and_blends_only_its_edge() {
+        // Eight source pixels, alternating, upscaled by five.
+        let (w, dw) = (8usize, 40usize);
+        let mut src = vec![0u8; w * 4];
+        for (x, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = if x % 2 == 0 { 0 } else { 255 };
+            *px = [v, v, v, 255];
+        }
+        let mixed = |kernel| {
+            let mut scaler = Scaler::with_kernel((w, 1), (dw, 1), kernel);
+            let out = scaler.resample(&src, (w, 1), (dw, 1)).expect("scales");
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| (8..248).contains(&p[0]))
+                .count()
+        };
+        let pixel = mixed(Kernel::Pixel);
+        let spline = mixed(Kernel::B_SPLINE);
+        // Seven boundaries in a 40-pixel output, each costing a band about one
+        // output pixel wide: most of the frame should still be flat colour.
+        assert!(
+            pixel * 2 <= dw,
+            "the pixel filter blended {pixel} of {dw}, which is not mostly flat"
+        );
+        assert!(
+            pixel < spline,
+            "pixel {pixel} should blend less than the B-spline's {spline}"
+        );
+    }
+
     /// Upscaling never needs more than four taps once the zero-weight ones at
     /// the kernel's radius are trimmed. [`column`] takes that path straight
     /// into registers, so this is the property the speed rests on — including
@@ -628,7 +826,7 @@ mod tests {
     #[test]
     fn an_upscale_never_needs_more_than_four_taps() {
         for (src, dst) in [(800, 1920), (452, 1085), (720, 2160), (7, 21), (100, 101)] {
-            let taps = axis(src, dst, B_SPLINE);
+            let taps = axis(src, dst, Kernel::B_SPLINE);
             let widest = taps.iter().map(|t| t.weights.len()).max().unwrap_or(0);
             assert!(widest <= 4, "{src} -> {dst} needed {widest} taps");
             for t in &taps {
@@ -656,21 +854,32 @@ mod tests {
             row.fill(v);
         }
         let (dw, dh) = (16usize, 500usize);
-        let mut scaler = Scaler::default();
-        let out = scaler
-            .resample(&src, (w, h), (dw, dh))
-            .expect("should scale");
-        let at = |y: usize| out[y * dw * 4] as i32;
-        for y in 1..dh {
-            let step = at(y) - at(y - 1);
-            assert!(
-                (0..=3).contains(&step),
-                "row {y} jumped by {step}: a band boundary at {}",
-                y % BAND
-            );
+        for kernel in [Kernel::B_SPLINE, Kernel::Pixel] {
+            let mut scaler = Scaler::with_kernel((w, h), (dw, dh), kernel);
+            let out = scaler
+                .resample(&src, (w, h), (dw, dh))
+                .expect("should scale");
+            let at = |y: usize| out[y * dw * 4] as i32;
+            for y in 1..dh {
+                assert!(
+                    at(y) >= at(y - 1),
+                    "{kernel:?} row {y} went backwards: a band boundary at {}",
+                    y % BAND
+                );
+            }
+            // The smooth kernel spreads the ramp over every row, so its steps
+            // stay small. The pixel filter puts each step at a texel boundary
+            // on purpose, which is the whole of what it is for, so the only
+            // thing to insist on there is that the ramp never reverses.
+            if kernel == Kernel::B_SPLINE {
+                for y in 1..dh {
+                    let step = at(y) - at(y - 1);
+                    assert!((0..=3).contains(&step), "row {y} jumped by {step}");
+                }
+            }
+            assert_eq!(at(0), 0, "{kernel:?}: the top stays the top");
+            assert_eq!(at(dh - 1), 255, "{kernel:?}: and the bottom the bottom");
         }
-        assert_eq!(at(0), 0, "the top stays the top");
-        assert_eq!(at(dh - 1), 255, "and the bottom the bottom");
     }
 
     /// Nothing to do is nothing done: an unscaled frame is handed back

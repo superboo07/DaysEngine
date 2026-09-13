@@ -183,10 +183,10 @@ whatever filter the driver gave:
 Scaler = bicubic
 
 [UI]
+; pixel (the default), bspline, mitchell, catmull_rom
+Scaler = pixel
 ; Whole-number scaling: no resampling at all, at the cost of a border
 PixelPerfect = off
-; bspline, mitchell, catmull_rom — one cubic family, softest first
-Scaler = bspline
 ```
 
 The file is optional, never written by the game, and a value it cannot read is
@@ -200,6 +200,22 @@ filter costs only its own width; the game's own art goes through the engine's
 resampler in `playback::scale`. A libavfilter graph — a debander before the
 scale, say — is **not implemented**; the decoder is where it would go.
 
+### The pixel filter
+
+The default for the game's own art is not a cubic. The art is 800x450 of flat
+colour and hard edges, a 1920x1200 window wants 2.4x of it, and a cubic answers
+that by blending everywhere — which is what "soft" means here.
+
+`Scaler = pixel` is the **band-limited pixel filter**, which is what gamescope's
+`GamescopeUpscaleFilter::PIXEL` is: `sampleBandLimited` in its
+`src/shaders/composite.h`. It warps the bilinear phase so the inside of a source
+pixel comes out exactly its own colour and only the boundary between two of them
+is blended, over about the one output pixel that straddles it. Crisp like point
+sampling, but with the edge band-limited to the output grid instead of falling
+wherever rounding puts it — so it works at **any** scale, with no border and no
+stair-stepping. `playback::scale::band_limited` has the derivation, and a test
+checks it against the shader's own formula.
+
 ### Pixel-perfect
 
 The game is authored at 800x450 and ships nothing larger, so on a modern window
@@ -208,7 +224,7 @@ of 2.4, and the 0.4 is where softness comes from: two source pixels in five fall
 between destination pixels, and no filter can do anything about that but blur
 across the gap.
 
-`PixelPerfect = on` scales by a whole number instead — the largest that fits,
+`PixelPerfect = on` is the other answer: scale by a whole number — the largest that fits,
 centred, with a border around the rest. 1920x1200 takes ×2, so the game draws at
 1600x900 and every source pixel becomes the same exact 2x2 block. Nothing is
 resampled: the composite goes to the GPU at its own size and is point-sampled
