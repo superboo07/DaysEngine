@@ -524,6 +524,23 @@ impl Config {
         }
     }
 
+    /// Sets a channel's fraction, the way the shipped writer writes one.
+    ///
+    /// `FUN_1000bd20` stores the figure the drag worked out and hands the key
+    /// and the float straight to the settings object's `VT_R4` setter, slot
+    /// `+0x28` — the same slot `FUN_100077f0` flushes all four float keys
+    /// through, against the `+0x20` the bools take. The text it produces is
+    /// six decimals: every float key in a `Config.DAT` the retail game wrote is
+    /// `"0.500000"` or `"-1.000000"`, which is what `%f` gives.
+    ///
+    /// The upper clamp is [`Config::fraction`]'s, on the way back in. The drag
+    /// cannot produce anything outside `0.0..=1.0` anyway — the knob is clamped
+    /// to its track before the division — so this is the reader's rule rather
+    /// than a second one.
+    pub fn set_fraction(&mut self, channel: Channel, value: f32) {
+        self.set(channel.key(), format!("{:.6}", value));
+    }
+
     /// `MasterVolume`, the per-step factor the level is multiplied by.
     ///
     /// `FUN_0046cb50`, so `VT_R4` and the same rule as the other two: absent
@@ -929,6 +946,19 @@ mod tests {
         assert_eq!(config.system_se_gain(Sound::Levels), 0.0);
         config.set_flag(Flag::Mute, false);
         assert_eq!(config.system_se_gain(Sound::Levels), 1.0);
+    }
+
+    /// The shipped writer puts six decimals in the file: every float key in a
+    /// `Config.DAT` the retail game wrote reads `"0.500000"` or `"-1.000000"`.
+    /// A shorter spelling still parses, but it is not what the game leaves
+    /// behind, and this file is the player's.
+    #[test]
+    fn a_fraction_is_written_the_way_the_game_writes_one() {
+        let mut config = Config::parse_text("");
+        config.set_fraction(Channel::Bgm, 0.5);
+        assert_eq!(config.get("BgmVolume"), Some("0.500000"));
+        // And it survives the round trip the reader makes of it.
+        assert_eq!(config.fraction(Channel::Bgm), 0.5);
     }
 
     /// The other model's volumes are fractions, and a file written by its own

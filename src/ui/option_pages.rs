@@ -500,11 +500,11 @@ fn def_action(widget: usize, display: Display) -> Act {
 
 /// `FUN_10009430`.
 ///
-/// Widgets 8, 9 and 10 begin a drag of slider `widget - 8` and are **not
-/// wired**: this engine has no drag to commit one from yet. What the value
-/// means is recovered — a fraction of the knob's travel, stored and then run
-/// through [`crate::install::config::Sound::Fractions`] — so wiring them is a
-/// matter of the drag, not of the arithmetic.
+/// Widgets 8, 9 and 10 are the sliders, and they activate **nothing**: their
+/// arm latches a drag of slider `widget - 8` at `+0x24c` and `+0x170` and runs
+/// one step of it, and the value only ever changes from inside `FUN_1000bd20`.
+/// So they are `Act::None` here and the press is what starts them — see
+/// `Menu::press`.
 fn sound_action(widget: usize) -> Act {
     match widget {
         4 => Act::SetFlag(Flag::MenVoice, true),
@@ -760,6 +760,17 @@ fn travel(track: &Widget, knob: &Widget) -> f32 {
     (track.dst.width.saturating_sub(knob.dst.width)) as f32
 }
 
+/// A knob position held to its track, from `FUN_1000bd20`.
+///
+/// The drag clamps `+0x1bc` itself, on every step, before it takes the value
+/// from it: low to the track's own x and high to the last x the knob fits at.
+/// So a pointer that runs off the end and comes back does not bank the
+/// overshoot.
+pub fn clamp_knob_x(track: &Widget, knob: &Widget, knob_x: f32) -> f32 {
+    let low = track.dst.x as f32;
+    knob_x.clamp(low, low + travel(track, knob))
+}
+
 /// The value a knob at `knob_x` stands for, from `FUN_1000bd20`.
 ///
 /// Zero to one across the travel, not one of ten levels.
@@ -880,6 +891,23 @@ mod tests {
         // beyond either end still reads as an end.
         assert_eq!(slider_value(&track, &knob, 9000.0), 1.0);
         assert_eq!(slider_value(&track, &knob, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_drag_clamps_the_knob_before_it_takes_the_value_not_after() {
+        // `FUN_1000bd20` holds `+0x1bc` to the track on every step and only
+        // then divides, so a pointer that runs off the end and comes back
+        // starts from the end rather than from where it would have been. A
+        // clamp applied to the value instead would bank the overshoot.
+        let dll = sound_table();
+        let p = pages(0);
+        let (track, knob) = (p.track(&dll, 0).unwrap(), p.knob(&dll, 0).unwrap());
+        let rest = slider_knob_x(&track, &knob, 0.5);
+        let far = clamp_knob_x(&track, &knob, rest + 9000.0);
+        assert_eq!(slider_value(&track, &knob, far), 1.0);
+        assert_eq!(clamp_knob_x(&track, &knob, far - 100.0), far - 100.0);
+        // And the low end is the track's own x, not zero.
+        assert_eq!(clamp_knob_x(&track, &knob, -9000.0), track.dst.x as f32);
     }
 
     #[test]

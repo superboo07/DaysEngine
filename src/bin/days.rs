@@ -381,7 +381,8 @@ struct MenuArgs {
     at_size: Option<String>,
     /// Events to replay, comma separated: `down`, `up`, `left`, `right`,
     /// `enter`, `esc`, `at:X:Y` to point at a pixel, and `click:X:Y` to point
-    /// and confirm.
+    /// and confirm. A slider is dragged with `press:X:Y`, then `drag:X:Y` for
+    /// each step, then `release`.
     #[arg(long, short = 'e', default_value = "")]
     events: String,
     /// Resolution: standard, wide, note or full.
@@ -2470,8 +2471,7 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
         "menu sounds",
         config.system_se_gain(sound),
         match sound {
-            Sound::Levels => "SeVolume, never muted",
-            Sound::Fractions => "SeVolume, muted with the rest",
+            Sound::Levels | Sound::Fractions => "SeVolume, silenced by Mute",
         }
     );
     if sound == Sound::Levels {
@@ -2977,16 +2977,18 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             "enter" => (menu.confirm(&vfs, &dll)?, "enter".to_string()),
             "esc" => (menu.cancel(&vfs, &dll)?, "esc".to_string()),
             "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),
+            "release" => (menu.release(), "release".to_string()),
             other => {
                 // Points are written `at:X:Y` rather than `at:X,Y` so the comma
                 // stays free as the separator between events.
                 let (kind, point) = other
                     .split_once(':')
-                    .filter(|(k, _)| *k == "at" || *k == "click")
+                    .filter(|(k, _)| ["at", "click", "press", "drag"].contains(k))
                     .with_context(|| {
                         format!(
                             "unknown menu event {other:?}; expected down, up, enter, \
-                             esc, yes, left, right, at:X:Y or click:X:Y"
+                             esc, yes, left, right, release, at:X:Y, click:X:Y, \
+                             press:X:Y or drag:X:Y"
                         )
                     })?;
                 let (x, y) = point
@@ -2995,10 +2997,14 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 let x: u32 = x.parse().with_context(|| format!("bad x in {other:?}"))?;
                 let y: u32 = y.parse().with_context(|| format!("bad y in {other:?}"))?;
                 let pointed = menu.point_at(x, y);
-                if kind == "at" {
-                    (pointed, format!("at {x},{y}"))
-                } else {
-                    (menu.confirm(&vfs, &dll)?, format!("click {x},{y}"))
+                match kind {
+                    "at" => (pointed, format!("at {x},{y}")),
+                    // A drag is the pointer moving with the button already
+                    // down, so it is the same motion event and the drag latch
+                    // is what makes it one.
+                    "drag" => (pointed, format!("drag {x},{y}")),
+                    "press" => (menu.press(x), format!("press {x},{y}")),
+                    _ => (menu.confirm(&vfs, &dll)?, format!("click {x},{y}")),
                 }
             }
         };

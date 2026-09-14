@@ -197,6 +197,44 @@ so the value is a float from 0 to 1 over 511 pixels of travel, not a level.
 `FUN_1000c280` is the matching hit test, and it tests only `x` — the pointer is
 over slider `n` when `knob_x <= pointer_x <= knob_x + knob.w * scale`.
 
+**The drag is relative.** The shipped line is
+
+```text
++0x1bc[n]  -=  width * (+0x3c - +0x44)
+```
+
+where `+0x3c` and `+0x44` are the previous and the current pointer as fractions
+of the client width and `width` is host `+0xd4`. So the knob moves by the
+frame's pointer *delta* and is never put under the pointer: a press that grabs
+it off-centre keeps its grip for the whole drag. The carousel's own drag two
+branches up in `FUN_1000b3d0` is written the same way, against `+0xb0`.
+
+`+0x44` is the current pointer — `FUN_1000c280` hit-tests with it — and `+0x34`
+is a third copy, the one `FUN_10010e70` keeps for the hit test's own refresh.
+The clamp lands on `+0x1bc` **before** the division, so a pointer that runs past
+the end of the track and comes back starts from the end rather than from where
+it would have been.
+
+The latch is `FUN_10009430`'s last arm: widgets 8 to 10, gated on
+`FUN_10008f50` — which for those three is `FUN_1000c280` and nothing else — and
+on the carousel being still (`+0x244` and `+0x248` both zero). It sets `+0x24c`,
+puts the slider in `+0x170`, and runs one `FUN_1000bd20` immediately, which
+moves nothing because the pointer has not moved yet. `FUN_1000b3d0` re-enters
+the drag every frame while `+0x24c` is set, and `FUN_1000bd20`'s own first test
+is `+0x58`, the held flag: with the button up it clears `+0x24c` and returns. So
+the release is the only thing that ends a drag, and the sliders activate
+nothing — the value only ever changes from inside the drag.
+
+`+0x1bc` is the live truth while the screen is up. `FUN_100083b0` fills all
+three from the fractions as the screen loads and nothing reads them back out of
+the settings afterwards.
+
+The value is written through to the key as it changes, by the settings object's
+`VT_R4` setter at slot `+0x28` — the same slot `FUN_100077f0` flushes all four
+float keys through, against the `+0x20` the bools take. It writes six decimals:
+every float key in a `Config.DAT` the retail game wrote reads `"0.500000"` or
+`"-1.000000"`.
+
 **`MasterVolume` has no slider.** `FUN_100075d0` reads it into `+0xc0` and
 `FUN_100077f0` writes it back, and nothing on any tab edits it. It is also the
 only one of the four the screen does not clamp to 1, and the only one whose

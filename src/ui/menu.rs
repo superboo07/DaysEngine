@@ -918,6 +918,32 @@ struct OptionPage {
     at: (u32, u32),
     /// The sheet this tab's sprites are cut from, which is not the screen's.
     chip: days_ui::Image,
+    /// Where each of the three knobs sits, which is `+0x1bc` and is the live
+    /// truth while the screen is up.
+    ///
+    /// `FUN_100083b0` fills it once from the three fractions as the screen
+    /// loads and `FUN_1000bd20` moves it from there; nothing reads it back out
+    /// of the settings. Deriving it from the stored fraction instead would put
+    /// it through six decimals of text on every step.
+    knob_x: Vec<f32>,
+    /// Which slider the pointer is dragging, and where it was last seen.
+    ///
+    /// `FUN_10009430` latches `+0x24c` and `+0x170` on the press and
+    /// `FUN_1000b3d0` re-enters `FUN_1000bd20` every frame until the button
+    /// comes up. The pointer's last position is the other half: the shipped
+    /// drag is **relative**, moving the knob by the frame's pointer delta
+    /// rather than putting it under the pointer.
+    drag: Option<Drag>,
+}
+
+/// A slider drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Drag {
+    /// `+0x170`, the slider `FUN_1000bd20` is called for.
+    slider: usize,
+    /// The pointer x the next delta is measured from, in layout space.
+    /// `FUN_1000bd20` reads `+0x3c` against `+0x44` for it.
+    from: f32,
 }
 
 /// The Replay screen's page for one view: the records it draws from, resolved
@@ -1313,7 +1339,25 @@ impl Menu {
             scaled,
             at: self.screen.size(),
             chip,
+            knob_x: Vec::new(),
+            drag: None,
         });
+        // `FUN_100083b0` works the three knob positions out from the three
+        // fractions as the last thing it does, once the tables are in hand.
+        let knob_x = (0..option_pages::SLIDERS)
+            .map_while(|slider| {
+                let page = self.option_page.as_ref()?;
+                let channel = *option_pages::SLIDER_CHANNELS.get(slider)?;
+                Some(option_pages::slider_knob_x(
+                    page.tracks.get(slider)?,
+                    page.knobs.get(slider)?,
+                    self.session.config.fraction(channel),
+                ))
+            })
+            .collect();
+        if let Some(page) = &mut self.option_page {
+            page.knob_x = knob_x;
+        }
         self.dirty = true;
     }
 
@@ -1623,17 +1667,9 @@ impl Menu {
         (self.tab == options::Tab::Sound && slider < option_pages::SLIDERS).then_some(slider)
     }
 
-    /// Where a Sound slider's knob sits, from the volume in force.
+    /// Where a Sound slider's knob sits: `+0x1bc`.
     fn knob_x(&self, slider: usize) -> Option<f32> {
-        let page = self.option_page.as_ref()?;
-        let track = page.tracks.get(slider)?;
-        let knob = page.knobs.get(slider)?;
-        let channel = *option_pages::SLIDER_CHANNELS.get(slider)?;
-        Some(option_pages::slider_knob_x(
-            track,
-            knob,
-            self.session.config.fraction(channel),
-        ))
+        self.option_page.as_ref()?.knob_x.get(slider).copied()
     }
 
     /// The sprites this screen draws that are not widget states.
@@ -1967,12 +2003,115 @@ impl Menu {
 
     /// Moves the pointer. Coordinates are in the screen's own pixel space.
     pub fn point_at(&mut self, x: u32, y: u32) -> Action {
+        // A drag owns the pointer while it lasts: `FUN_1000b3d0` goes straight
+        // to `FUN_1000bd20` and never reaches the hit test, so the selection
+        // stays on the slider however far the pointer wanders off the track.
+        if self.dragging().is_some() {
+            return self.drag_to(x);
+        }
         let hit = match self.screen.hit(x, y) {
             Some(widget) => Some(widget),
             None => self.page_hit(x, y),
         };
         let hit = hit.filter(|widget| self.enabled(*widget) || self.grabbing(*widget, x));
         self.select(hit)
+    }
+
+    /// The slider a drag is in progress on.
+    fn dragging(&self) -> Option<usize> {
+        Some(self.option_page.as_ref()?.drag?.slider)
+    }
+
+    /// The pointer went down.
+    ///
+    /// Only one thing on these screens cares: `FUN_10009430`'s last arm takes
+    /// widgets 8 to 10, checks the gate — which for those three is
+    /// `FUN_1000c280`, the knob's own hit test — and only then latches
+    /// `+0x24c` and `+0x170`. It also runs one `FUN_1000bd20` immediately,
+    /// which with the pointer where it already was moves nothing: the drag
+    /// tests `+0x3c` against `+0x44` and returns when they match.
+    ///
+    /// Everything else is decided on the release, so a press elsewhere is not
+    /// an activation and this says so.
+    ///
+    /// Only the pointer's `x` is wanted: the widget is already named by the
+    /// selection, the way `FUN_10009430` is handed one, and `FUN_1000c280`
+    /// tests `x` alone.
+    pub fn press(&mut self, x: u32) -> Action {
+        let Some(widget) = self.selection else {
+            return Action::Stay;
+        };
+        let Some(slider) = self.slider_at(widget).filter(|_| self.grabbing(widget, x)) else {
+            return Action::Stay;
+        };
+        let (x, _) = self.screen.to_layout(x, 0);
+        if let Some(page) = &mut self.option_page {
+            page.drag = Some(Drag { slider, from: x });
+        }
+        Action::Stay
+    }
+
+    /// The pointer came up, which is the only thing that ends a drag.
+    ///
+    /// `FUN_1000bd20`'s first test is `+0x58`, the held flag: with the button
+    /// up it clears `+0x24c` and does nothing else, so the last value written
+    /// is the one that stands.
+    pub fn release(&mut self) -> Action {
+        if let Some(page) = &mut self.option_page {
+            page.drag = None;
+        }
+        Action::Stay
+    }
+
+    /// One step of a slider drag: `FUN_1000bd20`.
+    ///
+    /// The knob moves by the pointer's **delta**, not to the pointer — the
+    /// shipped line is `+0x1bc[n] -= width * (+0x3c - +0x44)`, the two being
+    /// the previous and current pointer as fractions of the client width. So a
+    /// press that grabs the knob off-centre keeps its grip, and a pointer that
+    /// runs past the end of the track and comes back does not bank the
+    /// overshoot: the knob is clamped to the track on every step, before the
+    /// value is taken from it.
+    ///
+    /// The value then goes to the member, to the INI key, and to the host —
+    /// which this engine does by writing the config the mixer reads.
+    fn drag_to(&mut self, x: u32) -> Action {
+        let (x, _) = self.screen.to_layout(x, 0);
+        let Some(drag) = self.option_page.as_ref().and_then(|page| page.drag) else {
+            return Action::Stay;
+        };
+        // `FUN_1000bd20` asks host `+0xc8` whether the pointer moved at all and
+        // returns when it has not, so a still pointer writes nothing.
+        if x == drag.from {
+            return Action::Stay;
+        }
+        let (Some(knob_x), Some(channel)) = (
+            self.knob_x(drag.slider),
+            option_pages::SLIDER_CHANNELS.get(drag.slider).copied(),
+        ) else {
+            return Action::Stay;
+        };
+        let Some(page) = self.option_page.as_ref() else {
+            return Action::Stay;
+        };
+        let (Some(track), Some(knob)) = (page.tracks.get(drag.slider), page.knobs.get(drag.slider))
+        else {
+            return Action::Stay;
+        };
+        let moved = option_pages::clamp_knob_x(track, knob, knob_x + (x - drag.from));
+        let value = option_pages::slider_value(track, knob, moved);
+        if let Some(page) = &mut self.option_page {
+            page.drag = Some(Drag { from: x, ..drag });
+            if let Some(slot) = page.knob_x.get_mut(drag.slider) {
+                *slot = moved;
+            }
+        }
+        if value == self.session.config.fraction(channel) {
+            return Action::Stay;
+        }
+        self.session.config.set_fraction(channel, value);
+        self.dirty = true;
+        Action::SettingsChanged
     }
 
     /// The Option page's own hit test.
@@ -2021,6 +2160,12 @@ impl Menu {
 
     /// The pointer left the screen, or the window lost focus.
     pub fn point_away(&mut self) -> Action {
+        // A drag keeps the selection, the same way it keeps it when the
+        // pointer wanders off the track: while `+0x24c` is set
+        // `FUN_1000b3d0` goes to the drag and never to the hit test.
+        if self.dragging().is_some() {
+            return Action::Stay;
+        }
         self.select(None)
     }
 

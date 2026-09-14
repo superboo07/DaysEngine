@@ -1490,6 +1490,7 @@ fn run_menu(
         let mut asked: Vec<Control> = Vec::new();
         let mut pointed: Option<(i32, i32)> = None;
         let mut clicked = false;
+        let mut released = false;
         for event in events.poll_iter() {
             match &event {
                 Event::Quit { .. } => return Ok(Outcome::Quit),
@@ -1513,6 +1514,13 @@ fn run_menu(
                     mouse_btn: MouseButton::Right,
                     ..
                 } => asked.push(Control::Cancel),
+                // The button coming up is what ends a slider drag, and it is
+                // the only thing that does: `FUN_1000bd20` tests the held flag
+                // at `+0x58` first and clears `+0x24c` when it is down.
+                Event::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => released = true,
                 _ => {}
             }
             asked.extend(player.controls.take(&event, now));
@@ -1537,7 +1545,18 @@ fn run_menu(
                 None => menu.point_away(),
             });
         }
+        if released {
+            actions.push(menu.release());
+        }
         if clicked {
+            // The press latches a slider drag before the activation runs, the
+            // way `FUN_10009430`'s last arm does: the three sliders activate
+            // nothing, so the two never collide.
+            if let Some((sx, _)) =
+                pointed.and_then(|(x, y)| to_screen(canvas, &menu, whole, x as f32, y as f32))
+            {
+                actions.push(menu.press(sx));
+            }
             actions.push(confirm(&mut menu, player)?);
         }
         for control in asked {
