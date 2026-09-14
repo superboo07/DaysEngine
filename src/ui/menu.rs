@@ -59,6 +59,7 @@ use crate::ui::options::Dir;
 use crate::ui::paths::Paths;
 use crate::ui::playdata;
 use crate::ui::replay::{self, Scenes};
+use crate::ui::replay_pages;
 use crate::ui::routemap;
 use crate::ui::saveload::{self, Kind, Slots};
 use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
@@ -594,6 +595,7 @@ pub struct Menu {
     /// against a table rather than giving each tab its own hit map. Absent on
     /// the module that does, and on any other screen.
     option_page: Option<OptionPage>,
+    replay_page: Option<ReplayPage>,
     /// The player's own font, for the text a screen draws itself rather than
     /// picking out of its art. Absent when the install has no readable
     /// `FONTDATA`, which leaves that text undrawn and the screen usable.
@@ -705,6 +707,7 @@ impl Menu {
             kind,
             thumbnails: None,
             option_page: None,
+            replay_page: None,
             font: load_font(vfs),
             rows: None,
             pending_save: None,
@@ -712,6 +715,7 @@ impl Menu {
         };
         menu.load_thumbnails(vfs, dll);
         menu.load_page(vfs, dll);
+        menu.load_replay_page(vfs, dll);
         menu.refresh();
         Ok(menu)
     }
@@ -747,6 +751,7 @@ impl Menu {
         self.selection = None;
         self.load_thumbnails(vfs, dll);
         self.load_page(vfs, dll);
+        self.load_replay_page(vfs, dll);
         self.refresh();
         Ok(())
     }
@@ -775,6 +780,59 @@ struct OptionPage {
     at: (u32, u32),
     /// The sheet this tab's sprites are cut from, which is not the screen's.
     chip: days_ui::Image,
+}
+
+/// The Replay screen's page for one view: the records it draws from, resolved
+/// once out of the module, and the art they are drawn over.
+///
+/// Only the module that ships one hit map for the whole Replay screen has
+/// these; School Days HQ gives each view a map carrying all its widgets and
+/// [`crate::ui::replay`] reads them straight out of it. A page is reloaded
+/// whenever the view or the page changes, which is what `FUN_100293e0` does.
+struct ReplayPage {
+    /// Which view this is, because the sheet a hover sprite is cut from
+    /// depends on it.
+    view: replay::View,
+    /// The view's widget rectangles, in widget order from
+    /// [`replay_pages::FIRST`].
+    widgets: Vec<days_ui::atlas::Widget>,
+    /// The sprite each of those widgets lights when the pointer is on it, in
+    /// the same order, resolved here so that [`Menu::compose`] never needs the
+    /// module again.
+    hovers: Vec<Option<days_ui::atlas::Widget>>,
+    /// The page button of the page showing, drawn lit under the hover.
+    page_mark: Option<days_ui::atlas::Widget>,
+    /// The view's background with the page's panel over it, in native layout
+    /// space, and — on the grid — the player's unlocked thumbnails already
+    /// blitted in the way `FUN_10027900` blits them...
+    art: days_ui::Image,
+    /// ...and the same art at the size the screen is composited at.
+    scaled: days_ui::Image,
+    at: (u32, u32),
+    /// The sheet the view's own sprites are cut from, which is not the
+    /// screen's and not the page's art.
+    chip: days_ui::Image,
+    /// The grid's second sheet, which only its thumbnails are cut from. `None`
+    /// on the list, which has no second sheet.
+    thumbs: Option<days_ui::Image>,
+}
+
+impl ReplayPage {
+    /// The sheet one of this page's sprites comes from.
+    ///
+    /// `FUN_10024c20` draws the grid's arrows and page buttons from the chip
+    /// sheet and the thumbnail under the pointer from the thumbnail sheet, in
+    /// the one layer.
+    fn sheet_for(&self, widget: usize) -> &days_ui::Image {
+        let thumbnail = self.view == replay::View::HScene
+            && (replay_pages::FIRST_THUMBNAIL
+                ..replay_pages::FIRST_THUMBNAIL + replay_pages::THUMBNAILS)
+                .contains(&widget);
+        match (thumbnail, &self.thumbs) {
+            (true, Some(thumbs)) => thumbs,
+            _ => &self.chip,
+        }
+    }
 }
 
 /// Which of the two screens that list the player's slots is showing.
@@ -871,6 +929,136 @@ impl Menu {
         match replay::Thumbnails::recover(dll, &slots, (sheet.width, sheet.height)) {
             Ok(table) => self.thumbnails = Some((sheet, table)),
             Err(err) => log::warn!("no thumbnail table for {path}: {err}"),
+        }
+    }
+
+    /// Loads the Replay page for the view and page showing.
+    ///
+    /// Only one of the two menu modules has these; the other gives each view a
+    /// hit map carrying all of its widgets. A view whose tables cannot be
+    /// placed, or whose art will not load, leaves the frame drawn and the two
+    /// view headers working, which is the rule every other missing asset
+    /// follows.
+    fn load_replay_page(&mut self, vfs: &Vfs, dll: &[u8]) {
+        self.replay_page = None;
+        if self.mode != Mode::REPLAY || !self.paths.replay_has_pages() {
+            return;
+        }
+        let Some(pages) = replay_pages::Pages::locate(dll, self.screen.atlas().offset) else {
+            log::warn!("no Replay page tables in this module; the views draw empty");
+            return;
+        };
+        let view = self.view;
+        let read = |path: &str| {
+            vfs.read_path(path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| days_ui::Image::decode_png(&bytes).map_err(|e| e.to_string()))
+        };
+        let Some(panel_path) = replay_pages::panel_art(view, self.page) else {
+            log::warn!("replay {} has no page {}", view.variant(), self.page);
+            return;
+        };
+        let (mut art, chip) = match (
+            read(replay_pages::base_art(view)),
+            read(replay_pages::chip_art(view)),
+        ) {
+            (Ok(art), Ok(chip)) => (art, chip),
+            (Err(err), _) | (_, Err(err)) => {
+                log::warn!("Replay page art for the {} view: {err}", view.variant());
+                return;
+            }
+        };
+        // The panel goes over the background at the origin: at rest the page
+        // showing is scrolled exactly over it, and a still frame is one page.
+        let (panel_x, panel_y) = replay_pages::panel_origin(view);
+        match read(&panel_path) {
+            Ok(panel) => art.blit_scaled(
+                &panel,
+                (0, 0, panel.width, panel.height),
+                (panel_x, panel_y, panel.width, panel.height),
+            ),
+            Err(err) => log::warn!("replay panel {panel_path}: {err}"),
+        }
+        let thumbs = match view {
+            replay::View::HScene => {
+                self.blit_resting_thumbnails(&mut art, &pages, dll, &read);
+                match read(replay_pages::HOVER_THUMBNAILS) {
+                    Ok(sheet) => Some(sheet),
+                    Err(err) => {
+                        log::warn!(
+                            "replay thumbnails {}: {err}",
+                            replay_pages::HOVER_THUMBNAILS
+                        );
+                        None
+                    }
+                }
+            }
+            replay::View::PlayData => None,
+        };
+        let scaled = self.screen.to_display(&art);
+        let widgets = pages.widgets(dll, view);
+        let hovers = (0..widgets.len())
+            .map(|index| pages.hover(dll, view, index + replay_pages::FIRST, self.page))
+            .collect();
+        self.replay_page = Some(ReplayPage {
+            view,
+            widgets,
+            hovers,
+            page_mark: pages.page_mark(dll, view, self.page),
+            art,
+            scaled,
+            at: self.screen.size(),
+            chip,
+            thumbs,
+        });
+        self.dirty = true;
+    }
+
+    /// Blits the player's unlocked thumbnails into the grid's page art, the way
+    /// `FUN_10027900` blits them.
+    ///
+    /// The shipped loop walks all 36 h-scenes, asks the host whether each one's
+    /// flag is set, and copies only those out of
+    /// [`replay_pages::RESTING_THUMBNAILS`] into the panel of the page they
+    /// belong to — so a scene the player has not seen leaves its slot bare.
+    /// Here only the page showing is built, because only its panel is drawn.
+    fn blit_resting_thumbnails(
+        &self,
+        art: &mut days_ui::Image,
+        pages: &replay_pages::Pages,
+        dll: &[u8],
+        read: &impl Fn(&str) -> Result<days_ui::Image, String>,
+    ) {
+        let sheet = match read(replay_pages::RESTING_THUMBNAILS) {
+            Ok(sheet) => sheet,
+            Err(err) => {
+                log::warn!(
+                    "replay thumbnails {}: {err}",
+                    replay_pages::RESTING_THUMBNAILS
+                );
+                return;
+            }
+        };
+        for slot in 0..replay_pages::THUMBNAILS {
+            let Some(scene) = replay_pages::scene_of(self.page, slot) else {
+                continue;
+            };
+            if !self.session.scenes.unlocked(scene, &self.session.flags) {
+                continue;
+            }
+            let Some(cell) = pages.thumbnail(dll, self.page, slot) else {
+                continue;
+            };
+            art.blit_scaled(
+                &sheet,
+                (cell.src_x, cell.src_y, cell.dst.width, cell.dst.height),
+                (
+                    i64::from(cell.dst.x),
+                    i64::from(cell.dst.y),
+                    cell.dst.width,
+                    cell.dst.height,
+                ),
+            );
         }
     }
 
@@ -1014,14 +1202,10 @@ impl Menu {
         self.refit_page();
         let page_sprites = self.page_sprites();
         let sprites = self.sprites();
-        let page = self
-            .option_page
-            .as_ref()
-            .map(|page| crate::ui::screen::Page {
-                art: &page.scaled,
-                sheet: &page.chip,
-                sprites: &page_sprites,
-            });
+        let page = self.page_art().map(|art| crate::ui::screen::Page {
+            art,
+            sprites: &page_sprites,
+        });
         let mut out = self
             .screen
             .compose_over_page(backdrop, page, &self.states, &sprites);
@@ -1062,14 +1246,67 @@ impl Menu {
     /// moves, not every frame.
     fn refit_page(&mut self) {
         let size = self.screen.size();
-        let Some(page) = &mut self.option_page else {
-            return;
-        };
-        if page.at == size {
-            return;
+        if let Some(page) = &mut self.option_page {
+            if page.at != size {
+                page.scaled = self.screen.to_display(&page.art);
+                page.at = size;
+            }
         }
-        page.scaled = self.screen.to_display(&page.art);
-        page.at = size;
+        if let Some(page) = &mut self.replay_page {
+            if page.at != size {
+                page.scaled = self.screen.to_display(&page.art);
+                page.at = size;
+            }
+        }
+    }
+
+    /// The art of whichever page layer this screen has, at display scale.
+    ///
+    /// At most one is ever loaded: [`Menu::load_page`] takes only the Option
+    /// screen and [`Menu::load_replay_page`] only the Replay screen.
+    fn page_art(&self) -> Option<&days_ui::Image> {
+        match (&self.option_page, &self.replay_page) {
+            (Some(page), _) => Some(&page.scaled),
+            (_, Some(page)) => Some(&page.scaled),
+            _ => None,
+        }
+    }
+
+    /// What a page layer draws over its own art, each sprite with the sheet it
+    /// is cut from.
+    fn page_sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
+        if let Some(page) = &self.option_page {
+            return self
+                .option_page_sprites()
+                .into_iter()
+                .map(|sprite| (&page.chip, sprite))
+                .collect();
+        }
+        self.replay_page_sprites()
+    }
+
+    /// What the Replay view draws over its own art, in the order
+    /// `FUN_10024c20` and `FUN_10024e30` put them down: the page button of the
+    /// page showing, then the widget under the pointer.
+    fn replay_page_sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
+        let Some(page) = &self.replay_page else {
+            return Vec::new();
+        };
+        let mut out: Vec<(&days_ui::Image, days_ui::atlas::Widget)> = Vec::new();
+        if let Some(mark) = page.page_mark {
+            out.push((&page.chip, mark));
+        }
+        if let Some(widget) = self.selection.filter(|w| *w >= replay_pages::FIRST) {
+            if let Some(hover) = widget
+                .checked_sub(replay_pages::FIRST)
+                .and_then(|index| page.hovers.get(index))
+                .copied()
+                .flatten()
+            {
+                out.push((page.sheet_for(widget), hover));
+            }
+        }
+        out
     }
 
     /// What the Option page draws over its own art, in the order the tab's draw
@@ -1078,7 +1315,7 @@ impl Menu {
     /// `FUN_10006500`, `FUN_10006a20` and `FUN_100070f0` all go: the value in
     /// force on each of the tab's rows, then the widget under the pointer, and
     /// the Sound tab then puts its three knobs on top of both.
-    fn page_sprites(&self) -> Vec<days_ui::atlas::Widget> {
+    fn option_page_sprites(&self) -> Vec<days_ui::atlas::Widget> {
         let Some(page) = &self.option_page else {
             return Vec::new();
         };
@@ -1264,6 +1501,9 @@ impl Menu {
                 self.session.som,
             );
         }
+        if self.replay_page.is_some() && self.mode == Mode::REPLAY {
+            return replay_pages::enabled(self.view, widget, &self.unlocked_slots());
+        }
         if widget >= self.states.len() {
             return false;
         }
@@ -1442,9 +1682,27 @@ impl Menu {
     /// the hit map first and the class's `+0x4c` — `FUN_1000bb10` — only when
     /// the map answers -1, which on a page it always does.
     fn page_hit(&self, x: u32, y: u32) -> Option<usize> {
-        let page = self.option_page.as_ref()?;
         let (x, y) = self.screen.to_layout(x, y);
-        option_pages::hit_in(&page.widgets, x.max(0.0) as u32, y.max(0.0) as u32)
+        let (x, y) = (x.max(0.0) as u32, y.max(0.0) as u32);
+        // The two pages number their widgets from different places — the
+        // Option frame has four widgets ahead of its tabs and the Replay frame
+        // three — so each run is scanned by its own module.
+        match (&self.option_page, &self.replay_page) {
+            (Some(page), _) => option_pages::hit_in(&page.widgets, x, y),
+            (_, Some(page)) => replay_pages::hit_in(&page.widgets, x, y),
+            _ => None,
+        }
+    }
+
+    /// Whether each of the twelve slots of the grid page showing has been seen,
+    /// which is what `FUN_10028260` fills `+0x4e8` with.
+    fn unlocked_slots(&self) -> Vec<bool> {
+        (0..replay_pages::THUMBNAILS)
+            .map(|slot| {
+                replay_pages::scene_of(self.page, slot)
+                    .is_some_and(|scene| self.session.scenes.unlocked(scene, &self.session.flags))
+            })
+            .collect()
     }
 
     /// Whether the pointer is on a slider's knob, which is the rest of
@@ -1582,6 +1840,9 @@ impl Menu {
                 self.advance(vfs, dll, next)
             }
             Mode::OPTION => self.confirm_option(vfs, dll, widget),
+            Mode::REPLAY if self.replay_page.is_some() => {
+                self.confirm_replay_page(vfs, dll, widget)
+            }
             Mode::REPLAY if self.view == replay::View::HScene => {
                 self.confirm_replay(vfs, dll, widget)
             }
@@ -1956,6 +2217,43 @@ impl Menu {
     }
 
     /// The replay grid's dispatch.
+    /// What a click does on a Replay view that is a page layer.
+    ///
+    /// [`replay_pages::action`] is the shipped dispatch. The two ends it
+    /// cannot reach yet — what a thumbnail plays and what a row loads — stay
+    /// where the player is rather than guessing at a script.
+    fn confirm_replay_page(
+        &mut self,
+        vfs: &Vfs,
+        dll: &[u8],
+        widget: usize,
+    ) -> Result<Action, Error> {
+        match replay_pages::action(self.view, widget, self.page) {
+            replay_pages::Act::View(next) => {
+                if next == self.view {
+                    return Ok(Action::Stay);
+                }
+                self.view = next;
+                self.page = 0;
+                self.reopen(vfs, dll, Mode::REPLAY)
+            }
+            replay_pages::Act::Back => self.advance(vfs, dll, Mode::CONFIRM),
+            replay_pages::Act::Page(page) => {
+                if page == self.page || page >= replay_pages::panels(self.view) {
+                    return Ok(Action::Stay);
+                }
+                self.page = page;
+                self.selection = None;
+                self.load_replay_page(vfs, dll);
+                self.refresh();
+                Ok(Action::Sound(SystemSe::Click))
+            }
+            replay_pages::Act::Scene(_) | replay_pages::Act::Row(_) | replay_pages::Act::None => {
+                Ok(Action::Stay)
+            }
+        }
+    }
+
     fn confirm_replay(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
         match replay::hscene_action(&self.session.scenes, self.page, widget) {
             replay::Act::View(next) => {
@@ -2234,17 +2532,16 @@ fn load_screen(
     let stem = paths
         .stem(mode.0, stem_variant)
         .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
-    // Three screens name art that is not their stem, and which of them do
-    // depends on how the module spells its paths — a module whose replay views
-    // share one hit map has to name their two backgrounds apart from it, and
-    // one whose cleared title shares the plain title's map names both that
-    // title's art and its chip sheet. The rest is the same either way.
+    // Two screens name art that is not their stem, and which of them do
+    // depends on how the module spells its paths: a module whose cleared title
+    // shares the plain title's map names both that title's art and its chip
+    // sheet, and a dress-select screen's background is the shared transparent
+    // plate. The rest is the same either way.
     let (base, chip) = match mode {
         Mode::TITLE => match paths.title_art(variant) {
             Some((base, chip)) => (Some(base), Some(chip)),
             None => (None, None),
         },
-        Mode::REPLAY => (paths.replay_art(variant), None),
         Mode::DRESS_SELECT => (paths.dress_select_art(), None),
         Mode::OPTION if paths.option_tabs_have_own_map() => {
             (options::base_art(tab, session.som), None)

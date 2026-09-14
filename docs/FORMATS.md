@@ -487,9 +487,9 @@ scene table, and a thumbnail is live exactly when its h-scene has been seen.
 
 ### How a Replay view is drawn
 
-`FUN_10024480` is the order, and it is `FUN_10006110`'s: every page's
-full-screen art, then the view's own contents, then the frame's header
-highlight and the frame widget under the pointer. `FUN_10024c20` draws the
+`FUN_10024480` is the order, and it is `FUN_10006110`'s: the view's background
+and the panels stacked over it, then the view's own contents, then the frame's
+header highlight and the frame widget under the pointer. `FUN_10024c20` draws the
 grid's contents and `FUN_10024e30` the list's, and the two refits that bind
 their sprites to records are `FUN_10028260` and `FUN_100288a0`.
 
@@ -505,9 +505,17 @@ list   the hovered row                   list record `row`, 740 wide
 
 A thumbnail's rectangle does not move between pages. Records 5–0x10, 0x11–0x1c
 and 0x1d–0x28 hold the same twelve rectangles at three `src_y`, so the hit table
-covers page 0's and the page picks the art out of the run behind it. The resting
-grid is in the page's own full-screen art; only the thumbnail under the pointer
-is drawn, from the sheet `FUN_10026350` loads. `FUN_10028260` also names
+covers page 0's and the page picks the art out of the run behind it.
+
+The resting grid is **not** in the panel art as it ships. `FUN_10027900` builds
+it: it loads `System/Replay/HScene/Replay_ThmBase%02d.png`, walks all 36
+h-scenes, asks the host `+0x18` whether each one's flag is set, and copies only
+those out of that sheet into the panel of the page they belong to — source and
+destination both taken from `DAT_10057e28 + (scene + 5) * 0x18`, the same record
+the hover uses. A scene the player has not seen is never copied, so a locked
+slot shows the bare panel. The thumbnail under the pointer is a sprite over
+that, cut from the second sheet of the same 36 rectangles, which
+`FUN_10026350` loads. `FUN_10028260` also names
 `System/Replay/HScene/ReplayThum_Chip.png`, which is where the arrows, page
 buttons and the lit page button come from.
 
@@ -541,8 +549,76 @@ ReplayList_Chip.png    910x794   rows and comment panels to 910, page buttons to
 thirty-six thumbnails in one column of nine rows, and only `record = 5 + page *
 12 + slot` reaches all of them without running off. `FUN_10026350` spells that
 sheet `System/Replay/HScene/Replay_Thm%02d.png` formatted with a **literal 1**,
-never the page, and the install ships no `02` or `03` — so the page moves down
-one sheet rather than swapping sheets.
+never the page, and `FUN_10027900` spells `Replay_ThmBase%02d.png` the same way
+— so each is one sheet however many pages the grid has, and the page moves down
+the sheet rather than swapping sheets.
+
+### What a Replay view draws, and from where
+
+Every path the screen names, with the function that spells it. The frame is the
+stem's own art like every other screen's; the rest is the page layer inside it.
+
+```text
+frame    ReplayBase.png, ReplayBase_Chip.png       FUN_10029550
+         ReplayBase[_Wide][_Note|_Full].cmap       FUN_100295e0
+
+grid     Replay_HScene.png            background   FUN_100293e0 -> FUN_10029020
+         HScene/ReplayThum%d.png      3 panels     FUN_10025770,  d = page + 1
+         HScene/Replay_ThmBase01.png  resting      FUN_10027900,  blitted in
+         HScene/Replay_Thm01.png      hovered      FUN_10026350
+         HScene/ReplayThum_Chip.png   sprites      FUN_10028260
+
+list     Replay_PlayData.png          background   FUN_100293e0 -> FUN_10029020
+         PlayData/ReplayList.png      6 panels     FUN_10025e70,  one sheet
+         PlayData/ReplayList_Chip.png sprites      FUN_100288a0
+```
+
+`FUN_100293e0` stores the panel count in `+0x628` on each arm: three for the
+grid and six for the list. **Six is not ten**, and the list's table holds ten
+page buttons — what decides the other four is not recovered.
+
+The panels are one scrolling strip per view rather than a stack of
+backgrounds. `FUN_10025770` gives the grid's three one texture each and puts
+panel `i` at `x = pitch * i`, scrolled by `+0xb0`; `FUN_10025e70` loads the
+list's **one** texture and gives it six sprites at
+`y = i * panel_height + _DAT_1004bd60`, scrolled by `+0xb4`. `FUN_100293e0`
+zeroes whichever offset the other view uses, so only one axis ever moves. At
+rest the page showing sits at the strip's origin: `(0, 0)` for the grid and
+`(_DAT_1004978c, _DAT_1004bd60)` for the list, which are **doubles** — `-0.5`
+and `122.0`, not the zeroes Ghidra's f32 view of `.rdata` shows — so the list's
+first page lands at `(0, 122)`, four pixels above the first row bar at y = 126.
+
+### What activating a Replay widget does
+
+`FUN_1002a3e0` takes the frame: widget 0 and widget 1 switch view — storing into
+`+0x618` and calling `FUN_100293e0`, which zeroes the page `+0x60c` whenever the
+view changes — and widget 2 is CLOSE. Everything else goes to `FUN_1002a4a0` for
+the grid or `FUN_1002a780` for the list.
+
+```text
+grid   3          back arrow, taken only while the page is above 0
+       4          forward arrow, taken only while the page is below 2
+       5 ..  7    the page button's own page
+       8 .. 0x13  the h-scene page * 12 + (widget - 8)
+
+list   3 .. 0xc   the row, gated on +0x1cc[row]
+       0xd..0x16  the same row again, less 0xd
+       0x17..0x20 the page button's own page
+```
+
+Neither arrow wraps. The list's page buttons animate to an adjacent page
+(`FUN_1002d060`) and jump to a distant one (`FUN_1002d260`).
+
+**Neither end of the dispatch is recovered.** A thumbnail stores the scene in
+`+0x610` and switches on it: the seven scenes 6, 8, 9, 10, 0x10, 0x11 and 0x19
+raise a popup through `FUN_100018b0(0, n)` for n = 0 to 6 in that order, and
+every other scene goes to the host's `+0xb0` with a script from
+`PTR_PTR_10057868[scene][+0x614]`. That script run has not been followed, and
+neither has which popup variant each of the seven asks for. A list row is
+refused unless `+0x1cc[row]` is set and otherwise hands the host `+0x54` the
+entry `page * 10 + +0x624 + row`; what fills `+0x1cc`, and what `+0x624` is,
+have not been followed either. So `src/ui/replay_pages.rs` carries the scene and
+the row as far as the index and stops there.
 
 Neither hit table is anchored to anything, so `src/ui/replay_pages.rs` finds
 both by shape, the way the Option pages' two unanchored tables are found. The

@@ -176,19 +176,21 @@ pub struct Cut {
 /// A screen drawn **inside** another screen's base art: art of its own that
 /// covers the layout, plus the sprites it draws over that.
 ///
-/// The Option screen's tab pages are the one of these. `FUN_10006110` draws
-/// each page's background and then its contents, and only after both the
-/// frame's own tab highlight and hover sprite — so a page is not a backdrop
-/// and not a sprite, it is a layer between the two. See
-/// [`crate::ui::option_pages`].
+/// The Option screen's tab pages and the Replay screen's two views are these.
+/// `FUN_10006110` and `FUN_10024480` both draw the page's background and then
+/// its contents, and only after both the frame's own highlight and hover sprite
+/// — so a page is not a backdrop and not a sprite, it is a layer between the
+/// two. See [`crate::ui::option_pages`] and [`crate::ui::replay_pages`].
 pub struct Page<'a> {
     /// The page's full-screen art, **already in display space**: run it
     /// through [`Screen::to_display`] first, the same as a backdrop.
     pub art: &'a Image,
-    /// The sheet its sprites are cut from, which is not the screen's own.
-    pub sheet: &'a Image,
-    /// The sprites, in the order they are drawn.
-    pub sprites: &'a [Widget],
+    /// The sprites, in the order they are drawn, each with the sheet it is cut
+    /// from. A page's sheet is never the screen's own, and one page can draw
+    /// from more than one: the replay grid takes its arrows and page buttons
+    /// from `ReplayThum_Chip.png` and the thumbnail under the pointer from
+    /// `Replay_Thm01.png`, in that one layer.
+    pub sprites: &'a [(&'a Image, Widget)],
 }
 
 /// A loaded screen at one resolution.
@@ -698,8 +700,8 @@ impl Screen {
         self.blit_display(&mut out, &self.base);
         if let Some(page) = page {
             self.blit_display(&mut out, page.art);
-            for sprite in page.sprites {
-                self.blit_sprite(&mut out, page.sheet, sprite);
+            for (sheet, sprite) in page.sprites {
+                self.blit_sprite(&mut out, sheet, sprite);
             }
         }
         self.draw_states(&mut out, states);

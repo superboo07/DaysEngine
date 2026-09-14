@@ -53,10 +53,18 @@
 //! # How a view is drawn
 //!
 //! A view is a layer of its own between the frame's art and the frame's
-//! sprites, and `FUN_10024480` is the order: each page's full-screen art, then
-//! the contents of the view showing (`FUN_10024c20` for the grid,
-//! `FUN_10024e30` for the list), then the frame's header highlight and its
-//! hovered widget. [`crate::ui::screen::Page`] is that layer.
+//! sprites, and `FUN_10024480` is the order: the view's background and the
+//! panels stacked over it, then the contents of the view showing
+//! (`FUN_10024c20` for the grid, `FUN_10024e30` for the list), then the frame's
+//! header highlight and its hovered widget. [`crate::ui::screen::Page`] is that
+//! layer.
+//!
+//! The background is one full-screen image per view ([`base_art`]) and the
+//! panels are a strip of pages over it ([`panel_art`]) — three side by side for
+//! the grid, scrolled horizontally by the page buttons, and six one above
+//! another for the list, scrolled vertically. At rest the page showing sits
+//! exactly over the background, so a still frame of one page is the background
+//! with that page's panel on top.
 //!
 //! What each view puts down, from the two content draws and the two refits that
 //! bind their sprites to records — `FUN_10028260` for the grid and
@@ -75,9 +83,16 @@
 //! A thumbnail's rectangle does not move between pages — records 5 to 0x10,
 //! 0x11 to 0x1c and 0x1d to 0x28 hold the same twelve rectangles at three
 //! `src_y` — so the hit table covers page 0's and [`Pages::thumbnail`] picks the
-//! page's art out of the run behind it. The resting grid is in the page's own
-//! full-screen art; only the thumbnail under the pointer is drawn from the
-//! sheet `FUN_10026350` loads.
+//! page's art out of the run behind it.
+//!
+//! The resting grid is not in the panel art as it ships. `FUN_10027900` builds
+//! it: for each of the 36 h-scenes it asks the host whether that scene's flag
+//! is set, and only then copies the scene's rectangle out of
+//! [`RESTING_THUMBNAILS`] into the panel its page belongs to, at the same
+//! record [`Pages::thumbnail`] returns. A scene the player has not seen is
+//! never copied, so a locked slot shows the bare panel. The thumbnail under the
+//! pointer is a sprite over that, cut from [`HOVER_THUMBNAILS`] — the second
+//! sheet of the same 36 rectangles, which `FUN_10026350` loads.
 //!
 //! Hovering **either** band of the list lights the same row: `FUN_10024e30`
 //! draws list record `row` when the selection is `row + 3` or `row + 0xd`, and
@@ -137,6 +152,104 @@ pub fn records(view: View) -> usize {
         View::PlayData => 0x1e,
     }
 }
+
+/// The view's full-screen background.
+///
+/// `FUN_100293e0` hands `FUN_10029020` one of two literals on a view change:
+/// `System/Replay/Replay_HScene.png` for the grid and
+/// `System/Replay/Replay_PlayData.png` for the list. Neither is the screen's
+/// own base art — `FUN_10029550` takes that from the stem like every other
+/// screen, as `System/Replay/ReplayBase.png` — so both of these are drawn
+/// inside the frame rather than under it. Holding both is what
+/// [`crate::ui::paths::Paths::replay_has_pages`] recognises a one-map module
+/// by.
+pub fn base_art(view: View) -> &'static str {
+    match view {
+        View::HScene => "System/Replay/Replay_HScene.png",
+        View::PlayData => "System/Replay/Replay_PlayData.png",
+    }
+}
+
+/// How many pages of panel a view stacks over its background, from the store to
+/// `+0x628` on each arm of `FUN_100293e0`.
+///
+/// The grid's three are the three the page buttons switch between. The list's
+/// six are **not** the ten page buttons its table holds: `FUN_100293e0` stores
+/// six, and rasterises six pages of text to match (`FUN_100288a0` runs
+/// `FUN_10027c10` six times). What decides the other four buttons is not
+/// recovered.
+pub fn panels(view: View) -> usize {
+    match view {
+        View::HScene => HSCENE_PAGES,
+        View::PlayData => PLAYDATA_PANELS,
+    }
+}
+
+/// The list's panel count, kept apart from its ten page buttons because they
+/// are different numbers. See [`panels`].
+pub const PLAYDATA_PANELS: usize = 6;
+
+/// The panel art for one page, or `None` for a page the view has not got.
+///
+/// The grid's three pages are three sheets: `FUN_10025770` formats
+/// `System/Replay/HScene/ReplayThum%d.png` with `page + 1` — the `ADD EAX,0x1`
+/// ahead of the `_vswprintf_p_l` call at `0x10025849` — so they are
+/// `ReplayThum1` to `ReplayThum3`, and the three are laid side by side in one
+/// strip the page buttons scroll horizontally.
+///
+/// The list's six pages are six copies of **one** sheet: `FUN_10025e70` loads
+/// `System/Replay/PlayData/ReplayList.png` once and gives it six sprites, each
+/// one panel height further down a strip scrolled vertically. So every page of
+/// the list rests on the same art and only its text differs.
+pub fn panel_art(view: View, page: usize) -> Option<String> {
+    if page >= panels(view) {
+        return None;
+    }
+    Some(match view {
+        View::HScene => format!("System/Replay/HScene/ReplayThum{}.png", page + 1),
+        View::PlayData => "System/Replay/PlayData/ReplayList.png".to_string(),
+    })
+}
+
+/// Where the page showing sits over the view's background, in layout space.
+///
+/// Each view stacks its panels in one strip and scrolls the strip, so at rest
+/// the page showing lands at the strip's own origin. `FUN_10025770` puts the
+/// grid's panel `i` at `x = pitch * i` with no `y` of its own, so page 0 is the
+/// origin; `FUN_10025e70` puts the list's panel `i` at
+/// `x = _DAT_1004978c, y = i * panel_height + _DAT_1004bd60`, and those two are
+/// **doubles** — `-0.5` and `122.0`, not the zeroes Ghidra's f32 view of
+/// `.rdata` shows. The `-0.5` is this engine's half-pixel convention for 0, so
+/// the list's first page sits at `(0, 122)`, four pixels above the first row
+/// bar at y = 126.
+pub fn panel_origin(view: View) -> (i64, i64) {
+    match view {
+        View::HScene => (0, 0),
+        View::PlayData => (0, 122),
+    }
+}
+
+/// The sheet a view's own sprites are cut from, which is neither the frame's
+/// chip sheet nor the page's art.
+///
+/// `FUN_10028260` loads the grid's and `FUN_100288a0` the list's.
+pub fn chip_art(view: View) -> &'static str {
+    match view {
+        View::HScene => "System/Replay/HScene/ReplayThum_Chip.png",
+        View::PlayData => "System/Replay/PlayData/ReplayList_Chip.png",
+    }
+}
+
+/// The sheet the grid's resting thumbnails are blitted out of, and the sheet
+/// the one under the pointer is drawn from.
+///
+/// Two sheets of the same 36 rectangles. `FUN_10027900` formats
+/// `System/Replay/HScene/Replay_ThmBase%02d.png` and `FUN_10026350`
+/// `System/Replay/HScene/Replay_Thm%02d.png`, and **both pass a literal 1** —
+/// neither takes the page — so each title ships exactly one of each however
+/// many pages it has.
+pub const RESTING_THUMBNAILS: &str = "System/Replay/HScene/Replay_ThmBase01.png";
+pub const HOVER_THUMBNAILS: &str = "System/Replay/HScene/Replay_Thm01.png";
 
 /// Where the grid's thumbnail art starts, from `FUN_10028260`: record
 /// `5 + page * 12 + slot`.
@@ -401,6 +514,83 @@ pub fn enabled(view: View, widget: usize, unlocked: &[bool]) -> bool {
     }
 }
 
+/// What activating a widget on a Replay view does.
+///
+/// `FUN_1002a3e0` takes the frame — widgets 0 and 1 switch view, widget 2 is
+/// CLOSE — and hands everything else to `FUN_1002a4a0` for the grid or
+/// `FUN_1002a780` for the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    /// Nothing, or a widget this view has not got.
+    None,
+    /// Show the other view. Both dispatchers reset the page to 0 on the way —
+    /// `FUN_100293e0` zeroes `+0x60c` whenever the view it is given differs
+    /// from the one in force.
+    View(View),
+    /// Leave the Replay screen.
+    Back,
+    /// Show a page of the view.
+    Page(usize),
+    /// An h-scene thumbnail the player has unlocked, by its index into the
+    /// scene run. **What this plays is not recovered** — see [`action`].
+    Scene(usize),
+    /// A row of the play-data list, by its index within the page. **What this
+    /// loads is not recovered** — see [`action`].
+    Row(usize),
+}
+
+/// What activating a widget does, from `FUN_1002a4a0` and `FUN_1002a780`.
+///
+/// `page` is the page showing. The two arrows are the grid's only widgets that
+/// depend on it: `FUN_1002a4a0` refuses the back arrow at page 0 and the
+/// forward arrow at page 2, so neither wraps.
+///
+/// # What is not recovered
+///
+/// Both dispatchers end in a call this engine cannot yet make.
+///
+/// A thumbnail sets `+0x610` to `page * 12 + slot` and then switches on it:
+/// the seven scenes 6, 8, 9, 10, 0x10, 0x11 and 0x19 raise a popup
+/// (`FUN_100018b0(0, n)` for n = 0 to 6, in that order) and every other scene
+/// goes straight to the host's `+0xb0` with a script taken from
+/// `PTR_PTR_10057868[scene][+0x614]`. **That script run is not recovered**, and
+/// neither is which popup variant each of the seven asks for, so [`Act::Scene`]
+/// carries the index and stops there.
+///
+/// A list row is refused unless `+0x1cc[row]` is set — a slot that has
+/// something in it — and otherwise hands the host `+0x54` the entry
+/// `page * 10 + +0x624 + row`. **What fills `+0x1cc`, and what `+0x624` is,
+/// are not recovered**, so [`Act::Row`] carries the row and stops there.
+pub fn action(view: View, widget: usize, page: usize) -> Act {
+    match widget {
+        0 => return Act::View(View::HScene),
+        1 => return Act::View(View::PlayData),
+        2 => return Act::Back,
+        _ => {}
+    }
+    match view {
+        View::HScene => match widget {
+            // The arrows step one page and stop at the ends.
+            3 => page.checked_sub(1).map_or(Act::None, Act::Page),
+            4 if page + 1 < HSCENE_PAGES => Act::Page(page + 1),
+            FIRST_HSCENE_PAGE..FIRST_THUMBNAIL => Act::Page(widget - FIRST_HSCENE_PAGE),
+            FIRST_THUMBNAIL..=0x13 => {
+                scene_of(page, widget - FIRST_THUMBNAIL).map_or(Act::None, Act::Scene)
+            }
+            _ => Act::None,
+        },
+        // Either band activates the row it belongs to, the same way both light
+        // it. The page buttons animate to an adjacent page and jump to a
+        // distant one (`FUN_1002d060` against `FUN_1002d260`), which is one
+        // move either way from here.
+        View::PlayData => match widget {
+            FIRST_ROW..FIRST_PLAYDATA_PAGE => Act::Row((widget - FIRST_ROW) % PER_PAGE),
+            FIRST_PLAYDATA_PAGE..=0x20 => Act::Page(widget - FIRST_PLAYDATA_PAGE),
+            _ => Act::None,
+        },
+    }
+}
+
 /// The widget a point lands on among records already read out of the image.
 pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
     records
@@ -514,5 +704,52 @@ mod tests {
         assert_eq!(scene_of(HSCENE_PAGES - 1, THUMBNAILS - 1), Some(SCENES - 1));
         assert_eq!(scene_of(HSCENE_PAGES, 0), None);
         assert_eq!(scene_of(0, THUMBNAILS), None);
+    }
+
+    /// Neither arrow wraps. `FUN_1002a4a0` takes the back arrow only while the
+    /// page is above zero and the forward arrow only while it is below two, so
+    /// the ends of the strip are dead rather than circular.
+    #[test]
+    fn the_grid_arrows_stop_at_the_ends() {
+        assert_eq!(action(View::HScene, 3, 0), Act::None);
+        assert_eq!(action(View::HScene, 3, 1), Act::Page(0));
+        assert_eq!(action(View::HScene, 4, HSCENE_PAGES - 1), Act::None);
+        assert_eq!(action(View::HScene, 4, 0), Act::Page(1));
+    }
+
+    /// Both bands of the list are the same ten rows. `FUN_1002a780` runs the
+    /// identical body for widgets 3 to 0xc and 0xd to 0x16, each less its own
+    /// base, so the comment column activates the row beside it rather than
+    /// anything of its own.
+    #[test]
+    fn either_band_activates_the_same_row() {
+        for row in 0..PER_PAGE {
+            assert_eq!(
+                action(View::PlayData, FIRST_ROW + row, 0),
+                action(View::PlayData, FIRST_COMMENT + row, 0)
+            );
+            assert_eq!(action(View::PlayData, FIRST_ROW + row, 0), Act::Row(row));
+        }
+    }
+
+    /// The list's six pages all rest on one sheet, where the grid's three each
+    /// have their own: `FUN_10025e70` loads `ReplayList.png` once and gives it
+    /// six sprites, while `FUN_10025770` formats a new path per page.
+    #[test]
+    fn the_list_pages_share_one_panel() {
+        let list: Vec<Option<String>> = (0..PLAYDATA_PANELS)
+            .map(|page| panel_art(View::PlayData, page))
+            .collect();
+        assert!(list.iter().all(|path| *path == list[0]));
+        assert_eq!(panel_art(View::PlayData, PLAYDATA_PANELS), None);
+
+        let grid: Vec<Option<String>> = (0..HSCENE_PAGES)
+            .map(|page| panel_art(View::HScene, page))
+            .collect();
+        assert_eq!(
+            grid.iter().collect::<std::collections::HashSet<_>>().len(),
+            HSCENE_PAGES
+        );
+        assert_eq!(panel_art(View::HScene, HSCENE_PAGES), None);
     }
 }

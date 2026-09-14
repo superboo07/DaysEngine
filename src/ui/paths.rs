@@ -85,11 +85,19 @@ const TITLE_CLEAR: (&str, &str) = (
 /// does not draw it yet.
 const DRESS_SELECT_BASE: &str = "System/Screen/Transparence.png";
 
-/// The two backgrounds a one-map replay screen draws, keyed by the variant the
-/// screen was opened with. `FUN_100295e0` loads one map for both.
-const REPLAY_BASE: [(&str, &str); 2] = [
-    ("HScene", "System/Replay/Replay_HScene.png"),
-    ("PlayData", "System/Replay/Replay_PlayData.png"),
+/// The two view backgrounds a one-map replay screen draws **inside** its frame.
+///
+/// The frame itself is named after the stem like every other screen's:
+/// `FUN_10029550` hands `FUN_10010620` the pair
+/// `(System/Replay/ReplayBase.png, System/Replay/ReplayBase_Chip.png)`. These
+/// two are the page layer under it — `FUN_10029020` takes one of them on a view
+/// change — and are what tells a one-map module apart from School Days HQ,
+/// which has neither. The paths themselves belong to
+/// [`crate::ui::replay_pages::base_art`], which records where each is spelled;
+/// here they are only the signature.
+const REPLAY_PAGE_BACKGROUNDS: [&str; 2] = [
+    "System/Replay/Replay_HScene.png",
+    "System/Replay/Replay_PlayData.png",
 ];
 
 /// The screen paths one install's menu module holds.
@@ -100,9 +108,9 @@ pub struct Paths {
     /// Set when the module keeps its cleared title under `Clear/`, sharing the
     /// plain title's hit map.
     title_clear: Option<(&'static str, &'static str)>,
-    /// Set when the module names its replay backgrounds separately from the
-    /// one hit map they share.
-    replay_base: bool,
+    /// Set when the module's two replay views are a page layer inside one
+    /// frame rather than two screens with a hit map each.
+    replay_pages: bool,
     /// Set when the module has a dress-select screen, whose background is
     /// [`DRESS_SELECT_BASE`] rather than art named after its stem.
     dress_select_base: bool,
@@ -139,7 +147,7 @@ impl Paths {
         Paths {
             stems,
             title_clear: holds(TITLE_CLEAR.0).then_some(TITLE_CLEAR),
-            replay_base: REPLAY_BASE.iter().all(|(_, path)| holds(path)),
+            replay_pages: REPLAY_PAGE_BACKGROUNDS.iter().all(|path| holds(path)),
             dress_select_base: holds(DRESS_SELECT_BASE),
         }
     }
@@ -179,16 +187,13 @@ impl Paths {
         }
     }
 
-    /// The replay screen's base art when the module names it apart from the
-    /// one hit map its two views share.
-    pub fn replay_art(&self, variant: &str) -> Option<&'static str> {
-        if !self.replay_base {
-            return None;
-        }
-        REPLAY_BASE
-            .iter()
-            .find(|(view, _)| *view == variant)
-            .map(|(_, path)| *path)
+    /// Whether the module's two replay views are a page layer inside one
+    /// frame, which is what [`crate::ui::replay_pages`] draws.
+    ///
+    /// The other module gives each view a hit map of its own carrying all of
+    /// that view's widgets, and [`crate::ui::replay`] reads them out of it.
+    pub fn replay_has_pages(&self) -> bool {
+        self.replay_pages
     }
 
     /// The dress-select screen's background, or `None` when this module has no
