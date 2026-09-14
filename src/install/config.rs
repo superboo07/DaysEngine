@@ -630,26 +630,34 @@ impl Config {
 
     /// The gain the menus' own sounds play at.
     ///
-    /// Under [`Sound::Levels`] they are not a fourth setting and they are not
-    /// on the script's groups either: host slot `+0x50` (`FUN_00429c80`) keeps
-    /// them in its own run at `+0x540`, opens them unlooped at rate 1.0, and
-    /// gives them `_GetMasterVolume@4(1)` — the **sound-effect** level — with no
-    /// mute question asked. `FUN_0042a160`, which is what the Mute widget
-    /// reaches, never touches that run, so a click keeps its level while
-    /// everything the script owns drops.
+    /// They are not a fourth setting and they are not on the script's groups
+    /// either. Both titles keep them in a run of eight slots of their own —
+    /// `+0x540` under [`Sound::Levels`] (`FUN_00429c80`, host slot `+0x50`) and
+    /// `+0x598` under [`Sound::Fractions`] (`FUN_00418a10`, host slot `+0x5c`)
+    /// — and both open a slot unlooped and give it `_GetMasterVolume@4(1)`, the
+    /// **sound-effect** volume. So a click is on the sound-effect slider.
     ///
-    /// Whether [`Sound::Fractions`] keeps the same exemption is **not
-    /// recovered**. What that title's Mute widget reaches is `FUN_00416f50`,
-    /// which sweeps five named sound handles and, through `FUN_004299b0`, two
-    /// whole collections and one handle besides; which of those the menus' own
-    /// sounds live in has not been established. This engine mutes them with
-    /// everything else, because that is what the sweep that *is* recovered
-    /// does.
+    /// **`Mute` silences them, and it silences rather than attenuates.** Not
+    /// through the sweep: neither title's sweep reaches that run, and
+    /// `FUN_00416f50`'s five handles and the two collections and one handle
+    /// `FUN_004299b0` adds are all on other objects — `+0x5b8` is the member
+    /// past the end of the eight, not one of them. It happens one sound at a
+    /// time instead. Each slot, immediately after it is given its volume, is
+    /// handed to `FUN_004433d0` (Levels) or `FUN_00431ac0` (Fractions) with a
+    /// literal `1.0`, and those compare it against a constant **4.0** —
+    /// `FCOMP double ptr [0x004d5080]` at `0x0044341a` and `FLD float ptr
+    /// [0x0048f284]` at `0x00431aff`, the same value written two widths. One is
+    /// not greater than four, so both fall into the arm that calls
+    /// `_GetMute@0` and passes the answer to the suspend switch —
+    /// `FUN_00443650` and `FUN_00431810` — which stops the slot outright.
+    ///
+    /// That is why this is a silence and not [`Config::MUTE_LEVEL`]: the level
+    /// the ladder would give is never consulted again.
     pub fn system_se_gain(&self, sound: Sound) -> f32 {
-        match sound {
-            Sound::Levels => db_to_gain(self.centibels(self.volume(Channel::Se)) as f32 / 100.0),
-            Sound::Fractions => self.gain(Channel::Se, sound),
+        if self.flag(Flag::Mute) {
+            return 0.0;
         }
+        self.gain(Channel::Se, sound)
     }
 
     /// Encodes the file: the banner, every entry in order, deflated under the
@@ -893,10 +901,12 @@ mod tests {
         assert_eq!(config.centibels(1), -1750);
     }
 
-    /// Under [`Sound::Levels`] mute is an attenuation, not a silence: every
-    /// group is played at a fixed level of 2. A `Mute` that silenced the game
-    /// would be louder-sounding nonsense the first time a player turned it on
-    /// expecting the original.
+    /// Under [`Sound::Levels`] mute is an attenuation for the script's three
+    /// groups, not a silence: each is played at a fixed level of 2. A `Mute`
+    /// that silenced the game would be louder-sounding nonsense the first time
+    /// a player turned it on expecting the original. The menus' own run is the
+    /// one thing it does silence, and by a different route entirely — see
+    /// [`Config::system_se_gain`].
     #[test]
     fn muting_drops_every_script_group_to_level_two() {
         let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
@@ -912,8 +922,12 @@ mod tests {
         // Even a channel the player had set to silence comes back up to 2.
         config.set_volume(Channel::Bgm, 0);
         assert_eq!(config.effective_level(Channel::Bgm), 2);
-        // The menus keep their own level through it.
+        // The menus' own run is the exception, and it goes the other way: it
+        // is not swept at all, and each click is suspended as it is created
+        // instead, so it is silenced outright rather than dropped to level 2.
         config.set_volume(Channel::Se, 10);
+        assert_eq!(config.system_se_gain(Sound::Levels), 0.0);
+        config.set_flag(Flag::Mute, false);
         assert_eq!(config.system_se_gain(Sound::Levels), 1.0);
     }
 

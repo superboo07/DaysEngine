@@ -35,8 +35,10 @@
 //! category 3  (muted)       a fixed level of 2
 //! ```
 //!
-//! So the menus are on the **sound-effect** slider, and `Mute` swaps category 3
-//! in for the script's three but not for the menus'. See
+//! So the menus are on the **sound-effect** slider. `Mute` swaps category 3 in
+//! for the script's three, which is an attenuation; the menus' run is not
+//! swept at all, and is silenced one sound at a time instead — see
+//! [`crate::install::config::Config::system_se_gain`]. See
 //! [`crate::install::config::Config::centibels`] for what a level is worth.
 
 use crate::media::AudioBuffer;

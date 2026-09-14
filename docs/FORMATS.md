@@ -2979,14 +2979,32 @@ So **the menus' clicks are on the sound-effect slider**, and `[EndBGM]` is too.
 
 `Mute` swaps category 3 in for the script's three — `FUN_0043ea80` with
 `(-(muted != 0) & 2) + 1`, `FUN_00429250` with `(muted != 0) + 2`,
-`FUN_0043c900` with `-(muted != 0) & 3` — so **it is an attenuation, not a
-silence**: every group plays at a fixed level 2, which is -15.75 dB. The menus'
-run is not among them and keeps its own level; `FUN_0042a160`, which the widget
-reaches, never touches it.
+`FUN_0043c900` with `-(muted != 0) & 3` — so **for those three it is an
+attenuation, not a silence**: every group plays at a fixed level 2, which is
+-15.75 dB.
+
+**The menus' own run is silenced outright instead, in both titles.** The sweep
+really does not reach it — `FUN_0042a160` never touches `+0x540`, and
+`FUN_00416f50`'s five handles plus the two collections and one handle
+`FUN_004299b0` adds are all on other objects. Both sweeps stop just short in
+the same way: School Days HQ's takes `+0x2d8`, `+0x2e0`, `+0x560` and a
+collection at `+0x1b8`, and `+0x560` is the member **past** the eight slots at
+`+0x540`, exactly as Shiny Days' `+0x5b8` is past the eight at `+0x598`. The mute question is asked one
+sound at a time. Each slot, straight after `_GetMasterVolume@4(1)` sets its
+volume, is handed to `FUN_004433d0` (School Days HQ) or `FUN_00431ac0` (Shiny
+Days) with a literal `1.0`, and both compare it against a constant **4.0** —
+`FCOMP double ptr [0x004d5080]` at `0x0044341a`, `FLD float ptr [0x0048f284]`
+at `0x00431aff`, the same value written two widths. One is not greater than
+four, so both fall into the arm that calls `_GetMute@0` and hands the answer to
+the suspend switch, `FUN_00443650` and `FUN_00431810`. A suspended slot is
+stopped, so the ladder's level never matters.
 
 There is a second voice-category list at `+0x380` (`FUN_0043cff0`) that takes
-category 0 unconditionally, so it is not muted either. **What feeds it has not
-been recovered.**
+category 0 unconditionally, and `FUN_0042a160` does not sweep it. That is not
+on its own enough to say it is audible under `Mute` — the menus' run is not
+swept either and is still silenced, one sound at a time, by the assertion above
+— so **whether anything mutes it has not been recovered**, and neither has
+**what feeds it**.
 
 `Format`, `WindowWidth`, `WindowHeight`, `DisplayType`, `TypeMiniNote`,
 `WindowMode`, `UseAgate` and `Wheel` are written back untouched by the Option
