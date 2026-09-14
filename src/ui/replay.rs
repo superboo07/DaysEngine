@@ -600,7 +600,7 @@ pub fn hscene_enabled(scenes: &Scenes, page: usize, widget: usize, flags: &FlagS
 }
 
 /// What activating a widget on the thumbnail grid does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     /// Not live, or nothing on this screen.
     None,
@@ -610,8 +610,8 @@ pub enum Act {
     Back,
     /// Show a page of the grid.
     Page(usize),
-    /// Start this scene's first script.
-    Play { scene: usize, script: String },
+    /// Play this scene: its own script list, from the first.
+    Play { scene: usize },
     /// Ask which version of this scene to play.
     Ask { scene: usize },
 }
@@ -626,13 +626,10 @@ pub fn hscene_action(scenes: &Scenes, page: usize, widget: usize) -> Act {
         HSCENE_FIRST_PAGE..=6 => Act::Page(widget - HSCENE_FIRST_PAGE),
         HSCENE_FIRST_THUMBNAIL..=0x12 => match scenes.at(page, widget - HSCENE_FIRST_THUMBNAIL) {
             Some((index, scene)) if scene.asks() => Act::Ask { scene: index },
-            Some((index, scene)) => match scene.first_script() {
-                Some(script) => Act::Play {
-                    scene: index,
-                    script: script.to_string(),
-                },
-                None => Act::None,
-            },
+            // A scene with nothing to play is the caller's to refuse; it is the
+            // same refusal the other module's dispatch needs, so it lives in
+            // one place, next to the popup it is the alternative to.
+            Some((index, _)) => Act::Play { scene: index },
             None => Act::None,
         },
         _ => Act::None,
@@ -1403,14 +1400,14 @@ mod tests {
         let steps = ["02/02-2S-W00", "02/02-2S-W00b", "02/02-2S-W00c"];
         let scenes = Scenes::from_scenes(vec![scene("REP02_2S_W00", &steps)]);
         match hscene_action(&scenes, 0, HSCENE_FIRST_THUMBNAIL) {
-            Act::Play { scene: at, script } => {
+            Act::Play { scene: at } => {
                 assert_eq!(at, 0);
-                // The dispatch names the opening script, and the scene it names
-                // carries the rest — which is what the menu turns into the
-                // sequence the engine walks.
-                assert_eq!(script, steps[0]);
+                // The dispatch names the scene, and the scene carries the whole
+                // list — which is what the menu turns into the sequence the
+                // engine walks.
                 let played = &scenes.get(at).expect("just built").scripts;
                 assert_eq!(played.len(), steps.len());
+                assert_eq!(played.first().map(String::as_str), Some(steps[0]));
                 assert_eq!(played.last().map(String::as_str), Some(steps[2]));
             }
             other => panic!("a filled thumbnail should play, got {other:?}"),
@@ -1482,10 +1479,7 @@ mod tests {
 
         assert_eq!(
             hscene_action(&scenes, 1, HSCENE_FIRST_THUMBNAIL),
-            Act::Play {
-                scene: 12,
-                script: "02/02-2S-W12".to_string()
-            }
+            Act::Play { scene: 12 }
         );
         assert_eq!(
             hscene_action(&scenes, 1, HSCENE_FIRST_THUMBNAIL + 2),
@@ -1707,11 +1701,21 @@ mod tests {
         );
     }
 
+    /// A scene whose script entry is a hole and which has no versions either
+    /// has nothing to play. The dispatch still names it — refusing it is the
+    /// caller's, and lives in one place for both modules' grids — but the run
+    /// it hands over is empty and no script is invented for it.
     #[test]
     fn a_scene_with_no_scripts_at_all_plays_nothing_rather_than_guessing() {
         let scenes = Scenes::from_scenes(vec![scene("REP02_2S_W03", &[])]);
-        assert_eq!(scenes.get(0).unwrap().first_script(), None);
-        assert_eq!(hscene_action(&scenes, 0, HSCENE_FIRST_THUMBNAIL), Act::None);
+        let scene = scenes.get(0).unwrap();
+        assert_eq!(scene.first_script(), None);
+        assert!(!scene.asks());
+        assert!(scene.run().scripts.is_empty());
+        assert_eq!(
+            hscene_action(&scenes, 0, HSCENE_FIRST_THUMBNAIL),
+            Act::Play { scene: 0 }
+        );
     }
 
     #[test]

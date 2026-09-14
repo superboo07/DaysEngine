@@ -230,6 +230,21 @@ a module in one of those four `src/` groups — find the group it belongs to
 rather than dropping another file at the top level. Only add a crate for a
 standalone reader of a format the game ships, and say why in the commit.
 
+**One engine, not one per title.** A second game is not a second copy of the
+code. When a title needs behaviour a type or a function nearly has, **extend
+that type or function** so it serves both — a new parameter, a new arm, a
+recovered value read from the player's own module instead of written down. Do
+not add a parallel `Foo`/`FooSD`, a second enum whose variants restate the
+first's, or a second copy of arithmetic that already exists somewhere. Before
+writing anything, grep for what already does the job and call it; if two places
+end up doing the same thing, factor the shared half out rather than leaving both.
+
+Two things are not duplication and are expected: a **per-module screen
+recovery** gets its own module under `src/ui/` when a title lays a screen out
+differently, and a **recovered rule** that genuinely differs between titles gets
+its own branch with its own provenance. What must not be duplicated is the
+logic underneath them.
+
 Design decisions already made and not up for re-litigation:
 
 - Rust + SDL3 + **system** ffmpeg, linked not vendored, so we inherit the

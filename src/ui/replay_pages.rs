@@ -99,14 +99,26 @@
 //! that record is the row entire rather than the band. School Days HQ's list
 //! does the same thing.
 //!
-//! # What is not recovered here
+//! # The list's text, which this module does not yet place
 //!
-//! The list's text — the timestamps, chapters and comments the ten rows carry —
-//! is rasterised into six 1024x1024 surfaces by the loops at the foot of
-//! `FUN_100288a0`, and the expanded comment's two sprites (`+0xf4` and
-//! `+0x4c4`, over list records 0xa to 0x13) come from the same place. **Which
-//! record and which host call fill each of those is not recovered**, so this
-//! module places none of them.
+//! `FUN_100288a0` runs `FUN_100267c0` once per panel, and that is where the
+//! rows' timestamps, chapters and comments are rasterised into the panel's
+//! 1024x1024 surface. It asks the host `+0xa8` for each entry of the panel —
+//! `FUN_0041af00`, which reads the `[SaveFileName]` and `[SaveConfig]` keys
+//! formatted with the entry number, so the list is the player's saves, the same
+//! call School Days HQ's play-data list makes through `+0x9c` — and lays the
+//! three strings down through host `+0x64`, twenty characters apiece, at pen
+//! `(0, row * 0x30)` for the timestamp, `(600, row * 0x30)` for the chapter and
+//! `(0, row * 0x30 + 0x202)` for the comment, advancing 0x18 a glyph below
+//! U+0080 and 0x2d at or above it. The comment column is drawn only when host
+//! `+0xf4` — `[TextInput]` — answers true, and when host `+0x68` (the English
+//! question) answers true as well each comment is centred at
+//! `226.5 - width / 4`, clamped at zero, against a record `0xd + row` of the
+//! list run.
+//!
+//! **What is not recovered** is the expanded comment: `FUN_100288a0`'s two
+//! sprites `+0xf4` and `+0x4c4` over list records 0xa to 0x13. Nothing here
+//! places any of it yet.
 
 use crate::ui::replay::View;
 use days_ui::atlas::{self, Widget};
@@ -170,24 +182,42 @@ pub fn base_art(view: View) -> &'static str {
     }
 }
 
-/// How many pages of panel a view stacks over its background, from the store to
-/// `+0x628` on each arm of `FUN_100293e0`.
+/// How many pages a view's buttons reach.
 ///
-/// The grid's three are the three the page buttons switch between. The list's
-/// six are **not** the ten page buttons its table holds: `FUN_100293e0` stores
-/// six, and rasterises six pages of text to match (`FUN_100288a0` runs
-/// `FUN_10027c10` six times). What decides the other four buttons is not
-/// recovered.
-pub fn panels(view: View) -> usize {
+/// The grid's three are `FUN_1002a4a0`'s own clamp — the back arrow is refused
+/// at 0 and the forward arrow at 2. The list's ten are the ten page buttons
+/// `FUN_1002a390` and `FUN_1002a780` answer for, widgets 0x17 to 0x20.
+pub fn pages(view: View) -> usize {
     match view {
         View::HScene => HSCENE_PAGES,
-        View::PlayData => PLAYDATA_PANELS,
+        View::PlayData => PLAYDATA_PAGES,
     }
 }
 
-/// The list's panel count, kept apart from its ten page buttons because they
-/// are different numbers. See [`panels`].
+/// The list's ten page buttons. See [`pages`].
+pub const PLAYDATA_PAGES: usize = 10;
+
+/// How many panels of list the strip holds, from the 6 `FUN_100293e0` stores to
+/// `+0x628` on the list's arm — where the grid's arm stores its three pages.
+///
+/// Six is **fewer than the list's ten pages**, because the strip is a window
+/// over them rather than the whole of them. See [`window_top`].
 pub const PLAYDATA_PANELS: usize = 6;
+
+/// Which page the list's six-panel strip starts at, from `FUN_100267c0`.
+///
+/// That function takes the panel to rasterise and fills it from entry
+/// `(window_top(page) + panel) * 10`, so panel `p` carries page
+/// `window_top(page) + p` and the six slide as the page moves. The shipped
+/// chain is written out one page at a time — 0 and 1 give themselves and
+/// themselves less one, 7, 8 and 9 give themselves less three, four and five,
+/// everything between gives itself less two — which is `page - 2` held inside
+/// `0 ..= PLAYDATA_PAGES - PLAYDATA_PANELS`. So the page showing sits third of
+/// the six wherever there is room either side, and at the end the strip stops
+/// rather than running past the last page.
+pub fn window_top(page: usize) -> usize {
+    page.saturating_sub(2).min(PLAYDATA_PAGES - PLAYDATA_PANELS)
+}
 
 /// The panel art for one page, or `None` for a page the view has not got.
 ///
@@ -202,7 +232,7 @@ pub const PLAYDATA_PANELS: usize = 6;
 /// one panel height further down a strip scrolled vertically. So every page of
 /// the list rests on the same art and only its text differs.
 pub fn panel_art(view: View, page: usize) -> Option<String> {
-    if page >= panels(view) {
+    if page >= pages(view) {
         return None;
     }
     Some(match view {
@@ -532,10 +562,11 @@ pub enum Act {
     /// Show a page of the view.
     Page(usize),
     /// An h-scene thumbnail the player has unlocked, by its index into the
-    /// scene run. **What this plays is not recovered** — see [`action`].
+    /// scene run — see [`action`] for what it plays.
     Scene(usize),
-    /// A row of the play-data list, by its index within the page. **What this
-    /// loads is not recovered** — see [`action`].
+    /// A row of the play-data list, by its index within the page. The save
+    /// entry it loads is [`crate::ui::saveload::slot_of`] of the page and the
+    /// row — see [`action`].
     Row(usize),
 }
 
@@ -545,22 +576,56 @@ pub enum Act {
 /// depend on it: `FUN_1002a4a0` refuses the back arrow at page 0 and the
 /// forward arrow at page 2, so neither wraps.
 ///
-/// # What is not recovered
+/// # What a thumbnail plays
 ///
-/// Both dispatchers end in a call this engine cannot yet make.
+/// A thumbnail sets the scene `+0x610` to `page * 12 + slot` and the step
+/// `+0x614` to zero, then switches on the scene. Seven of them raise the
+/// version popup through `FUN_100018b0(0, n)` — scenes 6, 8, 9, 10, 0x10, 0x11
+/// and 0x19, for n = 0 to 6 in that order — and every other scene hands the
+/// host `+0xb0` the script at `PTR_PTR_10057868[scene][step]`, which with the
+/// step just zeroed is the scene's **first** script.
 ///
-/// A thumbnail sets `+0x610` to `page * 12 + slot` and then switches on it:
-/// the seven scenes 6, 8, 9, 10, 0x10, 0x11 and 0x19 raise a popup
-/// (`FUN_100018b0(0, n)` for n = 0 to 6, in that order) and every other scene
-/// goes straight to the host's `+0xb0` with a script taken from
-/// `PTR_PTR_10057868[scene][+0x614]`. **That script run is not recovered**, and
-/// neither is which popup variant each of the seven asks for, so [`Act::Scene`]
-/// carries the index and stops there.
+/// That is School Days HQ's `FUN_1001de10` over again: it zeroes the same pair,
+/// raises the same popup for its own three scenes and calls host `+0xa4` — the
+/// same slot, `0xc` lower, on the interface this title shifts — with element
+/// zero of the same run. So a thumbnail is [`crate::ui::replay::Act::Play`] or
+/// [`crate::ui::replay::Act::Ask`] exactly as it is there, and the scene run
+/// [`crate::ui::replay::Scenes`] recovers is the one being indexed:
+/// `FUN_1002ddf0` registers both tables from the same counter.
 ///
-/// A list row is refused unless `+0x1cc[row]` is set — a slot that has
-/// something in it — and otherwise hands the host `+0x54` the entry
-/// `page * 10 + +0x624 + row`. **What fills `+0x1cc`, and what `+0x624` is,
-/// are not recovered**, so [`Act::Row`] carries the row and stops there.
+/// **Which seven ask is not written down here.** The seven the switch names are
+/// exactly the seven whose own script list is a hole and whose flags carry `A`
+/// and `B` versions — the scenes [`crate::ui::replay::Scene::asks`] already
+/// answers for — so the caller asks the recovered table instead of the DLL's
+/// case labels.
+///
+/// All seven pass `FUN_100018b0`'s first argument as 0, which is Pop_Replay's
+/// two-widget variant: `FUN_10022ee0` reads it at `+0x110` and picks `L"2"`
+/// with two widgets over `L"4"` with four. Those are the only seven callers —
+/// Ghidra's reference index and a raw scan of `.text` for calls to
+/// `0x100018b0` both find exactly them, the byte scan reading `PUSH 0` for the
+/// variant at every one — so **the four-widget popup is unreachable in the
+/// retail Shiny Days build**, which is what having two versions everywhere
+/// means. `FUN_100238e0` says the same from the other side: its arms name
+/// `REP03_3O_A06A`/`B` through `REP04_YX_A01A`/`B`, the fourteen version flags
+/// of those seven scenes and nothing else.
+///
+/// # What a list row loads
+///
+/// A row is refused unless `+0x1cc[row]` is set, and otherwise hands the host
+/// `+0x54` the entry `page * 10 + +0x624 + row`, then `+0xa0(1)` and
+/// `+0x58(8)`. School Days HQ's `FUN_1001dfe0` makes the same three calls with
+/// the same literals at `+0x48`, `+0x94` and `+0x4c` — the same slots `0xc`
+/// lower — so the row loads that save entry, which is what
+/// [`crate::ui::menu::Action::PlayRecorded`] already is.
+///
+/// `+0x1cc` is the ten rows on screen: `FUN_100267c0` fills each from the
+/// host's answer for that entry, which is why an empty row does nothing.
+/// `+0x624` is how many rows the list has been flicked past the page's own top
+/// — `FUN_1002c1f0` sets it from the settled scroll divided by a tenth of the
+/// panel height and holds it under ten, and every page button zeroes it through
+/// `FUN_1002d060`. This engine has no flick, so it is zero and the entry is the
+/// page and the row.
 pub fn action(view: View, widget: usize, page: usize) -> Act {
     match widget {
         0 => return Act::View(View::HScene),
@@ -620,6 +685,22 @@ mod tests {
             dll.extend(rec([0.0, 0.0, 1.0, 1.0, index as f32, 0.0]));
         }
         dll
+    }
+
+    /// The six-panel strip is a window over the ten pages, from
+    /// `FUN_100267c0`'s page-at-a-time chain: the page showing is third of the
+    /// six once there is room either side, and the window stops at the last
+    /// page rather than running past it.
+    #[test]
+    fn the_list_strip_is_a_window_over_the_ten_pages() {
+        let tops: Vec<usize> = (0..PLAYDATA_PAGES).map(window_top).collect();
+        assert_eq!(tops, [0, 0, 0, 1, 2, 3, 4, 4, 4, 4]);
+        // Every page falls inside its own window, and the last window ends on
+        // the last page.
+        for (page, top) in tops.iter().enumerate() {
+            assert!((*top..top + PLAYDATA_PANELS).contains(&page));
+        }
+        assert_eq!(tops[PLAYDATA_PAGES - 1] + PLAYDATA_PANELS, PLAYDATA_PAGES);
     }
 
     /// Both bands of the list light the same bar: `FUN_10024e30` draws list
@@ -732,16 +813,16 @@ mod tests {
         }
     }
 
-    /// The list's six pages all rest on one sheet, where the grid's three each
+    /// The list's ten pages all rest on one sheet, where the grid's three each
     /// have their own: `FUN_10025e70` loads `ReplayList.png` once and gives it
     /// six sprites, while `FUN_10025770` formats a new path per page.
     #[test]
     fn the_list_pages_share_one_panel() {
-        let list: Vec<Option<String>> = (0..PLAYDATA_PANELS)
+        let list: Vec<Option<String>> = (0..PLAYDATA_PAGES)
             .map(|page| panel_art(View::PlayData, page))
             .collect();
         assert!(list.iter().all(|path| *path == list[0]));
-        assert_eq!(panel_art(View::PlayData, PLAYDATA_PANELS), None);
+        assert_eq!(panel_art(View::PlayData, PLAYDATA_PAGES), None);
 
         let grid: Vec<Option<String>> = (0..HSCENE_PAGES)
             .map(|page| panel_art(View::HScene, page))

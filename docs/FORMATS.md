@@ -716,7 +716,16 @@ list     Replay_PlayData.png          background   FUN_100293e0 -> FUN_10029020
 
 `FUN_100293e0` stores the panel count in `+0x628` on each arm: three for the
 grid and six for the list. **Six is not ten**, and the list's table holds ten
-page buttons — what decides the other four is not recovered.
+page buttons, because the six panels are a *window* over the ten pages rather
+than the whole of them. `FUN_100267c0` takes the panel to rasterise and fills it
+from entry `(window_top + panel) * 10`, where `window_top` is written out one
+page at a time — 0 and 1 give themselves and themselves less one, 7, 8 and 9
+give themselves less three, four and five, everything between gives itself less
+two. That is `page - 2` held inside `0 ..= 4`, so the page showing sits third of
+the six wherever there is room either side and the strip stops at the last page
+rather than running past it. All ten buttons work, and each has its own lit
+sprite at an even 54-pixel pitch down the chip sheet;
+`days ui System/Replay/ReplayBase --pages` prints the window each page opens.
 
 The panels are one scrolling strip per view rather than a stack of
 backgrounds. `FUN_10025770` gives the grid's three one texture each and puts
@@ -750,16 +759,63 @@ list   3 .. 0xc   the row, gated on +0x1cc[row]
 Neither arrow wraps. The list's page buttons animate to an adjacent page
 (`FUN_1002d060`) and jump to a distant one (`FUN_1002d260`).
 
-**Neither end of the dispatch is recovered.** A thumbnail stores the scene in
-`+0x610` and switches on it: the seven scenes 6, 8, 9, 10, 0x10, 0x11 and 0x19
-raise a popup through `FUN_100018b0(0, n)` for n = 0 to 6 in that order, and
-every other scene goes to the host's `+0xb0` with a script from
-`PTR_PTR_10057868[scene][+0x614]`. That script run has not been followed, and
-neither has which popup variant each of the seven asks for. A list row is
-refused unless `+0x1cc[row]` is set and otherwise hands the host `+0x54` the
-entry `page * 10 + +0x624 + row`; what fills `+0x1cc`, and what `+0x624` is,
-have not been followed either. So `src/ui/replay_pages.rs` carries the scene and
-the row as far as the index and stops there.
+#### What a thumbnail plays
+
+A thumbnail stores the scene in `+0x610`, zeroes the step `+0x614` and switches
+on the scene: the seven scenes 6, 8, 9, 10, 0x10, 0x11 and 0x19 raise the
+version popup through `FUN_100018b0(0, n)` for n = 0 to 6 in that order, and
+every other scene hands the host `+0xb0` the script at
+`PTR_PTR_10057868[scene][step]` — which, the step having just been zeroed, is
+the scene's **first** script.
+
+That is `SysMenuSDHQ.dll`'s `FUN_1001de10` over again. It zeroes the same pair,
+raises the same popup for its own three scenes through `FUN_10001830`, and calls
+host `+0xa4` — the same slot `0xc` lower, which is the shift this title applies
+below `+0xa8` — with element zero of the same run. So a thumbnail is the `Play`
+or `Ask` the screen with its own hit maps already produces, and
+`src/ui/menu.rs`'s `play_scene` serves both.
+
+**Which seven ask is not written down in the engine.** The seven the switch
+names are exactly the seven scenes whose own entry in the script run is a hole
+and whose flags carry `A` and `B` versions, which is what `Scene::asks` already
+answers, so the engine asks the recovered table rather than the case labels.
+`FUN_100238e0` confirms it from the other side: its seven arms name
+`REP03_3O_A06A`/`B`, `REP03_29_D05A`/`B`, `REP03_K2_D03A`/`B`,
+`REP03_K4_A00A`/`B`, `REP04_00_G01A`/`B`, `REP04_S1_B03A`/`B` and
+`REP04_YX_A01A`/`B` — the fourteen version flags of those seven scenes, in the
+same order, and nothing else.
+
+`FUN_100018b0`'s first argument is Pop_Replay's variant: `FUN_10022ee0` reads it
+at `+0x110` and picks `L"2"` with two widgets and a nine-record table at
+`0x100574b0` over `L"4"` with four widgets and a five-record table at
+`0x10057588`. The two tables abut, and the second ends exactly where the
+fourteen version-flag pointers begin at `0x10057600`. The two-widget table's
+records 0 and 1 are the buttons and records 2 to 8 the seven scenes' pictures,
+one per asking scene, reached as `+0x108 + +0x104`; the module's own count
+`+0x10c` says eleven, two more than the table holds, but nothing ever indexes
+past 8. **All seven call sites pass 0**, so the four-widget popup is unreachable
+in the retail Shiny Days build — Ghidra's reference index and a raw scan of
+`.text` for calls to `0x100018b0` both find exactly those seven and no others,
+and the byte scan reads `PUSH 0` for the variant at every one. School Days HQ's
+three sites are `(1, 0)`, `(0, 2)` and `(0, 3)`, so its four-widget popup *is*
+reached, by scene 11, which has four versions.
+
+#### What a list row loads
+
+A row is refused unless `+0x1cc[row]` is set, and otherwise hands the host
+`+0x54` the entry `page * 10 + +0x624 + row`, then `+0xa0(1)` and `+0x58(8)`.
+`SysMenuSDHQ.dll`'s `FUN_1001dfe0` makes the same three calls with the same
+literals at `+0x48`, `+0x94` and `+0x4c` — the same three slots `0xc` lower — so
+the row loads that save entry, which is what the engine's `PlayRecorded` already
+is, and `src/ui/menu.rs`'s `play_recorded` serves both lists.
+
+`+0x1cc` is the ten rows on screen. `FUN_100267c0` fills each from the host's
+`+0xa8` answer for that entry, which is why a row with no save does nothing.
+`+0x624` is how many rows the list has been flicked past the page's own top:
+`FUN_1002c1f0` sets it from the settled scroll divided by `_DAT_1004bda8` — a
+**double**, 10.0, a tenth of a panel — and holds it under ten, and every page
+button zeroes it through `FUN_1002d060`. This engine has no flick, so it is zero
+and the entry is the page and the row.
 
 Neither hit table is anchored to anything, so `src/ui/replay_pages.rs` finds
 both by shape, the way the Option pages' two unanchored tables are found. The
@@ -770,11 +826,22 @@ at all in `SysMenuSDHQ.dll`; checked both with a plain scan over the raw file an
 through the shipped locator. `days ui System/Replay/ReplayBase --pages` is the
 check.
 
-**The list's text is not recovered.** The timestamps, chapters and comments are
-rasterised into six 1024x1024 surfaces by the loops at the foot of
-`FUN_100288a0`, and the expanded comment's two sprites — `+0xf4` and `+0x4c4`,
-over list records 0xa to 0x13 — come from the same place. Which record and which
-host call fill each of those has not been followed, so nothing here places them.
+**The list's text is recovered but not placed.** `FUN_100288a0` runs
+`FUN_100267c0` once per panel, and that is where the rows' timestamps, chapters
+and comments go into the panel's 1024x1024 surface. It asks the host `+0xa8` for
+each entry — `FUN_0041af00` in `SHINYDAYS.exe`, which reads the
+`[SaveFileName]` and `[SaveConfig]` keys formatted with the entry number, so the
+list is the player's saves through the same call the save/load screen makes —
+and lays the three strings down through host `+0x64`, twenty characters apiece,
+at pen `(0, row * 0x30)` for the timestamp, `(600, row * 0x30)` for the chapter
+and `(0, row * 0x30 + 0x202)` for the comment, advancing `0x18` a glyph below
+U+0080 and `0x2d` at or above it. The comment column is drawn only when host
+`+0xf4` — `[TextInput]`, School Days HQ's `+0xd8` — answers true, and when host
+`+0x68` (the English question, School Days HQ's `+0x5c`) answers true as well
+each comment is centred at `226.5 - width / 4`, clamped at zero, against a
+record `0xd + row` of the list run. **What is not recovered** is the expanded
+comment: `FUN_100288a0`'s two sprites `+0xf4` and `+0x4c4` over list records 0xa
+to 0x13. `src/ui/replay_pages.rs` places none of it yet.
 
 ---
 

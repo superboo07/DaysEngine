@@ -1785,6 +1785,22 @@ fn replay_tables(dll: &[u8], frame: usize) {
             ),
         );
     }
+    for page in 0..replay_pages::pages(View::PlayData) {
+        let top = replay_pages::window_top(page);
+        let mark = pages.page_mark(dll, View::PlayData, page);
+        println!(
+            "  PlayData page {page}: entries {}..={}, panel {} of the strip over pages \
+             {top}..={}, lit button src {}",
+            page * replay_pages::PER_PAGE,
+            page * replay_pages::PER_PAGE + replay_pages::PER_PAGE - 1,
+            page - top,
+            top + replay_pages::PLAYDATA_PANELS - 1,
+            mark.map_or_else(
+                || "none".to_string(),
+                |m| format!("({},{})", m.src_x, m.src_y)
+            ),
+        );
+    }
 }
 
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {

@@ -2468,12 +2468,12 @@ impl Menu {
         Ok(())
     }
 
-    /// The replay grid's dispatch.
     /// What a click does on a Replay view that is a page layer.
     ///
-    /// [`replay_pages::action`] is the shipped dispatch. The two ends it
-    /// cannot reach yet — what a thumbnail plays and what a row loads — stay
-    /// where the player is rather than guessing at a script.
+    /// [`replay_pages::action`] is the shipped dispatch, and both of its ends
+    /// reach the same two places the screen with its own hit maps reaches: a
+    /// thumbnail through [`Menu::play_scene`] and a row through
+    /// [`Menu::play_recorded`].
     fn confirm_replay_page(
         &mut self,
         vfs: &Vfs,
@@ -2491,7 +2491,7 @@ impl Menu {
             }
             replay_pages::Act::Back => self.advance(vfs, dll, Mode::CONFIRM),
             replay_pages::Act::Page(page) => {
-                if page == self.page || page >= replay_pages::panels(self.view) {
+                if page == self.page || page >= replay_pages::pages(self.view) {
                     return Ok(Action::Stay);
                 }
                 self.page = page;
@@ -2500,9 +2500,46 @@ impl Menu {
                 self.refresh();
                 Ok(Action::Sound(SystemSe::Click))
             }
-            replay_pages::Act::Scene(_) | replay_pages::Act::Row(_) | replay_pages::Act::None => {
-                Ok(Action::Stay)
-            }
+            replay_pages::Act::Scene(scene) => self.play_scene(vfs, dll, scene),
+            replay_pages::Act::Row(row) => Ok(self.play_recorded(row)),
+            replay_pages::Act::None => Ok(Action::Stay),
+        }
+    }
+
+    /// What clicking an unlocked h-scene thumbnail does, on either Replay grid.
+    ///
+    /// A scene with versions raises the popup and plays nothing until one is
+    /// picked; every other scene starts its own first script. Which of the two
+    /// is [`replay::Scene::asks`] — the scene's own entry in the script run
+    /// being a hole — and both modules' dispatches agree on it: `FUN_1001de10`
+    /// and `FUN_1002a4a0` special-case exactly the scenes that have versions.
+    fn play_scene(&mut self, vfs: &Vfs, dll: &[u8], index: usize) -> Result<Action, Error> {
+        let Some(scene) = self.session.scenes.get(index) else {
+            return Ok(Action::Stay);
+        };
+        if scene.asks() {
+            self.asked = Some(index);
+            return self.advance(vfs, dll, Mode::REPLAY_POPUP);
+        }
+        Ok(if scene.scripts.is_empty() {
+            Action::Stay
+        } else {
+            Action::PlayReplay(scene.run())
+        })
+    }
+
+    /// What clicking a play-data row does, on either Replay list: load the save
+    /// entry the page and the row name, and nothing at all when it is empty.
+    ///
+    /// The shipped dispatches test the host's own answer for the row —
+    /// `+0x17c + row * 4` in `SysMenuSDHQ.dll`, `+0x1cc + row * 4` in
+    /// `SysMenuSD.dll` — before they call, which is this `filled`.
+    fn play_recorded(&self, row: usize) -> Action {
+        let slot = saveload::slot_of(self.page, row);
+        if self.session.slots.filled(slot) {
+            Action::PlayRecorded(slot)
+        } else {
+            Action::Stay
         }
     }
 
@@ -2526,13 +2563,8 @@ impl Menu {
                 self.refresh();
                 Ok(Action::Sound(SystemSe::Click))
             }
-            replay::Act::Play { scene, .. } => Ok(match self.session.scenes.get(scene) {
-                Some(scene) if !scene.scripts.is_empty() => Action::PlayReplay(scene.run()),
-                _ => Action::Stay,
-            }),
-            replay::Act::Ask { scene } => {
-                self.asked = Some(scene);
-                self.advance(vfs, dll, Mode::REPLAY_POPUP)
+            replay::Act::Play { scene } | replay::Act::Ask { scene } => {
+                self.play_scene(vfs, dll, scene)
             }
             replay::Act::None => Ok(Action::Stay),
         }
@@ -2562,14 +2594,7 @@ impl Menu {
                 self.refresh();
                 Ok(Action::Sound(SystemSe::Click))
             }
-            playdata::Act::Row(row) => {
-                let slot = saveload::slot_of(self.page, row);
-                Ok(if self.session.slots.filled(slot) {
-                    Action::PlayRecorded(slot)
-                } else {
-                    Action::Stay
-                })
-            }
+            playdata::Act::Row(row) => Ok(self.play_recorded(row)),
             playdata::Act::None => Ok(Action::Stay),
         }
     }
