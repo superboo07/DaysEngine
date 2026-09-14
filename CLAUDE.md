@@ -73,6 +73,35 @@ method you used and what its blind spots are. Confirm with a second, different
 method. `FUN_00421b30` really does have zero callers; that was checked with
 Ghidra's reference index *and* a raw byte scan of `.text`.
 
+### "The original ships this bug" is the claim that needs the most evidence
+
+When a reading predicts something visibly broken — a line drawn off its own
+sprite, a screen that cannot be reached, a value nobody uses — the explanation
+is nearly always that the disassembly has not been read far enough. It is the
+most comfortable conclusion available and the least verified, so treat a
+prediction of brokenness as a signal to keep going, not as a result.
+
+Three questions close most of them: what are the buffer's real dimensions, who
+writes the value **last**, and what runs every frame. Then check the prediction
+against a screenshot of the retail game before writing anything down. A claim
+of this kind is not recovered until something outside the decompiler agrees
+with it.
+
+Both of the Shiny Days Replay list's "shipped bugs" were mine, not Overflow's.
+The expanded comment's pen goes back to `0x400` after every twenty characters
+while the sprite cuts from x 0, 986 wide — so lines two and three are invisible.
+They are not: `FUN_100296a0` builds that buffer `(0x400, 0x100, 0x208888)`, and
+the blitter takes a pitch rather than a width, so `0x400` is the first pixel of
+the next scanline. And the comment centring "applies under `[UseEnglish]`" —
+except the retail screen shows comments hard left in an English install, because
+`FUN_100267c0` wipes all six panels' centres every time it fills one and
+`FUN_1002c1f0` re-reads that array every frame.
+
+This does not forbid the finding. A shipped bug that really is one stays, the
+way the save/load tooltip's two uninitialised floats stay — that one is
+established by reading the branches that never write them. What is forbidden is
+reaching for it as the explanation.
+
 ### Never fabricate a value
 
 If something is not recovered, the code and the docs say **"not recovered"**.
