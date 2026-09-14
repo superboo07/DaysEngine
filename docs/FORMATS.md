@@ -1676,12 +1676,19 @@ of the code rather than of the table's shape:
 
 The gauge is a different instrument too. `FUN_10035780` asks the host for the
 **single** counter `001` through slot `+0x8` and ramps `this+0x3c` towards it
-over 1500ms, holds 2000ms and lowers itself — the same five steps and the same
-two windows as School Days HQ's — and `FUN_10035670` draws the result as one bar
-at record 17 whose width is that value clamped to the record's own 599. There
-are no pieces, no second counter and no leads. **This is recovered but not
-wired**: nothing yet drives `this+0x3c`, so the bed draws and nothing moves in
-it.
+over 1500ms, holds 2000ms and lowers itself — the same five steps, the same two
+windows and the same two sounds as School Days HQ's, 4 on a fall and 3 on a rise
+— and `FUN_10035670` draws the result as one bar at record 17 whose width is
+that value clamped to the record's own 599. There are no pieces, no second
+counter and no leads: both the ramp's literal at `0x1004e2b0` and the settle's
+at `0x1004e2a8` are `L"001"`. `FUN_10035670` sets only the destination, and only
+its width — the source stays the whole strip `FUN_10031bc0` gave it, so the art
+is **squeezed** into the shorter destination rather than clipped to it.
+
+The settle, `FUN_100353b0` at vtable `+0x38`, moves the drawn value as well as
+the settled one, which School Days HQ's `FUN_10026050` does not — so this bar is
+at its counter from the first frame rather than at zero until something raises
+the gauge.
 
 Everything else carries over, and the host slots are what say so rather than the
 resemblance. Every one of the eighteen the bar calls is School Days HQ's shifted

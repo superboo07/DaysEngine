@@ -283,8 +283,8 @@ pub enum Gauge {
     /// that value, clamped to the record's own 599. There are no pieces, no
     /// second counter and no leads.
     ///
-    /// **Recovered but not wired**: nothing yet drives `this+0x3c`, so the bed
-    /// is drawn and nothing moves inside it. See [`Bar::gauge_cuts`].
+    /// [`gauge::Fill`] is the ramp and [`State::gauge_fill`] the value it
+    /// leaves; [`Bar::gauge_fill_cut`] is where the bar comes out.
     Fill { bed: usize, fill: usize },
 }
 
@@ -744,6 +744,11 @@ pub struct State {
     /// [`State::gauge`]. A tie is the default because the static `FILM::MenuBar`
     /// starts zeroed.
     pub gauge_leads: (f32, f32),
+    /// Shiny Days' `this+0x3c`: the counter its gauge draws, which is a level
+    /// rather than a lead. [`gauge::Fill`] is what moves it, and
+    /// [`Gauge::Fill`] what draws it — [`State::gauge_leads`] is the other
+    /// module's and the two are never both in play.
+    pub gauge_fill: f32,
 }
 
 impl State {
@@ -1439,6 +1444,7 @@ impl Bar {
     /// knob, which does not.
     fn cuts(&self, state: State) -> (Vec<Cut>, Vec<Cut>) {
         let mut faded = self.gauge_cuts(state);
+        faded.extend(self.gauge_fill_cut(state));
         let pinned = if state.gauge_raised {
             std::mem::take(&mut faded)
         } else {
@@ -1546,13 +1552,8 @@ impl Bar {
     /// The pieces are sized from the ramp's leads and not from
     /// [`State::gauge`], because the two disagree for the three and a half
     /// seconds a raise lasts — that is the whole of what the ramp is.
-    /// **School Days HQ's gauge only.** Shiny Days' `FILM::MenuBar` has a gauge
-    /// of its own and it is a different instrument: `FUN_10035780`, its ramp,
-    /// asks the host for the single counter `001` rather than for a pair, and
-    /// `FUN_10035670` draws the result as one bar at record 17 whose width is
-    /// the ramped value clamped to that record's own 599. It has no pieces and
-    /// no leads. That is recovered but **not yet wired**, so on Shiny Days the
-    /// bed is drawn and nothing moves inside it.
+    /// **School Days HQ's gauge only.** Shiny Days' is a different instrument
+    /// and comes out of [`Bar::gauge_fill_cut`].
     pub fn gauge_cuts(&self, state: State) -> Vec<Cut> {
         let Some(layout) = self.layout else {
             return Vec::new();
@@ -1571,6 +1572,39 @@ impl Bar {
             .drawn()
             .map(|piece| cut(piece.src, piece.dst))
             .collect()
+    }
+
+    /// Shiny Days' gauge bar, as a cut of the chip sheet.
+    ///
+    /// `FUN_10035670` sets only the destination, and only its width:
+    /// `clamp(this+0x3c, 0, w)` where `w` is the record's own. The source is
+    /// left at the whole strip `FUN_10031bc0` gave it, so the art is
+    /// **squeezed** into the shorter destination rather than clipped to it.
+    ///
+    /// Drawn whenever the bed is, which is the pair of tests
+    /// [`Bar::records`] already applies to the bed.
+    fn gauge_fill_cut(&self, state: State) -> Option<Cut> {
+        let Gauge::Fill { bed, fill } = self.layout?.gauge else {
+            return None;
+        };
+        if !self.records(None, state, 0).contains(&bed) {
+            return None;
+        }
+        let art = self
+            .screen
+            .atlas()
+            .extras
+            .get(fill.checked_sub(self.extras_base())?)?;
+        let (w, h) = (art.dst.width as f32, art.dst.height as f32);
+        Some(Cut {
+            src: (art.src_x as f32, art.src_y as f32, w, h),
+            dst: (
+                art.dst.x as f32 - slider::HALF,
+                art.dst.y as f32 - slider::HALF,
+                state.gauge_fill.clamp(0.0, w) + slider::ONE,
+                h + slider::ONE,
+            ),
+        })
     }
 
     /// The `REPLAYMODE` indicator, where it is not part of the strip's layer.
@@ -2045,6 +2079,43 @@ mod tests {
         assert_eq!(auto.frame(60_000, 4), record);
     }
 
+    /// `FUN_100353b0` moves the drawn value as well as the settled one, which
+    /// `FUN_10026050` does not — so Shiny Days' bar is at its counter from the
+    /// first frame rather than at zero until something raises the gauge.
+    #[test]
+    fn settling_the_level_gauge_moves_what_is_drawn() {
+        let mut fill = gauge::Fill::default();
+        assert_eq!(fill.value(), 0.0);
+        fill.settle(300);
+        assert_eq!(fill.value(), 300.0);
+    }
+
+    /// The five steps of `FUN_10035780`, which are `FUN_10026b40`'s over one
+    /// counter: read, sound, slide, hold, commit.
+    #[test]
+    fn the_level_gauge_slides_over_the_ramp_and_then_lowers_itself() {
+        let mut fill = gauge::Fill::default();
+        fill.settle(100);
+        assert_eq!(fill.advance(0, 300).sound, None, "step 0 only reads");
+        assert_eq!(
+            fill.advance(0, 300).sound,
+            Some(crate::ui::menu::SystemSe::Up)
+        );
+        fill.advance(gauge::RAMP_MS / 2, 300);
+        assert_eq!(fill.value(), 200.0, "half way is half the change");
+        fill.advance(gauge::RAMP_MS, 300);
+        assert_eq!(fill.value(), 300.0);
+        // The hold runs from the moment the slide ended.
+        assert!(!fill.advance(gauge::RAMP_MS, 300).lowered);
+        assert!(!fill.advance(gauge::RAMP_MS + gauge::HOLD_MS, 300).lowered);
+        assert!(fill.advance(gauge::RAMP_MS + gauge::HOLD_MS, 300).lowered);
+        // And a raise that moves nothing is silent and skips straight to it.
+        let mut fill = gauge::Fill::default();
+        fill.settle(100);
+        fill.advance(0, 100);
+        assert_eq!(fill.advance(0, 100).sound, None);
+    }
+
     /// The knob's travel and the alpha it produces, from `FUN_100359c0`: the
     /// run reaches a full 255 where School Days HQ's ten cells stop at 250, and
     /// a fresh bar starts at the solid end.
@@ -2502,6 +2573,112 @@ pub mod gauge {
         pub lowered: bool,
     }
 
+    /// Shiny Days' gauge: one counter, one bar, and the same five steps.
+    ///
+    /// `FUN_10035780` is School Days HQ's `FUN_10026b40` over a single value.
+    /// Step 0 sets the bed and the bar opaque and asks the host for the
+    /// counter; step 1 picks the rise or the fall sound, or skips straight to
+    /// the hold when nothing moved; step 2 slides for [`RAMP_MS`]; step 3 holds
+    /// for [`HOLD_MS`]; step 4 commits and lowers the gauge. The sounds are the
+    /// same two, from the same host slot: 4 on a fall and 3 on a rise, which
+    /// are [`SystemSe::Down`] and [`SystemSe::Up`].
+    ///
+    /// **It asks for `001` and nothing else.** Both the ramp's literal at
+    /// `0x1004e2b0` and the settle's at `0x1004e2a8` are `L"001"`, so the
+    /// second counter School Days HQ's gauge weighs against this one is not
+    /// read at all — there is no lead here, just a level.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Fill {
+        /// `this+0x30`: the counter the bar is drawn from once settled.
+        shown: f32,
+        /// `this+0x34`: the counter it is sliding towards.
+        target: f32,
+        /// `this+0x2c`: `target - shown`.
+        change: f32,
+        /// `this+0x3c`: the width the bar is actually drawn at, which is what
+        /// slides.
+        value: f32,
+        /// `this+0x38`.
+        step: u32,
+        /// `this+0x40`, the tick the slide or the hold started on. `None` is
+        /// the original's zero, for the same reason it is on [`Anim`].
+        since: Option<u32>,
+    }
+
+    impl Fill {
+        /// The width the bar is drawn at, before [`Fill`]'s own clamp.
+        pub fn value(&self) -> f32 {
+            self.value
+        }
+
+        /// Puts the gauge at a counter with no ramp: `FUN_100353b0`, vtable
+        /// slot `+0x38`, the same slot School Days HQ settles through.
+        ///
+        /// Unlike [`Anim::settle`] this also moves the drawn value, so the bar
+        /// is at the counter from the first frame rather than at zero until
+        /// something raises it.
+        pub fn settle(&mut self, first: i32) {
+            self.shown = first as f32;
+            self.value = self.shown;
+            self.step = 0;
+            self.since = None;
+        }
+
+        /// One frame of the ramp, given the wall clock and the counter as the
+        /// save holds it now.
+        pub fn advance(&mut self, now_ms: u32, first: i32) -> Tick {
+            let mut tick = Tick::default();
+            match self.step {
+                0 => {
+                    self.target = first as f32;
+                    self.change = self.target - self.shown;
+                    self.step = 1;
+                }
+                1 => {
+                    if self.shown == self.target {
+                        self.step = 3;
+                    } else {
+                        self.step = 2;
+                        self.since = Some(now_ms);
+                        // `this+0x34 <= this+0x30`, with equality already ruled
+                        // out above, so this is a strict fall.
+                        tick.sound = Some(if self.target < self.shown {
+                            SystemSe::Down
+                        } else {
+                            SystemSe::Up
+                        });
+                    }
+                }
+                2 => {
+                    let run = now_ms.saturating_sub(self.since.unwrap_or(now_ms));
+                    if run < RAMP_MS {
+                        self.value = run as f32 * self.change / RAMP_MS as f32 + self.shown;
+                    } else {
+                        self.value = self.shown + self.change;
+                        self.since = Some(now_ms);
+                        self.step = 3;
+                    }
+                }
+                3 => {
+                    let done = match self.since {
+                        Some(at) => now_ms.saturating_sub(at) >= HOLD_MS,
+                        None => true,
+                    };
+                    if done {
+                        self.step = 4;
+                    }
+                }
+                _ => {
+                    self.since = None;
+                    self.step = 0;
+                    self.shown = self.target;
+                    tick.lowered = true;
+                }
+            }
+            tick
+        }
+    }
+
     /// The gauge's ramp: `FUN_10026b40`, and the values it slides between.
     ///
     /// # Where it runs
@@ -2828,9 +3005,15 @@ mod gauge_tests {
             anim.advance(0, to.0, to.1);
             anim.advance(0, to.0, to.1).sound
         };
-        assert_eq!(sound((60, 60), (70, 60)), Some(SystemSe::Up));
+        assert_eq!(
+            sound((60, 60), (70, 60)),
+            Some(crate::ui::menu::SystemSe::Up)
+        );
         assert_eq!(sound((60, 60), (50, 60)), Some(SystemSe::Down));
-        assert_eq!(sound((60, 60), (60, 70)), Some(SystemSe::Up));
+        assert_eq!(
+            sound((60, 60), (60, 70)),
+            Some(crate::ui::menu::SystemSe::Up)
+        );
         assert_eq!(sound((60, 60), (60, 50)), Some(SystemSe::Down));
         // `001` fell and `002` rose: the first counter's direction is the one
         // that plays, and the second's is not consulted.

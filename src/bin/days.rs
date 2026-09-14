@@ -1211,15 +1211,24 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     // far into that ramp the picture is taken.
     let mut gauge_sound = None;
     let mut ramp = bar::gauge::Anim::default();
+    let mut fill = bar::gauge::Fill::default();
     if let Some((first, second)) = was {
         ramp.settle(first, second);
+        fill.settle(first);
     }
     if let (true, Some((first, second))) = (args.gauge, feeling) {
         ramp.advance(0, first, second);
         gauge_sound = ramp.advance(0, first, second).sound;
         ramp.advance(settled, first, second);
+        fill.advance(0, first);
+        let fill_sound = fill.advance(0, first).sound;
+        fill.advance(settled, first);
+        if matches!(bar.layout().map(|l| l.gauge), Some(bar::Gauge::Fill { .. })) {
+            gauge_sound = fill_sound;
+        }
     }
     state.gauge_leads = ramp.leads();
+    state.gauge_fill = fill.value();
     if let Some(want) = args.transparency {
         match bar.layout().map(|l| l.knob) {
             // School Days HQ's ten cells: pressing one stores its level.
@@ -1335,11 +1344,23 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         None => println!("gauge: no save to read the counters from"),
         Some((first, second)) => {
             let (lead, _) = state.gauge_leads;
+            let level = matches!(bar.layout().map(|l| l.gauge), Some(bar::Gauge::Fill { .. }));
             println!(
-                "gauge: {} {first}, {} {second} — lead {lead:+}px to the {}, {}",
+                "gauge: {} {first}, {} {second} — {}, {}",
                 daysengine::install::feeling::FIRST,
                 daysengine::install::feeling::SECOND,
-                if lead >= 0.0 { "first" } else { "second" },
+                if level {
+                    format!(
+                        "{} alone, at {}",
+                        daysengine::install::feeling::FIRST,
+                        state.gauge_fill
+                    )
+                } else {
+                    format!(
+                        "lead {lead:+}px to the {}",
+                        if lead >= 0.0 { "first" } else { "second" }
+                    )
+                },
                 if state.gauge_raised {
                     "raised, so it draws even with the bar faded out"
                 } else {
@@ -1366,7 +1387,18 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
                     },
                 );
             }
-            let p = bar::gauge::pieces_at(lead, -lead);
+            let p = if matches!(bar.layout().map(|l| l.gauge), Some(bar::Gauge::Fill { .. })) {
+                // A level, not a lead: one bar whose width is the ramped
+                // counter, and no pieces at all.
+                println!(
+                    "  bar    {} wide, from {} alone",
+                    state.gauge_fill.max(0.0).round(),
+                    daysengine::install::feeling::FIRST,
+                );
+                bar::gauge::Pieces::default()
+            } else {
+                bar::gauge::pieces_at(lead, -lead)
+            };
             for (name, piece) in [("second", p.second), ("first", p.first), ("level", p.level)] {
                 match piece {
                     None => println!("  {name:6} down"),

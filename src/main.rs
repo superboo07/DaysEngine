@@ -622,6 +622,9 @@ struct Player<'a> {
     /// credited in the last seconds of a scene goes on sliding over the start
     /// of the next one. Our [`Bar`] is rebuilt per script; this is not.
     gauge: bar::gauge::Anim,
+    /// Shiny Days' gauge ramp, which is the same machine over one counter.
+    /// Both are settled; only the one this module's bar draws is stepped.
+    gauge_fill: bar::gauge::Fill,
     /// A clock for the whole session, which is what `timeGetTime` is to the
     /// original.
     ///
@@ -857,6 +860,7 @@ fn main() -> Result<()> {
         font: &font,
         mixer: &mixer,
         gauge: bar::gauge::Anim::default(),
+        gauge_fill: bar::gauge::Fill::default(),
         clock: Instant::now(),
         sounds: Sounds::default(),
         film: &film,
@@ -1277,6 +1281,7 @@ fn enter_slot(
 fn settle_gauge(player: &mut Player, progress: &mut Progress) {
     let ((first, second), _) = progress.gauge();
     player.gauge.settle(first, second);
+    player.gauge_fill.settle(first);
     progress.lower_gauge();
 }
 
@@ -2709,13 +2714,22 @@ fn run_script(
         // gauge to the new lead, holds it there and then puts it down again —
         // so this is also where the flag is cleared in ordinary play.
         let now_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        // Which gauge this module's bar carries. With no recovered layout there
+        // is no bed to draw either, so the pair ramp is the harmless default.
+        let pieces = !matches!(
+            control.as_ref().and_then(|b| b.layout()).map(|l| l.gauge),
+            Some(bar::Gauge::Fill { .. })
+        );
         if let Some(p) = progress.as_deref_mut() {
             let ((first, second), raised) = p.gauge();
             bar_state.gauge = Some((first, second));
             bar_state.gauge_raised = raised;
             if raised {
                 let at = player.clock.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                let tick = player.gauge.advance(at, first, second);
+                let tick = match pieces {
+                    true => player.gauge.advance(at, first, second),
+                    false => player.gauge_fill.advance(at, first),
+                };
                 if let Some(se) = tick.sound {
                     player
                         .system_se
@@ -2728,6 +2742,7 @@ fn run_script(
             }
         }
         bar_state.gauge_leads = player.gauge.leads();
+        bar_state.gauge_fill = player.gauge_fill.value();
         // Host `+0x98`, which is what the bar's right-hand box is about: the
         // slider lights up, its ten cells become pressable, and the REPLAYMODE
         // indicator goes on the picture.
