@@ -578,14 +578,8 @@ pub fn slider_knob_x(track: &Widget, knob: &Widget, value: f32) -> f32 {
 pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
     records
         .iter()
-        .position(|w| contains(&w.dst, x, y))
+        .position(|w| atlas::contains(&w.dst, x, y))
         .map(|index| index + FIRST)
-}
-
-/// The shipped containment test: `rec.x < x <= rec.x + rec.w`, and the same in
-/// `y`.
-fn contains(rect: &Rect, x: u32, y: u32) -> bool {
-    x > rect.x && x <= rect.x + rect.width && y > rect.y && y <= rect.y + rect.height
 }
 
 #[cfg(test)]

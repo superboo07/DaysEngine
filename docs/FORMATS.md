@@ -441,6 +441,124 @@ to the split-screen layout a box with no map file already got.
 
 **The hit maps are not drawn as precisely.** See the `_CHIP` section.
 
+### The Shiny Days Replay screen — the same split again
+
+`MENU::SceneView`'s vtable is at **`0x1004da6c`**, confirmed the way every other
+one in this module is: the run of pointers in `.rdata` begins exactly there, and
+the slots line up with the five classes around it, which all share the same
+twenty-slot shape — `+0x1c` setup, `+0x24` activation, `+0x44` draw, `+0x48`
+update, `+0x4c` the table scan. Slot `+0x4c` is **`FUN_1002cf00`**, and it is
+`FUN_1000bb10` with different numbers:
+
+```text
++0x618 == 0   h-scene grid   17 records from 0x10057e28
++0x618 != 0   play-data list 30 records from 0x10058248
+```
+
+returning `index + 3`, because `ReplayBase.cmap` has three regions — the two
+view headers and CLOSE — where `OptionBase.cmap` has four. `+0x618` is the view:
+`FUN_1002a3e0` stores the widget into it for widgets 0 and 1, so widget 0 is the
+grid and widget 1 the list, and the constructor leaves it zero.
+
+The two tables give:
+
+```text
+h-scene grid                      play-data list
+ 3,  4    the two arrows           3 .. 0xc    the ten rows, left band
+ 5 ..  7  the three page buttons   0xd .. 0x16 the ten rows, right band
+ 8 .. 0x13 the twelve thumbnails   0x17..0x20  the ten page buttons
+```
+
+The list's three runs are the same three School Days HQ's play-data list has
+**in a different order** — there the page buttons are widgets 0xd to 0x16 and
+the comment column 0x17 to 0x20. Both ends of this module agree on the order
+above: the table is laid out that way, and `FUN_10024e30` raises the expanded
+comment for `selection - 0xd` where `FUN_1001a060` uses `selection - 0x17`.
+
+`FUN_1002a2d0` answers whether a widget can be chosen, handing the view to
+`FUN_1002a330` or `FUN_1002a390`. Nothing on the list is ever greyed out. On the
+grid only the thumbnails are, from a per-slot member at `+0x4e8` that
+`FUN_10028260` fills: for each of the twelve slots it forms `page * 12 + slot`,
+refuses it at 36, and otherwise asks the host `+0x18` whether the flag named by
+`PTR_u_REP02_28_A20_10057930[scene]` is set. **That run of 36 flag names is the
+same scene run `src/ui/replay.rs` already recovers** as the longest run of
+scene-flag names in the module — so the grid is three pages of twelve over the
+scene table, and a thumbnail is live exactly when its h-scene has been seen.
+
+### How a Replay view is drawn
+
+`FUN_10024480` is the order, and it is `FUN_10006110`'s: every page's
+full-screen art, then the view's own contents, then the frame's header
+highlight and the frame widget under the pointer. `FUN_10024c20` draws the
+grid's contents and `FUN_10024e30` the list's, and the two refits that bind
+their sprites to records are `FUN_10028260` and `FUN_100288a0`.
+
+```text
+grid   the hovered arrow or page button  its own record, over the chip sheet
+       the page button of the page       record 0x29 + page
+       the hovered thumbnail             record 5 + page * 12 + slot
+
+list   the hovered row                   list record `row`, 740 wide
+       the hovered page button           list record 0x14 + button
+       the page button of the page       list record 0x1e + page
+```
+
+A thumbnail's rectangle does not move between pages. Records 5–0x10, 0x11–0x1c
+and 0x1d–0x28 hold the same twelve rectangles at three `src_y`, so the hit table
+covers page 0's and the page picks the art out of the run behind it. The resting
+grid is in the page's own full-screen art; only the thumbnail under the pointer
+is drawn, from the sheet `FUN_10026350` loads. `FUN_10028260` also names
+`System/Replay/HScene/ReplayThum_Chip.png`, which is where the arrows, page
+buttons and the lit page button come from.
+
+Hovering **either** band of the list lights the same row: `FUN_10024e30` draws
+list record `row` for a selection of `row + 3` or `row + 0xd`, and that record is
+the row entire — 740 wide — rather than the band the pointer is in. School Days
+HQ's list does the same thing.
+
+The list's sprite records are not in its hit table. `FUN_100288a0` reaches them
+at `DAT_10057a68`, which is five records past the frame's own table — the
+frame's three widgets and its two header highlights — so that run is anchored
+where the frame's ends:
+
+```text
+ 0 ..  9   the row bars, 740x27        0x14 .. 0x1d  the page buttons hovered
+0xa .. 0x13 the comment panels, 454x87 0x1e .. 0x27  the page button lit
+```
+
+The art confirms every one of those indices independently. Read at the record
+numbers above, the four sheets the screen draws from are filled exactly, to the
+pixel, in both axes:
+
+```text
+ReplayThum_Chip.png    174x333   arrows to 333 down, the lit page button to 174 across
+Replay_Thm01.png       652x837   36 thumbnails, 4 across to 652 and 9 down to 837
+ReplayBase_Chip.png    321x74    the frame's three widgets and its two highlights
+ReplayList_Chip.png    910x794   rows and comment panels to 910, page buttons to 794
+```
+
+`Replay_Thm01.png` is the one that settles the page rule: the sheet holds all
+thirty-six thumbnails in one column of nine rows, and only `record = 5 + page *
+12 + slot` reaches all of them without running off. `FUN_10026350` spells that
+sheet `System/Replay/HScene/Replay_Thm%02d.png` formatted with a **literal 1**,
+never the page, and the install ships no `02` or `03` — so the page moves down
+one sheet rather than swapping sheets.
+
+Neither hit table is anchored to anything, so `src/ui/replay_pages.rs` finds
+both by shape, the way the Option pages' two unanchored tables are found. The
+shapes are two flanking arrows plus a header strip plus a three-by-four grid of
+one cell size, and two ten-row columns at one pitch sharing ten baselines plus a
+strip of buttons. Each matches exactly one place in `SysMenuSD.dll` and nothing
+at all in `SysMenuSDHQ.dll`; checked both with a plain scan over the raw file and
+through the shipped locator. `days ui System/Replay/ReplayBase --pages` is the
+check.
+
+**The list's text is not recovered.** The timestamps, chapters and comments are
+rasterised into six 1024x1024 surfaces by the loops at the foot of
+`FUN_100288a0`, and the expanded comment's two sprites — `+0xf4` and `+0x4c4`,
+over list records 0xa to 0x13 — come from the same place. Which record and which
+host call fill each of those has not been followed, so nothing here places them.
+
 ---
 
 ## `.GPK` — STKFile0 archive

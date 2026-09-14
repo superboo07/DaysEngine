@@ -1563,9 +1563,23 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reports the Option screen's three page tables, found from the frame table
-/// this screen's hit map already anchored.
-fn ui_pages(dll: &[u8], frame: usize) {
+/// Reports the page tables a screen lays its contents out in.
+///
+/// Each set is anchored to its own screen's frame table, so the screen asked
+/// for is what picks between them.
+fn ui_pages(dll: &[u8], screen: &str, frame: usize) {
+    let stem = screen.to_ascii_lowercase();
+    if stem.contains("option") {
+        option_tables(dll, frame);
+    } else if stem.contains("replay") {
+        replay_tables(dll, frame);
+    } else {
+        println!("{screen} has no page tables");
+    }
+}
+
+/// The Option screen's three tab pages.
+fn option_tables(dll: &[u8], frame: usize) {
     use daysengine::ui::option_pages::{self, Pages};
     use daysengine::ui::options::Tab;
 
@@ -1621,6 +1635,68 @@ fn ui_pages(dll: &[u8], frame: usize) {
                 );
             }
         }
+    }
+}
+
+/// The Replay screen's two views.
+fn replay_tables(dll: &[u8], frame: usize) {
+    use daysengine::ui::replay::View;
+    use daysengine::ui::replay_pages::{self, Pages};
+
+    let Some(pages) = Pages::locate(dll, frame) else {
+        println!("no Replay view tables in this module");
+        return;
+    };
+    for view in [View::HScene, View::PlayData] {
+        let base = pages.base(view);
+        let count = replay_pages::records(view);
+        println!(
+            "{} view: {count} records at DLL offset {base:#x}, widgets {}..={}",
+            view.variant(),
+            replay_pages::FIRST,
+            replay_pages::FIRST + count - 1,
+        );
+        for widget in replay_pages::FIRST..replay_pages::FIRST + count {
+            let Some(w) = pages.widget(dll, view, widget) else {
+                println!("  widget {widget:3}  unreadable");
+                continue;
+            };
+            // The pointer lands on the last pixel of a record, not the first:
+            // the shipped test is half-open low and closed high.
+            let back = pages.hit(dll, view, w.dst.x + w.dst.width, w.dst.y + w.dst.height);
+            let hover = pages.hover(dll, view, widget, 0).map_or_else(
+                || "none".to_string(),
+                |h| format!("({},{})", h.src_x, h.src_y),
+            );
+            println!(
+                "  widget {widget:3}  dst ({:4},{:4}) {:4}x{:<3}  src ({:4},{:4})  hit -> {}  hover src {hover}",
+                w.dst.x,
+                w.dst.y,
+                w.dst.width,
+                w.dst.height,
+                w.src_x,
+                w.src_y,
+                back.map_or_else(|| "none".to_string(), |n| n.to_string()),
+            );
+        }
+    }
+    println!("play-data list run at DLL offset {:#x}", pages.list());
+    for page in 0..replay_pages::HSCENE_PAGES {
+        let mark = pages.page_mark(dll, View::HScene, page);
+        let first = pages.thumbnail(dll, page, 0);
+        println!(
+            "  HScene page {page}: scenes {}..={}, lit button src {}, first thumbnail src {}",
+            replay_pages::scene_of(page, 0).map_or(-1, |s| s as i32),
+            replay_pages::scene_of(page, replay_pages::THUMBNAILS - 1).map_or(-1, |s| s as i32),
+            mark.map_or_else(
+                || "none".to_string(),
+                |m| format!("({},{})", m.src_x, m.src_y)
+            ),
+            first.map_or_else(
+                || "none".to_string(),
+                |t| format!("({},{})", t.src_x, t.src_y)
+            ),
+        );
     }
 }
 
@@ -1691,7 +1767,7 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     }
 
     if args.pages {
-        ui_pages(&dll, screen.atlas().offset);
+        ui_pages(&dll, &args.screen, screen.atlas().offset);
         if args.out.is_none() {
             return Ok(());
         }

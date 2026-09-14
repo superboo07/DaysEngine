@@ -532,6 +532,17 @@ fn in_layout(rect: &Rect) -> bool {
     rect.x + rect.width <= LAYOUT.0 && rect.y + rect.height <= LAYOUT.1
 }
 
+/// The containment test both page tables are scanned with.
+///
+/// `FUN_1000bb10` and `FUN_1002cf00` — the Option and Replay hit tests that run
+/// when the screen's hit map misses — compare a point against a record the same
+/// way: `rec.x < x <= rec.x + rec.w`, and the same in `y`. Half-open at the low
+/// edge and closed at the high one, which is the shipped comparison rather than
+/// a tidied version of it.
+pub fn contains(rect: &Rect, x: u32, y: u32) -> bool {
+    x > rect.x && x <= rect.x + rect.width && y > rect.y && y <= rect.y + rect.height
+}
+
 /// One record of a table whose base offset is already known.
 pub fn record_at(dll: &[u8], base: usize, index: usize) -> Option<Widget> {
     record(dll, base.checked_add(index.checked_mul(RECORD)?)?)

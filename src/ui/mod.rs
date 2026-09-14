@@ -21,6 +21,7 @@ pub mod options;
 pub mod paths;
 pub mod playdata;
 pub mod replay;
+pub mod replay_pages;
 pub mod routemap;
 pub mod saveload;
 pub mod screen;
