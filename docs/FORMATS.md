@@ -1562,6 +1562,18 @@ other.
 
 ### `System/MenuBar` — the control bar
 
+Everything in this section is `SysMenuSDHQ.dll`'s bar. **Shiny Days' is a
+different one**: `SysMenuSD.dll` gives the strip sixteen hit regions rather than
+twenty-five — it has no row of ten transparency cells — and lays its record
+table out to match, so not one of the raw record indices below addresses the
+same art there. Its twelve caption strips all share the destination
+`(401, 48) 389x24`, and School Days HQ's resting-art indices land on three of
+them, which drew three captions stacked at that spot on every frame of Shiny
+Days playback. `src/ui/bar.rs` now names no records at all on a strip whose
+region count is not 25; the widget under the pointer still lights, because that
+sprite comes from the hit map's own run and is right on either module.
+**Shiny Days' bar records are not recovered.**
+
 The art and the 25-region widget table are in `SysMenuSDHQ.dll` like any other
 screen, but the module is not in the mode switch. `_SetMenuBar@4` is a one-line
 export — `*param = &DAT_10050790` — so the executable is handed a pointer to a

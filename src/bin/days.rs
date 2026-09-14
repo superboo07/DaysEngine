@@ -1348,7 +1348,19 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     }
 
     println!("  wgt  region  dst                live   caption  action");
-    for widget in 0..bar::WIDGETS {
+    // A strip with fewer regions than School Days HQ's is a different bar, and
+    // the dispatch below is HQ's. Report what this module actually has rather
+    // than running off the end of its table.
+    let widgets = bar.screen().atlas().widgets.len().min(bar::WIDGETS);
+    if !bar.decorated() {
+        println!(
+            "  this module's strip has {} regions, not {} — its resting art and its \
+             captions are not recovered, so the bar draws neither",
+            bar.screen().atlas().widgets.len(),
+            bar::WIDGETS
+        );
+    }
+    for widget in 0..widgets {
         let rect = bar.screen().atlas().widgets[widget].dst;
         let act = bar::action(widget, state, false);
         let shown = match act {

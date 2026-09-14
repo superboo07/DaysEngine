@@ -121,7 +121,15 @@ use days_ui::Image;
 /// The screen's path stem, as the DLL spells it.
 pub const PATH: &str = "System/MenuBar/MenuBar";
 
-/// Number of hit regions, and so of widgets.
+/// Number of hit regions, and so of widgets, on the bar every record index in
+/// this module was recovered against.
+///
+/// **A module whose bar has a different number of them is a different bar**,
+/// and none of the record constants below address the same art on it. Shiny
+/// Days' is one: `SysMenuSD.dll` gives the strip sixteen regions rather than
+/// twenty-five — it has no row of ten transparency cells — and lays its table
+/// out to match, so School Days HQ's indices land on whatever happens to sit
+/// there. See [`Bar::decorated`].
 pub const WIDGETS: usize = 25;
 
 /// The five playback rates widgets 5..9 select, from the table at `0x004f99f0`
@@ -693,6 +701,9 @@ pub struct Bar {
     /// `this+0xec`: how solid the replay-mode indicator is drawn, 0 to 10.
     /// See [`indicator`].
     transparency: usize,
+    /// Whether this module's bar is the one every record index here was
+    /// recovered against. See [`Bar::decorated`].
+    decorated: bool,
 }
 
 impl Bar {
@@ -701,11 +712,22 @@ impl Bar {
         dll: &[u8],
         resolution: Resolution,
     ) -> Result<Bar, Error> {
+        let screen = Screen::load(vfs, dll, PATH, resolution)?;
+        let decorated = screen.atlas().widgets.len() == WIDGETS;
+        if !decorated {
+            log::warn!(
+                "{PATH}: {} hit regions, not {WIDGETS} — this module's strip is not the one the \
+                 record indices were recovered against, so its resting art and its captions are \
+                 not drawn",
+                screen.atlas().widgets.len()
+            );
+        }
         Ok(Bar {
-            screen: Screen::load(vfs, dll, PATH, resolution)?,
+            screen,
             latch: None,
             fade: Fade::default(),
             transparency: indicator::INITIAL_LEVEL,
+            decorated,
         })
     }
 
@@ -832,6 +854,20 @@ impl Bar {
     /// **not recovered**.
     pub fn records(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Vec<usize> {
         let mut out = Vec::new();
+
+        // On a strip these indices were not recovered against, every one of
+        // them addresses the wrong record — Shiny Days' twelve caption strips
+        // share one destination, so its bar drew several of them stacked there
+        // every frame. Only the widget under the pointer survives, because that
+        // one is the widget's own record and is right on any module.
+        if !self.decorated {
+            if !state.hidden {
+                if let Some(widget) = hovered.filter(|w| *w < self.screen.atlas().widgets.len()) {
+                    out.push(widget);
+                }
+            }
+            return out;
+        }
 
         // `if (host+0x140() == 0)`: with the bar hidden, only the pinned gauge
         // bed survives, and even that only under host +0x154.
@@ -977,6 +1013,21 @@ impl Bar {
             }
         }
         (faded, pinned)
+    }
+
+    /// Whether this module's strip is the one every record index here was
+    /// recovered against, which is what [`Bar::records`] may name records from.
+    ///
+    /// The widget records are safe either way: they come from the hit map's own
+    /// run, so the sprite for the widget under the pointer is that widget's on
+    /// any module. Everything else in this module — the resting art, the rate
+    /// readout, the auto animation, the gauge, the caption strips — is a raw
+    /// index into School Days HQ's table, recovered from `FUN_10021c20` and
+    /// `FUN_10024ca0` in `SysMenuSDHQ.dll`. **Shiny Days' equivalents are not
+    /// recovered**, so on that module they are not drawn rather than drawn
+    /// wrong.
+    pub fn decorated(&self) -> bool {
+        self.decorated
     }
 
     /// Turns a record index into a widget state, warning rather than drawing
