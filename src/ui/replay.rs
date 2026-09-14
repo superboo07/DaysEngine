@@ -93,19 +93,27 @@
 //! image for a switch of that shape and takes the addresses out of its arms.
 //!
 //! `SysMenuSD.dll` writes the same rule without a switch, because it has only
-//! one branching scene to write: `FUN_1002bd00` compares its scene member
-//! `+0x610` against `0x15` and, when it matches, reads `+0x614 * 0xc +
-//! column * 4` from `0x100579c0` — four rows for scene 21's four scripts, which
-//! is the whole of that module's branching. [`branch_switches`] does not see
-//! it, since it is a compare and a jump rather than a jump table, so scene 21
-//! is walked straight down its list here and the table it should walk instead
-//! is **not recovered**.
+//! one branching scene to write, so MSVC emitted a compare and a jump instead
+//! of a jump table. `FUN_1002bd00` loads its scene member, compares it against
+//! `0x15` and, when it matches, takes an arm of exactly the shape above.
+//! [`read_compare`] reads that second shape, and the two differ only in how the
+//! scene selects an arm — the arm itself is the same five instructions, so the
+//! step member is read out of the instruction that names it (`+0x2ac` in
+//! `SysMenuSDHQ.dll`, `+0x614` in `SysMenuSD.dll`) rather than written down,
+//! and every arm of one site has to agree on it.
 //!
-//! Against the retail DLL exactly one switch matches, and it yields the eleven
-//! scenes and scene 11's four version tables that the decompile shows. Each
-//! table is then read as one row per script in the scene's list and refused
-//! unless every entry is a step that list has — a check all fourteen pass, and
-//! one whose lengths land exactly on the next table or the padding before it.
+//! Against `SysMenuSDHQ.dll` exactly one switch matches and no compare does; it
+//! yields the eleven scenes and scene 11's four version tables that the
+//! decompile shows. Against `SysMenuSD.dll` exactly one compare matches and no
+//! switch does; it yields scene 21, `REP04_K2_A11`, whose four rows are the
+//! whole of that module's branching. Both counts hold under two methods — this
+//! scan, and a plain byte scan of the same shape over the raw files, which also
+//! finds neither shape anywhere in `SHINYDAYS.exe` or `RouteProcSD.dll`.
+//!
+//! Each table is then read as one row per script in the scene's list and
+//! refused unless every entry is a step that list has — a check all fifteen
+//! pass, and one whose lengths land exactly on the next table or the padding
+//! before it.
 //!
 //! # The three scenes that ask first
 //!
@@ -947,15 +955,25 @@ fn read_branch(image: &Image, va: u32, steps: usize) -> Option<Branch> {
 /// simply recovers no tables and plays every scene in order.
 fn branch_switches(image: &Image) -> std::collections::BTreeMap<usize, Switch> {
     let mut best = std::collections::BTreeMap::new();
+    let mut compared = std::collections::BTreeMap::new();
     for code in image.raw_sections() {
         for at in 0..code.len() {
-            let Some(found) = read_switch(image, &code[at..]) else {
-                continue;
-            };
-            if found.len() > best.len() {
-                best = found;
+            if let Some(found) = read_switch(image, &code[at..]) {
+                if found.len() > best.len() {
+                    best = found;
+                }
+            }
+            if let Some((scene, arm)) = read_compare(&code[at..]) {
+                compared.insert(scene, arm);
             }
         }
+    }
+    for (scene, arm) in compared {
+        if best.contains_key(&scene) {
+            log::warn!("scene {scene} branches by both a switch and a compare; taking the switch");
+            continue;
+        }
+        best.insert(scene, Switch::Table(arm.table));
     }
     best
 }
@@ -986,29 +1004,58 @@ fn read_switch(image: &Image, at: &[u8]) -> Option<std::collections::BTreeMap<us
         .map(|case| image.dword(jump.checked_add((case * 4) as u32)?))
         .collect::<Option<_>>()?;
     let mut out = std::collections::BTreeMap::new();
+    let mut step = None;
     for (index, case) in map.iter().enumerate() {
-        let Some(arm) = arms.get(usize::from(*case)).and_then(|va| image.code(*va)) else {
+        let Some(at) = arms.get(usize::from(*case)).and_then(|va| image.code(*va)) else {
             continue;
         };
-        let switch = match read_arm(arm) {
-            Some(va) => Switch::Table(va),
-            None => match read_versions(image, arm) {
-                Some(vas) => Switch::Versions(vas),
+        let (switch, read) = match read_arm(at) {
+            Some(arm) => (Switch::Table(arm.table), vec![Some(arm)]),
+            None => match read_versions(image, at) {
+                Some(versions) => (
+                    Switch::Versions(
+                        versions
+                            .iter()
+                            .map(|arm| arm.map(|arm| arm.table))
+                            .collect(),
+                    ),
+                    versions,
+                ),
                 // The `default` arm, `step + 1`, which every other scene takes.
                 None => continue,
             },
         };
+        // Every arm of one switch reads the same step member. Requiring that is
+        // what keeps the shape discriminating now that the offset is read out
+        // of the instruction rather than written down.
+        for arm in read.iter().flatten() {
+            if *step.get_or_insert(arm.step) != arm.step {
+                return None;
+            }
+        }
         out.insert(index + bias, switch);
     }
     (!out.is_empty()).then_some(out)
 }
 
-/// The table address one arm of the switch reads, or `None` when the arm is not
-/// a branch read at all.
-fn read_arm(at: &[u8]) -> Option<u32> {
+/// One arm of the branch rule: the step member it reads and the table it reads
+/// with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Arm {
+    /// The offset of the step index in the replay module — `+0x2ac` in
+    /// `SysMenuSDHQ.dll`, `+0x614` in `SysMenuSD.dll`. Read out of the arm
+    /// rather than written down, and every arm of one site has to agree.
+    step: u32,
+    /// The address of the table the arm indexes.
+    table: u32,
+}
+
+/// The branch read one arm makes, or `None` when the arm is not a branch read
+/// at all.
+fn read_arm(at: &[u8]) -> Option<Arm> {
     let code = &mut Code::new(at);
     code.frame()?;
-    code.member(0x2ac)?;
+    let step = code.member()?;
     // IMUL r, r, 0xc
     code.lit(&[0x6b])?;
     code.range(0xc0, 0xff)?;
@@ -1018,15 +1065,49 @@ fn read_arm(at: &[u8]) -> Option<u32> {
     code.lit(&[0x8b])?;
     code.one_of(&[0x84, 0x8c, 0x94, 0x9c, 0xa4, 0xac, 0xb4, 0xbc])?;
     code.range(0x80, 0xbf)?;
-    code.dword()
+    Some(Arm {
+        step,
+        table: code.dword()?,
+    })
 }
 
-/// The per-version tables of the arm that switches on `+0x2b4`, for the one
-/// scene whose versions each walk their own.
-fn read_versions(image: &Image, at: &[u8]) -> Option<Vec<Option<u32>>> {
+/// The one branching scene a module writes as a compare rather than a switch,
+/// and the branch read that follows it.
+///
+/// `SysMenuSD.dll` has a single scene to branch, so MSVC wrote `FUN_1002bd00`
+/// as a compare and a jump instead of a jump table:
+///
+/// ```text
+/// MOV  r1, [EBP+this]
+/// MOV  r2, [r1 + 0x610]          the scene
+/// MOV  [EBP+d], r2
+/// CMP  [EBP+d], 0x15             scene 21, REP04_K2_A11
+/// JZ   arm                       and JMP over it to `step + 1` otherwise
+/// ```
+///
+/// The arm it jumps to is the same five instructions every arm of the switch
+/// form is, so the two shapes differ only in how the scene selects one.
+fn read_compare(at: &[u8]) -> Option<(usize, Arm)> {
     let code = &mut Code::new(at);
     code.frame()?;
-    code.member(0x2b4)?;
+    code.member()?;
+    // MOV [EBP+d], r / CMP [EBP+d], scene — the same slot, or this is not it.
+    code.lit(&[0x89])?;
+    code.range(0x40, 0x7f)?;
+    let slot = code.byte()?;
+    code.lit(&[0x83, 0x7d])?;
+    (code.byte()? == slot).then_some(())?;
+    let scene = usize::from(code.byte()?);
+    let taken = code.zero()?;
+    read_arm(code.ahead(taken)?).map(|arm| (scene, arm))
+}
+
+/// The per-version branch reads of the arm that switches on the version member,
+/// for the one scene whose versions each walk their own table.
+fn read_versions(image: &Image, at: &[u8]) -> Option<Vec<Option<Arm>>> {
+    let code = &mut Code::new(at);
+    code.frame()?;
+    code.member()?;
     code.lit(&[0x89])?;
     code.range(0x40, 0x7f)?;
     code.byte()?;
@@ -1102,6 +1183,17 @@ impl<'a> Code<'a> {
         }
     }
 
+    /// `JZ rel`, in either encoding, giving the distance it jumps.
+    fn zero(&mut self) -> Option<i32> {
+        match self.one_of(&[0x74, 0x0f])? {
+            0x74 => self.byte().map(|rel| i32::from(rel as i8)),
+            _ => {
+                self.lit(&[0x84])?;
+                self.dword().map(|rel| rel as i32)
+            }
+        }
+    }
+
     /// `MOV r, [EBP+d]` — a frame slot into a register.
     fn frame(&mut self) -> Option<()> {
         self.lit(&[0x8b])?;
@@ -1109,11 +1201,19 @@ impl<'a> Code<'a> {
         self.byte().map(|_| ())
     }
 
-    /// `MOV r, [r + offset]` — a member of the replay module.
-    fn member(&mut self, offset: u32) -> Option<()> {
+    /// `MOV r, [r + disp32]` — a member of the replay module, at whatever
+    /// offset the instruction names.
+    fn member(&mut self) -> Option<u32> {
         self.lit(&[0x8b])?;
         self.range(0x80, 0xbf)?;
-        self.lit(&offset.to_le_bytes())
+        self.dword()
+    }
+
+    /// The bytes `taken` past the cursor, which is where a jump the cursor has
+    /// just consumed lands.
+    fn ahead(&self, taken: i32) -> Option<&'a [u8]> {
+        self.bytes
+            .get(self.at.checked_add_signed(taken as isize)?..)
     }
 }
 
@@ -1612,6 +1712,33 @@ mod tests {
         let scenes = Scenes::from_scenes(vec![scene("REP02_2S_W03", &[])]);
         assert_eq!(scenes.get(0).unwrap().first_script(), None);
         assert_eq!(hscene_action(&scenes, 0, HSCENE_FIRST_THUMBNAIL), Act::None);
+    }
+
+    #[test]
+    fn the_scene_a_compare_selects_is_read_like_an_arm_of_the_switch() {
+        // FUN_1002bd00 at 0x1002bd54 — the whole of SysMenuSD.dll's branching.
+        let mut code = vec![
+            0x8b, 0x45, 0xf0, // MOV EAX, [EBP-0x10]            this
+            0x8b, 0x88, 0x10, 0x06, 0x00, 0x00, // MOV ECX, [EAX+0x610]  the scene
+            0x89, 0x4d, 0xec, // MOV [EBP-0x14], ECX
+            0x83, 0x7d, 0xec, 0x15, // CMP [EBP-0x14], 21
+            0x74, 0x02, // JZ over the jump to the default arm
+            0xeb, 0x1b, // JMP default
+            0x8b, 0x55, 0xf0, // MOV EDX, [EBP-0x10]
+            0x8b, 0x82, 0x14, 0x06, 0x00, 0x00, // MOV EAX, [EDX+0x614]  the step
+            0x6b, 0xc0, 0x0c, // IMUL EAX, EAX, 0xc
+            0x8b, 0x4d, 0xf4, // MOV ECX, [EBP-0x0c]            the column
+            0x8b, 0x94, 0x88, 0xc0, 0x79, 0x05, 0x10, // MOV EDX, [EAX+ECX*4+0x100579c0]
+        ];
+        let (scene, arm) = read_compare(&code).unwrap();
+        assert_eq!(scene, 21);
+        assert_eq!(arm.step, 0x614);
+        assert_eq!(arm.table, 0x100579c0);
+
+        // The slot the scene is stored in has to be the slot the compare tests,
+        // or this is some other compare that happens to be followed by a read.
+        code[14] = 0xe8;
+        assert!(read_compare(&code).is_none());
     }
 
     #[test]

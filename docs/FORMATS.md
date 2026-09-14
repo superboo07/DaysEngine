@@ -614,9 +614,17 @@ MOV  r4, [r2 + r3*4 + 0x100579c0]
 
 Four rows of three at `0x100579c0` — `2 1 0`, `3 0 0`, `3 0 0`, `4 0 0` — one
 per script in scene 21's four-script list, and the floats of the next table
-begin at `0x100579f0`. The engine's branch-table scan looks for the switch shape
-and does not match a compare, so this table is **not recovered** by it and scene
-21 is walked straight down its list instead.
+begin at `0x100579f0`.
+
+The engine reads both shapes. The arm the compare jumps to is the same five
+instructions every arm of `FUN_1001ee20`'s switch is, so the two differ only in
+how the scene selects one, and the step member is taken from the instruction
+that names it — `+0x2ac` here, `+0x614` there — with every arm of one site
+required to agree on it. Against `SysMenuSD.dll` exactly one compare matches and
+no switch does; against `SysMenuSDHQ.dll` exactly one switch matches and no
+compare does. Both counts were confirmed twice, by the engine's own scan and by
+a plain byte scan of the same shape over the raw files, which also finds neither
+shape in `SHINYDAYS.exe` or `RouteProcSD.dll`.
 
 ### How a Replay view is drawn
 
