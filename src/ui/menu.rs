@@ -2184,9 +2184,10 @@ impl Menu {
     /// Keyboard navigation.
     ///
     /// The title is a vertical list and uses `step`; the Option screens are
-    /// not, and each tab has a hand-written transition table in the DLL — see
-    /// [`options::navigate`]. A screen with no transcribed table falls back to
-    /// walking its widgets in order, which is at least reachable.
+    /// not, and each tab of each module has a hand-written transition table in
+    /// its DLL — see [`options::navigate`] and [`option_pages::navigate`]. A
+    /// screen with no transcribed table falls back to walking its widgets in
+    /// order, which is at least reachable.
     ///
     /// The replay grid's table is **decompiled but not transcribed**. It is
     /// `FUN_1001e3a0`, and one of its arms does not yet read consistently with
