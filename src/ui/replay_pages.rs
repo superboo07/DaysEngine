@@ -168,9 +168,12 @@
 //! whenever the list is showing. The five panels whose centres were wiped draw
 //! their comments at the column's left edge.
 //!
-//! [`comment_centred`] is which page keeps its centring, and it is the tenth:
-//! the page showing sits in panel `page - window_top(page)`, and that is panel
-//! 5 only at page 9.
+//! The one page that could still show it is the tenth — the page showing sits
+//! in panel `page - window_top(page)`, and that is panel 5 only at page 9 — and
+//! **that has not been confirmed against the retail game**. Every page anyone
+//! has looked at draws its comments hard left, so [`render`] draws them hard
+//! left on all ten and [`comment_centre`] is kept as the recovered rule rather
+//! than as something this engine applies.
 //!
 //! `FUN_100267c0` places the comment sprite once itself on the way past, out
 //! of the **hit** table at `0x10058248` rather than the list run. Nothing is
@@ -851,23 +854,17 @@ fn dest_width(column: Column) -> f32 {
 /// The clamp is unreachable here: [`CAP`] characters at the widest advance
 /// total 900, which leaves 1.5. It is kept because it is what the function
 /// does, not because anything reaches it.
+///
+/// **Nothing calls this.** The centre it works out is wiped from `+0x518` for
+/// five of the six panels before the update re-reads it, and the one page that
+/// could still show it has not been checked against the retail game — see the
+/// module doc. It is recorded here because it is recovered, not because the
+/// screen draws it.
 pub fn comment_centre(width: i32, english: bool) -> f32 {
     if !english {
         return 0.0;
     }
     (226.5 - width as f32 / 4.0).max(0.0)
-}
-
-/// Whether the page showing keeps the centring worked out for its comments.
-///
-/// `FUN_100267c0` zeroes all six panels' centres on entry and refills only its
-/// own, `FUN_100288a0` runs it over panels 0 to 5 in order and is the only
-/// thing that runs it, and `FUN_1002c1f0` re-reads the array every frame. So
-/// the centres that survive belong to panel `PLAYDATA_PANELS - 1`, and the
-/// page showing is in that panel only at the end of the strip — see the module
-/// doc.
-pub fn comment_centred(page: usize) -> bool {
-    page.checked_sub(window_top(page)) == Some(PLAYDATA_PANELS - 1)
 }
 
 /// Where the expanded comment's line `n` is really rasterised, from
@@ -1027,10 +1024,10 @@ pub fn render(
                 surface_pen(column, row),
                 &advance,
             );
-            let centre = match column {
-                Column::Comment if comment_centred(page) => comment_centre(drawn, english),
-                _ => 0.0,
-            };
+            // The comment is never centred: see [`comment_centre`] and the
+            // module doc for what happens to the shift it works out.
+            let centre = 0.0;
+            let _ = drawn;
             let (sx, sy, sw, sh) = source_rect(column, row);
             quads.push(Quad {
                 src: (sx as u32, sy as u32, sw as u32, sh as u32),
@@ -1332,20 +1329,23 @@ mod tests {
         }
     }
 
-    /// The centring survives on one page only. `FUN_100267c0` wipes all six
-    /// panels' centres every time it fills one, `FUN_100288a0` fills them 0 to
-    /// 5 in order and nothing else fills any, and `FUN_1002c1f0` re-places the
-    /// comment sprites from what is left — so the page sitting in the last
-    /// panel is the only one that keeps it, and that is the tenth.
+    /// The comment column starts where its record does on every page, whatever
+    /// centre `FUN_100267c0` worked out for it — see the module doc.
     #[test]
-    fn the_last_page_is_the_only_one_whose_comments_are_centred() {
-        let centred: Vec<usize> = (0..PLAYDATA_PAGES)
-            .filter(|p| comment_centred(*p))
-            .collect();
-        assert_eq!(centred, [PLAYDATA_PAGES - 1]);
-        // And on that page it is School Days HQ's rule 9 short of its 235.5.
-        // Its clamp cannot be reached: twenty of the widest characters advance
-        // 900, which is 1.5 short of turning the shift negative.
+    fn the_comment_column_is_never_centred() {
+        let record = days_ui::cmap::Rect {
+            x: 316,
+            y: 126,
+            width: 454,
+            height: 87,
+        };
+        for english in [false, true] {
+            let (x, ..) = dest_rect(Column::Comment, record, english, 0.0);
+            assert_eq!(x, 318.0);
+        }
+        // The rule itself is School Days HQ's 9 short of its 235.5, and its
+        // clamp cannot be reached: twenty of the widest characters advance 900,
+        // which is 1.5 short of turning the shift negative.
         assert_eq!(comment_centre(CAP as i32 * 0x18, true), 106.5);
         assert_eq!(comment_centre(CAP as i32 * 0x2d, true), 1.5);
         assert_eq!(comment_centre(CAP as i32 * 0x18, false), 0.0);

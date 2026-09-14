@@ -969,6 +969,33 @@ impl ReplayPage {
     }
 }
 
+/// Which widget of the title screen is `REPLAY`, and whether its caption is a
+/// sprite in both of its states.
+///
+/// `SysMenuSD.dll`'s `FUN_1002f550` builds **two** sprites for it, `+0xd8` from
+/// the first alternate and `+0xd4` from the second, and `FUN_1002f1c0` draws
+/// one or the other on every pass: `FUN_1002fbd0(this, 2)` — not the trial
+/// build and host `+0x108(1)` — picks `+0xd8`, and anything else picks `+0xd4`.
+/// So on that module the base art carries no `REPLAY` caption at all and
+/// leaving the widget resting draws nothing, which is what it did here.
+/// `SysMenuSDHQ.dll` keeps the live caption in the base art and gives the dead
+/// one the single alternate.
+///
+/// The two are told apart by the table rather than by the module: a screen that
+/// draws both states holds two alternates over the **same rectangle**, where
+/// the other module's second alternate belongs to a different row entirely.
+/// `None` is a title with no alternate at all, which draws nothing either way.
+const TITLE_REPLAY: usize = 2;
+
+fn title_replay_caption(extras: &[days_ui::atlas::Widget], widget: usize) -> Option<bool> {
+    debug_assert_eq!(widget, TITLE_REPLAY);
+    match extras {
+        [first, second, ..] => Some(first.dst == second.dst),
+        [_] => Some(false),
+        [] => None,
+    }
+}
+
 /// Which of the two screens that list the player's slots is showing.
 ///
 /// The save/load screen and the replay screen's play-data list read the same
@@ -1794,7 +1821,19 @@ impl Menu {
     /// any.
     fn extra_for(&self, widget: usize) -> Option<usize> {
         match self.mode {
-            Mode::TITLE if widget == 2 && !self.session.save.replay_unlocked() => Some(0),
+            Mode::TITLE if widget == TITLE_REPLAY => {
+                title_replay_caption(&self.screen.atlas().extras, widget).and_then(|both| {
+                    let unlocked = self.session.save.replay_unlocked();
+                    match both {
+                        // Both states are sprites: one of the two is always
+                        // drawn.
+                        true => Some(if unlocked { 0 } else { 1 }),
+                        // Only the dead state is; the live one is in the
+                        // base art.
+                        false => (!unlocked).then_some(0),
+                    }
+                })
+            }
             // Both replay views mark the tab and the page you are on, which no
             // resting/active pair can say. An index past the alternates the
             // screen actually placed draws nothing: see
@@ -2949,6 +2988,31 @@ mod tests {
     }
 
     /// ...and Close from the title still goes where it always did.
+    /// The title's `REPLAY` caption is a sprite in both states on the module
+    /// that gives it two alternates over one rectangle, and only in its dead
+    /// state on the module whose base art carries the live one. The shapes are
+    /// the two shipped tables: `SysMenuSD.dll` puts both of its at (637, 301),
+    /// `SysMenuSDHQ.dll`'s second alternate is a row 50 pixels higher.
+    #[test]
+    fn a_title_that_draws_both_replay_captions_holds_them_at_one_rectangle() {
+        let at = |x: u32, y: u32| days_ui::atlas::Widget {
+            dst: days_ui::cmap::Rect {
+                x,
+                y,
+                width: 164,
+                height: 28,
+            },
+            src_x: 0,
+            src_y: 0,
+        };
+        let sd = [at(637, 301), at(637, 301)];
+        let hq = [at(348, 353), at(348, 303)];
+        assert_eq!(title_replay_caption(&sd, TITLE_REPLAY), Some(true));
+        assert_eq!(title_replay_caption(&hq, TITLE_REPLAY), Some(false));
+        assert_eq!(title_replay_caption(&hq[..1], TITLE_REPLAY), Some(false));
+        assert_eq!(title_replay_caption(&[], TITLE_REPLAY), None);
+    }
+
     #[test]
     fn closing_a_title_rooted_screen_goes_back_to_the_title() {
         assert_eq!(leaving(Entry::Title, Mode::TITLE), Leaving::To(Mode::TITLE));

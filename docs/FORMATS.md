@@ -874,12 +874,17 @@ entry** and refills only the panel it was given, so once the sixth returns the
 array holds centres for panel 5 and zeroes for the rest. `FUN_1002c1f0`, the
 screen's update, re-places all three sprites of all six panels out of that same
 array whenever the list is showing, so the five wiped panels draw their comments
-at the column's left edge. Only the page sitting in panel 5 keeps its centring,
-and that is the tenth: the page showing is in panel `page - window_top(page)`.
+at the column's left edge. The one page that could still show it is the
+tenth — the page showing is in panel `page - window_top(page)`, and that is
+panel 5 only at page 9 — and **that has not been checked against the retail
+game**.
 
 A screenshot of the retail game on page 1 shows the comments hard against the
 left edge of their column in an install whose `[UseEnglish]` is 1, which is what
-this predicts and what an earlier reading of `FUN_100267c0` alone did not.
+this predicts and what an earlier reading of `FUN_100267c0` alone did not. Every
+page anyone has looked at draws them hard left, so `src/ui/replay_pages.rs`
+draws them hard left on all ten and keeps `comment_centre` as a recovered rule
+it does not apply.
 
 `FUN_100267c0` also places the comment sprite once itself, out of the **hit**
 table at `0x10058248` at record `0xd + row` rather than the list run. Nothing is
@@ -1418,6 +1423,29 @@ Each table is followed by exactly **one** further 24-byte record — the greyed
 which is each table's base plus `count * 0x18`. This is the ground truth behind
 the warning in [`days_ui::Atlas::extras`]: only the first trailing record
 belongs to the screen, and the run after it is the next screen's table.
+
+#### The Shiny Days title draws both `REPLAY` captions
+
+`SysMenuSD.dll` does not keep a live `REPLAY` label in its base art at all.
+`FUN_1002f550` builds the five widgets' sprites from records 0 to 4 — or 7 to
+11, the same rectangles half a pixel lower, when host `+0x108(0)` says the save
+is cleared — and then **two** more: `+0xd8` from record 5 and `+0xd4` from
+record 6, both at `(637, 301)` over the widget's own `(636, 301)`. They are the
+caption in its two states, cut from the chip sheet's second and third columns:
+white with an orange rule at `src (168, 59)`, grey at `src (334, 59)`.
+
+`FUN_1002f1c0` draws one of them on every pass, before the hover loop:
+`FUN_1002fbd0(this, 2)` — not the trial build **and** host `+0x108(1)` — picks
+`+0xd8`, and anything else picks `+0xd4`. So leaving the widget resting draws
+nothing, which is what `src/ui/menu.rs` did until it was told the difference:
+`SysMenuSDHQ.dll` keeps the live caption in the base art and gives the dead one
+its single trailing record, so there the alternate is drawn only when the widget
+is locked.
+
+The two are told apart by the table rather than by the module. A screen that
+draws both states holds its two alternates **over the same rectangle**; School
+Days HQ's second trailing record is a row 50 pixels higher and belongs to
+another layout entirely.
 
 Clicking a widget runs `FUN_100207a0`, gated by the enablement switch
 `FUN_100206e0`:
