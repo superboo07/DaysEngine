@@ -384,7 +384,9 @@ pub fn render(
             // English never shifts anything on this screen, but the glyph
             // advances are still the menu font's own, so the flag still reaches
             // the rasteriser.
-            saveload::draw_line(&mut surface, font, &text, surface_pen(column, row), false);
+            saveload::draw_line(&mut surface, font, &text, surface_pen(column, row), &|c| {
+                crate::playback::text::menu_advance(c, false)
+            });
             let (sx, sy, sw, sh) = source_rect(column, row);
             quads.push(Quad {
                 src: (sx as u32, sy as u32, sw as u32, sh as u32),
@@ -400,6 +402,7 @@ pub fn render(
         surface,
         quads,
         tooltip,
+        tip_surface: None,
     }
 }
 
@@ -463,7 +466,9 @@ fn expand(
             TIP_PEN.0 as i32,
             (TIP_PEN.1 + pen_shift + n as f32 * TIP_PEN_PITCH) as i32,
         );
-        saveload::draw_line(surface, font, line, pen, false);
+        saveload::draw_line(surface, font, line, pen, &|c| {
+            crate::playback::text::menu_advance(c, false)
+        });
     }
 
     let panel = Quad {

@@ -932,6 +932,10 @@ struct ReplayPage {
     hovers: Vec<Option<days_ui::atlas::Widget>>,
     /// The page button of the page showing, drawn lit under the hover.
     page_mark: Option<days_ui::atlas::Widget>,
+    /// The list run's first twenty records — the ten row bars and the ten
+    /// comment panels beside them — which are what place the list's text.
+    /// Empty on the grid, which has none.
+    list: Vec<days_ui::atlas::Widget>,
     /// The view's background with the page's panel over it, in native layout
     /// space, and — on the grid — the player's unlocked thumbnails already
     /// blitted in the way `FUN_10027900` blits them...
@@ -975,6 +979,9 @@ impl ReplayPage {
 enum List {
     SaveLoad,
     PlayData,
+    /// The same list on the module that lays it out from a record run rather
+    /// than from its own hit map — see [`crate::ui::replay_pages`].
+    ReplayPages,
 }
 
 impl Menu {
@@ -986,13 +993,31 @@ impl Menu {
         self.rows = None;
         let list = match self.mode {
             Mode::SAVELOAD => List::SaveLoad,
-            Mode::REPLAY if self.view == replay::View::PlayData => List::PlayData,
+            Mode::REPLAY if self.view != replay::View::PlayData => return,
+            Mode::REPLAY if self.paths.replay_has_pages() => List::ReplayPages,
+            Mode::REPLAY => List::PlayData,
             _ => return,
         };
         let Some(font) = &self.font else {
             log::warn!("no font, so the slot rows stay empty");
             return;
         };
+        if list == List::ReplayPages {
+            let Some(records) = self.replay_page.as_ref().map(|page| page.list.clone()) else {
+                return;
+            };
+            self.rows = Some(replay_pages::render(
+                font,
+                &self.session.slots,
+                self.page,
+                &records,
+                self.session.text_input,
+                self.session.english,
+                self.selection.and_then(replay_pages::tooltip_row),
+            ));
+            self.dirty = true;
+            return;
+        }
         if list == List::PlayData {
             let hovered = self.selection.and_then(playdata::tooltip_row);
             self.rows = Some(playdata::render(
@@ -1137,10 +1162,19 @@ impl Menu {
         let hovers = (0..widgets.len())
             .map(|index| pages.hover(dll, view, index + replay_pages::FIRST, self.page))
             .collect();
+        // The list's text is laid out against the run the hit table does not
+        // hold, so it is read here with everything else the page needs.
+        let list = match view {
+            replay::View::PlayData => (0..replay_pages::PER_PAGE * 2)
+                .map_while(|index| days_ui::atlas::record_at(dll, pages.list(), index))
+                .collect(),
+            replay::View::HScene => Vec::new(),
+        };
         self.replay_page = Some(ReplayPage {
             view,
             widgets,
             hovers,
+            list,
             page_mark: pages.page_mark(dll, view, self.page),
             art,
             scaled,
@@ -1378,18 +1412,18 @@ impl Menu {
             // short it is drawn, so a one- or two-line panel is that art
             // squashed — the shipped sprite's own source rectangle.
             if let Some(tip) = &rows.tooltip {
+                // The panel is cut from the sheet the list's own sprites come
+                // from: the view's chip sheet on the module that draws its
+                // views from a record run, and the screen's own otherwise.
+                let chip = match &self.replay_page {
+                    Some(page) if page.view == replay::View::PlayData => &page.chip,
+                    _ => self.screen.chip(),
+                };
                 let panel = &tip.panel;
-                out.blit_downscaled(
-                    self.screen.chip(),
-                    panel.src,
-                    self.screen.place_layout(panel.dst),
-                );
+                out.blit_downscaled(chip, panel.src, self.screen.place_layout(panel.dst));
+                let from = rows.tip_surface.as_ref().unwrap_or(&rows.surface);
                 for line in &tip.lines {
-                    out.blit_downscaled(
-                        &rows.surface,
-                        line.src,
-                        self.screen.place_layout(line.dst),
-                    );
+                    out.blit_downscaled(from, line.src, self.screen.place_layout(line.dst));
                 }
             }
         }

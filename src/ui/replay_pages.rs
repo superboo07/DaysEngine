@@ -99,28 +99,114 @@
 //! that record is the row entire rather than the band. School Days HQ's list
 //! does the same thing.
 //!
-//! # The list's text, which this module does not yet place
+//! # The list's text
 //!
-//! `FUN_100288a0` runs `FUN_100267c0` once per panel, and that is where the
-//! rows' timestamps, chapters and comments are rasterised into the panel's
-//! 1024x1024 surface. It asks the host `+0xa8` for each entry of the panel —
-//! `FUN_0041af00`, which reads the `[SaveFileName]` and `[SaveConfig]` keys
-//! formatted with the entry number, so the list is the player's saves, the same
-//! call School Days HQ's play-data list makes through `+0x9c` — and lays the
-//! three strings down through host `+0x64`, twenty characters apiece, at pen
-//! `(0, row * 0x30)` for the timestamp, `(600, row * 0x30)` for the chapter and
-//! `(0, row * 0x30 + 0x202)` for the comment, advancing 0x18 a glyph below
-//! U+0080 and 0x2d at or above it. The comment column is drawn only when host
-//! `+0xf4` — `[TextInput]` — answers true, and when host `+0x68` (the English
-//! question) answers true as well each comment is centred at
-//! `226.5 - width / 4`, clamped at zero, against a record `0xd + row` of the
-//! list run.
+//! `FUN_10027c10` fills a panel and then places what it filled: it calls
+//! `FUN_100267c0` to rasterise the panel's ten rows, and then binds the three
+//! sprites per row that cut them back out. Each of the six panels keeps a
+//! surface of its own — `FUN_100296a0` builds six `FrameBuffer`s at
+//! `(0x400, 0x400, 0x208888)` and `FUN_100267c0` clears its own as 0x400 rows
+//! of 0x1000 bytes, which is the same 1024 pixels of 32 bits.
 //!
-//! **What is not recovered** is the expanded comment: `FUN_100288a0`'s two
-//! sprites `+0xf4` and `+0x4c4` over list records 0xa to 0x13. Nothing here
-//! places any of it yet.
+//! `FUN_100267c0` asks the host `+0xa8` for every entry of the panel —
+//! `FUN_0041af00`, which formats `[SaveFileName]` and `[SaveConfig]` with the
+//! entry number and answers with the timestamp, the chapter and the player's
+//! comment, the same three strings School Days HQ's `FUN_0042a980` gives
+//! through `+0x9c` — and lays them down through host `+0x64`, twenty
+//! characters apiece, at pen `(0, row * 0x30)` for the timestamp,
+//! `(600, row * 0x30)` for the chapter and `(0, row * 0x30 + 0x202)` for the
+//! comment. Its advance is a flat `0x18` below U+0080 and `0x2d` at or above
+//! it, with none of the per-character kerning
+//! [`crate::playback::text::menu_advance`] adds under English — see
+//! [`advance`].
+//!
+//! What `FUN_10027c10` then cuts and where it puts it:
+//!
+//! ```text
+//!            record        cut from the panel surface   drawn at
+//! timestamp  list[row]     (0,   row*48 + 2,  548, 48)  (+95 +5en, +2, 189, 24)
+//! chapter    list[row]     (600, row*48 + 2,  548, 48)  (+20 +15en, +2, 252, 24)
+//! comment    list[row+10]  (0,   row*48 + 514, 986, 48) (+2 +centre, +2, 494, 24)
+//! ```
+//!
+//! — the offsets being against that record's own origin. So the two halves of
+//! the stored line share the row bar's record and the comment takes the
+//! 454x87 panel record beside it, which is the same split
+//! [`crate::ui::saveload`] and [`crate::ui::playdata`] make between their two
+//! bands.
+//!
+//! The timestamp and the chapter are rasterised two pixels above where they are
+//! cut, exactly as School Days HQ's play-data list does; the comment's pen and
+//! cut agree, because its pen carries the `0x202` its cut does.
+//!
+//! The chapter's cut runs from 600 to 1148 across a surface 1024 wide. That is
+//! the shipped rectangle and it is kept: a chapter is `第N話` or two digits, so
+//! the glyphs are long finished by the edge.
+//!
+//! Two things come off the host. The comment column is drawn only when `+0xf4`
+//! — `FILMENGINE.INI [TextInput]`, reached the way [`crate::ui::saveload`] sets
+//! out — answers true. `+0x68` is the English question: `FUN_10018c40` picks
+//! `L"%4d年%2d月%2d日(%s)%02d:%02d"` and `L"第%d話"` when it answers zero and
+//! `L"%2d/%2d/%4d(%s)%02d:%02d"` and `L"%02d"` when it does not, which is what
+//! a save line in an English install reads like. It moves the timestamp 5 right
+//! and the chapter 15, the same two shifts the save/load screen makes.
+//!
+//! # The comment is not centred, and the reason is worth keeping
+//!
+//! `FUN_100267c0` measures each comment's advance and works out a centre for it
+//! — `226.5 - width / 4` clamped at zero, School Days HQ's rule 9 short of its
+//! 235.5 — and stores it at `+0x518 + panel * 0x28 + row * 4`. But it **zeroes
+//! all six panels' ten centres on entry** and refills only the panel it was
+//! given, and `FUN_100288a0` is the one and only caller of `FUN_10027c10`,
+//! which is the one and only caller of `FUN_100267c0`: six panels in order,
+//! every pass. So when the last of them returns, the array holds centres for
+//! panel 5 and zeroes for the other five.
+//!
+//! That would not matter if the sprite kept the position it was given — but
+//! `FUN_1002c1f0`, the screen's own update, re-places all three sprites of all
+//! six panels out of the same array, so the comment's x is re-read from it
+//! whenever the list is showing. The five panels whose centres were wiped draw
+//! their comments at the column's left edge.
+//!
+//! [`comment_centred`] is which page keeps its centring, and it is the tenth:
+//! the page showing sits in panel `page - window_top(page)`, and that is panel
+//! 5 only at page 9.
+//!
+//! `FUN_100267c0` places the comment sprite once itself on the way past, out
+//! of the **hit** table at `0x10058248` rather than the list run. Nothing is
+//! ever drawn from it: `FUN_10027c10` places the same sprite again the moment
+//! it returns, and the update places it again every frame after that.
+//!
+//! # The expanded comment
+//!
+//! `FUN_10024e30` raises it while the selection is past `0xc`, handing
+//! `FUN_100271f0` `selection - 0xd`. That is the comment band; the page buttons
+//! above it index a row the panel never filled, so they find nothing and draw
+//! nothing.
+//!
+//! It has a **seventh** buffer of its own, `+0x1a4`, built `(0x400, 0x100,
+//! 0x208888)` by `FUN_100296a0` and cleared 0x100 rows of 0x1000 bytes. The
+//! row's whole comment is laid into it cut at `0x3c` characters: the pen starts
+//! at `(0, 0)`, steps `0x18`/`0x2d` a glyph, and every twenty characters drops
+//! `0x3a` and goes back to `0x400`.
+//!
+//! `0x400` is the right edge of a buffer 1024 pixels wide, and the blitter
+//! takes a pitch rather than a width, so a glyph put there lands one whole
+//! scanline on: `y * 0x1000 + 0x400 * 4` is `(y + 1) * 0x1000`. The second and
+//! third lines therefore come out at x 0, one pixel below where the `0x3a`
+//! steps put them, and all three are inside the 986-wide rectangle the sprite
+//! cuts. See [`tip_pen`].
+//!
+//! The panel behind it is the list run's `row + 10` record — `row - 2` for the
+//! last two rows, so three lines cannot run off the bottom — sized by the
+//! character count over twenty: a third of the record less 3 for one line, two
+//! thirds less 3 for two, the whole record for three. A row opening upwards
+//! takes another 3 off and pushes the panel down by what it did not use. None
+//! of those shifts is read before it is written, where the save/load screen's
+//! pair are.
 
 use crate::ui::replay::View;
+use crate::ui::saveload::{self, Column, Line, Quad, Rows, Slots, Tooltip};
 use days_ui::atlas::{self, Widget};
 
 /// The first widget of a view. Widgets 0 to 2 are the frame's, and
@@ -664,6 +750,425 @@ pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
         .map(|index| index + FIRST)
 }
 
+/// The surface one panel's ten rows are rasterised into, from `FUN_100296a0`:
+/// six `FrameBuffer`s built `(0x400, 0x400, 0x208888)`, one per panel, and
+/// `FUN_100267c0` clears its own as 0x400 rows of 0x1000 bytes.
+pub const LIST_SURFACE: (u32, u32) = (0x400, 0x400);
+
+/// How many characters of any column are drawn, from `FUN_100267c0`'s
+/// `if (0x14 < n) n = 0x14`. The same cap on all three, English or not.
+pub const CAP: usize = 0x14;
+
+/// One row of the surface, `_DAT_1004bd90` — an `fmull`, so the double 48.0 —
+/// and how tall each column's slice of it is, `_DAT_10049794`, an `flds` so the
+/// float 48.0. The same number, so the rows abut exactly.
+const SURFACE_ROW_PITCH: f32 = 48.0;
+const SURFACE_ROW_HEIGHT: f32 = 48.0;
+
+/// Where `FUN_100267c0`'s pen starts down a row for the two halves of the
+/// stored line and for the comment — `0` and `0x202` — against the cut
+/// `FUN_10027c10` makes at `_DAT_10049760` (2.0) and `_DAT_1004bd68` (514.0),
+/// both `faddl` so both doubles.
+const PEN_LINE_Y: f32 = 0.0;
+const PEN_COMMENT_Y: f32 = 514.0;
+const CUT_LINE_Y: f32 = 2.0;
+const CUT_COMMENT_Y: f32 = 514.0;
+
+/// How far down its record every column is drawn, `_DAT_10049760` (2.0), and
+/// how tall, `_DAT_1004b288` (24.0) — half the surface row, which is why the
+/// text is rasterised at the font's own cell and comes down to size in the
+/// blit.
+const DEST_Y: f32 = 2.0;
+const DEST_HEIGHT: f32 = 24.0;
+
+/// The advance for one character, from `FUN_100267c0` and `FUN_100271f0`.
+///
+/// Both spell it out in full — `0x18` below U+0080 and `0x2d` at or above —
+/// with no kerning table and no language test, where School Days HQ's lists go
+/// through `FUN_10011dc0` and pick up
+/// [`crate::playback::text::menu_advance`]'s English kerning. The two agree on
+/// everything but an English ASCII character.
+pub fn advance(c: char) -> i32 {
+    if u32::from(c) >= 0x80 {
+        0x2d
+    } else {
+        0x18
+    }
+}
+
+/// Where in the surface a column's glyphs start, and how wide the sprite cuts
+/// it.
+///
+/// The x origins are `FUN_100267c0`'s own pen starts — 0, 600 and 0 — the
+/// chapter's being `_DAT_1004bd78` (600.0f) again on the cutting side, and the
+/// widths are `_DAT_1004bd98` (548.0f) and `_DAT_1004bd38` (986.0f). The
+/// chapter's cut therefore ends at 1148 on a surface 1024 wide; see the module
+/// doc.
+fn surface_span(column: Column) -> (f32, f32) {
+    match column {
+        Column::When => (0.0, 548.0),
+        Column::Chapter => (600.0, 548.0),
+        Column::Comment => (0.0, 986.0),
+    }
+}
+
+/// The x this column is offset by inside its record, and the extra shift
+/// English adds.
+///
+/// `_DAT_1004bd80` (95.0), `_DAT_10049738` (20.0) and `_DAT_10049760` (2.0),
+/// all `faddl` so all doubles; the English shifts are `_DAT_1004bda0` (5.0f)
+/// and `_DAT_1004bd9c` (15.0f), the same pair the save/load screen uses. The
+/// comment has none — it is centred instead, in [`comment_centre`].
+fn dest_x(column: Column, english: bool) -> f32 {
+    let shift = if english { 1.0 } else { 0.0 };
+    match column {
+        Column::When => 95.0 + 5.0 * shift,
+        Column::Chapter => 20.0 + 15.0 * shift,
+        Column::Comment => 2.0,
+    }
+}
+
+/// How wide this column is drawn: `_DAT_1004bd88` (189.0), `_DAT_1004bd70`
+/// (252.0) and `_DAT_1004bd10` (494.0), all `fmull` so all doubles. Each is
+/// cut wider than it is drawn, so every column is squeezed horizontally — the
+/// timestamp's 548 into 189 hardest of the three.
+fn dest_width(column: Column) -> f32 {
+    match column {
+        Column::When => 189.0,
+        Column::Chapter => 252.0,
+        Column::Comment => 494.0,
+    }
+}
+
+/// How far right an English comment is pushed, from `FUN_100267c0`.
+///
+/// `_DAT_1004bd18 - width / _DAT_1004bd20`, clamped to zero below
+/// `_DAT_10049770` — an `fsubrl`, an `fdivl` and an `fcompl`, so 226.5, 4.0 and
+/// 0.0. `width` is the advance total the rasterising loop accumulated, in
+/// surface pixels, and the column comes down to the screen at half, so dividing
+/// by four is half the drawn width. Japanese comments are not moved at all.
+///
+/// The clamp is unreachable here: [`CAP`] characters at the widest advance
+/// total 900, which leaves 1.5. It is kept because it is what the function
+/// does, not because anything reaches it.
+pub fn comment_centre(width: i32, english: bool) -> f32 {
+    if !english {
+        return 0.0;
+    }
+    (226.5 - width as f32 / 4.0).max(0.0)
+}
+
+/// Whether the page showing keeps the centring worked out for its comments.
+///
+/// `FUN_100267c0` zeroes all six panels' centres on entry and refills only its
+/// own, `FUN_100288a0` runs it over panels 0 to 5 in order and is the only
+/// thing that runs it, and `FUN_1002c1f0` re-reads the array every frame. So
+/// the centres that survive belong to panel `PLAYDATA_PANELS - 1`, and the
+/// page showing is in that panel only at the end of the strip — see the module
+/// doc.
+pub fn comment_centred(page: usize) -> bool {
+    page.checked_sub(window_top(page)) == Some(PLAYDATA_PANELS - 1)
+}
+
+/// Where the expanded comment's line `n` is really rasterised, from
+/// `FUN_100271f0` and the shape of the buffer it writes into.
+///
+/// The pen is `(0, 0)` and every twentieth character drops it `0x3a` and sends
+/// it back to `0x400`. The buffer is 1024 pixels wide and the blitter is given
+/// a pitch rather than a width, so `0x400` is the first pixel of the next
+/// scanline: every line after the first lands at x 0, one pixel below its own
+/// `0x3a` step.
+fn tip_pen(n: usize, base: f32) -> (i32, i32) {
+    let folded = if n == 0 { 0.0 } else { 1.0 };
+    (0, (base + n as f32 * TIP_PEN_PITCH + folded) as i32)
+}
+
+/// Which record of the list run places a column of a row.
+///
+/// `FUN_10027c10` reads `row` for the timestamp and the chapter and `row + 10`
+/// for the comment — the row bar and the comment panel beside it.
+pub fn record_of(column: Column, row: usize) -> usize {
+    match column {
+        Column::When | Column::Chapter => row,
+        Column::Comment => row + PER_PAGE,
+    }
+}
+
+/// Where in the surface a column of a row is rasterised, from `FUN_100267c0`.
+fn surface_pen(column: Column, row: usize) -> (i32, i32) {
+    let base = match column {
+        Column::When | Column::Chapter => PEN_LINE_Y,
+        Column::Comment => PEN_COMMENT_Y,
+    };
+    (
+        surface_span(column).0 as i32,
+        (row as f32 * SURFACE_ROW_PITCH + base) as i32,
+    )
+}
+
+/// The rectangle of the surface a column of a row is cut from, from
+/// `FUN_10027c10`.
+fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
+    let (x, width) = surface_span(column);
+    let base = match column {
+        Column::When | Column::Chapter => CUT_LINE_Y,
+        Column::Comment => CUT_COMMENT_Y,
+    };
+    (
+        x,
+        row as f32 * SURFACE_ROW_PITCH + base,
+        width,
+        SURFACE_ROW_HEIGHT,
+    )
+}
+
+/// Where a column of a row is drawn, in the 800x450 layout space the records
+/// use, from `FUN_10027c10`.
+fn dest_rect(
+    column: Column,
+    record: days_ui::cmap::Rect,
+    english: bool,
+    centre: f32,
+) -> (f32, f32, f32, f32) {
+    (
+        record.x as f32 + dest_x(column, english) + centre,
+        record.y as f32 + DEST_Y,
+        dest_width(column),
+        DEST_HEIGHT,
+    )
+}
+
+/// The row whose comment the pointer expands, from `FUN_10024e30`'s
+/// `0xc < selection` and its `selection - 0xd`.
+///
+/// The page buttons above the band pass that test too, and ask for a row from
+/// ten up. `FUN_100267c0` only ever files the ten rows it drew, so those find
+/// nothing and nothing is drawn — which is what this refuses outright.
+pub fn tooltip_row(widget: usize) -> Option<usize> {
+    (FIRST_COMMENT..FIRST_COMMENT + PER_PAGE)
+        .contains(&widget)
+        .then(|| widget - FIRST_COMMENT)
+}
+
+/// The expanded comment's own surface, from `FUN_100271f0`: a seventh buffer at
+/// `+0x1a4`, cleared 0x100 rows of 0x1000 bytes.
+const TIP_SURFACE: (u32, u32) = (0x400, 0x100);
+
+/// How many characters of the comment it lays out, `0x3c` — three lines of
+/// [`CAP`].
+const TIP_CAP: usize = 0x3c;
+
+/// How far the pen drops at each twentieth character, `0x3a`. Where it goes
+/// back to is [`tip_pen`].
+const TIP_PEN_PITCH: f32 = 58.0;
+
+/// How far down the surface a deep row's lines are rasterised so the fixed cut
+/// picks them up in the right slot, from `FUN_100271f0`: `0x7e` for one line
+/// and `0x3b` for two. Three lines fill the slice and are not moved.
+const TIP_DEEP_PEN: [f32; 2] = [126.0, 59.0];
+
+/// What the expanded comment's one sprite cuts — `_DAT_1004bdbc` (2.0f),
+/// `_DAT_1004bd38` (986.0f) and `_DAT_1004dabc` (192.0f), three lines' worth in
+/// one piece — and how tall it is drawn, `_DAT_1004dac0` (96.0), so the three
+/// line slots are 32 screen pixels each.
+const TIP_CUT: (f32, f32, f32, f32) = (0.0, 2.0, 986.0, 192.0);
+const TIP_DEST_HEIGHT: f32 = 96.0;
+
+/// How many rows of the list the panel's record spans, `_DAT_1004bd58` — an
+/// `fdivl`, so the double 3.0 — and how much a shortened panel gives back,
+/// which is that same 3.0 and `_DAT_1004bd50` (3.0f) again for a row opening
+/// upwards.
+const PANEL_ROWS: f32 = 3.0;
+const PANEL_INSET: f32 = 3.0;
+
+/// The last row whose panel can open downwards, from `FUN_100271f0`'s
+/// `7 < param_1` test.
+const LAST_ROW_OPENING_DOWN: usize = 7;
+
+/// Rasterises a page of the list.
+///
+/// A row whose slot has no file is skipped entirely, which is what
+/// `FUN_100267c0` does: it only draws when the host's entry query answers
+/// non-zero. `list` is the list run [`Pages::list`] anchors, `comments` is host
+/// `+0xf4` — `FILMENGINE.INI [TextInput]` — and `english` is host `+0x68`.
+/// `hovered` is the row the pointer is expanding, from [`tooltip_row`].
+pub fn render(
+    font: &days_font::Font,
+    slots: &Slots,
+    page: usize,
+    list: &[Widget],
+    comments: bool,
+    english: bool,
+    hovered: Option<usize>,
+) -> Rows {
+    let (width, height) = LIST_SURFACE;
+    let mut surface = days_ui::Image::empty(width, height);
+    let mut quads = Vec::new();
+
+    for row in 0..PER_PAGE {
+        let Some(line) = slots.get(saveload::slot_of(page, row)) else {
+            continue;
+        };
+        for column in Column::ALL {
+            if column == Column::Comment && !comments {
+                continue;
+            }
+            let text: String = text_of(line, column).chars().take(CAP).collect();
+            if text.is_empty() {
+                continue;
+            }
+            let Some(record) = list.get(record_of(column, row)) else {
+                continue;
+            };
+            let drawn = saveload::draw_line(
+                &mut surface,
+                font,
+                &text,
+                surface_pen(column, row),
+                &advance,
+            );
+            let centre = match column {
+                Column::Comment if comment_centred(page) => comment_centre(drawn, english),
+                _ => 0.0,
+            };
+            let (sx, sy, sw, sh) = source_rect(column, row);
+            quads.push(Quad {
+                src: (sx as u32, sy as u32, sw as u32, sh as u32),
+                dst: dest_rect(column, record.dst, english, centre),
+            });
+        }
+    }
+
+    let (tooltip, tip_surface) = match hovered
+        .filter(|_| comments)
+        .and_then(|row| expand(font, slots, page, row, list))
+    {
+        Some((tip, surface)) => (Some(tip), Some(surface)),
+        None => (None, None),
+    };
+    Rows {
+        surface,
+        quads,
+        tooltip,
+        tip_surface,
+    }
+}
+
+fn text_of(line: &Line, column: Column) -> &str {
+    match column {
+        Column::When => &line.when,
+        Column::Chapter => &line.chapter,
+        Column::Comment => &line.comment,
+    }
+}
+
+/// How far the expanded comment's panel is moved, how tall it is drawn and how
+/// far down the surface its lines are rasterised, from `FUN_100271f0`.
+///
+/// The line count is the **character count** over [`CAP`], not the wrap's own:
+/// the shipped switch divides the capped length and takes three arms off it.
+/// A row past [`LAST_ROW_OPENING_DOWN`] opens upwards — its panel starts as far
+/// down the borrowed record as the lines it does not need, and its text is
+/// rasterised into the matching slot of the one fixed cut. All three are zeroed
+/// before the branches that set them, so a shallow row reads no uninitialised
+/// float here where the save/load screen's pair do.
+fn panel_geometry(row: usize, chars: usize, height: f32) -> (f32, f32, f32) {
+    let deep = row > LAST_ROW_OPENING_DOWN;
+    let row_of_panel = height / PANEL_ROWS;
+    let given_back = if deep { PANEL_INSET } else { 0.0 };
+    match chars.min(TIP_CAP) / CAP {
+        0 => (
+            if deep {
+                row_of_panel * 2.0 + PANEL_INSET
+            } else {
+                0.0
+            },
+            row_of_panel - PANEL_INSET - given_back,
+            if deep { TIP_DEEP_PEN[0] } else { 0.0 },
+        ),
+        1 => (
+            if deep {
+                row_of_panel + PANEL_INSET
+            } else {
+                0.0
+            },
+            row_of_panel * 2.0 - PANEL_INSET - given_back,
+            if deep { TIP_DEEP_PEN[1] } else { 0.0 },
+        ),
+        _ => (0.0, height, 0.0),
+    }
+}
+
+/// Rasterises the expanded comment into a surface of its own and lays it out,
+/// from `FUN_100271f0`.
+///
+/// The wrap is a hard break every [`CAP`] characters over the first [`TIP_CAP`]
+/// of the comment, with no language test at all — which is
+/// [`saveload::wrap_comment`]'s Japanese arm. Only the first line lands inside
+/// the rectangle the sprite cuts; see the module doc.
+fn expand(
+    font: &days_font::Font,
+    slots: &Slots,
+    page: usize,
+    row: usize,
+    list: &[Widget],
+) -> Option<(Tooltip, days_ui::Image)> {
+    let comment = &slots.get(saveload::slot_of(page, row))?.comment;
+    let lines = saveload::wrap_comment(comment, false);
+    if lines.is_empty() {
+        return None;
+    }
+    let record = *list.get(record_of(Column::Comment, Tooltip::record_row(row)))?;
+
+    let (panel_shift, panel_height, pen_shift) =
+        panel_geometry(row, comment.chars().count(), record.dst.height as f32);
+
+    let (width, tip_height) = TIP_SURFACE;
+    let mut surface = days_ui::Image::empty(width, tip_height);
+    for (n, line) in lines.iter().enumerate() {
+        saveload::draw_line(&mut surface, font, line, tip_pen(n, pen_shift), &advance);
+    }
+
+    let panel = Quad {
+        // The half-pixel outset is the DLL's, on this sprite as on every other.
+        src: (
+            record.src_x,
+            record.src_y,
+            record.dst.width,
+            record.dst.height,
+        ),
+        dst: (
+            record.dst.x as f32 - 0.5,
+            record.dst.y as f32 - 0.5 + panel_shift,
+            record.dst.width as f32 + 1.0,
+            panel_height + 1.0,
+        ),
+    };
+    // One sprite, three line slots. Which slot the text lands in was decided by
+    // where it was rasterised, not by where this is drawn.
+    let text = Quad {
+        src: (
+            TIP_CUT.0 as u32,
+            TIP_CUT.1 as u32,
+            TIP_CUT.2 as u32,
+            TIP_CUT.3 as u32,
+        ),
+        dst: (
+            record.dst.x as f32 + dest_x(Column::Comment, false),
+            record.dst.y as f32 + DEST_Y,
+            dest_width(Column::Comment),
+            TIP_DEST_HEIGHT,
+        ),
+    };
+    Some((
+        Tooltip {
+            panel,
+            lines: vec![text],
+        },
+        surface,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +1316,82 @@ mod tests {
             );
             assert_eq!(action(View::PlayData, FIRST_ROW + row, 0), Act::Row(row));
         }
+    }
+
+    /// Only the comment band opens the expanded comment, and the page buttons
+    /// that pass `FUN_10024e30`'s `0xc < selection` do not: they name a row the
+    /// panel never filled.
+    #[test]
+    fn only_the_comment_band_expands_a_row() {
+        for row in 0..PER_PAGE {
+            assert_eq!(tooltip_row(FIRST_COMMENT + row), Some(row));
+            assert_eq!(tooltip_row(FIRST_ROW + row), None);
+        }
+        for button in 0..PLAYDATA_PAGES {
+            assert_eq!(tooltip_row(FIRST_PLAYDATA_PAGE + button), None);
+        }
+    }
+
+    /// The centring survives on one page only. `FUN_100267c0` wipes all six
+    /// panels' centres every time it fills one, `FUN_100288a0` fills them 0 to
+    /// 5 in order and nothing else fills any, and `FUN_1002c1f0` re-places the
+    /// comment sprites from what is left — so the page sitting in the last
+    /// panel is the only one that keeps it, and that is the tenth.
+    #[test]
+    fn the_last_page_is_the_only_one_whose_comments_are_centred() {
+        let centred: Vec<usize> = (0..PLAYDATA_PAGES)
+            .filter(|p| comment_centred(*p))
+            .collect();
+        assert_eq!(centred, [PLAYDATA_PAGES - 1]);
+        // And on that page it is School Days HQ's rule 9 short of its 235.5.
+        // Its clamp cannot be reached: twenty of the widest characters advance
+        // 900, which is 1.5 short of turning the shift negative.
+        assert_eq!(comment_centre(CAP as i32 * 0x18, true), 106.5);
+        assert_eq!(comment_centre(CAP as i32 * 0x2d, true), 1.5);
+        assert_eq!(comment_centre(CAP as i32 * 0x18, false), 0.0);
+    }
+
+    /// Every line of the expanded comment after the first is sent back to
+    /// `0x400`, which on a buffer 1024 wide is the first pixel of the next
+    /// scanline — so it lands at x 0, one pixel below its own `0x3a` step, and
+    /// inside the rectangle the sprite cuts.
+    #[test]
+    fn the_expanded_comments_lines_fold_onto_the_next_scanline() {
+        assert_eq!(tip_pen(0, 0.0), (0, 0));
+        assert_eq!(tip_pen(1, 0.0), (0, 59));
+        assert_eq!(tip_pen(2, 0.0), (0, 117));
+        // All three sit inside the cut, which starts two pixels down and runs
+        // 192 deep.
+        for n in 0..saveload::TIP_LINES {
+            let (x, y) = tip_pen(n, 0.0);
+            assert!(x >= TIP_CUT.0 as i32 && (x as f32) < TIP_CUT.0 + TIP_CUT.2);
+            assert!((y as f32) + SURFACE_ROW_HEIGHT <= TIP_CUT.1 + TIP_CUT.3);
+        }
+    }
+
+    /// A deep row's panel opens upwards and its text is rasterised into the
+    /// slot that opening leaves, from `FUN_100271f0`'s three arms. A shallow
+    /// row never moves either.
+    #[test]
+    fn a_deep_rows_panel_opens_upwards_into_the_record_above() {
+        let height = 87.0;
+        let third = height / PANEL_ROWS;
+        assert_eq!(panel_geometry(0, 5, height), (0.0, third - 3.0, 0.0));
+        assert_eq!(panel_geometry(0, 25, height), (0.0, third * 2.0 - 3.0, 0.0));
+        assert_eq!(panel_geometry(0, 45, height), (0.0, height, 0.0));
+        assert_eq!(
+            panel_geometry(9, 5, height),
+            (third * 2.0 + 3.0, third - 6.0, 126.0)
+        );
+        assert_eq!(
+            panel_geometry(9, 25, height),
+            (third + 3.0, third * 2.0 - 6.0, 59.0)
+        );
+        // Three lines fill the record whichever way the row opens, and the row
+        // that borrows a record borrows the one two above it.
+        assert_eq!(panel_geometry(9, 45, height), (0.0, height, 0.0));
+        assert_eq!(saveload::Tooltip::record_row(7), 7);
+        assert_eq!(saveload::Tooltip::record_row(8), 6);
     }
 
     /// The list's ten pages all rest on one sheet, where the grid's three each

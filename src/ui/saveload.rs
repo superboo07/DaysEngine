@@ -690,6 +690,14 @@ pub struct Rows {
     /// The expanded comment, when the pointer is in the second band and the
     /// row it names has one.
     pub tooltip: Option<Tooltip>,
+    /// The surface [`Tooltip::lines`] are cut from, when the screen gives the
+    /// expanded comment one of its own.
+    ///
+    /// This screen does not: `FUN_10012900` rasterises the tooltip into the
+    /// same buffer as the rows, clear of all three columns, so this is `None`
+    /// and the lines come out of [`Rows::surface`]. The Shiny Days list keeps a
+    /// seventh buffer for it — see [`crate::ui::replay_pages`].
+    pub tip_surface: Option<days_ui::Image>,
 }
 
 /// One column's sprite: what it cuts out of the surface and where it lands.
@@ -746,7 +754,9 @@ impl Rows {
                     continue;
                 };
 
-                let drawn = draw_line(&mut surface, font, &text, surface_pen(column, row), english);
+                let drawn = draw_line(&mut surface, font, &text, surface_pen(column, row), &|c| {
+                    text::menu_advance(c, english)
+                });
                 let centre = match column {
                     Column::Comment => comment_centre(drawn, english),
                     _ => 0.0,
@@ -766,6 +776,7 @@ impl Rows {
             surface,
             quads,
             tooltip,
+            tip_surface: None,
         }
     }
 
@@ -798,7 +809,9 @@ impl Rows {
                     TIP_SURFACE_X as i32,
                     (TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH) as i32,
                 );
-                draw_line(surface, font, line, pen, english)
+                draw_line(surface, font, line, pen, &|c| {
+                    text::menu_advance(c, english)
+                })
             })
             .collect::<Vec<i32>>();
 
@@ -820,16 +833,19 @@ impl Rows {
 /// already produces exactly those two planes when asked for white, and already
 /// combines glyphs with `max` for the same reason, so the line goes in as one
 /// piece.
+///
+/// `advance` is the per-character step the screen's own rasterising loop uses,
+/// because the two modules do not share one: this module and
+/// [`crate::ui::playdata`] call [`text::menu_advance`], while
+/// [`crate::ui::replay_pages`] has a flat rule of its own.
 pub(crate) fn draw_line(
     surface: &mut days_ui::Image,
     font: &days_font::Font,
     text: &str,
     (x, y): (i32, i32),
-    english: bool,
+    advance: &dyn Fn(char) -> i32,
 ) -> i32 {
-    let line = text::render_line_with(font, text, [0xff, 0xff, 0xff], &|c| {
-        text::menu_advance(c, english)
-    });
+    let line = text::render_line_with(font, text, [0xff, 0xff, 0xff], advance);
     for sy in 0..line.height {
         let dy = y + sy as i32;
         if dy < 0 || dy >= surface.height as i32 {
@@ -847,7 +863,7 @@ pub(crate) fn draw_line(
             }
         }
     }
-    text.chars().map(|c| text::menu_advance(c, english)).sum()
+    text.chars().map(advance).sum()
 }
 
 /// The weekday names the timestamp uses.

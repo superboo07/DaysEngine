@@ -826,22 +826,90 @@ at all in `SysMenuSDHQ.dll`; checked both with a plain scan over the raw file an
 through the shipped locator. `days ui System/Replay/ReplayBase --pages` is the
 check.
 
-**The list's text is recovered but not placed.** `FUN_100288a0` runs
-`FUN_100267c0` once per panel, and that is where the rows' timestamps, chapters
-and comments go into the panel's 1024x1024 surface. It asks the host `+0xa8` for
-each entry — `FUN_0041af00` in `SHINYDAYS.exe`, which reads the
-`[SaveFileName]` and `[SaveConfig]` keys formatted with the entry number, so the
-list is the player's saves through the same call the save/load screen makes —
-and lays the three strings down through host `+0x64`, twenty characters apiece,
-at pen `(0, row * 0x30)` for the timestamp, `(600, row * 0x30)` for the chapter
-and `(0, row * 0x30 + 0x202)` for the comment, advancing `0x18` a glyph below
-U+0080 and `0x2d` at or above it. The comment column is drawn only when host
-`+0xf4` — `[TextInput]`, School Days HQ's `+0xd8` — answers true, and when host
-`+0x68` (the English question, School Days HQ's `+0x5c`) answers true as well
-each comment is centred at `226.5 - width / 4`, clamped at zero, against a
-record `0xd + row` of the list run. **What is not recovered** is the expanded
-comment: `FUN_100288a0`'s two sprites `+0xf4` and `+0x4c4` over list records 0xa
-to 0x13. `src/ui/replay_pages.rs` places none of it yet.
+#### The list's text
+
+`FUN_100288a0` is the only caller of `FUN_10027c10`, which is the only caller of
+`FUN_100267c0`, and it runs the pair over all six panels in order. `FUN_100267c0`
+rasterises a panel's ten rows into a surface of its own — `FUN_100296a0` builds
+six `FrameBuffer`s at `(0x400, 0x400, 0x208888)` and each fill clears its own as
+0x400 rows of 0x1000 bytes — and `FUN_10027c10` then binds the three sprites per
+row that cut them back out.
+
+The strings come from host `+0xa8` per entry: `FUN_0041af00` in `SHINYDAYS.exe`,
+which formats `[SaveFileName]` and `[SaveConfig]` with the entry number and
+answers with the timestamp, the chapter and the player's comment — the same
+three `SysMenuSDHQ.dll` gets through `+0x9c` from `FUN_0042a980`. They go down
+through host `+0x64`, twenty characters apiece, at pen `(0, row * 0x30)`,
+`(600, row * 0x30)` and `(0, row * 0x30 + 0x202)`, advancing a flat `0x18` below
+U+0080 and `0x2d` at or above it — no kerning table and no language test, where
+School Days HQ's lists go through `FUN_10011dc0` and pick up its English
+kerning.
+
+```text
+           record        cut from the panel surface    drawn at
+timestamp  list[row]     (0,   row*48 + 2,   548, 48)  (+95 +5en,  +2, 189, 24)
+chapter    list[row]     (600, row*48 + 2,   548, 48)  (+20 +15en, +2, 252, 24)
+comment    list[row+10]  (0,   row*48 + 514, 986, 48)  (+2,        +2, 494, 24)
+```
+
+The offsets are against that record's own origin, so the two halves of the
+stored line share the row bar's record and the comment takes the 454x87 panel
+beside it. The chapter's cut runs to 1148 across a surface 1024 wide; that is
+the shipped rectangle, and a chapter is `第N話` or two digits, so the glyphs end
+long before the edge.
+
+Two things come off the host. The comment column is drawn only when `+0xf4` —
+`[TextInput]`, School Days HQ's `+0xd8` — answers true. `+0x68` is the English
+question, School Days HQ's `+0x5c`: `FUN_10018c40` picks
+`L"%4d年%2d月%2d日(%s)%02d:%02d"` with `L"第%d話"` when it answers zero and
+`L"%2d/%2d/%4d(%s)%02d:%02d"` with `L"%02d"` when it does not. It moves the
+timestamp 5 right and the chapter 15.
+
+#### Why the comment is not centred
+
+`FUN_100267c0` works out a centre for each comment — `226.5 - width / 4` clamped
+at zero, School Days HQ's rule 9 short of its 235.5 — and stores it at
+`+0x518 + panel * 0x28 + row * 4`. But it **zeroes all six panels' ten entries on
+entry** and refills only the panel it was given, so once the sixth returns the
+array holds centres for panel 5 and zeroes for the rest. `FUN_1002c1f0`, the
+screen's update, re-places all three sprites of all six panels out of that same
+array whenever the list is showing, so the five wiped panels draw their comments
+at the column's left edge. Only the page sitting in panel 5 keeps its centring,
+and that is the tenth: the page showing is in panel `page - window_top(page)`.
+
+A screenshot of the retail game on page 1 shows the comments hard against the
+left edge of their column in an install whose `[UseEnglish]` is 1, which is what
+this predicts and what an earlier reading of `FUN_100267c0` alone did not.
+
+`FUN_100267c0` also places the comment sprite once itself, out of the **hit**
+table at `0x10058248` at record `0xd + row` rather than the list run. Nothing is
+ever drawn from it: `FUN_10027c10` places the same sprite again the moment it
+returns, and the update places it again every frame after that.
+
+#### The expanded comment
+
+`FUN_10024e30` raises it while the selection is past `0xc`, handing
+`FUN_100271f0` `selection - 0xd`. That covers the page buttons too, and they ask
+for a row from ten up, which the panel never filled — so they find nothing and
+draw nothing.
+
+It gets a seventh buffer, `+0x1a4`, built `(0x400, 0x100, 0x208888)` and cleared
+0x100 rows of 0x1000 bytes. The row's whole comment goes in cut at `0x3c`
+characters: the pen starts at `(0, 0)`, steps `0x18`/`0x2d` a glyph, and every
+twenty characters drops `0x3a` and goes back to `0x400`. **`0x400` is not off
+the sprite.** The buffer is 1024 pixels wide and the blitter takes a pitch, so
+`y * 0x1000 + 0x400 * 4` is `(y + 1) * 0x1000`: the second and third lines land
+at x 0, one pixel below their own `0x3a` step, and all three sit inside the
+986-wide rectangle the sprite cuts at `(0, 2, 986, 192)`, drawn 494 by 96.
+
+The panel behind it is the list run's `row + 10` record, or `row - 2`'s for the
+last two rows so three lines cannot run off the bottom. Its height is the
+character count over twenty: a third of the record less 3 for one line, two
+thirds less 3 for two, the whole record for three; a row opening upwards gives
+back another 3 and is pushed down by what it did not use, and its pen drops
+`0x7e` or `0x3b` so the text lands in the slot that leaves. All three shifts are
+zeroed before the branches that set them, where School Days HQ's `FUN_10012900`
+leaves two of its own uninitialised.
 
 ---
 
