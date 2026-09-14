@@ -50,7 +50,7 @@
 //! where the reasoning is written down, because getting this wrong produced a
 //! title screen the real game never shows.
 
-use crate::install::config::Config;
+use crate::install::config::{Config, Sound};
 use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
 use crate::ui::dress;
@@ -420,6 +420,13 @@ pub struct Session {
     pub flags: FlagStore,
     /// The settings file, read and written by the Option screen.
     pub config: Config,
+    /// Which sound model this install's settings are in, from
+    /// [`crate::ui::paths::Paths::sound`].
+    ///
+    /// The settings file does not say: `[BgmVolume]="5"` and
+    /// `[BgmVolume]="0.500000"` are both a volume at rest, and only the module
+    /// that reads them settles which. See [`crate::install::config::Sound`].
+    pub sound: Sound,
     /// The replay scene table, recovered from the player's own menu DLL.
     pub scenes: Scenes,
     /// What this engine can say about the display, for the Def tab's two rows.
@@ -470,6 +477,7 @@ impl Session {
             save,
             flags: FlagStore::default(),
             config: Config::default(),
+            sound: Sound::default(),
             scenes: Scenes::from_scenes(Vec::new()),
             display: options::Display::default(),
             som: options::Som::default(),
@@ -1624,7 +1632,7 @@ impl Menu {
         Some(option_pages::slider_knob_x(
             track,
             knob,
-            option_pages::volume(&self.session.config, channel),
+            self.session.config.fraction(channel),
         ))
     }
 

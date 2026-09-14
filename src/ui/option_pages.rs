@@ -501,10 +501,10 @@ fn def_action(widget: usize, display: Display) -> Act {
 /// `FUN_10009430`.
 ///
 /// Widgets 8, 9 and 10 begin a drag of slider `widget - 8` and are **not
-/// wired**: this title keeps its three volumes as floats — see [`volume`] — and
-/// what its executable makes of one is not recovered, so there is nothing to
-/// write a dragged value into. The sliders draw, hover and read back; they do
-/// not yet move.
+/// wired**: this engine has no drag to commit one from yet. What the value
+/// means is recovered — a fraction of the knob's travel, stored and then run
+/// through [`crate::install::config::Sound::Fractions`] — so wiring them is a
+/// matter of the drag, not of the arithmetic.
 fn sound_action(widget: usize) -> Act {
     match widget {
         4 => Act::SetFlag(Flag::MenVoice, true),
@@ -530,22 +530,6 @@ fn somcon_action(widget: usize) -> Act {
         },
     }
 }
-
-/// The volume a slider shows, as a fraction of its travel.
-///
-/// `FUN_100075d0` reads `BgmVolume`, `SeVolume` and `VoiceVolume` through the
-/// settings object's float getter, defaulting to **0.5**, and clamps anything
-/// above 1.0 back to 1.0 — so this title's volumes are not the 0 to 10 levels
-/// [`crate::install::config::Config::volume`] reads for the other one.
-///
-/// **What the engine does with the number is not recovered.** This is what the
-/// screen draws the knob from, and nothing else reads it yet.
-pub fn volume(config: &Config, channel: Channel) -> f32 {
-    config.r4_or(channel.key(), DEFAULT_VOLUME).min(1.0)
-}
-
-/// The volume a missing key stands for, from `FUN_100075d0`.
-pub const DEFAULT_VOLUME: f32 = 0.5;
 
 /// How far a knob may travel: the track less the knob's own width.
 fn travel(track: &Widget, knob: &Widget) -> f32 {

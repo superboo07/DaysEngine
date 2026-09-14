@@ -203,6 +203,70 @@ only one of the four the screen does not clamp to 1, and the only one whose
 default is not `0.5`: `FUN_100075d0` asks for it with `-1.0` (verified by
 disassembly — `FLD float ptr [0x1004a004]` at `0x100075e4`).
 
+### What a fraction is worth, and what Mute does
+
+The number the slider stores is what `_GetMasterVolume@4` hands back, and that
+export is `FUN_10007990` itself — the same shape as School Days HQ's
+`FUN_10006fd0`, on fractions instead of levels:
+
+```text
+cat 0  VOICE   v = +0xc4
+cat 1  SE      v = +0xcc
+cat 2  BGM     v = +0xc8 / 2.0        FDIV double ptr [0x10049760]
+cat 3          v = 0.4                FLD  float  ptr [0x1004a008]
+                figure = (1.0 - v) * MasterVolume
+```
+
+Music goes in **halved** and the other two do not, so a music slider at rest is
+8.75 dB quieter than the other two rather than level with them.
+
+The host turns that figure into centibels in `FUN_00431750`, which is
+`FUN_004434a0`'s opposite number and the same arithmetic with two different
+constants. The decompiler hides the x87 half; the disassembly at `0x00431750`
+is
+
+```text
+FLD   float ptr [ESP + 0x4]       the figure
+FST   float ptr [ESI + 0x34]      kept, and compared against below
+FLD   double ptr [0x0048f270]     1750.0
+FMUL  ST1
+CALL  0x00483190                  truncate to an integer
+...   clamp to -10000 ..= 0
+FLD   float ptr [0x0048e200]      figure == -1.0 ? then -10000
+FLDZ                              figure ==  0.0 ? then 0
+```
+
+so a full slider is 0 dB, an empty one is true silence, and everything between
+is `1750 * figure` hundredths of a decibel. `FUN_00483190` and School Days HQ's
+`FUN_0047b710` are the same `_ftol2`: the `FIST` rounds to nearest and the
+correction below it takes that back to **truncation toward zero**. It only shows
+on a figure whose product has a fraction, which the level ladder never produces
+and this one does — music at rest scales to exactly `-1312.5`.
+
+**`Mute` is a silence here, not an attenuation.** Widgets 6 and 7 call host
+`+0x90`, which is `FUN_00416f50`: it walks five named sound handles and, through
+`FUN_00421ed0` and `FUN_004299b0`, two whole collections and one handle besides,
+handing each to `FUN_00431810`. That posts message `0x8010` to the sound
+object's own thread with the flag as `LPARAM`; `FUN_0040fe90` case `0x10` moves
+a suspend count at `+0x5c` by one and calls `FUN_00411210`, which while the
+count stands sets the device to `0xffffd8f0` and does not ask the ladder at all.
+`FUN_00431ac0` re-asserts it from `_GetMute@0` whenever a sound's volume moves.
+School Days HQ instead swaps a fixed level of 2 in for each category, which is
+−15.75 dB and audible.
+
+Which leaves `FUN_10007990`'s fourth category, the fixed `0.4` that
+`FUN_1000bd20` would substitute for a dragged slider's own value while muted.
+**It is unreachable in the retail build.** The question it turns on is host
+`+0x100` — `FUN_0041dbe0`, returning the member at object `+0x7cc`, the
+interface being a secondary base at `+0x2c` and both of its install sites
+confirming that. That member is set to zero by the constructor (`FUN_0041d660`,
+`XOR EBX,EBX` at `0x0041d69a`), the one call to its setter at host `+0xfc`
+passes zero (`FUN_1002fc60` case 0), and nothing else writes it: Ghidra's
+reference index and a raw byte scan of `.text` for the displacement agree, as do
+a reference scan and a raw scan for calls to the setter itself. Nothing visible
+turns on it — the device is already at the floor — so the substitution is dead
+weight rather than a bug the player can see.
+
 ### What the Option screen reads and writes
 
 `FUN_100075d0` reads the settings on entry and `FUN_100077f0` writes them back;
@@ -2824,6 +2888,15 @@ getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):
 
 `MasterVolume` is a float the same write-back stores; the shipped value is
 `-1.0`.
+
+The same ten keys carry different units on the other module. `FUN_100075d0`
+reads the three volumes through the settings object's `VT_R4` getter, defaulting
+each to `0.5` and clamping anything above `1.0` back down, because that screen's
+sliders are continuous — so `[BgmVolume]="0.500000"` and `[BgmVolume]="5"` are
+both a volume at rest and the file does not say which it is in. The module does:
+see "The Sound tab's volumes are continuous, not ten levels" above, and
+`Paths::sound` for how this engine asks. Reading a fraction as a level converts
+it to 0 and plays the game in silence, which is the shape of getting it wrong.
 
 ### What a volume level is worth, and what each slider covers
 

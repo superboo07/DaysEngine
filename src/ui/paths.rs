@@ -37,6 +37,7 @@
 //! (Pop_Replay), `FUN_1000d7f0` (DressSelect). The School Days HQ spellings
 //! are the ones this engine already ran on.
 
+use crate::install::config::Sound;
 use days_route::pe::Image;
 
 /// Every spelling of every screen's hit map this engine knows, best first.
@@ -253,6 +254,27 @@ impl Paths {
     /// work either way.
     pub fn option_tabs_have_own_map(&self) -> bool {
         self.literal(4).is_some_and(|l| l.contains("%s"))
+    }
+
+    /// Which sound model this module's settings drive.
+    ///
+    /// The same shape of the Option hit map answers this, because it is the
+    /// same fact: a module that lays its tabs out against rectangles of its own
+    /// is the module whose Sound tab has continuous sliders, and a continuous
+    /// slider carries a fraction. `FUN_1000bd20` commits one as the knob's
+    /// position across its travel and `FUN_100075d0` reads it back through the
+    /// settings object's `VT_R4` getter; the module with a hit map per tab
+    /// steps through ten levels instead, clamped by `FUN_10007140` and read
+    /// back through `VT_I4` in `FUN_10006ce0`.
+    ///
+    /// A module holding no Option screen at all gets [`Sound::Levels`], which
+    /// is the model this engine ran on first; it has no Sound tab to disagree
+    /// with.
+    pub fn sound(&self) -> Sound {
+        match self.option_tabs_have_own_map() {
+            true => Sound::Levels,
+            false => Sound::Fractions,
+        }
     }
 
     fn literal(&self, mode: i32) -> Option<&'static str> {

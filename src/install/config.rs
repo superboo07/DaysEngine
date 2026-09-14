@@ -75,6 +75,15 @@
 //! float the same write-back stores and the Option screen never edits through
 //! any widget this engine has recovered; the shipped value is `-1.0`.
 //!
+//! The other module on this engine keeps the same ten keys but reads its three
+//! volumes as **floats**: `FUN_100075d0` asks the settings object's `VT_R4`
+//! getter for each, defaults every one to `0.5`, and clamps anything above
+//! `1.0` back down — there is no lower clamp and no ten-step ladder, because
+//! its sliders are continuous. So `[BgmVolume]="0.500000"` and
+//! `[BgmVolume]="5"` are both volumes at rest, in two different units, and
+//! which one a file is in is the install's, not the file's, question. See
+//! [`Sound`].
+//!
 //! The remaining keys — `Format`, `WindowWidth`, `WindowHeight`, `DisplayType`,
 //! `TypeMiniNote`, `WindowMode`, `UseAgate`, `Wheel` — are written back
 //! untouched. The Option screen reads the display ones through the host rather
@@ -196,6 +205,101 @@ pub const MAX_VOLUME: i32 = 10;
 
 /// The `MasterVolume` the shipped file carries, used when the key is absent.
 pub const DEFAULT_MASTER_VOLUME: f32 = -1.0;
+
+/// The volume a missing key stands for under [`Sound::Fractions`], from
+/// `FUN_100075d0`.
+pub const DEFAULT_FRACTION: f32 = 0.5;
+
+/// The divisor `FUN_10007990` puts under the music fraction, and nothing else.
+///
+/// `FDIV double ptr [0x10049760]`, which is `2.0`. Voice and sound effects go
+/// into the ladder as they are stored; music goes in halved, so a music slider
+/// at rest is 8.75 dB quieter than the other two rather than level with them.
+const MUSIC_DIVISOR: f32 = 2.0;
+
+/// Which of the two sound models an install drives.
+///
+/// Both titles hand their sound layer a **centibel attenuation**, and both
+/// build it the same way: a per-channel *ladder figure* is scaled by a
+/// constant, truncated to an integer, clamped to `-10000..=0`, and then forced
+/// to one endpoint or the other when the figure is exactly an endpoint's own.
+/// `FUN_004434a0` is that arithmetic in `SCHOOLDAYS HQ.exe` and `FUN_00431750`
+/// is the same arithmetic in `SHINYDAYS.exe`; the decompiler hides the x87 half
+/// of both, and the disassembly of the second is
+///
+/// ```text
+/// FLD   float ptr [ESP + 0x4]       the ladder figure
+/// FST   float ptr [ESI + 0x34]      kept, and compared against below
+/// FLD   double ptr [0x0048f270]     1750.0
+/// FMUL  ST1
+/// CALL  0x00483190                  truncate to an integer
+/// ...   clamp to -10000 ..= 0
+/// FLD   float ptr [0x0048e200]      == -1.0 ? then -10000
+/// FLDZ                              ==  0.0 ? then 0
+/// ```
+///
+/// `FUN_00483190` and its opposite number `FUN_0047b710` are the same `_ftol2`:
+/// the `FIST` rounds to nearest and the correction below it takes that back to
+/// **truncation toward zero**. It only shows on a figure whose product has a
+/// fraction, which the level ladder never produces and the fraction ladder
+/// does — music at rest scales to exactly `-1312.5`.
+///
+/// What differs between the two is what the ladder is made of, and what `Mute`
+/// does; [`Config::gain`] is where both branches meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sound {
+    /// Ten steps per channel, and `Mute` is an attenuation.
+    ///
+    /// `FUN_10006fd0` in `SysMenuSDHQ.dll` gives `(11 - level) * MasterVolume`,
+    /// and muting swaps each category for its index 3, a fixed level of 2. See
+    /// [`Config::ladder`] and [`Config::MUTE_LEVEL`].
+    #[default]
+    Levels,
+    /// A fraction of full travel per channel, and `Mute` is a silence.
+    ///
+    /// `FUN_10007990` in `SysMenuSD.dll` gives `(1.0 - v) * MasterVolume`,
+    /// where `v` is the stored fraction and music's is halved first. Muting
+    /// does not go through the ladder at all: the Sound tab's two buttons
+    /// reach host `+0x90` (`FUN_00416f50`), which walks every sound the engine
+    /// owns and hands each a suspend count (`FUN_00431810`, message `0x8010`,
+    /// `FUN_0040fe90` case `0x10`); while that count stands, `FUN_00411210`
+    /// forces the device to `-10000` centibels and does not ask the ladder.
+    ///
+    /// `FUN_10007990` does have a fourth category holding a fixed `0.4`, which
+    /// `FUN_1000bd20` would substitute for a dragged slider's own value while
+    /// muted. It is unreachable in the retail build: the question it turns on
+    /// is host `+0x100` (`FUN_0041dbe0`), which returns the member at object
+    /// `+0x7cc`, and that member is set to zero by the constructor
+    /// (`FUN_0041d660`, `XOR EBX,EBX` at `0x0041d69a`) and written by nothing
+    /// else. Ghidra's reference index and a raw byte scan of `.text` for the
+    /// displacement agree on that, and the `+0x2c` the interface subobject sits
+    /// at was confirmed from both of its install sites.
+    Fractions,
+}
+
+impl Sound {
+    /// Hundredths of a decibel per unit of ladder figure.
+    fn scale(self) -> f32 {
+        match self {
+            Sound::Levels => 175.0,
+            Sound::Fractions => 1750.0,
+        }
+    }
+
+    /// The two ladder figures that are forced past the arithmetic: the one
+    /// that means silence and the one that means full volume.
+    ///
+    /// With the shipped `MasterVolume` of `-1.0` these are the ends of each
+    /// model's own travel — level 0 and level 10, fraction 0.0 and 1.0 — and
+    /// the comparisons are exact, so a `MasterVolume` that is anything else
+    /// leaves both ends to the ordinary clamp.
+    fn endpoints(self) -> (f32, f32) {
+        match self {
+            Sound::Levels => (-11.0, -1.0),
+            Sound::Fractions => (-1.0, 0.0),
+        }
+    }
+}
 
 /// The player's settings file.
 #[derive(Debug, Clone, Default)]
@@ -435,16 +539,18 @@ impl Config {
     /// `(11 - level) * MasterVolume`.
     ///
     /// This is the figure that crosses the boundary, and it is **not** the
-    /// attenuation that reaches the device — see [`Config::centibels`], which
-    /// is where the factor and the two endpoint overrides are. With the shipped
+    /// attenuation that reaches the device — see [`Sound`], which is where the
+    /// factor and the two endpoint overrides are. With the shipped
     /// `MasterVolume` of -1.0 it runs from -1.0 at level 10 to -11.0 at level 0.
     pub fn ladder(&self, level: i32) -> f32 {
         (11 - level) as f32 * self.master_volume()
     }
 
-    /// The level every group drops to while `Mute` is on.
+    /// The level every group drops to while `Mute` is on under
+    /// [`Sound::Levels`].
     ///
-    /// Muting does not silence anything. Each of the three per-frame updaters
+    /// Muting does not silence anything there. Each of the three per-frame
+    /// updaters
     /// swaps its own category for `FUN_10006fd0`'s index 3 — `FUN_0043ea80`
     /// with `(-(muted != 0) & 2) + 1`, `FUN_00429250` with `(muted != 0) + 2`,
     /// `FUN_0043c900` with `-(muted != 0) & 3` — and index 3 is a **fixed level
@@ -454,46 +560,57 @@ impl Config {
 
     /// A level as the hundredths of a decibel the sound layer is given.
     ///
-    /// `FUN_004434a0` is the whole conversion, and the decompiler hides half of
-    /// it; the disassembly at `0x004434a7` is
-    ///
-    /// ```text
-    /// FLD   float ptr [EBP + 0x8]        the ladder figure
-    /// FMUL  double ptr [0x004d5098]      175.0
-    /// CALL  0x0047b710                   round to an integer
-    /// ...   clamp to -10000 ..= 0
-    /// FCOMP double ptr [0x004d5090]      == -11.0 ? then -10000
-    /// FCOMP double ptr [0x004d5088]      == -1.0  ? then 0
-    /// ```
-    ///
-    /// then `FUN_0041a0a0` hands the result to the sound buffer, which is
-    /// DirectSound's centibel scale. So a level is worth **1.75 dB**, not the
-    /// 1 dB the ladder reads as, and the two ends are special-cased: level 10
-    /// is full volume and level 0 is true silence, because those are the levels
-    /// whose ladder figures are exactly -1.0 and -11.0.
-    ///
-    /// The comparisons are `float` against `double`, so the overrides only fire
-    /// where the product is exact — which it is for the shipped `MasterVolume`
-    /// of -1.0 and integer levels.
+    /// This is [`Sound::Levels`]' half of the shared arithmetic — see [`Sound`]
+    /// for the arithmetic itself, and `FUN_004434a0` for this title's copy of
+    /// it. A level is worth **1.75 dB**, not the 1 dB the ladder figure reads
+    /// as, and the two ends are special-cased: level 10 is full volume and
+    /// level 0 is true silence, because those are the levels whose ladder
+    /// figures are exactly `-1.0` and `-11.0`.
     pub fn centibels(&self, level: i32) -> i32 {
-        let db = self.ladder(level);
-        if db == -11.0 {
-            return -10000;
-        }
-        if db == -1.0 {
-            return 0;
-        }
-        ((db * 175.0).round() as i32).clamp(-10000, 0)
+        centibels(self.ladder(level), Sound::Levels)
     }
 
-    /// The attenuation in decibels a channel's level reaches the device as,
+    /// A channel's stored fraction under [`Sound::Fractions`].
+    ///
+    /// `FUN_100075d0` reads each through the settings object's `VT_R4` getter,
+    /// defaulting to [`DEFAULT_FRACTION`], and clamps anything above `1.0` back
+    /// to `1.0`. There is no lower clamp.
+    ///
+    /// This is what a slider draws its knob from as well as what the ladder
+    /// takes, and it is the fraction as stored — music's halving belongs to the
+    /// ladder, not to here.
+    pub fn fraction(&self, channel: Channel) -> f32 {
+        self.r4_or(channel.key(), DEFAULT_FRACTION).min(1.0)
+    }
+
+    /// What `FUN_10007990` gives for a channel: `(1.0 - v) * MasterVolume`,
+    /// with music's fraction divided by [`MUSIC_DIVISOR`] on the way in.
+    ///
+    /// The figure that crosses the boundary, the way [`Config::ladder`] is for
+    /// the other model. It is not the attenuation that reaches the device; see
+    /// [`Sound`] for the rest.
+    fn fraction_ladder(&self, channel: Channel) -> f32 {
+        let stored = self.fraction(channel);
+        let value = match channel {
+            Channel::Bgm => stored / MUSIC_DIVISOR,
+            Channel::Voice | Channel::Se => stored,
+        };
+        (1.0 - value) * self.master_volume()
+    }
+
+    /// The attenuation in decibels a channel's volume reaches the device as,
     /// with `Mute` taken into account.
-    pub fn attenuation_db(&self, channel: Channel) -> f32 {
-        self.centibels(self.effective_level(channel)) as f32 / 100.0
+    pub fn attenuation_db(&self, channel: Channel, sound: Sound) -> f32 {
+        let centibels = match sound {
+            Sound::Levels => self.centibels(self.effective_level(channel)),
+            Sound::Fractions if self.flag(Flag::Mute) => SILENCE,
+            Sound::Fractions => centibels(self.fraction_ladder(channel), sound),
+        };
+        centibels as f32 / 100.0
     }
 
-    /// The level a channel is actually played at: its own, or
-    /// [`Config::MUTE_LEVEL`] while `Mute` is on.
+    /// The level a channel is actually played at under [`Sound::Levels`]: its
+    /// own, or [`Config::MUTE_LEVEL`] while `Mute` is on.
     pub fn effective_level(&self, channel: Channel) -> i32 {
         if self.flag(Flag::Mute) {
             Config::MUTE_LEVEL
@@ -507,21 +624,32 @@ impl Config {
     /// The original hands the centibel figure to DirectSound; this engine's
     /// mixer multiplies samples, so the conversion happens here rather than
     /// silently in a driver.
-    pub fn gain(&self, channel: Channel) -> f32 {
-        db_to_gain(self.attenuation_db(channel))
+    pub fn gain(&self, channel: Channel, sound: Sound) -> f32 {
+        db_to_gain(self.attenuation_db(channel, sound))
     }
 
     /// The gain the menus' own sounds play at.
     ///
-    /// They are not a fourth setting and they are not on the script's groups
-    /// either: host slot `+0x50` (`FUN_00429c80`) keeps them in its own run at
-    /// `+0x540`, opens them unlooped at rate 1.0, and gives them
-    /// `_GetMasterVolume@4(1)` — the **sound-effect** level — with no mute
-    /// question asked. `FUN_0042a160`, which is what the Mute widget reaches,
-    /// never touches that run, so a click keeps its level while everything the
-    /// script owns drops.
-    pub fn system_se_gain(&self) -> f32 {
-        db_to_gain(self.centibels(self.volume(Channel::Se)) as f32 / 100.0)
+    /// Under [`Sound::Levels`] they are not a fourth setting and they are not
+    /// on the script's groups either: host slot `+0x50` (`FUN_00429c80`) keeps
+    /// them in its own run at `+0x540`, opens them unlooped at rate 1.0, and
+    /// gives them `_GetMasterVolume@4(1)` — the **sound-effect** level — with no
+    /// mute question asked. `FUN_0042a160`, which is what the Mute widget
+    /// reaches, never touches that run, so a click keeps its level while
+    /// everything the script owns drops.
+    ///
+    /// Whether [`Sound::Fractions`] keeps the same exemption is **not
+    /// recovered**. What that title's Mute widget reaches is `FUN_00416f50`,
+    /// which sweeps five named sound handles and, through `FUN_004299b0`, two
+    /// whole collections and one handle besides; which of those the menus' own
+    /// sounds live in has not been established. This engine mutes them with
+    /// everything else, because that is what the sweep that *is* recovered
+    /// does.
+    pub fn system_se_gain(&self, sound: Sound) -> f32 {
+        match sound {
+            Sound::Levels => db_to_gain(self.centibels(self.volume(Channel::Se)) as f32 / 100.0),
+            Sound::Fractions => self.gain(Channel::Se, sound),
+        }
     }
 
     /// Encodes the file: the banner, every entry in order, deflated under the
@@ -588,6 +716,28 @@ fn variant_bool(text: &str) -> bool {
 /// `VT_R4`. See [`variant_i4`] for the limits.
 fn variant_r4(text: &str) -> f32 {
     text.trim().parse().unwrap_or(0.0)
+}
+
+/// The centibel figure that means silence, and the floor of the clamp.
+///
+/// `0xffffd8f0` in both executables, which is DirectSound's own minimum.
+const SILENCE: i32 = -10000;
+
+/// A ladder figure as the hundredths of a decibel the sound layer is given.
+///
+/// The arithmetic both titles share; [`Sound`] is where it is written down and
+/// where each model's two constants come from. The truncation is `_ftol2`, not
+/// a rounding, and the two endpoint comparisons are against the ladder figure
+/// rather than against the product.
+fn centibels(ladder: f32, sound: Sound) -> i32 {
+    let (silent_at, full_at) = sound.endpoints();
+    if ladder == silent_at {
+        return SILENCE;
+    }
+    if ladder == full_at {
+        return 0;
+    }
+    ((ladder * sound.scale()) as i32).clamp(SILENCE, 0)
 }
 
 /// Decibels to a linear amplitude, clamped to unity.
@@ -726,7 +876,7 @@ mod tests {
         let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
         config.set_volume(Channel::Bgm, 10);
         assert_eq!(config.centibels(10), 0, "the ladder's -1.0 is forced full");
-        assert_eq!(config.gain(Channel::Bgm), 1.0);
+        assert_eq!(config.gain(Channel::Bgm, Sound::Levels), 1.0);
         config.set_volume(Channel::Bgm, 0);
         assert_eq!(
             config.centibels(0),
@@ -734,7 +884,7 @@ mod tests {
             "the ladder's -11.0 is the floor"
         );
         assert!(
-            config.gain(Channel::Bgm) < 1.0 / 32768.0,
+            config.gain(Channel::Bgm, Sound::Levels) < 1.0 / 32768.0,
             "-100 dB is under a 16-bit step, which is what the floor is for"
         );
         // Every step in between is the ladder figure times 175.
@@ -743,24 +893,79 @@ mod tests {
         assert_eq!(config.centibels(1), -1750);
     }
 
-    /// Mute is an attenuation, not a silence: every group is played at a fixed
-    /// level of 2. A `Mute` that silenced the game would be louder-sounding
-    /// nonsense the first time a player turned it on expecting the original.
+    /// Under [`Sound::Levels`] mute is an attenuation, not a silence: every
+    /// group is played at a fixed level of 2. A `Mute` that silenced the game
+    /// would be louder-sounding nonsense the first time a player turned it on
+    /// expecting the original.
     #[test]
     fn muting_drops_every_script_group_to_level_two() {
         let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
         config.set_flag(Flag::Mute, true);
         for channel in Channel::ALL {
             assert_eq!(config.effective_level(channel), 2);
-            assert_eq!(config.attenuation_db(channel), -15.75);
-            assert!(config.gain(channel) > 0.0, "muting is not silence");
+            assert_eq!(config.attenuation_db(channel, Sound::Levels), -15.75);
+            assert!(
+                config.gain(channel, Sound::Levels) > 0.0,
+                "muting is not silence"
+            );
         }
         // Even a channel the player had set to silence comes back up to 2.
         config.set_volume(Channel::Bgm, 0);
         assert_eq!(config.effective_level(Channel::Bgm), 2);
         // The menus keep their own level through it.
         config.set_volume(Channel::Se, 10);
-        assert_eq!(config.system_se_gain(), 1.0);
+        assert_eq!(config.system_se_gain(Sound::Levels), 1.0);
+    }
+
+    /// The other model's volumes are fractions, and a file written by its own
+    /// Option screen is what this reads. Under [`Sound::Levels`] every one of
+    /// these would convert to the integer 0 and play as silence, which is the
+    /// shape of getting the model wrong.
+    #[test]
+    fn a_fraction_at_rest_is_not_a_level_at_rest() {
+        let config = Config::parse_text(
+            "[MasterVolume]=\"-1.000000\"\n\
+             [VoiceVolume]=\"0.500000\"\n\
+             [BgmVolume]=\"0.500000\"\n\
+             [SeVolume]=\"0.500000\"\n",
+        );
+        // (1 - 0.5) * -1.0, scaled by 1750.
+        assert_eq!(config.attenuation_db(Channel::Se, Sound::Fractions), -8.75);
+        // Music goes in halved, and its product is the half-integer -1312.5
+        // that settles the truncation against a rounding.
+        assert_eq!(
+            config.attenuation_db(Channel::Bgm, Sound::Fractions),
+            -13.12
+        );
+        assert_eq!(config.attenuation_db(Channel::Voice, Sound::Levels), -100.0);
+    }
+
+    /// Both ends of the fraction ladder are forced past the arithmetic, the way
+    /// both ends of the level ladder are.
+    #[test]
+    fn a_fraction_at_either_end_is_forced() {
+        let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
+        config.set("SeVolume", "1.000000".to_string());
+        assert_eq!(config.gain(Channel::Se, Sound::Fractions), 1.0);
+        config.set("SeVolume", "0.000000".to_string());
+        assert_eq!(config.attenuation_db(Channel::Se, Sound::Fractions), -100.0);
+        // Music is halved on the way in, so a full music slider is not an
+        // endpoint and takes the ordinary arithmetic.
+        config.set("BgmVolume", "1.000000".to_string());
+        assert_eq!(config.attenuation_db(Channel::Bgm, Sound::Fractions), -8.75);
+    }
+
+    /// This title's mute does not go through the ladder at all: every sound the
+    /// engine owns is suspended, and a suspended sound is held at the floor.
+    #[test]
+    fn the_fraction_model_mutes_to_silence() {
+        let mut config = Config::parse_text("[MasterVolume]=\"-1.000000\"");
+        config.set_flag(Flag::Mute, true);
+        for channel in Channel::ALL {
+            assert_eq!(config.attenuation_db(channel, Sound::Fractions), -100.0);
+        }
+        // Including the menus' own sounds, unlike the other model's.
+        assert!(config.system_se_gain(Sound::Fractions) < 1.0 / 32768.0);
     }
 
     /// A rewrite has to survive a round trip *and* keep the keys this engine

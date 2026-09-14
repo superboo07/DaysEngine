@@ -139,7 +139,9 @@ pub struct Stage {
     voices: BTreeMap<String, VoiceLine>,
     /// The player's `MenVoice` option. `FUN_0044e800` refuses to start a clip
     /// whose `[PlayVoice]` male-voice flag is set when this is off; the
-    /// option's default is on.
+    /// option's default is on. The other title's pair of the same function,
+    /// `FUN_00431430` and `FUN_0043b110` in `SHINYDAYS.exe`, asks the same
+    /// export the same way.
     men_voice: bool,
     /// Male voice lines that `men_voice` has refused so far, still inside
     /// their window and still being offered.

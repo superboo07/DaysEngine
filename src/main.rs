@@ -14,7 +14,7 @@ use days_font::Font;
 use days_script::{Frame, Script, FPS};
 use daysengine::install::binaries::Binaries;
 use daysengine::install::binding::{Action as Control, Bindings, Sign, Trigger};
-use daysengine::install::config::{Channel, Config, Flag};
+use daysengine::install::config::{Channel, Config, Flag, Sound};
 use daysengine::install::engine::Settings;
 use daysengine::install::progress::Progress;
 use daysengine::install::save::FlagStore;
@@ -28,6 +28,7 @@ use daysengine::ui::comment;
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
 use daysengine::ui::options::{self, Dir, Display, Som};
+use daysengine::ui::paths::Paths;
 use daysengine::ui::replay::{self, Scenes};
 use daysengine::ui::saveload::{self, Slots};
 use daysengine::ui::screen::Resolution;
@@ -641,6 +642,11 @@ struct Player<'a> {
     system_se: SystemSounds,
     /// The user's own menu module, which holds every widget table.
     dll: Vec<u8>,
+    /// Which sound model that module's settings drive, read from it once.
+    ///
+    /// The three volumes are pushed at the mixer every tick and the module is
+    /// searched by literal, so this is settled at load rather than per frame.
+    sound: Sound,
     /// What the player has unlocked, out of their `Save/GlobalFlag.DAT`.
     flags: FlagStore,
     /// The install root, which is where `Config.DAT` is written back.
@@ -868,6 +874,7 @@ fn main() -> Result<()> {
         flags: daysengine::install::save::load_flags(&game, &film),
         // The widget tables are only needed for menus. A missing module is not
         // fatal to playing a script, so this is reported and left empty.
+        sound: Paths::from_module(&binaries.menu_bytes()).sound(),
         dll: binaries.menu_bytes(),
     };
 
@@ -1344,6 +1351,9 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
     Session {
         save: SaveState::from_flags(&player.flags, start),
         flags: player.flags.clone(),
+        // Which units the three volumes are in is the menu module's answer,
+        // not the settings file's.
+        sound: player.sound,
         scenes,
         // The Def tab shows which value is in force and greys the other, so
         // this has to be the engine's real mode rather than a fixed answer.
@@ -1380,21 +1390,20 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
 /// has one master gain, so until the mixer grows per-channel gain the quietest
 /// of the three is what it can honestly apply. Muting is exact either way.
 fn apply_settings(session: &Session, mixer: &Mixer) {
-    apply_volumes(&session.config, mixer);
+    apply_volumes(&session.config, session.sound, mixer);
 }
 
 /// Hands the mixer the gain each group of sounds plays at.
 ///
-/// Every sound in the original carries the level of the category it asks
-/// `_GetMasterVolume@4` for, and `Mute` swaps a fixed level 2 in for the
-/// script's three — but not for the menus', which keep `SeVolume`. See
-/// [`daysengine::install::config::Config::centibels`].
-fn apply_volumes(config: &Config, mixer: &Mixer) {
+/// Every sound in the original carries the attenuation of the category it
+/// belongs to, and what `Mute` does to it depends on which model the install
+/// drives — see [`daysengine::install::config::Sound`].
+fn apply_volumes(config: &Config, sound: Sound, mixer: &Mixer) {
     mixer.set_gains(daysengine::playback::mixer::Gains {
-        bgm: config.gain(Channel::Bgm),
-        se: config.gain(Channel::Se),
-        voice: config.gain(Channel::Voice),
-        system: config.system_se_gain(),
+        bgm: config.gain(Channel::Bgm, sound),
+        se: config.gain(Channel::Se, sound),
+        voice: config.gain(Channel::Voice, sound),
+        system: config.system_se_gain(sound),
     });
 }
 
@@ -2671,7 +2680,7 @@ fn run_script(
         // and set it on every object they own, every frame — so a slider moved
         // on the Sound tab the bar just opened takes hold on the sound in hand
         // rather than at the next script. See `daysengine::playback::mixer`.
-        apply_volumes(&config, player.mixer);
+        apply_volumes(&config, player.sound, player.mixer);
         // Male voice lines are refused while `MenVoice` is off, and the
         // original asks it per tick rather than per statement: `FUN_0043c900`
         // walks the live voice list every frame and `FUN_0044e800` calls

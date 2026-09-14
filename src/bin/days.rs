@@ -2420,7 +2420,7 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
 /// Prints the player's settings the way the Option screen reads them.
 fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
-    use daysengine::install::config::{Channel, Config, Flag};
+    use daysengine::install::config::{Channel, Config, Flag, Sound};
 
     let path = Config::path(game);
     let config = Config::load(game);
@@ -2428,40 +2428,61 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
     if roundtrip {
         return config_roundtrip(&path, &config);
     }
+    // Which units the three volumes are in is the menu module's answer, and a
+    // module this tool cannot read leaves the settings unreadable too rather
+    // than read in the wrong units.
+    let sound = daysengine::ui::paths::Paths::from_module(&system_menu_dll(game)?).sound();
     println!();
-    println!("volumes (level, then what reaches the sound layer):");
+    match sound {
+        Sound::Levels => println!("volumes (level, then what reaches the sound layer):"),
+        Sound::Fractions => println!("volumes (fraction, then what reaches the sound layer):"),
+    }
+    let muted = config.flag(Flag::Mute);
     for channel in Channel::ALL {
-        let level = config.volume(channel);
-        let played = config.effective_level(channel);
+        let held = match sound {
+            Sound::Levels => format!("{:>2}/10", config.volume(channel)),
+            Sound::Fractions => format!("{:>5.3}", config.fraction(channel)),
+        };
+        let note = match (sound, muted) {
+            (Sound::Levels, true) => {
+                format!(
+                    "   (muted: played at level {})",
+                    config.effective_level(channel)
+                )
+            }
+            (Sound::Fractions, true) => "   (muted: silenced)".to_string(),
+            (_, false) => String::new(),
+        };
+        let db = config.attenuation_db(channel, sound);
         println!(
-            "  {:<12} {:>2}/10   {:>6} cB {:>7.2} dB   gain {:.3}{}",
+            "  {:<12} {held}   {:>6} cB {:>7.2} dB   gain {:.3}{note}",
             channel.key(),
-            level,
-            config.centibels(played),
-            config.attenuation_db(channel),
-            config.gain(channel),
-            if played == level {
-                String::new()
-            } else {
-                format!("   (muted: played at level {played})")
-            },
+            (db * 100.0).round() as i32,
+            db,
+            config.gain(channel, sound),
         );
     }
     println!("  {:<12} {:>6.3}", "MasterVolume", config.master_volume());
-    // The menus' own sounds follow SeVolume and ignore Mute, so they are worth
-    // printing beside the three rather than left to be assumed.
+    // Whether the menus' own sounds follow Mute is the one place the two models
+    // differ that is not visible from the three rows above.
     println!(
-        "  {:<12} {:>27.3}   (SeVolume, never muted)",
+        "  {:<12} {:>27.3}   ({})",
         "menu sounds",
-        config.system_se_gain()
+        config.system_se_gain(sound),
+        match sound {
+            Sound::Levels => "SeVolume, never muted",
+            Sound::Fractions => "SeVolume, muted with the rest",
+        }
     );
-    println!();
-    println!("the ladder, level by level:");
-    print!("  ");
-    for level in 0..=daysengine::install::config::MAX_VOLUME {
-        print!("{level:>2}:{:<6} ", config.centibels(level));
+    if sound == Sound::Levels {
+        println!();
+        println!("the ladder, level by level:");
+        print!("  ");
+        for level in 0..=daysengine::install::config::MAX_VOLUME {
+            print!("{level:>2}:{:<6} ", config.centibels(level));
+        }
+        println!();
     }
-    println!();
     println!();
     println!("settings:");
     for flag in Flag::ALL {
@@ -2776,6 +2797,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         save,
         flags: flags.clone(),
         config: Config::load(game),
+        sound: Paths::from_module(&dll).sound(),
         scenes: Scenes::recover(&dll).unwrap_or_else(|err| {
             log::warn!("no replay scene table: {err}");
             Scenes::from_scenes(Vec::new())
