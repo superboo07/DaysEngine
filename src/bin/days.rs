@@ -2494,6 +2494,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     use daysengine::install::config::Config;
     use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session};
     use daysengine::ui::options::{Dir, Display, Som};
+    use daysengine::ui::paths::Paths;
     use daysengine::ui::replay::Scenes;
     use daysengine::ui::saveload::Kind;
     use daysengine::ui::screen::Resolution;
@@ -2566,14 +2567,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             ("som config", Mode::SOM_CONFIG),
             ("replay popup", Mode::REPLAY_POPUP),
             ("confirm popup", Mode::CONFIRM),
+            ("dress select", Mode::DRESS_SELECT),
         ];
+        let paths = Paths::from_module(&dll);
         for (name, mode) in modes {
             let variant = if mode == Mode::TITLE {
                 save.title_variant()
             } else {
                 mode.default_variant()
             };
-            let stem = mode.stem(variant).unwrap_or_default();
+            let stem = paths.stem(mode.0, variant).unwrap_or_default();
             match Menu::open(&vfs, &dll, mode, session(), resolution) {
                 Ok(menu) => println!(
                     "  mode {:>2}  {name:<14} {stem:<34} ok, {} widgets",

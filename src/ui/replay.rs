@@ -348,27 +348,27 @@ fn column(choice: i32) -> usize {
 /// What can go wrong recovering the tables.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("SysMenuSDHQ.dll is not a PE image this engine can read")]
+    #[error("the menu module is not a PE image this engine can read")]
     NotAPeImage,
     #[error(
-        "no run of replay scene names in SysMenuSDHQ.dll; the scene table cannot be recovered"
+        "no run of replay scene names in the menu module; the scene table cannot be recovered"
     )]
     NoSceneNames,
     #[error(
         "found {names} replay scene names but {scripts} script lists; \
-         the two tables in SysMenuSDHQ.dll do not describe the same scenes"
+         the two tables in the menu module do not describe the same scenes"
     )]
     Mismatched { names: usize, scripts: usize },
 }
 
-/// The replay scene table, recovered from the player's own `SysMenuSDHQ.dll`.
+/// The replay scene table, recovered from the player's own menu module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scenes {
     scenes: Vec<Scene>,
 }
 
 impl Scenes {
-    /// Recovers the table from the bytes of `SysMenuSDHQ.dll`.
+    /// Recovers the table from the bytes of the menu module.
     ///
     /// Nothing here is an address. Each table is found by what it contains, and
     /// every step is checked against the next:

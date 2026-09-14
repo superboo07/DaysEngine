@@ -53,7 +53,7 @@ pub enum Error {
     #[error("{0} is not in the packs")]
     MissingAsset(String),
     #[error(
-        "no widget table in SysMenuSDHQ.dll matches the hit map for {0}; \
+        "no widget table in the menu module matches the hit map for {0}; \
          the chip sprite positions cannot be recovered"
     )]
     NoAtlasFor(String),
@@ -210,7 +210,7 @@ impl Screen {
     ///
     /// `path` is the stem shared by the three files, as the DLL spells it, e.g.
     /// `System/Title/Title`. `dll` is the bytes of the user's own
-    /// `SysMenuSDHQ.dll`, which is where the widget-to-sprite table lives.
+    /// menu module, which is where the widget-to-sprite table lives.
     pub fn load(
         vfs: &Vfs,
         dll: &[u8],
@@ -235,11 +235,31 @@ impl Screen {
         base: Option<&str>,
         resolution: Resolution,
     ) -> Result<Screen, Error> {
+        Screen::load_with_art(vfs, dll, path, base, None, resolution)
+    }
+
+    /// Loads a screen whose chip sheet is not named after the stem either.
+    ///
+    /// One screen needs this: a menu module that keeps its cleared title under
+    /// `Clear/` gives that state its own art *and* its own chip sheet while
+    /// leaving it on the plain title's hit map, so both have to move together.
+    /// See [`crate::ui::paths::Paths::title_art`].
+    pub fn load_with_art(
+        vfs: &Vfs,
+        dll: &[u8],
+        path: &str,
+        base: Option<&str>,
+        chip: Option<&str>,
+        resolution: Resolution,
+    ) -> Result<Screen, Error> {
         let base_path = base
             .map(str::to_string)
             .unwrap_or_else(|| format!("{path}.png"));
+        let chip_path = chip
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{path}_Chip.png"));
         let native_base = Image::decode_png(&read(vfs, &base_path)?)?;
-        let chip = Image::decode_png(&read(vfs, &format!("{path}_Chip.png"))?)?;
+        let chip = Image::decode_png(&read(vfs, &chip_path)?)?;
 
         // The native map is the one the DLL's table is expressed in: the
         // widescreen variant where there is one, otherwise the only map there

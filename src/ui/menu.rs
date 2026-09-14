@@ -19,6 +19,11 @@
 //! remembers the mode it was opened from so it can draw the right question and
 //! return there on cancel. [`Mode`] and [`Menu::advance`] are that switch.
 //!
+//! Not every module has the same eight. `SysMenuSD.dll` adds a case 9,
+//! [`Mode::DRESS_SELECT`], and spells several of the others' paths differently;
+//! which screens a module has and where their art lives is read back out of
+//! that module rather than written down here. See [`crate::ui::paths`].
+//!
 //! # What a click does
 //!
 //! Every screen is [`Screen`]: base art, a chip sprite sheet, and a per-pixel
@@ -50,6 +55,7 @@ use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
 use crate::ui::options;
 use crate::ui::options::Dir;
+use crate::ui::paths::Paths;
 use crate::ui::playdata;
 use crate::ui::replay::{self, Scenes};
 use crate::ui::routemap;
@@ -81,30 +87,14 @@ impl Mode {
     /// to the title when opened from anywhere else.
     pub const CONFIRM: Mode = Mode(-1);
 
-    /// The screen's path stem, or `None` for [`Mode::PLAY`], which has no art.
+    /// Not a menu screen in every module: the dress-select screen.
     ///
-    /// Several modules share one class across several stems and choose at load
-    /// time, so `variant` is whichever one this screen was opened with. See
-    /// [`Mode::default_variant`] for where those come from.
-    pub fn stem(self, variant: &str) -> Option<String> {
-        Some(match self {
-            Mode::TITLE => format!("System/Title/{variant}"),
-            Mode::SAVELOAD => "System/SaveLoad/SaveLoad".to_string(),
-            Mode::OPTION => format!("System/Option/Option_{variant}"),
-            Mode::REPLAY => format!("System/Replay/Replay_{variant}"),
-            // Episodes 1 and 2 are one page; 3 upwards add a `-N` suffix the
-            // screen pages through, so the variant carries both parts and the
-            // directory is only the first of them.
-            Mode::ROUTEMAP => match variant.split_once('-') {
-                Some((episode, _)) => format!("System/RouteMap/{episode}/RouteMap{variant}"),
-                None => format!("System/RouteMap/{variant}/RouteMap{variant}"),
-            },
-            Mode::SOM_CONFIG => "System/Option/Pop_Som".to_string(),
-            Mode::REPLAY_POPUP => format!("System/Replay/Pop_Replay_{variant}"),
-            Mode::CONFIRM => "System/Exit/Popup".to_string(),
-            _ => return None,
-        })
-    }
+    /// `_SystemInit@8` in `SysMenuSD.dll` has a case for 9 that hands the
+    /// switch `DAT_1005b898`, whose static-init thunk `FUN_10048860` calls the
+    /// constructor `FUN_1000c470`, which installs `MENU::DressSelect::vftable`.
+    /// `SysMenuSDHQ.dll` has no case for 9 at all, so on that module
+    /// [`Paths::stem`] finds no screen for it and the mode is unavailable.
+    pub const DRESS_SELECT: Mode = Mode(9);
 
     /// The variant a module opens with the first time it is entered.
     ///
@@ -274,12 +264,19 @@ impl SaveState {
         }
     }
 
-    /// The title art variant, following the DLL's own three-way test.
+    /// The title art variant, following the DLL's own test.
     ///
     /// `Title_AC` is kept because the test is the DLL's and this is a
     /// reimplementation of it, not of its reachable subset — but nothing in
     /// the retail executable can set [`SaveState::all_clear`], so the live
     /// answers are only `Title_Clear` and `Title`.
+    ///
+    /// Which art each answer selects is the module's, not this test's:
+    /// `SysMenuSD.dll`'s `FUN_1002f550` has only two arms, `Title.png` and
+    /// `Clear/Title_Clear.png`, and no all-clear art ships in that install at
+    /// all. [`Paths::title_art`] maps a non-plain variant onto whichever
+    /// cleared spelling the module holds, so the unreachable all-clear arm
+    /// stays unreachable there rather than naming a file that is not present.
     pub fn title_variant(self) -> &'static str {
         if self.all_clear {
             "Title_AC"
@@ -553,6 +550,9 @@ pub fn backing_out(entry: Entry, mode: Mode, return_to: Mode) -> Leaving {
 /// The menu, as one screen plus the pointer state over it.
 pub struct Menu {
     mode: Mode,
+    /// Where this install's menu module puts each screen's art. Read once from
+    /// the module's own literals — see [`crate::ui::paths`].
+    paths: Paths,
     variant: String,
     screen: Screen,
     /// Which widget the pointer or the keyboard is on, if any. The title starts
@@ -665,10 +665,12 @@ impl Menu {
     ) -> Result<Menu, Error> {
         let tab = options::Tab::DEFAULT;
         let view = replay::View::DEFAULT;
+        let paths = Paths::from_module(dll);
         let variant = variant_for(&session, mode, tab, view, None, (0, 0));
         let screen = load_screen(
             vfs,
             dll,
+            &paths,
             mode,
             &variant,
             Mode::TITLE,
@@ -679,6 +681,7 @@ impl Menu {
         )?;
         let mut menu = Menu {
             mode,
+            paths,
             variant,
             states: vec![WidgetState::Resting; screen.widget_count()],
             screen,
@@ -719,6 +722,7 @@ impl Menu {
         let screen = load_screen(
             vfs,
             dll,
+            &self.paths,
             mode,
             &variant,
             return_to,
@@ -1956,6 +1960,7 @@ fn variant_for(
 fn load_screen(
     vfs: &Vfs,
     dll: &[u8],
+    paths: &Paths,
     mode: Mode,
     variant: &str,
     return_to: Mode,
@@ -1964,14 +1969,32 @@ fn load_screen(
     session: &Session,
     resolution: Resolution,
 ) -> Result<Screen, Error> {
-    let stem = mode
-        .stem(variant)
-        .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
-    let base = match mode {
-        Mode::OPTION => options::base_art(tab, session.som),
-        _ => base_art(mode, return_to, kind),
+    let stem_variant = match mode {
+        Mode::TITLE => paths.title_stem_variant(variant),
+        _ => variant,
     };
-    Screen::load_with_base(vfs, dll, &stem, base, resolution)
+    let stem = paths
+        .stem(mode.0, stem_variant)
+        .ok_or_else(|| Error::MissingAsset(format!("mode {}", mode.0)))?;
+    // Three screens name art that is not their stem, and which of them do
+    // depends on how the module spells its paths — a module whose replay views
+    // share one hit map has to name their two backgrounds apart from it, and
+    // one whose cleared title shares the plain title's map names both that
+    // title's art and its chip sheet. The rest is the same either way.
+    let (base, chip) = match mode {
+        Mode::TITLE => match paths.title_art(variant) {
+            Some((base, chip)) => (Some(base), Some(chip)),
+            None => (None, None),
+        },
+        Mode::REPLAY => (paths.replay_art(variant), None),
+        Mode::DRESS_SELECT => (paths.dress_select_art(), None),
+        Mode::OPTION if paths.option_tabs_have_own_map() => {
+            (options::base_art(tab, session.som), None)
+        }
+        Mode::OPTION => (None, None),
+        _ => (base_art(mode, return_to, kind), None),
+    };
+    Screen::load_with_art(vfs, dll, &stem, base, chip, resolution)
 }
 
 /// One step of keyboard navigation over `count` entries.
@@ -2118,12 +2141,6 @@ mod tests {
     }
     use super::*;
 
-    #[test]
-    fn play_is_the_mode_with_no_screen() {
-        assert_eq!(Mode::PLAY.stem(""), None);
-        assert!(Mode::TITLE.stem("Title").is_some());
-    }
-
     /// Host slot `+0x50`'s switch reads `this + 0x5a4 + 0x1c * index`, and
     /// `FUN_00422170` writes the INI's keys to the same run in declaration
     /// order — so the index is the key's position in `FILMENGINE.INI`.
@@ -2153,29 +2170,21 @@ mod tests {
         assert_eq!(SystemSe::Click.index(), 2);
     }
 
-    /// Every mode's default has to name art that actually ships, so a stem is
-    /// never a plausible-looking path nothing resolves. The packs are not in
-    /// this repository, so this pins the spellings; `days menu` checks them
-    /// against a real install.
+    /// The variant each module opens with is a member it zeroes, not a default
+    /// this engine chose, so it is pinned against the spelling that reads it.
+    /// Which stem that variant then names is [`crate::ui::paths`]'s question.
     #[test]
-    fn every_mode_opens_a_stem_the_game_ships() {
-        let expected = [
-            (Mode::TITLE, "Title", "System/Title/Title"),
-            (Mode::SAVELOAD, "", "System/SaveLoad/SaveLoad"),
-            (Mode::OPTION, "Def", "System/Option/Option_Def"),
-            (Mode::REPLAY, "HScene", "System/Replay/Replay_HScene"),
-            (Mode::ROUTEMAP, "01", "System/RouteMap/01/RouteMap01"),
-            (Mode::SOM_CONFIG, "", "System/Option/Pop_Som"),
-            (Mode::REPLAY_POPUP, "2", "System/Replay/Pop_Replay_2"),
-            (Mode::CONFIRM, "", "System/Exit/Popup"),
-        ];
-        for (mode, variant, stem) in expected {
-            assert_eq!(mode.stem(variant).as_deref(), Some(stem));
-            // The variant used above is the one the module actually opens with,
-            // except the title's, which comes from save state instead.
-            if mode != Mode::TITLE {
-                assert_eq!(mode.default_variant(), variant, "mode {}", mode.0);
-            }
+    fn every_modes_default_variant_is_the_one_its_module_opens_with() {
+        for (mode, variant) in [
+            (Mode::SAVELOAD, ""),
+            (Mode::OPTION, "Def"),
+            (Mode::REPLAY, "HScene"),
+            (Mode::ROUTEMAP, "01"),
+            (Mode::SOM_CONFIG, ""),
+            (Mode::REPLAY_POPUP, "2"),
+            (Mode::CONFIRM, ""),
+        ] {
+            assert_eq!(mode.default_variant(), variant, "mode {}", mode.0);
         }
     }
 

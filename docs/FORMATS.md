@@ -54,6 +54,54 @@ module itself. Shiny Days consolidates:
 | popups beside their screens | popups under a `Popup/` directory |
 | — | `DressSelect/DressSelect` and its `Popup/Popup_Select`, which School Days HQ has no equivalent of |
 
+Each module spells those stems itself, as four UTF-16 literals — the plain map
+and three widescreen ones — in the cmap loader for that screen. So nothing has
+to know which title an install is: `src/ui/paths.rs` tries the spellings it
+knows for each mode and keeps whichever the player's own module holds. The
+Shiny Days loaders are `FUN_10007c50` (Option), `FUN_100295e0` (Replay),
+`FUN_100125b0` (RouteMap), `FUN_1001b0f0` (SaveLoad), `FUN_1002f3f0` (Title),
+`FUN_1000faf0` (Exit), `FUN_1002e950` (Pop_Som), `FUN_10022d80` (Pop_Replay)
+and `FUN_1000d7f0` (DressSelect).
+
+**Shiny Days' cleared title has no hit map of its own.** `FUN_1002f3f0` fills
+the `%s` of `System/Title/%s.cmap` from a literal at `0x1004ddf8`, which is
+`L"Title"` on every path through the function — so the cleared title is the
+*same* map under different art. `FUN_1002f550` is where the art is chosen: host
+slot `+0x34` non-zero gives `Title.png`, otherwise slot `+0x108(0)` picks
+`Title.png` or `Clear/Title_Clear.png`, with matching `_Chip` sheets and the
+widget tables at `0x10058580` and `0x10058628`. Those two tables differ only by
+half a pixel of `y` on five records, so the box search cannot tell them apart
+and reaches the first; that is a half-pixel, and it is noted here rather than
+worked around. **What sets slot `+0x108` in `SHINYDAYS.exe` is not recovered**,
+so this engine still picks the cleared title from the `EndClear` flag, the way
+School Days HQ's `FUN_0042baf0` answers.
+
+**The Shiny Days Option screen is a carousel, not three screens.** Its four
+regions are the three tab headers and the close button — the same first four
+School Days HQ's per-tab maps have, which is why tab switching and close work on
+both. What is different is everything below them. `FUN_10008830` sets the page
+count at `+0x174`: **three, or two when host slot `+0x34` answers non-zero**,
+which drops the SOMCON tab. `FUN_100083b0` then loads every page at once,
+`FUN_10007d10` giving each its own texture placed at `pageWidth * index` and
+`FUN_100081a0` its own chip sheet — `Default/Option_Def`, `Sound/Option_Sound`,
+`Somcon/Option_SomCon` (or `Option_SomCon_Set` once `+0x224` is set) — and
+`+0xb0` is the scroll offset, `+0x16c` the tab in view. The widget table at
+`0x10054238` (file offset `0x52a38`) holds the four widgets as records 0–3 and
+one highlight per tab as records 4–6, indexed `tab + 4`.
+
+**What the Option tabs' own rows are on Shiny Days is not recovered.** The tab
+pages have chip sheets but no hit maps, so their rows are hit-tested some other
+way and this engine draws the frame with an empty page under it. School Days
+HQ's rows are unaffected: that module's maps still carry all 14 / 44 / 18
+widgets, and `src/ui/options.rs` still reads them.
+
+**Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
+`FUN_1000d980` hands the loader `System/Screen/Transparence.png` and
+`System/DressSelect/DressSelect_Chip.png` — the background is
+`STARTSCRIPT.INI`'s `[DressBG]` playing behind a transparent plate. Its own
+`DressSelect_Text.png` is a caption drawn afterwards by `FUN_1000cce0`, which
+this engine does not draw yet.
+
 **There is a menu mode School Days HQ does not have.** `_SystemInit@8` in
 `SysMenuSD.dll` switches the same mode integers onto the same screens —
 2 title, 3 save/load, 4 option, 5 replay, 6 route map, 7 SOM config, 8 replay
