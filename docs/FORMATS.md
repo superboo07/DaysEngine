@@ -85,15 +85,13 @@ which drops the SOMCON tab. `FUN_100083b0` then loads every page at once,
 `FUN_10007d10` giving each its own texture placed at `pageWidth * index` and
 `FUN_100081a0` its own chip sheet — `Default/Option_Def`, `Sound/Option_Sound`,
 `Somcon/Option_SomCon` (or `Option_SomCon_Set` once `+0x224` is set) — and
-`+0xb0` is the scroll offset, `+0x16c` the tab in view. The widget table at
-`0x10054238` (file offset `0x52a38`) holds the four widgets as records 0–3 and
-one highlight per tab as records 4–6, indexed `tab + 4`.
+`+0xb0` is the scroll offset, `+0x16c` the tab in view.
 
-**The Shiny Days Option tabs number their widgets the way School Days HQ does,
-but where those widgets *are* is not recovered.** `FUN_10008e60` is "is widget
-N live", and it is written in the same numbering: 0, 1 and 3 always — two tab
-headers and close — 2 only when host slot `+0x34` answers zero, and everything
-from 4 up delegated by `+0x16c` to one function per tab.
+**The Shiny Days Option tabs number their widgets the way School Days HQ does.**
+`FUN_10008e60` is "is widget N live", and it is written in the same numbering:
+0, 1 and 3 always — two tab headers and close — 2 only when host slot `+0x34`
+answers zero, and everything from 4 up delegated by `+0x16c` to one function per
+tab.
 
 | tab | function | live widgets |
 | --- | --- | --- |
@@ -103,17 +101,203 @@ from 4 up delegated by `+0x16c` to one function per tab.
 
 So the Def and SomCon tabs are the same screens under a new frame, and the
 Sound tab is not — School Days HQ's has 44 widgets and this one stops at 10,
-because its ten per-row level cells are gone.
+because its ten per-row level cells are gone. What replaces them is three
+continuous sliders; see below.
 
-What is missing is geometry and dispatch. The tab pages ship chip sheets and no
-hit maps, so their rows are hit-tested against rectangles rather than a map, and
-the table those rectangles come from has not been found: `FUN_100083b0` reads
-only the four frame widgets and the three tab highlights out of `0x10054238`,
-and the per-tab draw functions `FUN_10006110`, `FUN_10006500`, `FUN_10006a20`
-and `FUN_100070f0` have not been read yet. Until they are, this engine draws
-the Shiny Days Option frame with an empty page under the tabs. School Days HQ's
-rows are unaffected — that module's maps still carry all 14 / 44 / 18 widgets,
-and `src/ui/options.rs` still reads them.
+### The Shiny Days Option pages — one table per tab
+
+The tab pages ship chip sheets and no hit maps, so their widgets are rectangles
+rather than map regions, and each tab's rectangles are their own table of the
+usual six-float records. Every one of the three is laid out the same way and
+indexed the same way: **record `widget - 4` is widget `widget`**, records
+running in widget order from 4 up, and a second run of the same geometry with a
+different `src_y` follows the first — the two alternate runs School Days HQ's
+Option screen also has, here once per tab.
+
+| tab | draw | table | file offset | first run |
+| --- | --- | --- | --- | --- |
+| frame | `FUN_100083b0` | `0x10054238` | `0x52a38` | records 0–3 the four map widgets, 4–6 one highlight per tab at `tab + 4` |
+| 0 Def | `FUN_10006500` | `0x100542e0` | `0x52ae0` | records 0–9, widgets 4–13 |
+| 1 Sound | `FUN_10006a20` | `0x10054760` | `0x52f60` | records 0–3, widgets 4–7; 4–6 the slider tracks; 14–16 the slider knobs |
+| 2 SomCon | `FUN_100070f0` | `0x100544c0` | `0x52cc0` | records 0–13, widgets 4–17 |
+
+The Def table begins exactly where the frame table ends — `0x10054238 + 7 *
+0x18` — so the frame's four widgets, the three tab highlights and the Def page's
+ten records are one contiguous run. The Sound and SomCon tables are not
+adjacent to it or to each other.
+
+Record `tab + 4` of the frame table is confirmed twice over as the tab
+highlight: `FUN_100083b0` reads it at load, and `FUN_1000b3d0` re-points the
+highlight sprite at it every time the carousel settles on a new tab.
+
+### Which of a row's two buttons the highlight sits on
+
+Every row on every tab is a pair of buttons — the values the setting can take —
+and the draw picks the record of whichever button holds the current value. That
+is the same shape as School Days HQ's two alternate runs, but the choice is per
+row rather than per run, and it is always the widget's own record, so nothing
+has to be re-indexed: the highlight sits on record `widget - 4` of the widget
+whose value is in force.
+
+Tab 0, from `FUN_10006500`, paired against the dispatch in `FUN_10009150`:
+
+| widgets | records | the value | held in |
+| --- | --- | --- | --- |
+| 4, 5 | 0, 1 | host slot `+0xcc` | display, set through host `+0xe8` / `+0xec` |
+| 6, 7 | 2, 3 | host slot `+0xd0` | display, set through host `+0xf0` |
+| 8, 9 | 4, 5 | `Skip` | `+0x180` |
+| 10, 11 | 6, 7 | `SuperSkip` | `+0x1a0` |
+| 12, 13 | 8, 9 | `TextView` | `+0xd0` |
+
+The first widget of each pair is the on/first value and the second the
+off/second value, which `FUN_10009150` sets directly: widget 8 writes `Skip` 1
+and widget 9 writes 0, and so on for `SuperSkip` and `TextView`. The two
+display rows do not write a member; they raise a request at `+0xdc` and `+0xd8`
+for the host to act on, and only when the host says the mode would really
+change.
+
+Tab 1, from `FUN_10006a20` and `FUN_10009430`: widgets 4, 5 are `MenVoice`
+(`+0xd4`) on and off, widgets 6, 7 are `Mute` (`+0x184`) on and off. Widget 6
+also calls host `+0x90` with the new value.
+
+Tab 2, from `FUN_100070f0` and `FUN_100095c0`: widgets 4, 5 are `UseSOM`
+(`+0x224`) on and off — widget 4 runs the port scan and widget 5 clears both
+`+0x224` and `+0x218` — and widgets 6, 7 start and stop a test pulse
+(`+0x21c`), widget 6 through `FUN_10030930(.., 0x96, ..)`. Widgets 8–17 are the
+ten port buttons.
+
+### The Sound tab's volumes are continuous, not ten levels
+
+School Days HQ gives each volume a row of ten cells at 1.75 dB a step. Shiny
+Days gives it a slider, dragged. Widgets 8, 9 and 10 are the three sliders, and
+`FUN_1000bd20` — reached from `FUN_10009430` on press and from the per-frame
+`FUN_1000b3d0` for as long as the button is held — is the drag:
+
+| widget | slider | writes | INI key | and tells the host |
+| --- | --- | --- | --- | --- |
+| 8 | 0 | `+0xc8` | `BgmVolume` | `+0x8c` |
+| 9 | 1 | `+0xcc` | `SeVolume` | `+0x88` |
+| 10 | 2 | `+0xc4` | `VoiceVolume` | `+0x80`, or `+0x84` and `+0x80` together |
+
+A slider is two records. The **track** is record `widget - 4` — records 4, 5, 6,
+at `x = 173`, `w = 529`, `y = 177`, `219` and `261` — and the **knob** is record
+`widget + 6`, records 14, 15 and 16, `w = 18`. Only the knob's `x` is live; it
+is kept in `+0x1bc + slider * 4` and everything else about the knob comes from
+its record. The drag moves that `x` by the pointer's movement and clamps it to
+the track:
+
+```text
+knob_x  in  [ track.x * scale , (track.x + track.w - knob.w) * scale ]
+value   =   (knob_x - track.x * scale) / ((track.w - knob.w) * scale)
+```
+
+so the value is a float from 0 to 1 over 511 pixels of travel, not a level.
+`FUN_1000c280` is the matching hit test, and it tests only `x` — the pointer is
+over slider `n` when `knob_x <= pointer_x <= knob_x + knob.w * scale`.
+
+**`MasterVolume` has no slider.** `FUN_100075d0` reads it into `+0xc0` and
+`FUN_100077f0` writes it back, and nothing on any tab edits it. It is also the
+only one of the four the screen does not clamp to 1, and the only one whose
+default is not `0.5`: `FUN_100075d0` asks for it with `-1.0` (verified by
+disassembly — `FLD float ptr [0x1004a004]` at `0x100075e4`).
+
+### What the Option screen reads and writes
+
+`FUN_100075d0` reads the settings on entry and `FUN_100077f0` writes them back;
+widget 3 calls the write and then host `+0x58(0)` to leave the menus, which is
+the same "flush, then leave" School Days HQ does.
+
+| key | member | default |
+| --- | --- | --- |
+| `MasterVolume` | `+0xc0` | `-1.0` |
+| `VoiceVolume` | `+0xc4` | `0.5` |
+| `BgmVolume` | `+0xc8` | `0.5` |
+| `SeVolume` | `+0xcc` | `0.5` |
+| `TextView` | `+0xd0` | 1 |
+| `MenVoice` | `+0xd4` | 1 |
+| `Mute` | `+0x184` | 0 |
+| `Skip` | `+0x180` | 0 |
+| `Wheel` | `+0x198` | 0 |
+| `AutoDraw` | `+0x19c` | 1 |
+| `SuperSkip` | `+0x1a0` | 0 |
+| `UseSOM` | `+0x224` | 0 |
+
+`Wheel` and `AutoDraw` are read and written but no widget on any tab touches
+them. Reading `UseSOM` non-zero runs the port scan immediately. `VoiceVolume`,
+`BgmVolume` and `SeVolume` are each clamped down to 1 on the way in.
+
+### The port buttons disagree with the port scan, by two
+
+`+0x220` is the port index the SomCon page highlights, and the page draws the
+highlight at record `+0x220 + 4`. Two pieces of code write it and they do not
+agree:
+
+- `FUN_10008760`, the scan behind widget 4, walks ports 0 to 8 and on the first
+  that opens sets `+0x220` to that index. Nine values, 0–8, and record
+  `+0x220 + 4` is then records 4–12 — port buttons, correctly.
+- `FUN_100095c0`, a click on a port button, sets `+0x220` to `widget - 6` for
+  widgets 8 to 17, and opens that same number as the port. Ten values, 2–11,
+  and record `+0x220 + 4` is then records 6–15.
+
+Verified by disassembly at `0x10009739`: `MOV EDX,[EBP + 0x8]` / `SUB EDX,0x6` /
+`MOV [EAX + 0x220],EDX`, under a range check of `>= 8` and `<= 0x11`.
+
+Widget 8 is record 4, so the index that would put the highlight on the button
+just clicked is `widget - 8`. `widget - 6` puts it two buttons to the right,
+and for the last two buttons it leaves the run of ten entirely: records 14 and
+15 are the start of the table's second art run, the `UseSOM` pair's alternate
+sprites at `(447, 327)` and `(584, 327)`. So clicking the ninth or tenth port
+button throws the highlight to the bottom of the screen. The scan and the click
+also cannot reach the same set of ports — the scan alone can select 0 and 1,
+the click alone 9, 10 and 11.
+
+This is what the shipped code does; it is not a reading this engine has to
+reproduce a rationale for, and nothing here is inferred from the art.
+
+### The Option carousel is dragged, not clicked
+
+`FUN_1000b3d0` is the per-frame update. The three pages are laid out side by
+side at `pageWidth * index` and `+0xb0` scrolls between them, so switching tabs
+is a horizontal drag with a snap:
+
+- While the pointer is down, `+0xb0` follows it and `+0x248` marks a drag in
+  progress.
+- On release, the drag is `pageWidth * (start_x - end_x)`, and it snaps back to
+  the tab it started on unless `FUN_1000c380` of that is more than `pageWidth /
+  2`. Past that, a drag that ended to the **right** of where it started goes to
+  `tab - 1`, clamped at 0, and one that ended to the left to `tab + 1`, clamped
+  at 2 — or at 1 when host slot `+0x34` answers non-zero, the same answer that
+  drops the SOMCON tab from the page count. **What `FUN_1000c380` computes is
+  not recovered**: it widens its argument to a double and hands it to a CRT
+  math routine at `0x1003844f` that was not identified. The direction is
+  decided separately, by the sign of the same value, so only a magnitude makes
+  the branch coherent — but that is a reading of the branch, not of the
+  routine.
+- `+0x244` then animates `+0xb0` towards `+0x240` by `+0x234 / 20` a frame
+  while `+0x23c` climbs by `0.05`, arriving when it reaches 1 — so a tab change
+  is twenty frames.
+
+Clicking a tab header reaches the same animation: `FUN_1000bcb0`, which
+`FUN_10009060` calls for widgets 0, 1 and 2, sets `+0x240` and `+0x234` and
+raises `+0x244` without going through the drag at all.
+
+`FUN_10009060` is the activation dispatch, the counterpart of School Days HQ's
+`FUN_10007e80`: widgets 0–2 to `FUN_1000bcb0`, widget 3 to the flush and exit,
+and anything higher to `FUN_10009150`, `FUN_10009430` or `FUN_100095c0` by the
+tab in `+0x16c`. It is installed in the class vtable, and `FUN_10009760` — the
+per-frame input pump — is what calls it, having put the widget under the
+pointer in `+0x168` first.
+
+**Where `+0x168` comes from is not recovered.** `FUN_10009760` takes it from
+`FUN_10010ed0`, falling back to the class's own vtable slot `+0x4c` when that
+returns -1, and `FUN_10010ed0` is in the module's shared screen base rather
+than in `MENU::ConfigMenu`. Nothing in `MENU::ConfigMenu` writes `+0x168`
+except `FUN_10007c50`, which clears it, and the four arrow-key walkers
+`FUN_100099b0`, `FUN_10009f40` and `FUN_1000a330` — checked by scanning the
+whole class range `0x10005cb0`–`0x1000c350` for `mov`-class instructions with a
+`0x168` displacement, which finds those and nothing else. So how a pointer
+position becomes a widget number on a page that has no hit map is still open,
+and it is the one thing still missing before these tables can be used.
 
 **Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
 `FUN_1000d980` hands the loader `System/Screen/Transparence.png` and
