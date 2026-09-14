@@ -89,11 +89,31 @@ which drops the SOMCON tab. `FUN_100083b0` then loads every page at once,
 `0x10054238` (file offset `0x52a38`) holds the four widgets as records 0–3 and
 one highlight per tab as records 4–6, indexed `tab + 4`.
 
-**What the Option tabs' own rows are on Shiny Days is not recovered.** The tab
-pages have chip sheets but no hit maps, so their rows are hit-tested some other
-way and this engine draws the frame with an empty page under it. School Days
-HQ's rows are unaffected: that module's maps still carry all 14 / 44 / 18
-widgets, and `src/ui/options.rs` still reads them.
+**The Shiny Days Option tabs number their widgets the way School Days HQ does,
+but where those widgets *are* is not recovered.** `FUN_10008e60` is "is widget
+N live", and it is written in the same numbering: 0, 1 and 3 always — two tab
+headers and close — 2 only when host slot `+0x34` answers zero, and everything
+from 4 up delegated by `+0x16c` to one function per tab.
+
+| tab | function | live widgets |
+| --- | --- | --- |
+| 0 Def | `FUN_10008f20` | 4–13, unconditionally: **14 in all**, as School Days HQ |
+| 1 Sound | `FUN_10008f50` | 4–7 always, 8–10 when `FUN_1000c280(n - 8)` says so |
+| 2 SomCon | `FUN_10008fc0` | 4–5 always, 6–7 and 8–17 only with `+0x224` and `+0x218` both set: **18 in all**, as School Days HQ |
+
+So the Def and SomCon tabs are the same screens under a new frame, and the
+Sound tab is not — School Days HQ's has 44 widgets and this one stops at 10,
+because its ten per-row level cells are gone.
+
+What is missing is geometry and dispatch. The tab pages ship chip sheets and no
+hit maps, so their rows are hit-tested against rectangles rather than a map, and
+the table those rectangles come from has not been found: `FUN_100083b0` reads
+only the four frame widgets and the three tab highlights out of `0x10054238`,
+and the per-tab draw functions `FUN_10006110`, `FUN_10006500`, `FUN_10006a20`
+and `FUN_100070f0` have not been read yet. Until they are, this engine draws
+the Shiny Days Option frame with an empty page under the tabs. School Days HQ's
+rows are unaffected — that module's maps still carry all 14 / 44 / 18 widgets,
+and `src/ui/options.rs` still reads them.
 
 **Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
 `FUN_1000d980` hands the loader `System/Screen/Transparence.png` and
