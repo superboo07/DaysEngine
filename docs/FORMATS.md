@@ -110,15 +110,17 @@ The tab pages ship chip sheets and no hit maps, so their widgets are rectangles
 rather than map regions, and each tab's rectangles are their own table of the
 usual six-float records. Every one of the three is laid out the same way and
 indexed the same way: **record `widget - 4` is widget `widget`**, records
-running in widget order from 4 up, and a second run of the same geometry with a
-different `src_y` follows the first — the two alternate runs School Days HQ's
-Option screen also has, here once per tab.
+running in widget order from 4 up, followed by a second run at a different
+`src_y` — the two alternate runs School Days HQ's Option screen also has, here
+once per tab. On tabs 0 and 2 the second run repeats the first's geometry
+exactly; the Sound tab's is the one that does not, and it is described with the
+sliders below.
 
 | tab | draw | table | file offset | first run |
 | --- | --- | --- | --- | --- |
 | frame | `FUN_100083b0` | `0x10054238` | `0x52a38` | records 0–3 the four map widgets, 4–6 one highlight per tab at `tab + 4` |
 | 0 Def | `FUN_10006500` | `0x100542e0` | `0x52ae0` | records 0–9, widgets 4–13 |
-| 1 Sound | `FUN_10006a20` | `0x10054760` | `0x52f60` | records 0–3, widgets 4–7; 4–6 the slider tracks; 14–16 the slider knobs |
+| 1 Sound | `FUN_10006a20` | `0x10054760` | `0x52f60` | records 0–6, widgets 4–10 — 4–6 being the slider tracks; the knobs are 14–16 |
 | 2 SomCon | `FUN_100070f0` | `0x100544c0` | `0x52cc0` | records 0–13, widgets 4–17 |
 
 The Def table begins exactly where the frame table ends — `0x10054238 + 7 *
@@ -284,20 +286,61 @@ raises `+0x244` without going through the drag at all.
 `FUN_10009060` is the activation dispatch, the counterpart of School Days HQ's
 `FUN_10007e80`: widgets 0–2 to `FUN_1000bcb0`, widget 3 to the flush and exit,
 and anything higher to `FUN_10009150`, `FUN_10009430` or `FUN_100095c0` by the
-tab in `+0x16c`. It is installed in the class vtable, and `FUN_10009760` — the
-per-frame input pump — is what calls it, having put the widget under the
-pointer in `+0x168` first.
+tab in `+0x16c`. It is installed in the class vtable, and the per-frame input
+pump `FUN_10009760` is what calls it.
 
-**Where `+0x168` comes from is not recovered.** `FUN_10009760` takes it from
-`FUN_10010ed0`, falling back to the class's own vtable slot `+0x4c` when that
-returns -1, and `FUN_10010ed0` is in the module's shared screen base rather
-than in `MENU::ConfigMenu`. Nothing in `MENU::ConfigMenu` writes `+0x168`
-except `FUN_10007c50`, which clears it, and the four arrow-key walkers
-`FUN_100099b0`, `FUN_10009f40` and `FUN_1000a330` — checked by scanning the
-whole class range `0x10005cb0`–`0x1000c350` for `mov`-class instructions with a
-`0x168` displacement, which finds those and nothing else. So how a pointer
-position becomes a widget number on a page that has no hit map is still open,
-and it is the one thing still missing before these tables can be used.
+### The map answers the frame, a rectangle scan answers the page
+
+`FUN_10009760`, the per-frame input pump, puts the widget under the pointer in
+`+0x168`. It asks `FUN_10010ed0` first, and that is only the hit map: it hands
+the pointer to the map object at `+0x28` and returns the region number less one,
+or -1 when the map has nothing there. `OptionBase.cmap` covers the three tab
+headers and the close button and nothing else, so on a page it always misses.
+
+The miss is the interesting path. `FUN_10009760` then calls the class's own
+vtable slot `+0x4c`. `MENU::ConfigMenu`'s vtable is at **`0x10049fb4`**, which
+three facts agree on: `FUN_10009760` calls slot `+0x24` to activate a widget and
+`0x10049fd8` holds `FUN_10009060`, the activation dispatch; it calls slot `+0x48`
+each frame and `0x10049ffc` holds `FUN_1000b3d0`, the update; and the run of
+pointers ends at `+0x4c`, with `0x1004a004` onwards holding the float constants
+the class uses — `0xbf800000`, the `-1.0` default `FUN_100075d0` asks for
+`MasterVolume` with. Slot `+0x4c` is **`FUN_1000bb10`**, a linear scan of the
+tab's table:
+
+```text
+tab 0   10 records from 0x100542e0      tab 1   7 records from 0x10054760
+tab 2   14 records from 0x100544c0
+```
+
+and it returns `index + 4`. That is the second, independent confirmation of all
+three tables: the bases are the ones the draw functions use, the counts are the
+widget counts `FUN_10008f20`, `FUN_10008f50` and `FUN_10008fc0` declare live —
+10 for widgets 4–13, 7 for 4–10, 14 for 4–17 — and `index + 4` is the same
+`record = widget - 4` the draws index by, arrived at from the other end.
+
+The test is half-open at the low edge and closed at the high one, against the
+pointer scaled into page coordinates by `FUN_10037ef0`:
+
+```text
+rec.x < px <= rec.x + rec.w   and   rec.y < py <= rec.y + rec.h
+```
+
+The first record that contains the pointer wins; there is no z-order and no
+best match.
+
+This is also what records 4, 5 and 6 of the Sound table are for. They are the
+slider **tracks**, and nothing draws them — they exist so that widgets 8, 9 and
+10 have something 529 pixels wide to be hit against. `FUN_10008f50` then puts
+`FUN_1000c280` in front of the result, which narrows the live area back down to
+the knob, so the track catches the pointer and the knob decides whether the
+widget answers at all.
+
+So the Sound table is three runs rather than two: records 0–6 are the hit
+rectangles for widgets 4–10, records 7–10 are the alternate art for the four
+toggle widgets, and records 14–16 are the knob sprites the draw and the drag
+both use. Records 11–13 are knob-shaped too — same `src_x`, `src_y` of the
+alternate run, but 20 wide and 48 to 50 tall against the drawn knob's 18 by 26 —
+and **nothing decompiled so far reads them**.
 
 **Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
 `FUN_1000d980` hands the loader `System/Screen/Transparence.png` and
