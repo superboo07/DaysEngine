@@ -1562,17 +1562,13 @@ other.
 
 ### `System/MenuBar` — the control bar
 
-Everything in this section is `SysMenuSDHQ.dll`'s bar. **Shiny Days' is a
-different one**: `SysMenuSD.dll` gives the strip sixteen hit regions rather than
-twenty-five — it has no row of ten transparency cells — and lays its record
-table out to match, so not one of the raw record indices below addresses the
-same art there. Its twelve caption strips all share the destination
-`(401, 48) 389x24`, and School Days HQ's resting-art indices land on three of
-them, which drew three captions stacked at that spot on every frame of Shiny
-Days playback. `src/ui/bar.rs` now names no records at all on a strip whose
-region count is not 25; the widget under the pointer still lights, because that
-sprite comes from the hit map's own run and is right on either module.
-**Shiny Days' bar records are not recovered.**
+Unless a paragraph says otherwise, this section is `SysMenuSDHQ.dll`'s bar.
+**Shiny Days ships the same control over a different table** — see *The Shiny
+Days bar* below — so every raw record index here is School Days HQ's and means
+nothing on the other module. `src/ui/bar.rs` keeps the two sets in a `Layout`
+picked by the strip's region count, and a count that is neither module's names
+no records at all; the widget under the pointer still lights, because that
+sprite comes from the hit map's own run and is right on any module.
 
 The art and the 25-region widget table are in `SysMenuSDHQ.dll` like any other
 screen, but the module is not in the mode switch. `_SetMenuBar@4` is a one-line
@@ -1610,7 +1606,114 @@ bracket the 25 into the same twelve groups:
 | 15..24 | `FUN_10026ed0`, the replay indicator's transparency | `+0x98` |
 
 A press on a widget that is not live is swallowed *and silent*: the dispatch
-asks the enabled test before playing SE index 2.
+asks the enabled test before playing SE index 2. The enabled test is also what
+gates the hover sprite and the caption — the dispatch zeroes both flags for a
+widget it answers false for — so a dead button shows nothing under the pointer
+either.
+
+### The Shiny Days bar
+
+The same control, the same widgets in the same order, a different table.
+`SysMenuSD.dll`'s `_SetMenuBar@4` is the same one-liner, `*param =
+&DAT_1005c270`; that static `FILM::MenuBar` is built by `FUN_10030b40` through
+the CRT's static-init thunk `FUN_10048880`, and its vtable is at `0x1004e2bc`,
+anchored by the RTTI pointer immediately before it at `0x1004e2b8` that makes
+Ghidra name the symbol. Eighteen slots, the same shape as School Days HQ's, with
+`+0x0c` load, `+0x10` the gauge ramp, `+0x14` draw (`FUN_10034230`), `+0x1c` the
+host pointers, `+0x20` update (`FUN_100335f0`), `+0x2c` the play/pause re-place
+(`FUN_10034c50`), `+0x30` widget 2's action (`FUN_10034ef0`) and `+0x34` widget
+0's (`FUN_10035050`).
+
+Its record table is at VA `0x100586f8`, DLL file offset `0x56ef8`, and runs
+**forty-four** records — it ends where `FILM::MenuBar::RTTI_Type_Descriptor`
+starts at `0x10058b18`. Records 0 to 14 back the strip's first fifteen regions;
+region 16 is the transparency knob's track, which has no record of its own, so
+the alternates begin at record **15** rather than at the region count. The
+sprites' destinations come from `FUN_10031030` and their sources from
+`FUN_10031bc0`:
+
+| record | sprite | drawn when |
+|---|---|---|
+| 17 | `this+0x84`, the gauge's fill bar | with the bed |
+| 18 / 19 | `this+0x4c` / `this+0x6c`, widget 0 resting, auto off / on | `+0x150` |
+| 20 / 21 | `this+0x58`, widget 1 resting, playing / paused | always |
+| 22 / 36 | `this+0x5c` / `this+0x60`, widget 4 live / dead | `SuperSkip` |
+| 23 / 37 | `this+0x50` / `this+0x54`, the rate row live / dead | `+0x94` |
+| 24..35 | `this+0x64`, the twelve caption strips | hovered and live |
+| 38 / 39 | `this+0x7c` / `this+0x80`, `REPLAYMODE` live / dead | `+0xa4` |
+| 40 | `this+0x78`, the transparency knob | `+0xa4` |
+| 41 / 42 | `this+0x74`, the knob's bed live / dead | always |
+| 43 | `this+0x68`, the gauge's bed | with the fill |
+| 1 / 16 | `this+0x48`, widget 1 hovered, paused / playing | hovered |
+| 0 / 15 | `this+0x48`, widget 0 hovered, auto off / on | hovered |
+
+Four things are genuinely different from School Days HQ's, and each is a reading
+of the code rather than of the table's shape:
+
+* **No menu-button resting art.** `FUN_10031bc0` gives the five buttons no
+  sprite; they are part of `MenuBar.png`.
+* **No auto animation.** `FUN_10035050` sets `this+0x4c` to record 18 or 19 on
+  host `+0x150` and `FUN_10034230` picks between `this+0x4c` and `this+0x6c` on
+  the same answer — there is no frame arithmetic anywhere in the class. A raw
+  scan of `0x10030b30`..`0x100361c0` for four-byte references into the table
+  finds only the records above, with no consecutive run among them.
+* **The transparency control is a drag, not ten cells.** Widget `0xf` is the
+  track; `FUN_100334d0` returns 0 for it outright, so it is never "live" and its
+  press is silent, and `FUN_100335f0` reaches it from outside the enabled test.
+  `FUN_10035cb0` grants the grip only while the pointer is between the knob's
+  `x` and `x + 11`; `FUN_100359c0` then moves `this+0xb0` by the pointer's
+  movement for as long as the left button is down — `DAT_004b331c` in
+  `SHINYDAYS.exe`, which `WM_LBUTTONDOWN` sets and `WM_LBUTTONUP` clears. The
+  travel is `691.0` to `768.0` (doubles at `0x1004e320` and `0x1004e318`, span
+  `77.0` at `0x1004e310`) and the alpha is `round((x - 691) / 77 * 255)`, so
+  unlike HQ's ten cells, which stop at 250, this run reaches a full 255.
+  `FUN_10033270` starts it at `768.0` — a **float** at `0x1004e304`, unlike its
+  neighbours — so a fresh bar draws the sign solid.
+* **The `REPLAYMODE` sign is inside the strip**, at `(680, 20)`, where School
+  Days HQ's is at `(697, 80)` below it. `FUN_10034230` draws the live one past
+  both the visibility test and the fade all the same, so it still stays on the
+  picture with the bar gone.
+
+The gauge is a different instrument too. `FUN_10035780` asks the host for the
+**single** counter `001` through slot `+0x8` and ramps `this+0x3c` towards it
+over 1500ms, holds 2000ms and lowers itself — the same five steps and the same
+two windows as School Days HQ's — and `FUN_10035670` draws the result as one bar
+at record 17 whose width is that value clamped to the record's own 599. There
+are no pieces, no second counter and no leads. **This is recovered but not
+wired**: nothing yet drives `this+0x3c`, so the bed draws and nothing moves in
+it.
+
+Everything else carries over, and the host slots are what say so rather than the
+resemblance. Every one of the eighteen the bar calls is School Days HQ's shifted
+by `0xc` below `+0xa8` and by `0x1c` above it, with no exceptions. The host
+interface is at `0x0048e50c` in `SHINYDAYS.exe`, anchored three ways: an RTTI
+pointer immediately precedes it, a long run of `.text` pointers follows, and the
+one slot already known from the other side — `+0x94`, the only caller of
+`_GetSkipFlag@0` — lands exactly where the DLL asks for it. Four answers were
+chased to the member they return: `+0x13c` toggles `+0x254` and writes the
+`AutoMode` settings key, `+0x110` picks pause or resume off `+0x234`,
+`+0xa0`/`+0xa4` write and read `+0x1e8`, and `+0x170` returns `+0x79c` — the
+same member School Days HQ's `+0x154` returns. The five rates are the same five:
+`+0x98` is `FUN_004176a0`, the same routine over a table at `0x004a1b3c` holding
+`1.0, 2.0, 4.0, 12.0, 24.0`.
+
+`FUN_10035420`, the caption switch, has the same twelve arms grouped the same
+way, running consecutively from record 24 — so `caption()` in `src/ui/bar.rs`
+serves both. Its twelfth strip is unreachable in the retail build: it belongs to
+widget `0xf`, and the caption is drawn only for a widget the enabled test
+answers true for.
+
+**One shipped bug, reproduced.** `FUN_100335f0` picks record 16 for widget 1's
+hover art while playback is *running*, and record 16 is the play glyph — the
+sheet puts the pause glyph at `x` 1 and the play glyph at `x` 108 in both the
+hover row and the resting row. So hovering the button mid-playback turns it from
+"pause" into "play" while it still pauses. The module disagrees with itself:
+`FUN_10034c50` picks record 1 there and leaves the button consistent, but it
+runs only while host `+0x130` answers 1 and the pointer is already on widget 1,
+and **what writes the member it returns, `SHINYDAYS.exe`'s `+0x228`, is not
+recovered** — so when the original shows the other glyph is not recovered
+either. School Days HQ's `FUN_10024100` has the same two-record switch and its
+record 26 is the pause glyph, so HQ does not have the bug.
 
 ### What widget 4 actually skips to
 

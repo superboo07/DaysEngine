@@ -2226,8 +2226,9 @@ impl Cadence {
 ///
 /// The bar's own order, so this is widget 0 — auto-advance — unless something
 /// has turned it off, which nothing does.
-fn first_bar_widget(state: bar::State) -> Option<usize> {
-    (0..bar::WIDGETS).find(|widget| bar::enabled(*widget, state))
+fn first_bar_widget(bar: Option<&bar::Bar>, state: bar::State) -> Option<usize> {
+    let bar = bar?;
+    (0..bar.widgets()).find(|widget| bar.enabled(*widget, state))
 }
 
 /// The next live control bar widget along, wrapping.
@@ -2236,13 +2237,20 @@ fn first_bar_widget(state: bar::State) -> Option<usize> {
 /// for each of them and a press on one is swallowed *and silent*, so a
 /// selection that could rest on one would look like a control that had stopped
 /// working. The bar is one strip, so this is the whole of its navigation.
-fn step_bar(from: usize, forward: bool, state: bar::State) -> Option<usize> {
-    (1..=bar::WIDGETS)
+fn step_bar(
+    bar: Option<&bar::Bar>,
+    from: usize,
+    forward: bool,
+    state: bar::State,
+) -> Option<usize> {
+    let bar = bar?;
+    let widgets = bar.widgets();
+    (1..=widgets)
         .map(|step| {
-            let step = if forward { step } else { bar::WIDGETS - step };
-            (from + step) % bar::WIDGETS
+            let step = if forward { step } else { widgets - step };
+            (from + step) % widgets
         })
-        .find(|widget| bar::enabled(*widget, state))
+        .find(|widget| bar.enabled(*widget, state))
 }
 
 /// `elapsed` rounded to the nearest whole refresh.
@@ -2453,6 +2461,16 @@ fn run_script(
     let mut paused = false;
     let mut pointer = (0.0f32, 0.0f32);
     let mut buttons = (false, false);
+    // The left button's *held* state, which `buttons.0` is not: that one is a
+    // press latched for one frame and cleared at the end of it. Shiny Days'
+    // transparency knob is dragged rather than clicked, and `FUN_100359c0`
+    // moves it for as long as the button is down — the same `DAT_004b331c`
+    // that `WM_LBUTTONDOWN` sets and `WM_LBUTTONUP` clears.
+    let mut left_held = false;
+    // Where the pointer was on the strip last frame, in the strip's own units,
+    // so the knob can be moved by the difference. `FUN_100359c0` keeps the same
+    // pair at `this+0xcc`.
+    let mut bar_pointer: Option<f32> = None;
     // Which control bar widget the selection is on, for a player who is not
     // using a pointer. `None` leaves the bar to the pointer, which is the only
     // way the original has of reaching it at all.
@@ -2498,13 +2516,19 @@ fn run_script(
                     pointer = (*x, *y);
                     bar_focus = None;
                     match mouse_btn {
-                        MouseButton::Left => buttons.0 = true,
+                        MouseButton::Left => {
+                            buttons.0 = true;
+                            left_held = true;
+                        }
                         MouseButton::Right => buttons.1 = true,
                         _ => {}
                     }
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => match mouse_btn {
-                    MouseButton::Left => buttons.0 = false,
+                    MouseButton::Left => {
+                        buttons.0 = false;
+                        left_held = false;
+                    }
                     MouseButton::Right => buttons.1 = false,
                     _ => {}
                 },
@@ -2532,8 +2556,8 @@ fn run_script(
         // Quit behind it through.
         let answering = choice.is_some();
         let focused = bar_focus.is_some();
-        for control in asked {
-            match control {
+        for input in asked {
+            match input {
                 Control::Quit if !answering && !focused => return Ok(Outcome::Quit),
                 Control::Cancel if answering => answer.cancel = true,
                 Control::Cancel => bar_focus = None,
@@ -2551,26 +2575,29 @@ fn run_script(
                 Control::Down if answering => answer.next = true,
                 // Up reaches for the bar, which is where the bar is: a strip
                 // along the top of the picture. Down lets it go again.
-                Control::Up if !focused => bar_focus = first_bar_widget(bar_state),
+                Control::Up if !focused => {
+                    bar_focus = first_bar_widget(control.as_ref(), bar_state)
+                }
                 Control::Up => {}
                 Control::Down => bar_focus = None,
                 Control::FocusBar => {
                     bar_focus = if focused {
                         None
                     } else {
-                        first_bar_widget(bar_state)
+                        first_bar_widget(control.as_ref(), bar_state)
                     }
                 }
                 Control::Left if answering => answer.prev = true,
                 Control::Right if answering => answer.next = true,
                 Control::Left | Control::Right => match bar_focus {
                     Some(widget) => {
-                        bar_focus = step_bar(widget, control == Control::Right, bar_state)
+                        bar_focus =
+                            step_bar(control.as_ref(), widget, input == Control::Right, bar_state)
                     }
                     None => {
                         let at = clock(origin, now, offset, rate);
                         let delta = 5 * FPS;
-                        offset = if control == Control::Right {
+                        offset = if input == Control::Right {
                             Frame(at.0 + delta)
                         } else {
                             Frame(at.0.saturating_sub(delta))
@@ -2581,7 +2608,7 @@ fn run_script(
                 Control::SeekForward | Control::SeekBack => {
                     let at = clock(origin, now, offset, rate);
                     let delta = 5 * FPS;
-                    offset = if control == Control::SeekForward {
+                    offset = if input == Control::SeekForward {
                         Frame(at.0 + delta)
                     } else {
                         Frame(at.0.saturating_sub(delta))
@@ -2735,6 +2762,19 @@ fn run_script(
                 .then_some((sx as u32, sy as u32));
             hovered = control.point_at(over, now_ms);
 
+            // Shiny Days' transparency knob follows the pointer while the left
+            // button is down. `FUN_100359c0` runs every update, moves the knob
+            // by however far the pointer has come since the last one, and drops
+            // the grip the moment the button is up — so this is the movement,
+            // in the strip's own units, and the grip itself was taken by the
+            // press below.
+            let here = (f64::from(sx) / control.screen().scale()) as f32;
+            let moved = bar_pointer.map_or(0.0, |was| here - was);
+            bar_pointer = Some(here);
+            if control.drag(left_held, moved) {
+                bar_texture = None;
+            }
+
             // A click only reaches the bar while the bar is actually on
             // screen, and only the widget it lands on takes it. A press the
             // bar has no use for is left alone: the choice box reads the same
@@ -2753,7 +2793,7 @@ fn run_script(
             // there is one dispatch and one set of enable rules for the two.
             for widget in std::mem::take(&mut pressed) {
                 {
-                    let act = control.press(widget, bar_state, at.0);
+                    let act = control.press(widget, bar_state, at.0, over);
                     if act != bar::Act::None {
                         player.system_se.play(
                             SystemSe::Click,
@@ -2945,6 +2985,10 @@ fn run_script(
                         bar::Act::Transparency(level) => {
                             log::info!("the replay indicator is now at {level} of 10")
                         }
+                        // Taking hold of the knob asks the host for nothing
+                        // either: `FUN_100359c0` moves it from here on, and
+                        // the drag above is where that happens.
+                        bar::Act::GrabKnob => {}
                         bar::Act::None => {}
                     }
                 }
@@ -2955,8 +2999,8 @@ fn run_script(
             // on a dead widget looks like a control that has stopped working,
             // so it moves along to the next live one.
             if let Some(widget) = bar_focus {
-                if !bar::enabled(widget, bar_state) {
-                    bar_focus = step_bar(widget, true, bar_state);
+                if !control.enabled(widget, bar_state) {
+                    bar_focus = step_bar(Some(control), widget, true, bar_state);
                 }
             }
         }

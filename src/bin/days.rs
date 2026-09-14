@@ -1221,31 +1221,53 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     }
     state.gauge_leads = ramp.leads();
     if let Some(want) = args.transparency {
-        match (bar::indicator::FIRST_WIDGET..)
-            .take(bar::indicator::CELLS)
-            .find(|w| bar::indicator::level_for(*w) == Some(want))
-        {
-            Some(widget) => {
-                if bar.press(widget, state, 0) == Act::None {
-                    anyhow::bail!(
-                        "the cells are dead without --following-record, so the press \
-                         that sets the transparency is swallowed"
-                    );
+        match bar.layout().map(|l| l.knob) {
+            // School Days HQ's ten cells: pressing one stores its level.
+            Some(bar::Knob::Cells) => {
+                match (bar::indicator::FIRST_WIDGET..)
+                    .take(bar::indicator::CELLS)
+                    .find(|w| bar::indicator::level_for(*w) == Some(want))
+                {
+                    Some(widget) => {
+                        if bar.press(widget, state, 0, None) == Act::None {
+                            anyhow::bail!(
+                                "the cells are dead without --following-record, so the press \
+                                 that sets the transparency is swallowed"
+                            );
+                        }
+                    }
+                    None => anyhow::bail!(
+                        "no cell sets a transparency of {want}; level 1 is unreachable"
+                    ),
                 }
             }
-            None => anyhow::bail!("no cell sets a transparency of {want}; level 1 is unreachable"),
+            // Shiny Days' knob is dragged, so there is no press that reaches a
+            // level. Put it where that level would be: the run is 0 to 10 over
+            // the knob's own travel.
+            Some(bar::Knob::Drag { .. }) => {
+                if want > 10 {
+                    anyhow::bail!("--transparency runs 0 to 10, not {want}");
+                }
+                let across = want as f32 / 10.0;
+                bar.set_knob(bar::slider::MIN_X + across * bar::slider::TRAVEL);
+            }
+            None => anyhow::bail!("this module's strip has no recovered transparency control"),
         }
     }
 
     let (w, h) = bar.screen().size();
     println!(
-        "{} at {} — {w}x{h}, scale {:.2}, {} widgets ({}/{} boxes matched the table)",
+        "{} at {} — {w}x{h}, scale {:.2}, {} widgets ({}/{} boxes matched the table), {}",
         bar::PATH,
         resolution.name(),
         bar.screen().scale(),
-        bar::WIDGETS,
+        bar.widgets(),
         bar.screen().atlas().matched,
-        bar::WIDGETS,
+        bar.widgets(),
+        match bar.layout() {
+            Some(layout) => format!("records recovered from {}", layout.module),
+            None => "no recovered record table addresses this strip".to_string(),
+        },
     );
     println!(
         "state: auto {} paused {} replay {} message {} skippable {} \
@@ -1277,22 +1299,32 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     // bar sizes itself, and the indicator it sets the transparency of, which is
     // not on the strip at all.
     {
-        let level = bar.transparency();
+        let solidity = bar.transparency();
         println!(
-            "replay indicator: {}, transparency {level} of 10 (alpha {})",
+            "replay indicator: {}, {} (alpha {})",
             if state.following_record {
-                "on the picture, slider live"
+                "live, slider live"
             } else {
                 "off, slider dead"
             },
-            bar::indicator::alpha(level),
+            match solidity {
+                bar::Solidity::Level(level) => format!("transparency {level} of 10"),
+                bar::Solidity::Knob(x) => format!(
+                    "knob at x {x:.1} of {:.0}..{:.0}",
+                    bar::slider::MIN_X,
+                    bar::slider::MAX_X
+                ),
+            },
+            solidity.alpha(),
         );
-        match bar::indicator::knob(level) {
-            Some((src, dst)) => println!(
-                "  knob   sheet ({:.0},{:.0}) {:.0}x{:.0} -> strip ({:.1},{:.1}) {:.0}x{:.0}",
-                src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h,
-            ),
-            None => println!("  knob   level {level} has no case in FUN_10027030"),
+        if let bar::Solidity::Level(level) = solidity {
+            match bar::indicator::knob(level) {
+                Some((src, dst)) => println!(
+                    "  knob   sheet ({:.0},{:.0}) {:.0}x{:.0} -> strip ({:.1},{:.1}) {:.0}x{:.0}",
+                    src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h,
+                ),
+                None => println!("  knob   level {level} has no case in FUN_10027030"),
+            }
         }
     }
 
@@ -1348,21 +1380,18 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     }
 
     println!("  wgt  region  dst                live   caption  action");
-    // A strip with fewer regions than School Days HQ's is a different bar, and
-    // the dispatch below is HQ's. Report what this module actually has rather
-    // than running off the end of its table.
-    let widgets = bar.screen().atlas().widgets.len().min(bar::WIDGETS);
-    if !bar.decorated() {
+    if bar.layout().is_none() {
         println!(
-            "  this module's strip has {} regions, not {} — its resting art and its \
-             captions are not recovered, so the bar draws neither",
-            bar.screen().atlas().widgets.len(),
-            bar::WIDGETS
+            "  neither recovered record table addresses a strip with {} regions, so the bar \
+             draws only the widget under the pointer",
+            bar.widgets()
         );
     }
-    for widget in 0..widgets {
+    for widget in 0..bar.widgets() {
         let rect = bar.screen().atlas().widgets[widget].dst;
-        let act = bar::action(widget, state, false);
+        let act = bar
+            .layout()
+            .map_or(Act::None, |l| l.action(widget, state, false));
         let shown = match act {
             Act::None => "-".to_string(),
             Act::ToggleAuto => "toggle the auto flag".to_string(),
@@ -1377,6 +1406,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             Act::Menu(m) => format!("open menu {}", m.0),
             Act::Leave => "leave playback".to_string(),
             Act::Transparency(n) => format!("set the replay indicator to {n} of 10"),
+            Act::GrabKnob => "take hold of the replay indicator's knob".to_string(),
         };
         println!(
             "  {widget:3}  {:6}  ({:4},{:3}) {:3}x{:<3}  {:5}  {:>7}  {shown}",
@@ -1385,18 +1415,23 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             rect.y,
             rect.width,
             rect.height,
-            bar::enabled(widget, state),
+            bar.enabled(widget, state),
             bar::caption(widget)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string()),
         );
     }
-    if state.auto {
-        println!(
-            "widget 0 is on animation record {} after {}ms",
-            bar::auto_frame(args.elapsed, state.speed),
-            args.elapsed
-        );
+    if let (true, Some(layout)) = (state.auto, bar.layout()) {
+        match layout.auto_lit {
+            bar::Auto::Animated { frames, .. } => println!(
+                "widget 0 is on animation record {} of {frames} after {}ms",
+                layout.auto_lit.frame(args.elapsed, state.speed),
+                args.elapsed
+            ),
+            bar::Auto::Lit(record) => {
+                println!("widget 0 is lit: record {record}, and this module's bar has no animation")
+            }
+        }
     }
     // The bar is a drop-down: it is on screen only while the pointer is inside
     // the strip, and it ramps in over 300ms and out over 1000ms. Drive that

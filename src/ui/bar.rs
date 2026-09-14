@@ -65,17 +65,23 @@
 //! [`Bar::compose_faded`].
 //!
 //! So the widget geometry is in the DLL — the `MENUBAR` table the atlas search
-//! finds, 25 records plus a long trailing run of alternates — while every
-//! decision is a host call back into the executable. This module is the DLL's
-//! half: which widget is live, what it shows, and what it asks the host for.
-//! [`Act`] is that ask; the engine answers it.
+//! finds, one record per region plus a long trailing run of alternates — while
+//! every decision is a host call back into the executable. This module is the
+//! DLL's half: which widget is live, what it shows, and what it asks the host
+//! for. [`Act`] is that ask; the engine answers it.
 //!
-//! # The 25 widgets
+//! # The widgets
 //!
 //! One region per control, dense from 1, so widget index `n` is region `n + 1`
 //! and table record `n`. The grouping below is not a reading of the sprites:
 //! it is exactly how `FUN_10024100`'s dispatch, `FUN_10023fb0`'s enabled test
 //! and `FUN_100262e0`'s caption switch all three bracket the range.
+//!
+//! Twenty-five of them here; Shiny Days' strip has sixteen and stops after the
+//! first of the transparency controls, which on that module is a knob rather
+//! than the first of ten cells. Everything above it is the same widget asking
+//! the same host for the same thing — see [`Layout`], which is where the two
+//! modules' record tables live and what says which of them is in hand.
 //!
 //! ```text
 //!  0        toggles the host's auto-advance flag       host +0x120
@@ -121,16 +127,297 @@ use days_ui::Image;
 /// The screen's path stem, as the DLL spells it.
 pub const PATH: &str = "System/MenuBar/MenuBar";
 
-/// Number of hit regions, and so of widgets, on the bar every record index in
-/// this module was recovered against.
+/// Everything about the strip that belongs to one module rather than to the
+/// bar as a control.
 ///
-/// **A module whose bar has a different number of them is a different bar**,
-/// and none of the record constants below address the same art on it. Shiny
-/// Days' is one: `SysMenuSD.dll` gives the strip sixteen regions rather than
-/// twenty-five — it has no row of ten transparency cells — and lays its table
-/// out to match, so School Days HQ's indices land on whatever happens to sit
-/// there. See [`Bar::decorated`].
-pub const WIDGETS: usize = 25;
+/// The two games ship the same bar: the same widgets in the same order, asking
+/// the host for the same things through the same dispatch. What they do not
+/// share is the **record table** behind it. School Days HQ's strip has
+/// twenty-five hit regions and Shiny Days' sixteen, and each lays its alternate
+/// records out to match, so every index here is a raw offset into *one*
+/// module's table and means nothing on the other's. Naming one of HQ's on Shiny
+/// Days' strip reaches whatever happens to sit at that offset — which is how
+/// its twelve caption strips, all of which share one destination, once drew
+/// stacked on each other every frame.
+///
+/// Each field is named for the sprite object it belongs to, `this + N`, so the
+/// two halves of a recovery — the function that assigns the record and the
+/// function that draws the sprite — can be checked against each other.
+///
+/// # Where each set comes from
+///
+/// ```text
+/// School Days HQ   SysMenuSDHQ.dll   FILM::MenuBar vtable 0x1003d804
+///                  records assigned  FUN_10021c20 / FUN_10022650
+///                  drawn             FUN_10024ca0
+///                  hover and caption FUN_10024100 / FUN_100262e0
+///
+/// Shiny Days       SysMenuSD.dll     FILM::MenuBar vtable 0x1004e2bc
+///                  records assigned  FUN_10031bc0 (source) / FUN_10031030 (destination)
+///                  drawn             FUN_10034230
+///                  hover and caption FUN_100335f0 / FUN_10035420
+/// ```
+///
+/// Shiny Days' static `FILM::MenuBar` is `DAT_1005c270`, which is what its
+/// one-line `_SetMenuBar@4` hands out and what `FUN_10030b40` — the static
+/// initialiser reached through `_atexit` — constructs; its vtable is the
+/// `FILM::MenuBar::vftable` symbol Ghidra recovers from the RTTI pointer that
+/// precedes it at `0x1004e2b8`. Its table is at `0x100586f8` and runs
+/// forty-four records, ending where `FILM::MenuBar::RTTI_Type_Descriptor`
+/// starts at `0x10058b18`.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    /// Which module's bar this is, for diagnostics.
+    pub module: &'static str,
+    /// Hit regions on the strip, and so widgets. The count is what picks the
+    /// layout: see [`Layout::of`].
+    pub widgets: usize,
+    /// First of the five menu buttons' resting records, or `None` on a strip
+    /// whose base art already carries them.
+    ///
+    /// School Days HQ draws `this+0xa4[0..5]` from records `0x30 + k`
+    /// unconditionally. Shiny Days has no such run — `FUN_10031bc0` gives its
+    /// five buttons no sprite at all, so they are part of `MenuBar.png`.
+    pub menu_buttons_first: Option<usize>,
+    /// The whole rate row as one sprite, live and dead. HQ `this+0x68` and
+    /// `+0x6c`; Shiny Days `this+0x50` and `+0x54`.
+    pub rates_live: usize,
+    pub rates_dead: usize,
+    /// Widget 4, live and dead, picked by `_GetSuperSkipFlag@0` on both.
+    /// HQ `this+0x74` and `+0x78`; Shiny Days `this+0x5c` and `+0x60`.
+    pub skip_live: usize,
+    pub skip_dead: usize,
+    /// Widget 1's resting art, named for the playback state rather than for
+    /// the glyph: while playback runs the button offers "pause", so
+    /// [`Layout::resting_while_playing`] is the pause glyph on both modules.
+    /// HQ `this+0x70`, picked by host `+0x108`; Shiny Days `this+0x58`, picked
+    /// by host `+0x124` in `FUN_10034c50`.
+    pub resting_while_playing: usize,
+    pub resting_while_paused: usize,
+    /// Widget 0's resting art while the auto flag is clear. HQ `this+0x64`;
+    /// Shiny Days `this+0x4c`.
+    pub auto_resting: usize,
+    /// What widget 0 shows while the flag is set.
+    pub auto_lit: Auto,
+    /// The affection gauge, which is a different instrument on the two.
+    pub gauge: Gauge,
+    /// The trough the transparency control sits in, dead and live, picked by
+    /// the same host answer that makes the control usable. HQ `this+0x8c`;
+    /// Shiny Days `this+0x74`.
+    pub slider_dead: usize,
+    pub slider_live: usize,
+    /// The `REPLAYMODE` indicator, which is the thing the transparency control
+    /// fades.
+    pub replay_mode: ReplayMode,
+    /// How the player sets that transparency.
+    pub knob: Knob,
+    /// Widget 0's hover art while the auto flag is set; with it clear the
+    /// widget's own record is used. HQ `FUN_10024100`'s special case for index
+    /// 0, Shiny Days `FUN_100335f0`'s.
+    pub auto_hover_on: usize,
+    /// Widget 1's hover art, which both dispatches pick the same way: the
+    /// widget's own record while playback is paused, an alternate while it is
+    /// running.
+    ///
+    /// **On Shiny Days that alternate carries the wrong glyph.** Its sheet puts
+    /// the pause glyph at `x` 1 and the play glyph at `x` 108 in both the hover
+    /// row and the resting row, and record 16 — what `FUN_100335f0` reaches
+    /// while playback is *running* — is the one at 108. So hovering the button
+    /// mid-playback turns it from "pause" into "play" while it still pauses.
+    /// School Days HQ's record 26 is the pause glyph and does not.
+    ///
+    /// The module disagrees with itself about it: `FUN_10034c50`, the vtable
+    /// `+0x2c` re-place, picks record 1 where `FUN_100335f0` picks 16 and so
+    /// leaves the button consistent. It runs only while host `+0x130` answers
+    /// 1 and the pointer is already on widget 1, and **what writes the member
+    /// `+0x130` returns — `SHINYDAYS.exe`'s `+0x228` — is not recovered**, so
+    /// when the original shows the other glyph is not recovered either. The
+    /// steady state is `FUN_100335f0`'s, and that is what is reproduced.
+    pub hover_while_paused: usize,
+    pub hover_while_playing: usize,
+    /// First of the twelve caption strips [`caption`] indexes.
+    pub caption_first: usize,
+}
+
+/// What widget 0 shows while the auto flag is set.
+#[derive(Debug, Clone, Copy)]
+pub enum Auto {
+    /// School Days HQ: `this+0x64` cycles a run of frames.
+    ///
+    /// `FUN_10024ca0` picks one with
+    /// `((now - started) / (1000 / (speed + 1))) % frames + first`, so the
+    /// animation runs faster the higher the playback rate.
+    Animated { first: usize, frames: usize },
+    /// Shiny Days: one more record, and no animation.
+    ///
+    /// `FUN_10035050` — widget 0's action, vtable slot `+0x34` — sets
+    /// `this+0x4c` to one of two records on host `+0x150`, and `FUN_10034230`
+    /// draws `this+0x4c` while that answer is clear and `this+0x6c` while it is
+    /// set. Neither sprite is ever re-recorded after that.
+    ///
+    /// That this module has no animation is a claim, and two methods agree on
+    /// it: `FUN_10034230` contains no frame arithmetic of any kind, and a raw
+    /// scan of the whole class's code — `0x10030b30` to `0x100361c0` — for
+    /// four-byte references into the record table finds only the records named
+    /// in this [`Layout`], with no run of consecutive frames among them.
+    Lit(usize),
+}
+
+/// The affection gauge a module's bar carries.
+///
+/// Both draw a bed under the host's "gauge raised" answer — inside the bar's
+/// own visibility test while it is clear and outside it while it is set, which
+/// is what puts a raised gauge on a faded bar — and both ramp what sits in it
+/// over 1500ms and hold it for 2000ms. What sits in it is not the same thing.
+#[derive(Debug, Clone, Copy)]
+pub enum Gauge {
+    /// School Days HQ: `this+0x80`, a 538-wide bed, with three pieces the bar
+    /// sizes itself from the *pair* of counters `001` and `002`. See [`gauge`].
+    Pieces { bed: usize },
+    /// Shiny Days: `this+0x68`, a 666-wide bed, with one fill bar.
+    ///
+    /// `FUN_10035780` — vtable slot `+0x10`, the pass `DXGraphicModuleList`
+    /// runs before the draw — asks the host for the single counter `001`
+    /// through slot `+0x8` and ramps `this+0x3c` towards it. `FUN_10035670`
+    /// then places `this+0x84` at record `fill`'s origin with its width set to
+    /// that value, clamped to the record's own 599. There are no pieces, no
+    /// second counter and no leads.
+    ///
+    /// **Recovered but not wired**: nothing yet drives `this+0x3c`, so the bed
+    /// is drawn and nothing moves inside it. See [`Bar::gauge_cuts`].
+    Fill { bed: usize, fill: usize },
+}
+
+impl Gauge {
+    /// The bed's record, which both draw the same way.
+    pub fn bed(&self) -> usize {
+        match *self {
+            Gauge::Pieces { bed } | Gauge::Fill { bed, .. } => bed,
+        }
+    }
+}
+
+/// Where the `REPLAYMODE` indicator goes, which is not the same on the two.
+#[derive(Debug, Clone, Copy)]
+pub enum ReplayMode {
+    /// School Days HQ: `this+0x94`, one record at `(697, 80)` — **below** the
+    /// 800x75 strip, so it lands on the picture rather than on the bar. See
+    /// [`Bar::indicator`].
+    BelowStrip(usize),
+    /// Shiny Days: `this+0x7c` and `this+0x80`, a pair at `(680, 20)` inside
+    /// the strip.
+    ///
+    /// `FUN_10034230` draws the live one past both the bar's visibility test
+    /// and its fade, and the dead one only while the bar is down — so the strip
+    /// carries a `REPLAYMODE` sign that stays on the picture with the bar gone,
+    /// the same thing HQ's below-strip record does from outside the strip.
+    OnStrip { live: usize, dead: usize },
+}
+
+/// How the player sets the `REPLAYMODE` indicator's transparency.
+#[derive(Debug, Clone, Copy)]
+pub enum Knob {
+    /// School Days HQ: ten cells, widgets 15 to 24, and a knob sprite the bar
+    /// sizes itself rather than taking from a record. See [`indicator`].
+    Cells,
+    /// Shiny Days: one widget you take hold of and drag. See [`slider`].
+    ///
+    /// `record` is the knob's own record, whose `y`, width and height are used
+    /// whole and whose `x` is replaced by `this+0xb0`.
+    Drag { record: usize },
+}
+
+impl Layout {
+    /// School Days HQ's, from `SysMenuSDHQ.dll`.
+    pub const SCHOOL_DAYS_HQ: Layout = Layout {
+        module: "SysMenuSDHQ.dll",
+        widgets: 25,
+        menu_buttons_first: Some(48),
+        rates_live: 47,
+        rates_dead: 66,
+        skip_live: 46,
+        skip_dead: 65,
+        resting_while_playing: 44,
+        resting_while_paused: 45,
+        auto_resting: 42,
+        auto_lit: Auto::Animated {
+            first: 0x1d,
+            frames: 13,
+        },
+        gauge: Gauge::Pieces { bed: 67 },
+        slider_dead: 69,
+        slider_live: 70,
+        replay_mode: ReplayMode::BelowStrip(68),
+        knob: Knob::Cells,
+        auto_hover_on: 25,
+        hover_while_paused: 1,
+        hover_while_playing: 26,
+        caption_first: 53,
+    };
+
+    /// Shiny Days', from `SysMenuSD.dll`.
+    pub const SHINY_DAYS: Layout = Layout {
+        module: "SysMenuSD.dll",
+        widgets: 16,
+        menu_buttons_first: None,
+        rates_live: 23,
+        rates_dead: 37,
+        skip_live: 22,
+        skip_dead: 36,
+        resting_while_playing: 20,
+        resting_while_paused: 21,
+        auto_resting: 18,
+        auto_lit: Auto::Lit(19),
+        gauge: Gauge::Fill { bed: 43, fill: 17 },
+        slider_dead: 42,
+        slider_live: 41,
+        replay_mode: ReplayMode::OnStrip { live: 38, dead: 39 },
+        knob: Knob::Drag { record: 40 },
+        auto_hover_on: 15,
+        hover_while_paused: 1,
+        hover_while_playing: 16,
+        caption_first: 24,
+    };
+
+    /// The layout for a strip with this many hit regions, or `None` for one
+    /// neither set was recovered against.
+    ///
+    /// The count is the whole of the test, and it is not arbitrary: a strip
+    /// with a different number of regions has a different table behind it, and
+    /// every index in a [`Layout`] would address the wrong art on it. A third
+    /// module draws nothing but the widget under the pointer — that one sprite
+    /// comes from the hit map's own run and is right on any module — rather
+    /// than drawing garbage.
+    pub fn of(widgets: usize) -> Option<&'static Layout> {
+        match widgets {
+            25 => Some(&Layout::SCHOOL_DAYS_HQ),
+            16 => Some(&Layout::SHINY_DAYS),
+            _ => None,
+        }
+    }
+
+    /// The five menu buttons' resting records, empty where the base art carries
+    /// them.
+    pub fn menu_buttons(&self) -> impl Iterator<Item = usize> {
+        self.menu_buttons_first
+            .into_iter()
+            .flat_map(|first| first..first + 5)
+    }
+}
+
+impl Auto {
+    /// Which record widget 0 draws from while the auto flag is set.
+    pub fn frame(&self, elapsed_ms: u32, speed: usize) -> usize {
+        match *self {
+            Auto::Animated { first, frames } => {
+                let period = 1000 / (speed as u32 + 1);
+                let step = elapsed_ms.checked_div(period).unwrap_or(0);
+                first + (step as usize % frames)
+            }
+            Auto::Lit(record) => record,
+        }
+    }
+}
 
 /// The five playback rates widgets 5..9 select, from the table at `0x004f99f0`
 /// that host slot `+0x8c` indexes.
@@ -139,6 +426,10 @@ pub const WIDGETS: usize = 25;
 /// those two buttons as `▶×16` and `▶×32`, but the art is not the authority:
 /// `FUN_00424f90` stores `DAT_004f99f0[index]` as the rate and that table is
 /// `1.0, 2.0, 4.0, 12.0, 24.0`.
+///
+/// The two games share it, so this is not per-[`Layout`]: `SHINYDAYS.exe`'s
+/// host slot `+0x98` is `FUN_004176a0`, the same routine against the table at
+/// `0x004a1b3c`, and that table holds the same five rates.
 pub const SPEEDS: [f32; 5] = [1.0, 2.0, 4.0, 12.0, 24.0];
 
 /// How long the bar takes to fade in and out, in milliseconds.
@@ -338,6 +629,15 @@ pub enum Act {
     /// done it by the time this comes back. It is an [`Act`] so the caller
     /// still plays the click the original plays for any enabled widget.
     Transparency(usize),
+    /// Take hold of the transparency knob, on a module whose control is a
+    /// drag rather than ten cells. See [`slider`] and [`Bar::drag`].
+    ///
+    /// Like [`Act::Transparency`] this asks the host for nothing — but unlike
+    /// it, it is also **silent**: `FUN_100335f0`'s case `0xf` is the one arm of
+    /// the dispatch that does not go through the enabled test, and that test is
+    /// what plays the click. So taking hold of the knob makes no sound, which
+    /// is why [`Layout::enabled`] answers false for the widget.
+    GrabKnob,
 }
 
 /// What the engine has to tell the bar about itself for it to draw and dispatch.
@@ -495,58 +795,95 @@ impl State {
     }
 }
 
-/// Whether a widget can be activated, from `FUN_10023fb0`.
-///
-/// A press on a widget that is not live is swallowed *and makes no sound*: the
-/// dispatch asks this question before playing the click, so a dead button is
-/// silent as well as inert.
-pub fn enabled(widget: usize, state: State) -> bool {
-    match widget {
-        0..=3 | 0xd | 0xe => true,
-        4 => !state.replay && !state.message && state.skippable,
-        5..=9 => !state.message && state.skippable,
-        10..=12 => !state.replay,
-        0xf..=0x18 => state.following_record,
-        _ => false,
-    }
-}
-
-/// What a widget does, from `FUN_10024100`'s dispatch.
-///
-/// `latched` is the bar's own one-bit memory for widget 2, set by its first
-/// press and cleared after [`RESTART_LATCH_FRAMES`]; see [`restart_latch`].
-/// Every other widget is stateless.
-pub fn action(widget: usize, state: State, latched: bool) -> Act {
-    if !enabled(widget, state) {
-        return Act::None;
-    }
-    match widget {
-        0 => Act::ToggleAuto,
-        1 => Act::TogglePause,
-        // `FUN_10025b90`. The second press is refused outright while the
-        // replay menu is driving playback or the host's `+0x98` member is set,
-        // so in those cases the button restarts every time.
-        2 => {
-            if latched && !state.replay && !state.following_record {
-                Act::Seek(Seek::END_OF_SCRIPT)
-            } else {
-                Act::Seek(Seek::RESTART)
-            }
+impl Layout {
+    /// Whether a widget can be activated, from `FUN_10023fb0` and its Shiny
+    /// Days counterpart `FUN_100334d0`.
+    ///
+    /// A press on a widget that is not live is swallowed *and makes no sound*:
+    /// the dispatch asks this question before playing the click, so a dead
+    /// button is silent as well as inert. It is also what gates the hover art
+    /// and the caption — both dispatches set their "hovered" and "caption"
+    /// flags to zero for a widget this answers false for — so a dead button
+    /// shows nothing under the pointer either.
+    ///
+    /// The two modules agree on every widget the two strips share. They differ
+    /// only past the fifteenth, and only because the controls there are
+    /// different: HQ's ten transparency cells are live while the host is
+    /// following a record, while Shiny Days' single knob widget is **never**
+    /// live — `FUN_100334d0`'s case `0xf` returns 0 outright, and its dispatch
+    /// reaches the knob from outside the enabled test instead. See
+    /// [`Act::GrabKnob`].
+    pub fn enabled(&self, widget: usize, state: State) -> bool {
+        match widget {
+            0..=3 | 0xd | 0xe => true,
+            4 => !state.replay && !state.message && state.skippable,
+            5..=9 => !state.message && state.skippable,
+            10..=12 => !state.replay,
+            0xf..=0x18 => matches!(self.knob, Knob::Cells) && state.following_record,
+            _ => false,
         }
-        3 => Act::Seek(Seek::END_OF_SCRIPT),
-        4 => Act::Seek(Seek::SKIP),
-        5..=9 => Act::Speed(widget - 5),
-        10 => Act::Menu(MenuRequest(4)),
-        11 => Act::Menu(MenuRequest(5)),
-        12 => Act::Menu(MenuRequest(3)),
-        13 => Act::Menu(MenuRequest(2)),
-        14 => Act::Leave,
-        0xf..=0x18 => indicator::level_for(widget).map_or(Act::None, Act::Transparency),
-        _ => Act::None,
+    }
+
+    /// What a widget does, from `FUN_10024100`'s dispatch and Shiny Days'
+    /// `FUN_100335f0`.
+    ///
+    /// `latched` is the bar's own one-bit memory for widget 2, set by its first
+    /// press and cleared after [`RESTART_LATCH_FRAMES`]; see [`restart_latch`].
+    /// Every other widget is stateless.
+    ///
+    /// The two dispatches are the same switch in the same order, asking the
+    /// host for the same things: the Shiny Days slot numbers are School Days
+    /// HQ's shifted by `0xc` below `+0xa8` and by `0x1c` above it, without
+    /// exception across the eighteen slots the bar uses, and the four the
+    /// answers were chased to in `SHINYDAYS.exe` hold the members they should —
+    /// `+0x13c` toggles `+0x254` and writes the `AutoMode` settings key,
+    /// `+0x110` picks pause or resume off `+0x234`, `+0xa0`/`+0xa4` write and
+    /// read `+0x1e8`, and `+0x170` returns `+0x79c`, which is the same member
+    /// School Days HQ's `+0x154` returns.
+    pub fn action(&self, widget: usize, state: State, latched: bool) -> Act {
+        if let (Knob::Drag { .. }, 0xf) = (self.knob, widget) {
+            // `FUN_100335f0`'s case 0xf, which is reached whether or not the
+            // widget is live. Whether the pointer is actually on the knob is
+            // `FUN_10035cb0`, and that is [`Bar::press`]'s to ask because it
+            // needs the knob's position.
+            return if state.following_record {
+                Act::GrabKnob
+            } else {
+                Act::None
+            };
+        }
+        if !self.enabled(widget, state) {
+            return Act::None;
+        }
+        match widget {
+            0 => Act::ToggleAuto,
+            1 => Act::TogglePause,
+            // `FUN_10025b90`, and Shiny Days' `FUN_10034ef0` at vtable slot
+            // `+0x30`. The second press is refused outright while the replay
+            // menu is driving playback or the host's own "following a record"
+            // member is set, so in those cases the button restarts every time.
+            2 => {
+                if latched && !state.replay && !state.following_record {
+                    Act::Seek(Seek::END_OF_SCRIPT)
+                } else {
+                    Act::Seek(Seek::RESTART)
+                }
+            }
+            3 => Act::Seek(Seek::END_OF_SCRIPT),
+            4 => Act::Seek(Seek::SKIP),
+            5..=9 => Act::Speed(widget - 5),
+            10 => Act::Menu(MenuRequest(4)),
+            11 => Act::Menu(MenuRequest(5)),
+            12 => Act::Menu(MenuRequest(3)),
+            13 => Act::Menu(MenuRequest(2)),
+            14 => Act::Leave,
+            0xf..=0x18 => indicator::level_for(widget).map_or(Act::None, Act::Transparency),
+            _ => Act::None,
+        }
     }
 }
 
-/// The widgets [`action`] dispatches on, by name.
+/// The widgets [`Layout::action`] dispatches on, by name.
 ///
 /// The numbers are the hit map's own and belong to `FUN_10024100`'s switch;
 /// these are here so an engine that presses a widget without a pointer on it —
@@ -592,8 +929,8 @@ pub fn restart_latch(latched: bool, state: State) -> bool {
     !latched && !state.replay && !state.following_record
 }
 
-/// The caption strip shown for the hovered widget, as an index into the
-/// alternate run, or `None` for a widget with no caption.
+/// The caption strip shown for the hovered widget, as an offset from
+/// [`Layout::caption_first`], or `None` for a widget with no caption.
 ///
 /// From `FUN_100262e0`, which is a switch over the same twelve groups the
 /// dispatch uses: widgets 0 to 4 each have their own strip, 5..9 share one,
@@ -601,6 +938,17 @@ pub fn restart_latch(latched: bool, state: State) -> bool {
 /// The record addresses run `0x1004d318` upwards at the table's 24-byte stride,
 /// so the strips are consecutive records and this returns their order, not
 /// their address.
+///
+/// **The two modules share this**, which is a reading of Shiny Days'
+/// `FUN_10035420` and not an inference from its table's shape: that switch has
+/// the same twelve arms with the same widgets grouped the same way, running
+/// consecutively from `0x10058938`. Its twelfth arm is case `0xf` alone rather
+/// than `0xf..=0x18`, because its strip stops at sixteen widgets — the arm here
+/// covers both.
+///
+/// The caption is only drawn for a widget [`Layout::enabled`] answers true for,
+/// so on Shiny Days the twelfth strip is unreachable: its widget `0xf` is never
+/// live. The strip is in the sheet all the same.
 pub fn caption(widget: usize) -> Option<usize> {
     Some(match widget {
         0..=4 => widget,
@@ -611,76 +959,6 @@ pub fn caption(widget: usize) -> Option<usize> {
     })
 }
 
-/// First of the twelve caption records. `0x1004d318` is
-/// `(0x1004d318 - 0x1004ce20) / 0x18` records past the start of the table.
-pub const CAPTION_FIRST_RECORD: usize = 53;
-
-/// The records the bar's resting art comes from.
-///
-/// `MENUBAR.PNG` is nearly empty — two arrow buttons — so the bar cannot be
-/// composited from widget hover states alone. `FUN_10024ca0` draws about
-/// fifteen sprite objects every frame from the chip sheet, and `FUN_10021c20`
-/// is where each of those objects is given a record. Both halves are named
-/// here by the object they belong to, `this + N`, so the two can be checked
-/// against each other.
-mod record {
-    /// `this+0xa4[0..5]`, placed by `FUN_10026100` from records `0x30 + k`:
-    /// the five menu buttons' resting art, drawn unconditionally.
-    pub const MENU_BUTTONS: std::ops::RangeInclusive<usize> = 48..=52;
-    /// `this+0x68` and `this+0x6c`, one 216-wide sprite covering the whole
-    /// rate row. The live one is taken when host `+0x88` answers non-zero,
-    /// which is the same question that makes widgets 5..9 pressable.
-    pub const RATES_LIVE: usize = 47;
-    pub const RATES_DEAD: usize = 66;
-    /// `this+0x74` and `this+0x78`, widget 4, picked by `_GetSuperSkipFlag@0`
-    /// — again the same question that makes the widget pressable.
-    pub const SKIP_LIVE: usize = 46;
-    pub const SKIP_DEAD: usize = 65;
-    /// `this+0x70`, widget 1's resting art, picked by host `+0x108`.
-    pub const PLAY_RESTING: usize = 44;
-    pub const PAUSE_RESTING: usize = 45;
-    /// `this+0x64`, widget 0's resting art, drawn only while the auto flag is
-    /// clear — with it set, the animation takes over.
-    pub const AUTO_RESTING: usize = 42;
-    /// `this+0x8c`, the trough the ten transparency cells sit in, picked by
-    /// host `+0x98` — the same question that makes them pressable. The dead
-    /// one is grey and the live one a white-to-cyan gradient.
-    pub const SLIDER_DEAD: usize = 69;
-    pub const SLIDER_LIVE: usize = 70;
-    /// `this+0x80`, a 538-wide strip drawn alongside the gauge.
-    pub const GAUGE_BED: usize = 67;
-    /// `this+0x94`, the `REPLAYMODE` indicator, drawn while host `+0x98` is
-    /// set. Its destination is at y = 80, **below the 800x75 strip**, so it
-    /// lands on the picture rather than on the bar and is not part of the
-    /// strip's layer — [`Bar::indicator`] is where it comes out.
-    pub const REPLAY_MODE: usize = 68;
-    /// `this+0x60` while widget 0 is hovered, from `FUN_10024100`'s special
-    /// case for index 0: its own record with the flag clear, record 25 with it
-    /// set.
-    pub const AUTO_HOVER_ON: usize = 25;
-    /// `this+0x60` while widget 1 is hovered. Inverted on purpose: the button
-    /// shows what pressing it will do, so it offers "pause" while playing.
-    /// `FUN_10024100` and `FUN_100258f0` pick the same pair independently.
-    pub const PAUSE_HOVER: usize = 26;
-    pub const PLAY_HOVER: usize = 1;
-}
-
-/// The thirteen frames widget 0 cycles through while the auto flag is set.
-///
-/// `FUN_10024ca0` picks one with
-/// `((now - started) / (1000 / (speed + 1))) % 13 + 0x1d`, where `0x1d` is a
-/// record index into the same table the widgets come from — so the frames are
-/// records 29 to 41 and the animation runs faster the higher the playback rate.
-pub const AUTO_FRAMES: usize = 13;
-pub const AUTO_FIRST_RECORD: usize = 0x1d;
-
-/// Which of widget 0's animation frames is showing.
-pub fn auto_frame(elapsed_ms: u32, speed: usize) -> usize {
-    let period = 1000 / (speed as u32 + 1);
-    let step = elapsed_ms.checked_div(period).unwrap_or(0);
-    AUTO_FIRST_RECORD + (step as usize % AUTO_FRAMES)
-}
-
 /// The `REPLAYMODE` indicator, ready to draw. See [`Bar::indicator`].
 pub struct Indicator {
     /// The art at display scale.
@@ -688,8 +966,29 @@ pub struct Indicator {
     /// `(x, y, width, height)` in the same display space [`Bar::strip`] is in,
     /// whose origin is the picture's top-left corner. `y` is below the strip.
     pub dst: (i64, i64, u32, u32),
-    /// What the ten cells set: `round(level * 25.0)`.
+    /// How solid to draw it, from [`Solidity::alpha`].
     pub alpha: u8,
+}
+
+/// How solid the `REPLAYMODE` indicator is drawn, in whichever unit this
+/// module's control works in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Solidity {
+    /// School Days HQ's `this+0xec`: the level 0 to 10 the pressed cell stores.
+    Level(usize),
+    /// Shiny Days' `this+0xb0`: the knob's `x` in the strip's own units, which
+    /// [`slider`] turns into an alpha.
+    Knob(f32),
+}
+
+impl Solidity {
+    /// The alpha the indicator is drawn at.
+    pub fn alpha(self) -> u8 {
+        match self {
+            Solidity::Level(level) => indicator::alpha(level),
+            Solidity::Knob(x) => slider::alpha(x),
+        }
+    }
 }
 
 /// The bar, loaded and ready to hit-test and draw.
@@ -698,12 +997,15 @@ pub struct Bar {
     /// Widget 2's latch, and the frame it was set on.
     latch: Option<u32>,
     fade: Fade,
-    /// `this+0xec`: how solid the replay-mode indicator is drawn, 0 to 10.
-    /// See [`indicator`].
-    transparency: usize,
-    /// Whether this module's bar is the one every record index here was
-    /// recovered against. See [`Bar::decorated`].
-    decorated: bool,
+    /// How solid the replay-mode indicator is drawn.
+    solidity: Solidity,
+    /// Shiny Days' `this+0xe8`: the knob has been taken hold of and follows the
+    /// pointer until the button comes up. Always false on a module whose
+    /// control is ten cells.
+    gripped: bool,
+    /// This module's record table, or `None` for a strip neither set was
+    /// recovered against. See [`Layout::of`].
+    layout: Option<&'static Layout>,
 }
 
 impl Bar {
@@ -713,22 +1015,47 @@ impl Bar {
         resolution: Resolution,
     ) -> Result<Bar, Error> {
         let screen = Screen::load(vfs, dll, PATH, resolution)?;
-        let decorated = screen.atlas().widgets.len() == WIDGETS;
-        if !decorated {
+        let regions = screen.atlas().widgets.len();
+        let layout = Layout::of(regions);
+        if layout.is_none() {
             log::warn!(
-                "{PATH}: {} hit regions, not {WIDGETS} — this module's strip is not the one the \
-                 record indices were recovered against, so its resting art and its captions are \
-                 not drawn",
-                screen.atlas().widgets.len()
+                "{PATH}: {regions} hit regions, which is neither School Days HQ's 25 nor Shiny \
+                 Days' 16 — no recovered record table addresses this strip, so its resting art \
+                 and its captions are not drawn"
             );
         }
+        let solidity = match layout.map(|l| l.knob) {
+            Some(Knob::Drag { .. }) => Solidity::Knob(slider::INITIAL_X),
+            _ => Solidity::Level(indicator::INITIAL_LEVEL),
+        };
         Ok(Bar {
             screen,
             latch: None,
             fade: Fade::default(),
-            transparency: indicator::INITIAL_LEVEL,
-            decorated,
+            solidity,
+            gripped: false,
+            layout,
         })
+    }
+
+    /// This module's record table, or `None` for a strip neither set was
+    /// recovered against.
+    pub fn layout(&self) -> Option<&'static Layout> {
+        self.layout
+    }
+
+    /// How many widgets this strip has, which is the hit map's own count.
+    pub fn widgets(&self) -> usize {
+        self.screen.atlas().widgets.len()
+    }
+
+    /// Whether a widget can be activated. Always false without a [`Layout`]:
+    /// with no recovered table, nothing about the strip past its hit map is
+    /// known, and a press that dispatched School Days HQ's action from an
+    /// unknown module's region would be a guess.
+    pub fn enabled(&self, widget: usize, state: State) -> bool {
+        self.layout
+            .is_some_and(|layout| layout.enabled(widget, state))
     }
 
     pub fn screen(&self) -> &Screen {
@@ -795,10 +1122,22 @@ impl Bar {
     /// Activates the widget under the pointer and reports what it asks for.
     ///
     /// `frame` is the script frame, which is what expires widget 2's latch.
-    pub fn press(&mut self, widget: usize, state: State, frame: u32) -> Act {
+    /// `at` is the pointer in the strip's own units, which only Shiny Days'
+    /// knob needs: `FUN_10035cb0` refuses the grip unless the pointer is inside
+    /// the knob itself rather than merely inside its region.
+    pub fn press(
+        &mut self,
+        widget: usize,
+        state: State,
+        frame: u32,
+        at: Option<(u32, u32)>,
+    ) -> Act {
+        let Some(layout) = self.layout else {
+            return Act::None;
+        };
         self.expire_latch(frame);
         let latched = self.latch.is_some();
-        let act = action(widget, state, latched);
+        let act = layout.action(widget, state, latched);
         if widget == 2 && act != Act::None {
             self.latch = if restart_latch(latched, state) {
                 Some(frame)
@@ -806,17 +1145,74 @@ impl Bar {
                 None
             };
         }
-        // `FUN_10026ed0` stores the level in the bar itself and applies it to
-        // the bar's own sprites, so this is the whole of what the press does.
-        if let Act::Transparency(level) = act {
-            self.transparency = level;
+        match act {
+            // `FUN_10026ed0` stores the level in the bar itself and applies it
+            // to the bar's own sprites, so this is the whole of what the press
+            // does.
+            Act::Transparency(level) => self.solidity = Solidity::Level(level),
+            // `FUN_100335f0` case `0xf`: the grip is taken only when
+            // `FUN_10035cb0` agrees the pointer is on the knob.
+            Act::GrabKnob => {
+                let x = at.map_or(0.0, |(x, _)| (f64::from(x) / self.screen.scale()) as f32);
+                self.gripped =
+                    matches!(self.solidity, Solidity::Knob(knob) if slider::on_knob(knob, x));
+                if !self.gripped {
+                    return Act::None;
+                }
+            }
+            _ => {}
         }
         act
     }
 
-    /// How solid the replay-mode indicator is drawn, 0 to 10.
-    pub fn transparency(&self) -> usize {
-        self.transparency
+    /// Moves a gripped knob, and answers whether it moved.
+    ///
+    /// `FUN_100359c0` runs every update: while the button is down it adds the
+    /// pointer's movement since the last update to `this+0xb0` and clamps the
+    /// result, and while it is up it clears the grip. `dx` is that movement in
+    /// the strip's own units.
+    ///
+    /// **The original does this in two units at once.** It adds a movement in
+    /// screen pixels to a value it stores in the strip's units, and clamps that
+    /// value against bounds it has already multiplied by the display scale —
+    /// so at anything but the strip's native 800x600 the knob both travels at
+    /// the wrong rate and stops in the wrong place. That is a shipped bug and
+    /// it is **not** reproduced: this works in the strip's own units
+    /// throughout, which is what the original does at scale 1.
+    pub fn drag(&mut self, held: bool, dx: f32) -> bool {
+        if !held {
+            self.gripped = false;
+            return false;
+        }
+        if !self.gripped {
+            return false;
+        }
+        match &mut self.solidity {
+            Solidity::Knob(x) => {
+                let was = *x;
+                *x = (*x + dx).clamp(slider::MIN_X, slider::MAX_X);
+                *x != was
+            }
+            Solidity::Level(_) => false,
+        }
+    }
+
+    /// Puts a dragged knob at `x` in the strip's own units, clamped to its
+    /// travel. For the headless tools, which have no pointer to drag with.
+    pub fn set_knob(&mut self, x: f32) {
+        if let Solidity::Knob(at) = &mut self.solidity {
+            *at = x.clamp(slider::MIN_X, slider::MAX_X);
+        }
+    }
+
+    /// Whether the knob is being dragged.
+    pub fn gripped(&self) -> bool {
+        self.gripped
+    }
+
+    /// How solid the replay-mode indicator is drawn.
+    pub fn transparency(&self) -> Solidity {
+        self.solidity
     }
 
     /// Whether anything the strip draws keeps an alpha of its own this frame.
@@ -855,78 +1251,93 @@ impl Bar {
     pub fn records(&self, hovered: Option<usize>, state: State, elapsed_ms: u32) -> Vec<usize> {
         let mut out = Vec::new();
 
-        // On a strip these indices were not recovered against, every one of
-        // them addresses the wrong record — Shiny Days' twelve caption strips
-        // share one destination, so its bar drew several of them stacked there
-        // every frame. Only the widget under the pointer survives, because that
-        // one is the widget's own record and is right on any module.
-        if !self.decorated {
+        // On a strip no recovered table addresses, every index would reach the
+        // wrong record. Only the widget under the pointer survives, because
+        // that one is the widget's own record and is right on any module.
+        let Some(layout) = self.layout else {
             if !state.hidden {
-                if let Some(widget) = hovered.filter(|w| *w < self.screen.atlas().widgets.len()) {
+                if let Some(widget) = hovered.filter(|w| *w < self.widgets()) {
                     out.push(widget);
                 }
             }
             return out;
-        }
+        };
 
-        // `if (host+0x140() == 0)`: with the bar hidden, only the pinned gauge
-        // bed survives, and even that only under host +0x154.
+        // `if (host+0x140() == 0)` — Shiny Days' `+0x15c`: with the bar hidden,
+        // only the pinned gauge bed survives, and even that only under the
+        // host's "gauge raised" answer.
         if !state.hidden {
-            out.extend(record::MENU_BUTTONS);
+            out.extend(layout.menu_buttons());
             if state.message {
-                out.push(record::RATES_DEAD);
-                out.push(record::SKIP_DEAD);
+                out.push(layout.rates_dead);
+                out.push(layout.skip_dead);
             } else {
                 out.push(if state.skippable {
-                    record::RATES_LIVE
+                    layout.rates_live
                 } else {
-                    record::RATES_DEAD
+                    layout.rates_dead
                 });
                 out.push(if state.super_skip {
-                    record::SKIP_LIVE
+                    layout.skip_live
                 } else {
-                    record::SKIP_DEAD
+                    layout.skip_dead
                 });
                 out.push(if state.following_record {
-                    record::SLIDER_LIVE
+                    layout.slider_live
                 } else {
-                    record::SLIDER_DEAD
+                    layout.slider_dead
                 });
             }
             out.push(if state.paused {
-                record::PAUSE_RESTING
+                layout.resting_while_paused
             } else {
-                record::PLAY_RESTING
+                layout.resting_while_playing
             });
             if !state.auto {
-                out.push(record::AUTO_RESTING);
+                out.push(layout.auto_resting);
             }
             if !state.gauge_raised {
-                out.push(record::GAUGE_BED);
+                out.push(layout.gauge.bed());
+            }
+            // The dead half of a strip-borne `REPLAYMODE` sign, which is up
+            // only while the bar is. The live half is pinned — see
+            // [`Bar::split`].
+            if let ReplayMode::OnStrip { dead, .. } = layout.replay_mode {
+                if !state.following_record {
+                    out.push(dead);
+                }
             }
         }
         if state.gauge_raised {
-            out.push(record::GAUGE_BED);
+            out.push(layout.gauge.bed());
         }
 
         // The rate readout appears only once the rate is at least 2.0.
         if state.rate >= 2.0 && state.speed < SPEEDS.len() {
             out.push(state.speed + 5);
         }
+        if let ReplayMode::OnStrip { live, .. } = layout.replay_mode {
+            if state.following_record {
+                out.push(live);
+            }
+        }
         if state.auto {
-            out.push(auto_frame(elapsed_ms, state.speed));
+            out.push(layout.auto_lit.frame(elapsed_ms, state.speed));
         }
 
         if !state.hidden {
-            if let Some(widget) = hovered.filter(|w| *w < WIDGETS) {
+            // Both dispatches gate the hover sprite and the caption on the same
+            // enabled test the press goes through, so a dead widget shows
+            // nothing under the pointer.
+            if let Some(widget) = hovered.filter(|w| layout.enabled(*w, state)) {
                 out.push(match widget {
-                    0 if state.auto => record::AUTO_HOVER_ON,
-                    1 if state.paused => record::PLAY_HOVER,
-                    1 => record::PAUSE_HOVER,
+                    0 if state.auto => layout.auto_hover_on,
+                    1 if state.paused => layout.hover_while_paused,
+                    1 => layout.hover_while_playing,
                     other => other,
                 });
                 if let Some(group) = caption(widget) {
-                    out.push(CAPTION_FIRST_RECORD + group);
+                    out.push(layout.caption_first + group);
                 }
             }
         }
@@ -949,15 +1360,31 @@ impl Bar {
 
     /// As [`Bar::states`], for a record list already in hand.
     fn states_of(&self, records: &[usize]) -> Vec<WidgetState> {
-        let mut states = vec![WidgetState::Resting; WIDGETS];
+        let widgets = self.widgets();
+        let base = self.extras_base();
+        let mut states = vec![WidgetState::Resting; widgets];
         for record in records {
-            if *record < WIDGETS {
-                states[*record] = WidgetState::Active;
-            } else {
-                states.push(self.extra(*record));
+            match *record {
+                r if r < widgets && r < base => states[r] = WidgetState::Active,
+                r => states.push(self.extra(r)),
             }
         }
         states
+    }
+
+    /// The record the alternate run starts at.
+    ///
+    /// Not the widget count: the run is however many records the locator
+    /// actually matched against regions, and a strip can have a region with no
+    /// record of its own. Shiny Days' does — its knob's region is one the table
+    /// has no art for, so its sixteen regions are backed by fifteen records and
+    /// the alternates begin at record 15.
+    fn extras_base(&self) -> usize {
+        self.screen
+            .atlas()
+            .segments
+            .last()
+            .map_or(self.widgets(), |(first, _, count)| first + count)
     }
 
     /// This frame's records split by whether the fade reaches them.
@@ -973,9 +1400,21 @@ impl Bar {
     ) -> (Vec<usize>, Vec<usize>) {
         let mut faded = self.records(hovered, state, elapsed_ms);
         let mut pinned = Vec::new();
-        if state.gauge_raised {
-            faded.retain(|r| *r != record::GAUGE_BED);
-            pinned.push(record::GAUGE_BED);
+        if let Some(layout) = self.layout {
+            if state.gauge_raised {
+                faded.retain(|r| *r != layout.gauge.bed());
+                pinned.push(layout.gauge.bed());
+            }
+            // A strip-borne `REPLAYMODE` sign is drawn past the bar's own
+            // visibility test and is not in the list `FUN_10025690`'s
+            // counterpart walks, so it keeps full alpha with the bar gone —
+            // the same thing School Days HQ's below-strip record does.
+            if let ReplayMode::OnStrip { live, .. } = layout.replay_mode {
+                if state.following_record {
+                    faded.retain(|r| *r != live);
+                    pinned.push(live);
+                }
+            }
         }
         if let Some(readout) = self.rate_readout(state) {
             // Only the one `records` pushed for the readout: the same number
@@ -1005,35 +1444,53 @@ impl Bar {
         } else {
             Vec::new()
         };
-        // `this+0x90`. `FUN_10024ca0` draws it last of all, under the same
-        // three tests the trough is under plus the bar being up.
+        // HQ's `this+0x90`, Shiny Days' `this+0x78`. Both draws put it last of
+        // all, under the same three tests the trough is under plus the bar
+        // being up.
         if !state.hidden && !state.message && state.following_record {
-            if let Some((src, dst)) = indicator::knob(self.transparency) {
-                faded.push(cut(src, dst));
+            if let Some(c) = self.knob_cut() {
+                faded.push(c);
             }
         }
         (faded, pinned)
     }
 
-    /// Whether this module's strip is the one every record index here was
-    /// recovered against, which is what [`Bar::records`] may name records from.
+    /// The transparency knob, wherever this module's control has put it.
     ///
-    /// The widget records are safe either way: they come from the hit map's own
-    /// run, so the sprite for the widget under the pointer is that widget's on
-    /// any module. Everything else in this module — the resting art, the rate
-    /// readout, the auto animation, the gauge, the caption strips — is a raw
-    /// index into School Days HQ's table, recovered from `FUN_10021c20` and
-    /// `FUN_10024ca0` in `SysMenuSDHQ.dll`. **Shiny Days' equivalents are not
-    /// recovered**, so on that module they are not drawn rather than drawn
-    /// wrong.
-    pub fn decorated(&self) -> bool {
-        self.decorated
+    /// School Days HQ sizes its knob from constants rather than from a record,
+    /// so [`indicator::knob`] has the whole of it. Shiny Days takes the
+    /// record's `y`, width and height whole and replaces its `x` with
+    /// `this+0xb0` — `FUN_100359c0` writes exactly those four into the sprite.
+    fn knob_cut(&self) -> Option<Cut> {
+        match (self.layout?.knob, self.solidity) {
+            (Knob::Cells, Solidity::Level(level)) => {
+                indicator::knob(level).map(|(src, dst)| cut(src, dst))
+            }
+            (Knob::Drag { record }, Solidity::Knob(x)) => {
+                let art = self
+                    .screen
+                    .atlas()
+                    .extras
+                    .get(record.checked_sub(self.extras_base())?)?;
+                let (w, h) = (art.dst.width as f32, art.dst.height as f32);
+                Some(Cut {
+                    src: (art.src_x as f32, art.src_y as f32, w, h),
+                    dst: (
+                        x - slider::HALF,
+                        art.dst.y as f32 - slider::HALF,
+                        w + slider::ONE,
+                        h + slider::ONE,
+                    ),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Turns a record index into a widget state, warning rather than drawing
     /// the wrong sprite when the recovered table is shorter than expected.
     fn extra(&self, record: usize) -> WidgetState {
-        match record.checked_sub(WIDGETS) {
+        match record.checked_sub(self.extras_base()) {
             Some(n) if n < self.screen.atlas().extras.len() => WidgetState::Extra(n),
             _ => {
                 log::warn!("{PATH}: no alternate record {record} in the recovered table");
@@ -1089,11 +1546,24 @@ impl Bar {
     /// The pieces are sized from the ramp's leads and not from
     /// [`State::gauge`], because the two disagree for the three and a half
     /// seconds a raise lasts — that is the whole of what the ramp is.
+    /// **School Days HQ's gauge only.** Shiny Days' `FILM::MenuBar` has a gauge
+    /// of its own and it is a different instrument: `FUN_10035780`, its ramp,
+    /// asks the host for the single counter `001` rather than for a pair, and
+    /// `FUN_10035670` draws the result as one bar at record 17 whose width is
+    /// the ramped value clamped to that record's own 599. It has no pieces and
+    /// no leads. That is recovered but **not yet wired**, so on Shiny Days the
+    /// bed is drawn and nothing moves inside it.
     pub fn gauge_cuts(&self, state: State) -> Vec<Cut> {
+        let Some(layout) = self.layout else {
+            return Vec::new();
+        };
+        let Gauge::Pieces { bed } = layout.gauge else {
+            return Vec::new();
+        };
         if state.gauge.is_none() {
             return Vec::new();
         }
-        if !self.records(None, state, 0).contains(&record::GAUGE_BED) {
+        if !self.records(None, state, 0).contains(&bed) {
             return Vec::new();
         }
         let (first, second) = state.gauge_leads;
@@ -1103,14 +1573,18 @@ impl Bar {
             .collect()
     }
 
-    /// The `REPLAYMODE` indicator, which is not part of the strip's layer.
+    /// The `REPLAYMODE` indicator, where it is not part of the strip's layer.
     ///
-    /// `this+0x94` goes at `(697, 80) 97x19` in the strip's own space — below
-    /// the 800x75 strip, so it lands on the picture. `FUN_10024ca0` draws it
-    /// outside the test that gates every widget, and it is not in
-    /// `FUN_10025690`'s list, so it neither waits for the bar to drop down nor
-    /// fades with it. The one thing it carries is the transparency the ten
-    /// cells set.
+    /// School Days HQ's `this+0x94` goes at `(697, 80) 97x19` in the strip's
+    /// own space — below the 800x75 strip, so it lands on the picture.
+    /// `FUN_10024ca0` draws it outside the test that gates every widget, and it
+    /// is not in `FUN_10025690`'s list, so it neither waits for the bar to drop
+    /// down nor fades with it. The one thing it carries is the transparency the
+    /// ten cells set.
+    ///
+    /// `None` on a module whose sign sits inside the strip: Shiny Days' is at
+    /// `(680, 20)`, so it composites with everything else and [`Bar::split`]
+    /// pins it instead.
     ///
     /// Returns the art at display scale, where it goes in the same display
     /// space [`Bar::strip`] is in, and the alpha to draw it at.
@@ -1118,13 +1592,16 @@ impl Bar {
         if !state.following_record {
             return None;
         }
-        let n = record::REPLAY_MODE.checked_sub(WIDGETS)?;
+        let ReplayMode::BelowStrip(record) = self.layout?.replay_mode else {
+            return None;
+        };
+        let n = record.checked_sub(self.extras_base())?;
         let widget = self.screen.atlas().extras.get(n)?;
         let (art, dst) = self.screen.cut_widget(widget);
         Some(Indicator {
             art,
             dst,
-            alpha: indicator::alpha(self.transparency),
+            alpha: self.solidity.alpha(),
         })
     }
 
@@ -1231,6 +1708,18 @@ mod tests {
         assert_eq!(state.rate, 1.0);
     }
     use super::*;
+
+    /// School Days HQ's, which is what the record numbers in these tests are.
+    const HQ: &Layout = &Layout::SCHOOL_DAYS_HQ;
+    const WIDGETS: usize = Layout::SCHOOL_DAYS_HQ.widgets;
+
+    fn enabled(widget: usize, state: State) -> bool {
+        HQ.enabled(widget, state)
+    }
+
+    fn action(widget: usize, state: State, latched: bool) -> Act {
+        HQ.action(widget, state, latched)
+    }
 
     /// A state in which everything the bar can ask about is available.
     fn live() -> State {
@@ -1483,13 +1972,93 @@ mod tests {
 
     #[test]
     fn the_auto_animation_speeds_up_with_the_playback_rate() {
+        let auto = HQ.auto_lit;
+        let Auto::Animated { first, frames } = auto else {
+            panic!("School Days HQ's widget 0 animates");
+        };
         // At rate index 0 a frame lasts 1000 ms; at index 4, 200 ms.
-        assert_eq!(auto_frame(0, 0), AUTO_FIRST_RECORD);
-        assert_eq!(auto_frame(999, 0), AUTO_FIRST_RECORD);
-        assert_eq!(auto_frame(1000, 0), AUTO_FIRST_RECORD + 1);
-        assert_eq!(auto_frame(200, 4), AUTO_FIRST_RECORD + 1);
+        assert_eq!(auto.frame(0, 0), first);
+        assert_eq!(auto.frame(999, 0), first);
+        assert_eq!(auto.frame(1000, 0), first + 1);
+        assert_eq!(auto.frame(200, 4), first + 1);
         // And it wraps after thirteen.
-        assert_eq!(auto_frame(13_000, 0), AUTO_FIRST_RECORD);
+        assert_eq!(auto.frame(frames as u32 * 1000, 0), first);
+    }
+
+    /// The count of hit regions is the whole of what picks a layout, and a
+    /// count neither set was recovered against picks none rather than the
+    /// nearest one.
+    #[test]
+    fn the_region_count_picks_the_module() {
+        assert_eq!(
+            Layout::of(Layout::SCHOOL_DAYS_HQ.widgets).map(|l| l.module),
+            Some("SysMenuSDHQ.dll")
+        );
+        assert_eq!(
+            Layout::of(Layout::SHINY_DAYS.widgets).map(|l| l.module),
+            Some("SysMenuSD.dll")
+        );
+        assert!(Layout::of(24).is_none());
+        assert!(Layout::of(0).is_none());
+    }
+
+    /// The last widget is a different control on the two, and the difference
+    /// runs through both the enabled test and the dispatch: School Days HQ's is
+    /// the first of ten cells that store a level, and Shiny Days' is a knob
+    /// that is never live and is reached from outside the enabled test.
+    #[test]
+    fn the_last_widget_is_a_cell_on_one_module_and_a_knob_on_the_other() {
+        let hq = &Layout::SCHOOL_DAYS_HQ;
+        let sd = &Layout::SHINY_DAYS;
+        assert!(hq.enabled(0xf, live()));
+        assert_eq!(hq.action(0xf, live(), false), Act::Transparency(0));
+
+        assert!(!sd.enabled(0xf, live()));
+        assert_eq!(sd.action(0xf, live(), false), Act::GrabKnob);
+        // Dead without a record to follow, the same answer that darkens its
+        // trough.
+        assert_eq!(sd.action(0xf, State::default(), false), Act::None);
+    }
+
+    /// Every widget the two strips share dispatches the same way, which is
+    /// what makes one [`Act`] serve both.
+    #[test]
+    fn the_two_strips_dispatch_their_shared_widgets_alike() {
+        for widget in 0..Layout::SHINY_DAYS.widgets - 1 {
+            assert_eq!(
+                Layout::SCHOOL_DAYS_HQ.action(widget, live(), false),
+                Layout::SHINY_DAYS.action(widget, live(), false),
+                "widget {widget}"
+            );
+        }
+    }
+
+    /// Shiny Days' widget 0 has one lit record and no animation, so the clock
+    /// and the rate make no difference to it.
+    #[test]
+    fn a_lit_widget_0_does_not_animate() {
+        let auto = Layout::SHINY_DAYS.auto_lit;
+        let Auto::Lit(record) = auto else {
+            panic!("Shiny Days' widget 0 is lit, not animated");
+        };
+        assert_eq!(auto.frame(0, 0), record);
+        assert_eq!(auto.frame(60_000, 4), record);
+    }
+
+    /// The knob's travel and the alpha it produces, from `FUN_100359c0`: the
+    /// run reaches a full 255 where School Days HQ's ten cells stop at 250, and
+    /// a fresh bar starts at the solid end.
+    #[test]
+    fn the_dragged_knob_runs_the_whole_alpha() {
+        assert_eq!(slider::alpha(slider::MIN_X), 0);
+        assert_eq!(slider::alpha(slider::MAX_X), 255);
+        assert_eq!(slider::alpha(slider::INITIAL_X), 255);
+        assert_eq!(indicator::alpha(indicator::INITIAL_LEVEL), 250);
+        // `FUN_10035cb0` takes both ends of the knob, and nothing past them.
+        assert!(slider::on_knob(700.0, 700.0));
+        assert!(slider::on_knob(700.0, 700.0 + slider::KNOB_WIDTH));
+        assert!(!slider::on_knob(700.0, 699.0));
+        assert!(!slider::on_knob(700.0, 700.0 + slider::KNOB_WIDTH + 1.0));
     }
 }
 
@@ -1529,6 +2098,62 @@ mod tests {
 /// is opaque until the player moves it.
 ///
 /// Nothing saves the level. It is a member of the bar, gone with the bar.
+/// Shiny Days' transparency control: one knob you take hold of and drag.
+///
+/// Where School Days HQ gives the `REPLAYMODE` indicator's transparency ten
+/// cells to press — see [`indicator`] — Shiny Days gives it a slider. Widget
+/// `0xf` is the track, `this+0xb0` is the knob's `x` in the strip's own units,
+/// and the alpha is where in its travel the knob has got to.
+///
+/// Three functions are the whole of it. `FUN_10035cb0` answers whether the
+/// pointer is on the knob, which is what a press on widget `0xf` has to pass
+/// before the grip is taken; `FUN_100359c0` moves it while the button is held
+/// and writes the alpha onto the indicator's sprite; and `FUN_10033270` puts
+/// it at [`INITIAL_X`] when the bar loads.
+pub mod slider {
+    /// `_DAT_1004e320` and `_DAT_1004e318`, both doubles: the knob's travel.
+    /// The bed it runs in is 114 wide at x 678, so the knob stops short of
+    /// either end of it.
+    pub const MIN_X: f32 = 691.0;
+    pub const MAX_X: f32 = 768.0;
+    /// `_DAT_1004e310`, a double: [`MAX_X`] less [`MIN_X`], which the original
+    /// keeps as a constant of its own rather than subtracting.
+    pub const TRAVEL: f32 = 77.0;
+    /// `_DAT_1004e308`, a double: the alpha at the far end. Unlike HQ's ten
+    /// cells, which reach only 250, this run reaches a full 255.
+    pub const ALPHA_MAX: f32 = 255.0;
+    /// `_DAT_1004e304` — a **float**, not a double like its neighbours: where
+    /// `FUN_10033270` puts the knob when the bar loads. That is the far end,
+    /// so a fresh bar draws the indicator solid, which is what School Days HQ's
+    /// [`indicator::INITIAL_LEVEL`](super::indicator::INITIAL_LEVEL) of 10 does
+    /// too.
+    pub const INITIAL_X: f32 = 768.0;
+    /// `_DAT_10049750` and `_DAT_100497b0`, the half-pixel inset and the `+1`
+    /// every sprite on the bar gets.
+    pub(super) const HALF: f32 = 0.5;
+    pub(super) const ONE: f32 = 1.0;
+    /// `DAT_10058ac0`: the knob record's own width, which is how far past its
+    /// origin `FUN_10035cb0` will still call a point "on the knob".
+    pub const KNOB_WIDTH: f32 = 11.0;
+
+    /// The indicator's alpha with the knob at `x`, as `FUN_100359c0` computes
+    /// it: `round((x - MIN_X) / TRAVEL * ALPHA_MAX)`, put in the top byte of an
+    /// otherwise white ARGB.
+    pub fn alpha(x: f32) -> u8 {
+        (((x - MIN_X) / TRAVEL * ALPHA_MAX).round()).clamp(0.0, 255.0) as u8
+    }
+
+    /// Whether a pointer at `x` — in the strip's own units — is on a knob whose
+    /// origin is at `knob`.
+    ///
+    /// `FUN_10035cb0`, which tests `knob <= x` and `x <= knob + KNOB_WIDTH`.
+    /// Both ends are inclusive: Ghidra renders the first as
+    /// `(a < b) != (a == b)`, which is `a <= b`.
+    pub fn on_knob(knob: f32, x: f32) -> bool {
+        knob <= x && x <= knob + KNOB_WIDTH
+    }
+}
+
 pub mod indicator {
     use super::gauge::Rect;
 
