@@ -53,6 +53,7 @@
 use crate::install::config::Config;
 use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
+use crate::ui::option_pages;
 use crate::ui::options;
 use crate::ui::options::Dir;
 use crate::ui::paths::Paths;
@@ -589,6 +590,10 @@ pub struct Menu {
     /// table that cuts it up. Absent when the page's art will not load, which
     /// leaves the grid's empty frames showing.
     thumbnails: Option<(days_ui::Image, replay::Thumbnails)>,
+    /// The Option screen's page, on a module that lays a tab's widgets out
+    /// against a table rather than giving each tab its own hit map. Absent on
+    /// the module that does, and on any other screen.
+    option_page: Option<OptionPage>,
     /// The player's own font, for the text a screen draws itself rather than
     /// picking out of its art. Absent when the install has no readable
     /// `FONTDATA`, which leaves that text undrawn and the screen usable.
@@ -699,12 +704,14 @@ impl Menu {
             asked: None,
             kind,
             thumbnails: None,
+            option_page: None,
             font: load_font(vfs),
             rows: None,
             pending_save: None,
             out_scale: 1.0,
         };
         menu.load_thumbnails(vfs, dll);
+        menu.load_page(vfs, dll);
         menu.refresh();
         Ok(menu)
     }
@@ -739,9 +746,35 @@ impl Menu {
         self.return_to = return_to;
         self.selection = None;
         self.load_thumbnails(vfs, dll);
+        self.load_page(vfs, dll);
         self.refresh();
         Ok(())
     }
+}
+
+/// The Option screen's page for one tab: the records it draws from, read once
+/// out of the module, and the two images they are drawn from.
+///
+/// A page is reloaded whenever the tab changes, which is what the module does —
+/// `FUN_10007d10` releases the three sprites and takes the new tab's art.
+struct OptionPage {
+    /// The tab's widget rectangles, in widget order from
+    /// [`option_pages::FIRST`].
+    widgets: Vec<days_ui::atlas::Widget>,
+    /// The same rectangles again with the hover art's `src_y`.
+    hovers: Vec<days_ui::atlas::Widget>,
+    /// The Sound tab's three knob sprites, empty on the other two.
+    knobs: Vec<days_ui::atlas::Widget>,
+    /// The tracks those knobs travel, which is what the pointer is caught by.
+    tracks: Vec<days_ui::atlas::Widget>,
+    /// The page's full-screen art in native layout space...
+    art: days_ui::Image,
+    /// ...and the same art at the size the screen is composited at, which is
+    /// the expensive half and is kept until [`OptionPage::at`] moves.
+    scaled: days_ui::Image,
+    at: (u32, u32),
+    /// The sheet this tab's sprites are cut from, which is not the screen's.
+    chip: days_ui::Image,
 }
 
 /// Which of the two screens that list the player's slots is showing.
@@ -841,6 +874,55 @@ impl Menu {
         }
     }
 
+    /// Loads the Option page for the tab showing.
+    ///
+    /// Only one of the two menu modules has pages: the other gives each tab its
+    /// own hit map, and its widgets are the screen's own. A page whose table
+    /// cannot be placed, or whose art will not load, leaves the frame drawn and
+    /// the tab headers working, which is the rule every other missing asset
+    /// follows.
+    fn load_page(&mut self, vfs: &Vfs, dll: &[u8]) {
+        self.option_page = None;
+        if self.mode != Mode::OPTION || self.paths.option_tabs_have_own_map() {
+            return;
+        }
+        let Some(pages) = option_pages::Pages::locate(dll, self.screen.atlas().offset) else {
+            log::warn!("no Option page tables in this module; the tabs draw empty");
+            return;
+        };
+        let (art, chip) = option_pages::art(self.tab, self.session.som);
+        let read = |path: &str| {
+            vfs.read_path(path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| days_ui::Image::decode_png(&bytes).map_err(|e| e.to_string()))
+        };
+        let (art, chip) = match (read(art), read(chip)) {
+            (Ok(art), Ok(chip)) => (art, chip),
+            (Err(err), _) | (_, Err(err)) => {
+                log::warn!("Option page art for the {} tab: {err}", self.tab.variant());
+                return;
+            }
+        };
+        let scaled = self.screen.to_display(&art);
+        self.option_page = Some(OptionPage {
+            widgets: pages.widgets(dll, self.tab),
+            hovers: pages.hovers(dll, self.tab),
+            knobs: (0..option_pages::SLIDERS)
+                .filter(|_| self.tab == options::Tab::Sound)
+                .map_while(|slider| pages.knob(dll, slider))
+                .collect(),
+            tracks: (0..option_pages::SLIDERS)
+                .filter(|_| self.tab == options::Tab::Sound)
+                .map_while(|slider| pages.track(dll, slider))
+                .collect(),
+            art,
+            scaled,
+            at: self.screen.size(),
+            chip,
+        });
+        self.dirty = true;
+    }
+
     /// The session, for an engine that needs to read the settings.
     pub fn session(&self) -> &Session {
         &self.session
@@ -929,10 +1011,20 @@ impl Menu {
     /// clean. The backdrop is in display space; see [`Screen::compose_over`].
     pub fn compose(&mut self, backdrop: Option<&days_ui::Image>) -> days_ui::Image {
         self.dirty = false;
+        self.refit_page();
+        let page_sprites = self.page_sprites();
         let sprites = self.sprites();
+        let page = self
+            .option_page
+            .as_ref()
+            .map(|page| crate::ui::screen::Page {
+                art: &page.scaled,
+                sheet: &page.chip,
+                sprites: &page_sprites,
+            });
         let mut out = self
             .screen
-            .compose_over_sprites(backdrop, &self.states, &sprites);
+            .compose_over_page(backdrop, page, &self.states, &sprites);
         // The save/load rows are not widget sprites: their source is twice the
         // size of their destination, so they are blitted with the averaging
         // downscale.
@@ -963,6 +1055,91 @@ impl Menu {
         out
     }
 
+    /// Redraws the page's art at the size the screen is composited at.
+    ///
+    /// The page covers the whole layout, so resampling it is as expensive as
+    /// the base art's own resample and is kept the same way: done when the size
+    /// moves, not every frame.
+    fn refit_page(&mut self) {
+        let size = self.screen.size();
+        let Some(page) = &mut self.option_page else {
+            return;
+        };
+        if page.at == size {
+            return;
+        }
+        page.scaled = self.screen.to_display(&page.art);
+        page.at = size;
+    }
+
+    /// What the Option page draws over its own art, in the order the tab's draw
+    /// puts them down.
+    ///
+    /// `FUN_10006500`, `FUN_10006a20` and `FUN_100070f0` all go: the value in
+    /// force on each of the tab's rows, then the widget under the pointer, and
+    /// the Sound tab then puts its three knobs on top of both.
+    fn page_sprites(&self) -> Vec<days_ui::atlas::Widget> {
+        let Some(page) = &self.option_page else {
+            return Vec::new();
+        };
+        let record = |widget: usize| {
+            widget
+                .checked_sub(option_pages::FIRST)
+                .and_then(|index| page.widgets.get(index))
+                .copied()
+        };
+        let mut out: Vec<days_ui::atlas::Widget> = option_pages::values(
+            self.tab,
+            &self.session.config,
+            self.session.display,
+            self.session.som,
+        )
+        .into_iter()
+        .filter_map(record)
+        .collect();
+
+        if let Some(widget) = self.selection.filter(|w| *w >= option_pages::FIRST) {
+            if let Some(hover) = widget
+                .checked_sub(option_pages::FIRST)
+                .and_then(|index| page.hovers.get(index))
+            {
+                // A slider's hover art is drawn on the knob rather than on the
+                // track the pointer was caught by.
+                out.push(match self.slider_at(widget).and_then(|s| self.knob_x(s)) {
+                    Some(x) => option_pages::at_x(hover, x + option_pages::SLIDER_HOVER_OFFSET),
+                    None => *hover,
+                });
+            }
+        }
+
+        for slider in 0..page.knobs.len() {
+            let (Some(knob), Some(x)) = (page.knobs.get(slider), self.knob_x(slider)) else {
+                continue;
+            };
+            out.push(option_pages::at_x(knob, x));
+        }
+        out
+    }
+
+    /// Which Sound slider a widget is, if it is one.
+    fn slider_at(&self, widget: usize) -> Option<usize> {
+        let slider = widget.checked_sub(option_pages::FIRST_SLIDER)?;
+        (self.tab == options::Tab::Sound && slider < option_pages::SLIDERS).then_some(slider)
+    }
+
+    /// Where a Sound slider's knob sits, from the volume in force.
+    fn knob_x(&self, slider: usize) -> Option<f32> {
+        let page = self.option_page.as_ref()?;
+        let track = page.tracks.get(slider)?;
+        let knob = page.knobs.get(slider)?;
+        let channel = *option_pages::SLIDER_CHANNELS.get(slider)?;
+        Some(option_pages::slider_knob_x(
+            track,
+            knob,
+            option_pages::volume(&self.session.config, channel),
+        ))
+    }
+
     /// The sprites this screen draws that are not widget states.
     ///
     /// Three screens have them: the Sound tab's three volume bars, cut from the
@@ -980,7 +1157,15 @@ impl Menu {
         // button of the pair holds the value rather than on a fixed one. The
         // tab's draw function does exactly this before it looks at the pointer
         // at all — `FUN_100063c0` for the Sound tab.
-        if self.mode == Mode::OPTION {
+        // A page module draws one of these and only one: the tab's own header,
+        // which `FUN_100083b0` takes from the frame table at record `tab + 4`.
+        // Everything else on its screen belongs to the page.
+        if self.mode == Mode::OPTION && self.option_page.is_some() {
+            if let Some(header) = self.screen.atlas().extras.get(self.tab.index()) {
+                out.push((self.screen.chip(), *header));
+            }
+        }
+        if self.mode == Mode::OPTION && self.option_page.is_none() {
             let values = options::current_values(
                 self.tab,
                 &self.session.config,
@@ -997,7 +1182,7 @@ impl Menu {
             }
         }
         match self.mode {
-            Mode::OPTION if self.tab == options::Tab::Sound => {
+            Mode::OPTION if self.tab == options::Tab::Sound && self.option_page.is_none() => {
                 for row in 0..options::VOLUME_ROW_COUNT {
                     let Some((channel, first)) = options::volume_row(row) else {
                         continue;
@@ -1069,6 +1254,16 @@ impl Menu {
     /// [`replay::popup_enabled`] (`FUN_100195d0`). A screen with no recovered
     /// rule treats every widget as live.
     pub fn enabled(&self, widget: usize) -> bool {
+        // A page's widgets are numbered past the frame's four, so they are not
+        // in `states` at all and the length test below would refuse every one.
+        if self.option_page.is_some() && self.mode == Mode::OPTION {
+            return option_pages::enabled(
+                self.tab,
+                widget,
+                self.session.save.trial,
+                self.session.som,
+            );
+        }
         if widget >= self.states.len() {
             return false;
         }
@@ -1233,8 +1428,38 @@ impl Menu {
 
     /// Moves the pointer. Coordinates are in the screen's own pixel space.
     pub fn point_at(&mut self, x: u32, y: u32) -> Action {
-        let hit = self.screen.hit(x, y).filter(|i| self.enabled(*i));
+        let hit = match self.screen.hit(x, y) {
+            Some(widget) => Some(widget),
+            None => self.page_hit(x, y),
+        };
+        let hit = hit.filter(|widget| self.enabled(*widget) || self.grabbing(*widget, x));
         self.select(hit)
+    }
+
+    /// The Option page's own hit test.
+    ///
+    /// The shipped pump falls through to it exactly here: `FUN_10009760` asks
+    /// the hit map first and the class's `+0x4c` — `FUN_1000bb10` — only when
+    /// the map answers -1, which on a page it always does.
+    fn page_hit(&self, x: u32, y: u32) -> Option<usize> {
+        let page = self.option_page.as_ref()?;
+        let (x, y) = self.screen.to_layout(x, y);
+        option_pages::hit_in(&page.widgets, x.max(0.0) as u32, y.max(0.0) as u32)
+    }
+
+    /// Whether the pointer is on a slider's knob, which is the rest of
+    /// [`option_pages::enabled`] for the Sound tab's three sliders.
+    fn grabbing(&self, widget: usize, x: u32) -> bool {
+        let Some(slider) = self.slider_at(widget) else {
+            return false;
+        };
+        let (Some(page), Some(knob_x)) = (self.option_page.as_ref(), self.knob_x(slider)) else {
+            return false;
+        };
+        let (x, _) = self.screen.to_layout(x, 0);
+        page.knobs
+            .get(slider)
+            .is_some_and(|knob| option_pages::grabbed(knob, knob_x, x))
     }
 
     /// The pointer left the screen, or the window lost focus.
@@ -1271,6 +1496,21 @@ impl Menu {
     /// than a transition table that looks recovered and is not.
     pub fn navigate(&mut self, dir: Dir) -> Action {
         let next = match self.mode {
+            // A page module's tables are **decompiled but not transcribed**:
+            // `FUN_100099b0` (Def), `FUN_10009f40` (Sound) and `FUN_1000a330`
+            // (SomCon) are the three, each moving `+0x168` itself and each
+            // with its own wrap rules — the SomCon one swaps within a pair
+            // sideways, cycles the three headers and drops anything else on
+            // CLOSE. Until they are transcribed the fallback walks the tab's
+            // widgets in order, which is at least reachable.
+            Mode::OPTION if self.option_page.is_some() => {
+                let delta = match dir {
+                    Dir::Up | Dir::Left => -1,
+                    Dir::Down | Dir::Right => 1,
+                };
+                let count = option_pages::FIRST + option_pages::records(self.tab);
+                step(count, self.selection, delta, |i| self.enabled(i))
+            }
             Mode::OPTION => Some(options::navigate(
                 self.tab,
                 self.selection.unwrap_or(3),
@@ -1642,7 +1882,10 @@ impl Menu {
     /// Every setting is written through to the config as it changes, which is
     /// what the DLL does; only the close button flushes to disk.
     fn confirm_option(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
-        let act = options::action(self.tab, widget, self.session.display);
+        let act = match self.option_page {
+            Some(_) => option_pages::action(self.tab, widget, self.session.display),
+            None => options::action(self.tab, widget, self.session.display),
+        };
         match act {
             options::Act::Tab(next) => {
                 if next == self.tab {
@@ -1686,7 +1929,22 @@ impl Menu {
     /// changes what is on screen. A change to whether the toy is asked for at
     /// all swaps the base art and needs the screen loading again; anything
     /// else is a repaint.
-    pub fn set_som(&mut self, vfs: &Vfs, dll: &[u8], som: options::Som) -> Result<(), Error> {
+    pub fn set_som(&mut self, vfs: &Vfs, dll: &[u8], mut som: options::Som) -> Result<(), Error> {
+        // A page module keeps one answer where the other keeps two:
+        // `FUN_10008760` sets `UseSOM` and "a port is open" together and clears
+        // them together, and `FUN_100095c0`'s release zeroes both. So asking
+        // for the toy and finding nothing leaves the tab off rather than on,
+        // and the flush writes that member back to `UseSOM`.
+        //
+        // What the shipped screen also does with a detect that finds nothing is
+        // set `+0x228`; what reads that member is **not recovered**, so the
+        // message it stands for is not raised here.
+        if self.option_page.is_some() {
+            som.enabled = som.attached;
+            self.session
+                .config
+                .set_flag(crate::install::config::Flag::UseSom, som.enabled);
+        }
         let was = self.session.som;
         self.session.som = som;
         if was.enabled != som.enabled && self.mode == Mode::OPTION {

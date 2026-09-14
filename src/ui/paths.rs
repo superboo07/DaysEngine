@@ -201,12 +201,11 @@ impl Paths {
     /// of its own, which is what [`crate::ui::options`]'s widget numbering is.
     ///
     /// A module whose Option hit map is shared by every tab lays the tabs'
-    /// contents out at runtime instead, against rectangles rather than a map,
-    /// and **the table those rectangles come from is not recovered** — see
-    /// `docs/FORMATS.md`, which also has the widget numbering, which is
-    /// recovered and is the same one. The four widgets the shared map does have
-    /// are the three tab headers and the close button, and those are the first
-    /// four on the per-tab maps too, so they work either way.
+    /// contents out against rectangles in the module instead — see
+    /// [`crate::ui::option_pages`], which is that half of the screen. The four
+    /// widgets the shared map does have are the three tab headers and the close
+    /// button, and those are the first four on the per-tab maps too, so they
+    /// work either way.
     pub fn option_tabs_have_own_map(&self) -> bool {
         self.literal(4).is_some_and(|l| l.contains("%s"))
     }

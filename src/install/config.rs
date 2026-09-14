@@ -407,6 +407,19 @@ impl Config {
         self.set(channel.key(), level.clamp(0, MAX_VOLUME).to_string());
     }
 
+    /// A float the way `FUN_0046cb50` reads one: the same rule as
+    /// [`Config::int_or`], with `VT_R4` in place of `VT_I4`.
+    ///
+    /// The volumes this title's Option screen steps through are integers, so
+    /// nothing here uses this for them. The other module on this engine reads
+    /// its three volumes as floats — see [`crate::ui::option_pages::volume`].
+    pub fn r4_or(&self, key: &str, default: f32) -> f32 {
+        match self.get(key) {
+            Some(text) => variant_r4(text),
+            None => default,
+        }
+    }
+
     /// `MasterVolume`, the per-step factor the level is multiplied by.
     ///
     /// `FUN_0046cb50`, so `VT_R4` and the same rule as the other two: absent

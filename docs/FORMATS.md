@@ -225,7 +225,12 @@ the same "flush, then leave" School Days HQ does.
 | `UseSOM` | `+0x224` | 0 |
 
 `Wheel` and `AutoDraw` are read and written but no widget on any tab touches
-them. Reading `UseSOM` non-zero runs the port scan immediately. `VoiceVolume`,
+them. Reading `UseSOM` non-zero runs the port scan immediately, and that scan —
+`FUN_10008760` — sets `+0x224` and `+0x218` together on the first port that
+opens and clears both when none does. So on this module `UseSOM` is exactly "a
+port is in hand": asking for the toy and finding nothing leaves the tab off
+rather than on, and the flush writes that member back. `FUN_100095c0` also sets
+`+0x228` when widget 4 finds nothing; **what reads `+0x228` is not recovered**. `VoiceVolume`,
 `BgmVolume` and `SeVolume` are each clamped down to 1 on the way in.
 
 ### The port buttons disagree with the port scan, by two
@@ -345,11 +350,62 @@ the knob, so the track catches the pointer and the knob decides whether the
 widget answers at all.
 
 So the Sound table is three runs rather than two: records 0–6 are the hit
-rectangles for widgets 4–10, records 7–10 are the alternate art for the four
-toggle widgets, and records 14–16 are the knob sprites the draw and the drag
-both use. Records 11–13 are knob-shaped too — same `src_x`, `src_y` of the
-alternate run, but 20 wide and 48 to 50 tall against the drawn knob's 18 by 26 —
-and **nothing decompiled so far reads them**.
+rectangles for widgets 4–10, records 7–13 are the hover art for widgets 4–10 —
+the four toggles at their own rectangles and then the three knobs, 20 wide and
+48 to 50 tall against the drawn knob's 18 by 26, which is the arrows that appear
+above and below a knob the pointer is on — and records 14–16 are the resting
+knob sprites the draw and the drag both use.
+
+### How a page is drawn
+
+`FUN_10006110` is the whole frame, and the page is a layer between the frame's
+art and the frame's sprites:
+
+```text
+every page's background          the `+0x178` loop, each at pageWidth * index
+the tab in view, by `+0x174`     FUN_10006500 / FUN_10006a20 / FUN_100070f0
+the frame's tab highlight        frame record `tab + 4`
+the frame widget under the pointer
+```
+
+Each tab's draw then puts its own contents down in one order:
+
+```text
+the value in force on each row   the row's own record, chosen by the value
+the widget under the pointer     that widget's record in the second run
+(Sound only) the three knobs     record `widget + 6`, moved along the track
+```
+
+The second run is reached at one record per widget with the run's own length
+added: `FUN_1000adc0` uses `widget + 6` over the Def tab's ten, `FUN_1000af90`
+`widget + 3` over the Sound tab's seven and `FUN_1000b1d0` `widget + 10` over the
+SomCon tab's fourteen. A slider's hover art is the one thing not drawn at its
+record's `x`: `FUN_1000af90` puts it at `knob_x - 1.0`, one pixel left of the
+knob, which centres the 20-wide art on the 18-wide knob.
+
+Every page sprite is drawn at `record.x - +0xb0`, and `FUN_10008830` sets
+`+0xb0` to `pageWidth * tab` while each page's background sits at `pageWidth *
+its own index` — so at rest the two cancel and a record's own coordinates are
+where it lands, which is also why the hit test can scan the raw rectangles.
+
+The three backgrounds are `FUN_10007d10`'s literals and the three sheets are
+`FUN_100081a0`'s:
+
+| tab | background | sheet |
+| --- | --- | --- |
+| 0 Def | `System/Option/Default/Option_Def.png` | `.../Option_Def_Chip.png` |
+| 1 Sound | `System/Option/Sound/Option_Sound.png` | `.../Option_Sound_Chip.png` |
+| 2 SomCon | `System/Option/Somcon/Option_SomCon.png`, or `Option_SomCon_Set.png` when `+0x224` is set | `.../Option_SomCon_Chip.png` |
+
+All six are 800x450 RGBA: a page covers the layout and the frame shows through
+it.
+
+**The per-tab keyboard tables are decompiled but not transcribed.**
+`FUN_100099b0` (Def), `FUN_10009f40` (Sound) and `FUN_1000a330` (SomCon) are
+called from the input pump on the four direction members `+0x60` to `+0x6c`, and
+each moves `+0x168` itself: the SomCon one swaps within a pair sideways, cycles
+the three headers, and drops anything else on CLOSE. Until they are transcribed
+this engine walks the tab's widgets in order instead.
 
 **Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
 `FUN_1000d980` hands the loader `System/Screen/Transparence.png` and

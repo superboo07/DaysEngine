@@ -173,6 +173,24 @@ pub struct Cut {
     pub dst: (f32, f32, f32, f32),
 }
 
+/// A screen drawn **inside** another screen's base art: art of its own that
+/// covers the layout, plus the sprites it draws over that.
+///
+/// The Option screen's tab pages are the one of these. `FUN_10006110` draws
+/// each page's background and then its contents, and only after both the
+/// frame's own tab highlight and hover sprite — so a page is not a backdrop
+/// and not a sprite, it is a layer between the two. See
+/// [`crate::ui::option_pages`].
+pub struct Page<'a> {
+    /// The page's full-screen art, **already in display space**: run it
+    /// through [`Screen::to_display`] first, the same as a backdrop.
+    pub art: &'a Image,
+    /// The sheet its sprites are cut from, which is not the screen's own.
+    pub sheet: &'a Image,
+    /// The sprites, in the order they are drawn.
+    pub sprites: &'a [Widget],
+}
+
 /// A loaded screen at one resolution.
 pub struct Screen {
     /// Logical path stem, e.g. `System/Title/Title`.
@@ -447,6 +465,25 @@ impl Screen {
         (index < self.atlas.widgets.len()).then_some(index)
     }
 
+    /// A point in the output space [`Screen::hit`] takes, back in the 800x450
+    /// layout space the DLL's records are written in.
+    ///
+    /// For a screen whose widgets are not all in its hit map: the Option
+    /// screen's pages are rectangles in the module rather than regions in the
+    /// map, and [`crate::ui::option_pages::Pages::hit`] tests them where they
+    /// are written.
+    pub fn to_layout(&self, x: u32, y: u32) -> (f32, f32) {
+        let scale = if self.out_scale == 0.0 {
+            1.0
+        } else {
+            self.out_scale
+        };
+        (
+            (f64::from(x) / scale) as f32,
+            ((f64::from(y) - self.out_letterbox) / scale) as f32,
+        )
+    }
+
     /// A point inside a widget's hit region, in the same output space
     /// [`Screen::hit`] takes.
     ///
@@ -637,7 +674,35 @@ impl Screen {
         states: &[WidgetState],
         sprites: &[(&Image, Widget)],
     ) -> Image {
-        let mut out = self.compose_over(backdrop, states);
+        self.compose_over_page(backdrop, None, states, sprites)
+    }
+
+    /// Composites the screen with a [`Page`] over its base art.
+    ///
+    /// The page goes down between the base and the screen's own widget
+    /// sprites, which is where `FUN_10006110` draws it: the frame's tab
+    /// highlight and its hover sprite are drawn after the page's contents, so
+    /// they sit on top of it.
+    pub fn compose_over_page(
+        &self,
+        backdrop: Option<&Image>,
+        page: Option<Page>,
+        states: &[WidgetState],
+        sprites: &[(&Image, Widget)],
+    ) -> Image {
+        let (w, h) = self.size();
+        let mut out = Image::black(w, h);
+        if let Some(under) = backdrop {
+            self.blit_display(&mut out, under);
+        }
+        self.blit_display(&mut out, &self.base);
+        if let Some(page) = page {
+            self.blit_display(&mut out, page.art);
+            for sprite in page.sprites {
+                self.blit_sprite(&mut out, page.sheet, sprite);
+            }
+        }
+        self.draw_states(&mut out, states);
         for (sheet, widget) in sprites {
             self.blit_sprite(&mut out, sheet, widget);
         }

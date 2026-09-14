@@ -61,8 +61,34 @@
 //! narrowing the live area from the track back down to the knob — so the track
 //! catches the pointer and the knob decides whether the widget answers at all.
 //! [`Pages::slider_grabbed`] is that second test.
+//!
+//! # How a page is drawn
+//!
+//! A page is a layer of its own between the frame's art and the frame's
+//! sprites, and `FUN_10006110` is the order: each page's full-screen art, then
+//! the contents of the tab showing, then the frame's tab highlight and its
+//! hovered widget. [`crate::ui::screen::Page`] is that layer.
+//!
+//! The three tab draws all put their contents down the same way:
+//!
+//! ```text
+//! the value in force on each row   the row's own record, chosen by the value
+//! the widget under the pointer     that widget's record in the second run
+//! (Sound only) the three knobs     record `widget + 6`, moved along the track
+//! ```
+//!
+//! So the current-value highlight is not a run of its own here: each row is two
+//! records — one per button — and the tab draws whichever one the setting sits
+//! on. [`values`] is that choice, and [`Pages::hover`] is the second run.
+//!
+//! Every page sprite is drawn at `record.x - scroll`, where the scroll is the
+//! carousel's, and `FUN_10008830` sets it to `pageWidth * tab` while each page
+//! sits at `pageWidth * its own index` — so at rest the two cancel and a
+//! record's own coordinates are where it lands. Nothing here models the drag
+//! between tabs; `docs/FORMATS.md` has the carousel.
 
-use crate::ui::options::Tab;
+use crate::install::config::{Channel, Config, Flag};
+use crate::ui::options::{self, Act, Display, DisplayRequest, Som, Tab};
 use days_ui::atlas::{self, Widget};
 use days_ui::cmap::Rect;
 
@@ -81,6 +107,13 @@ pub const FIRST_SLIDER: usize = 8;
 
 /// How many sliders the Sound tab has.
 pub const SLIDERS: usize = 3;
+
+/// Which volume each slider carries.
+///
+/// `FUN_100083b0` works the three knob positions out from `+0xc8`, `+0xcc` and
+/// `+0xc4` in that order, and `FUN_100075d0` fills those three from
+/// `BgmVolume`, `SeVolume` and `VoiceVolume`.
+pub const SLIDER_CHANNELS: [Channel; SLIDERS] = [Channel::Bgm, Channel::Se, Channel::Voice];
 
 /// A slider's knob, as a **record index** rather than a widget: `FUN_1000bd20`
 /// reaches the track at record `widget - 4`, which is the ordinary page rule,
@@ -201,12 +234,23 @@ impl Pages {
     /// match — and the test is half-open at the low edge and closed at the high
     /// one, which is the shipped comparison rather than a tidied version of it.
     pub fn hit(&self, dll: &[u8], tab: Tab, x: u32, y: u32) -> Option<usize> {
+        let records: Vec<Widget> = self.widgets(dll, tab);
+        hit_in(&records, x, y)
+    }
+
+    /// A tab's page widgets, in widget order from [`FIRST`].
+    pub fn widgets(&self, dll: &[u8], tab: Tab) -> Vec<Widget> {
         (0..records(tab))
-            .find(|index| {
-                atlas::record_at(dll, self.base(tab), *index)
-                    .is_some_and(|w| contains(&w.dst, x, y))
-            })
-            .map(|index| index + FIRST)
+            .map_while(|index| atlas::record_at(dll, self.base(tab), index))
+            .collect()
+    }
+
+    /// The same for the run behind them: each widget's hover art.
+    pub fn hovers(&self, dll: &[u8], tab: Tab) -> Vec<Widget> {
+        let count = records(tab);
+        (count..count * 2)
+            .map_while(|index| atlas::record_at(dll, self.base(tab), index))
+            .collect()
     }
 
     /// A Sound slider's track — the full-width record the pointer is caught by.
@@ -226,9 +270,282 @@ impl Pages {
     /// on that row.
     pub fn slider_grabbed(&self, dll: &[u8], slider: usize, knob_x: f32, x: f32) -> bool {
         self.knob(dll, slider)
-            .is_some_and(|k| knob_x <= x && x <= knob_x + k.dst.width as f32)
+            .is_some_and(|knob| grabbed(&knob, knob_x, x))
+    }
+
+    /// A widget's hover sprite.
+    ///
+    /// Each tab's records are followed by a second run of the same rectangles
+    /// at a different `src_y` — the art with the pointer on it — and the three
+    /// hover draws reach it at one record per widget: `FUN_1000adc0` uses
+    /// `widget + 6` on the Def tab's ten, `FUN_1000af90` `widget + 3` on the
+    /// Sound tab's seven and `FUN_1000b1d0` `widget + 10` on the SomCon tab's
+    /// fourteen. All three are the page rule again with the run's length added.
+    ///
+    /// A slider's hover art is drawn at the knob's own x rather than the
+    /// track's, so `knob_x` moves it; the other widgets ignore it.
+    pub fn hover(
+        &self,
+        dll: &[u8],
+        tab: Tab,
+        widget: usize,
+        knob_x: Option<f32>,
+    ) -> Option<Widget> {
+        let index = widget.checked_sub(FIRST)?;
+        if index >= records(tab) {
+            return None;
+        }
+        let sprite = atlas::record_at(dll, self.base(tab), index + records(tab))?;
+        Some(match knob_x {
+            Some(x) => at_x(&sprite, x),
+            None => sprite,
+        })
     }
 }
+
+/// How far left of the knob a slider's hover art is drawn.
+///
+/// `FUN_1000af90` places that art at `knob_x - 1.0` where every other sprite on
+/// the page goes at its own record's x. The hover art is 20 wide against the
+/// knob's 18, so the pixel centres it on the knob it belongs to.
+pub const SLIDER_HOVER_OFFSET: f32 = -1.0;
+
+/// Whether the pointer is on a knob sitting at `knob_x`, from `FUN_1000c280`.
+///
+/// Closed at both ends, which the record test is not: the shipped comparison is
+/// `(knob_x < px) != (knob_x == px)`, and that is `knob_x <= px`.
+pub fn grabbed(knob: &Widget, knob_x: f32, x: f32) -> bool {
+    knob_x <= x && x <= knob_x + knob.dst.width as f32
+}
+
+/// A sprite moved to an x, which is how the Sound tab draws anything that sits
+/// on a slider.
+pub fn at_x(sprite: &Widget, x: f32) -> Widget {
+    Widget {
+        dst: Rect {
+            x: x.round().max(0.0) as u32,
+            ..sprite.dst
+        },
+        ..*sprite
+    }
+}
+
+/// A tab's own art, which is not named after the screen's stem.
+///
+/// A page is a full-screen 800x450 image with the frame showing through it,
+/// plus a chip sheet its sprites are cut from. `FUN_10007d10` spells the three
+/// backgrounds and `FUN_100081a0` the three sheets. The SomCon page swaps its
+/// background — and not its sheet — on the same `UseSOM` member that lights
+/// widget 4.
+pub fn art(tab: Tab, som: Som) -> (&'static str, &'static str) {
+    match tab {
+        Tab::Def => (
+            "System/Option/Default/Option_Def.png",
+            "System/Option/Default/Option_Def_Chip.png",
+        ),
+        Tab::Sound => (
+            "System/Option/Sound/Option_Sound.png",
+            "System/Option/Sound/Option_Sound_Chip.png",
+        ),
+        Tab::SomCon => (
+            if som.enabled {
+                "System/Option/Somcon/Option_SomCon_Set.png"
+            } else {
+                "System/Option/Somcon/Option_SomCon.png"
+            },
+            "System/Option/Somcon/Option_SomCon_Chip.png",
+        ),
+    }
+}
+
+/// The first `Port number` button, and how many there are.
+///
+/// `FUN_100095c0` takes widgets 8 to 0x11, and `FUN_100070f0` draws the row as
+/// records 4 to 13.
+pub const FIRST_PORT: usize = 8;
+pub const PORT_BUTTONS: usize = 10;
+
+/// The port a `Port number` button asks for, or `None` when it asks for one
+/// this engine has not got.
+///
+/// **The shipped handler stores `widget - 6`**, which is two past the button's
+/// own place in the row: `FUN_100095c0` opens that port and keeps it in the
+/// member `FUN_100070f0` draws the row's highlight from. The scan in
+/// `FUN_10008760` writes the same member with a real 0-based index, so the two
+/// writers disagree and the click is the one that is out by two — the first
+/// button takes the third port, the first two ports cannot be clicked at all,
+/// and the last two buttons ask for ports past the nine there are. That is
+/// reproduced here rather than tidied: the highlight sitting two buttons right
+/// of the press is what the retail screen shows, and it follows from this one
+/// store. The two buttons that run off the end are refused, the way
+/// [`crate::ui::options::SOM_PORTS`] refuses the other module's tenth.
+pub fn port_of(widget: usize) -> Option<usize> {
+    let port = widget.checked_sub(6)?;
+    (FIRST_PORT..FIRST_PORT + PORT_BUTTONS)
+        .contains(&widget)
+        .then_some(port)
+        .filter(|port| *port < options::SOM_PORTS)
+}
+
+/// Whether a widget can be chosen.
+///
+/// `FUN_10008e60` answers for the frame and hands the page to `FUN_10008f20`
+/// (Def), `FUN_10008f50` (Sound) or `FUN_10008fc0` (SomCon).
+///
+/// The Sound tab's three sliders are **false here whatever the pointer is
+/// doing**: `FUN_10008f50` answers for one only when `FUN_1000c280` says the
+/// pointer is on its knob, and that test needs a position this cannot see. See
+/// [`Pages::slider_grabbed`], which is the rest of it.
+pub fn enabled(tab: Tab, widget: usize, trial: bool, som: Som) -> bool {
+    match widget {
+        0 | 1 | 3 => true,
+        // The trial build has two tabs, so its SomCon header is not live —
+        // `FUN_10008830` reads the same host answer to size the carousel.
+        2 => !trial,
+        _ => match tab {
+            Tab::Def => (FIRST..=0xd).contains(&widget),
+            Tab::Sound => (FIRST..=7).contains(&widget),
+            // The two buttons that take and drop the toy are always live;
+            // everything else on the tab needs a port in hand.
+            Tab::SomCon => match widget {
+                4 | 5 => true,
+                6..=0x11 => som.enabled && som.attached,
+                _ => false,
+            },
+        },
+    }
+}
+
+/// The widget each of a tab's settings currently sits on: the buttons the
+/// current-value highlight is drawn over, in the order the tab draws them.
+///
+/// The highlight is not a run of its own here. Each tab's draw picks one of the
+/// row's **own two records** by the value in force — `if (menVoice == 0) rect =
+/// &DAT_10054778; else rect = &DAT_10054760;` and so on — so the highlight is
+/// the button's own rectangle and the widget is the slot. `FUN_10006500`,
+/// `FUN_10006a20` and `FUN_100070f0` are the three.
+///
+/// The SomCon tab's last two rows are drawn only while a port is in hand, which
+/// is the same gate their widgets have.
+pub fn values(tab: Tab, config: &Config, display: Display, som: Som) -> Vec<usize> {
+    match tab {
+        Tab::Def => vec![
+            if display.wide { 4 } else { 5 },
+            if display.full_screen { 7 } else { 6 },
+            if config.flag(Flag::Skip) { 8 } else { 9 },
+            if config.flag(Flag::SuperSkip) {
+                0xa
+            } else {
+                0xb
+            },
+            if config.flag(Flag::TextView) {
+                0xc
+            } else {
+                0xd
+            },
+        ],
+        Tab::Sound => vec![
+            if config.flag(Flag::MenVoice) { 4 } else { 5 },
+            if config.flag(Flag::Mute) { 6 } else { 7 },
+        ],
+        Tab::SomCon => {
+            let mut out = vec![if som.enabled { 4 } else { 5 }];
+            if som.enabled && som.attached {
+                out.push(if som.testing { 6 } else { 7 });
+                out.push(som.port + FIRST_PORT);
+            }
+            out
+        }
+    }
+}
+
+/// What activating a widget does, from `FUN_10009060` and the three handlers it
+/// dispatches to: `FUN_10009150` (Def), `FUN_10009430` (Sound) and
+/// `FUN_100095c0` (SomCon).
+///
+/// The caller is expected to have checked [`enabled`] first, as every arm of
+/// the shipped dispatch does.
+pub fn action(tab: Tab, widget: usize, display: Display) -> Act {
+    if let Some(next) = Tab::from_widget(widget) {
+        return Act::Tab(next);
+    }
+    if widget == 3 {
+        return Act::Close;
+    }
+    match tab {
+        Tab::Def => def_action(widget, display),
+        Tab::Sound => sound_action(widget),
+        Tab::SomCon => somcon_action(widget),
+    }
+}
+
+/// `FUN_10009150`.
+fn def_action(widget: usize, display: Display) -> Act {
+    match widget {
+        // The two display rows act only when the mode would really change: the
+        // arm for widget 4 runs only while the layout is 4:3, and so on down.
+        4 if !display.wide => Act::Display(DisplayRequest::Wide),
+        5 if display.wide => Act::Display(DisplayRequest::Normal),
+        6 if display.full_screen => Act::Display(DisplayRequest::Windowed),
+        7 if !display.full_screen => Act::Display(DisplayRequest::FullScreen),
+        8 => Act::SetFlag(Flag::Skip, true),
+        9 => Act::SetFlag(Flag::Skip, false),
+        0xa => Act::SetFlag(Flag::SuperSkip, true),
+        0xb => Act::SetFlag(Flag::SuperSkip, false),
+        0xc => Act::SetFlag(Flag::TextView, true),
+        0xd => Act::SetFlag(Flag::TextView, false),
+        _ => Act::None,
+    }
+}
+
+/// `FUN_10009430`.
+///
+/// Widgets 8, 9 and 10 begin a drag of slider `widget - 8` and are **not
+/// wired**: this title keeps its three volumes as floats — see [`volume`] — and
+/// what its executable makes of one is not recovered, so there is nothing to
+/// write a dragged value into. The sliders draw, hover and read back; they do
+/// not yet move.
+fn sound_action(widget: usize) -> Act {
+    match widget {
+        4 => Act::SetFlag(Flag::MenVoice, true),
+        5 => Act::SetFlag(Flag::MenVoice, false),
+        6 => Act::SetFlag(Flag::Mute, true),
+        7 => Act::SetFlag(Flag::Mute, false),
+        _ => Act::None,
+    }
+}
+
+/// `FUN_100095c0`.
+fn somcon_action(widget: usize) -> Act {
+    match widget {
+        4 => Act::SomDetect,
+        5 => Act::SomRelease,
+        // `FUN_10030930(.., 0x96, ..)` starts the test and `FUN_10030a30`
+        // stops it, each only when it is not already in that state.
+        6 => Act::SomTest(true),
+        7 => Act::SomTest(false),
+        _ => match port_of(widget) {
+            Some(port) => Act::SomPort(port),
+            None => Act::None,
+        },
+    }
+}
+
+/// The volume a slider shows, as a fraction of its travel.
+///
+/// `FUN_100075d0` reads `BgmVolume`, `SeVolume` and `VoiceVolume` through the
+/// settings object's float getter, defaulting to **0.5**, and clamps anything
+/// above 1.0 back to 1.0 — so this title's volumes are not the 0 to 10 levels
+/// [`crate::install::config::Config::volume`] reads for the other one.
+///
+/// **What the engine does with the number is not recovered.** This is what the
+/// screen draws the knob from, and nothing else reads it yet.
+pub fn volume(config: &Config, channel: Channel) -> f32 {
+    config.r4_or(channel.key(), DEFAULT_VOLUME).min(1.0)
+}
+
+/// The volume a missing key stands for, from `FUN_100075d0`.
+pub const DEFAULT_VOLUME: f32 = 0.5;
 
 /// How far a knob may travel: the track less the knob's own width.
 fn travel(track: &Widget, knob: &Widget) -> f32 {
@@ -252,6 +569,17 @@ pub fn slider_value(track: &Widget, knob: &Widget, knob_x: f32) -> f32 {
 /// outside zero to one cannot place it outside either.
 pub fn slider_knob_x(track: &Widget, knob: &Widget, value: f32) -> f32 {
     track.dst.x as f32 + travel(track, knob) * value.clamp(0.0, 1.0)
+}
+
+/// The widget under a point, over records already read out of a tab's table.
+///
+/// `FUN_1000bb10` itself, once the table is in hand: first record containing
+/// the point wins, and it answers `index + 4`.
+pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
+    records
+        .iter()
+        .position(|w| contains(&w.dst, x, y))
+        .map(|index| index + FIRST)
 }
 
 /// The shipped containment test: `rec.x < x <= rec.x + rec.w`, and the same in
@@ -353,6 +681,71 @@ mod tests {
     }
 
     #[test]
+    fn a_port_button_asks_for_the_port_two_past_its_own_place() {
+        // `FUN_100095c0` opens and stores `widget - 6` where the row of ten
+        // starts at widget 8, so the first button takes the third port, the
+        // first two ports cannot be clicked at all, and the last two buttons
+        // ask for ports there are no names for.
+        assert_eq!(port_of(FIRST_PORT), Some(2));
+        assert_eq!(port_of(FIRST_PORT + 6), Some(8));
+        assert_eq!(port_of(FIRST_PORT + 7), None);
+        assert_eq!(port_of(FIRST_PORT + PORT_BUTTONS), None);
+        // The row's highlight is drawn at `port + 4` records in, which is the
+        // widget `port + 8`: the same store, so the lit button sits two right
+        // of the pressed one. Bug and all — see `port_of`.
+        let som = Som {
+            enabled: true,
+            attached: true,
+            port: 2,
+            testing: false,
+        };
+        let values = values(
+            Tab::SomCon,
+            &Config::parse_text(""),
+            Display::default(),
+            som,
+        );
+        assert!(values.contains(&(FIRST_PORT + 2)));
+        // Nothing in hand draws no port highlight at all.
+        let values = values_of_somcon_without_a_port();
+        assert!(values.iter().all(|w| *w < FIRST_PORT));
+    }
+
+    fn values_of_somcon_without_a_port() -> Vec<usize> {
+        values(
+            Tab::SomCon,
+            &Config::parse_text(""),
+            Display::default(),
+            Som::default(),
+        )
+    }
+
+    #[test]
+    fn a_widgets_hover_art_is_its_own_record_one_run_later() {
+        // The Sound tab's seven records are followed by seven more with the
+        // hover art's `src_y`, which is what `FUN_1000af90` reaches at
+        // `widget + 3`. Reading it as a page widget would land on the tab's
+        // own rectangles again.
+        let dll = sound_table();
+        let p = pages(0);
+        let hovers = p.hovers(&dll, Tab::Sound);
+        assert_eq!(hovers.len(), records(Tab::Sound));
+        assert_eq!(p.widgets(&dll, Tab::Sound)[0].dst.x, 78);
+        assert_eq!((hovers[0].src_x, hovers[0].src_y), (0, 9));
+        assert_eq!(hovers[6].src_x, 6);
+    }
+
+    #[test]
+    fn a_slider_is_not_live_until_the_pointer_is_on_its_knob() {
+        // `FUN_10008f50` answers for widgets 8 to 10 only through
+        // `FUN_1000c280`, so the answer without a pointer has to be no: a
+        // caller that took `enabled` alone would light a knob from anywhere
+        // along a 529-pixel track.
+        assert!(enabled(Tab::Sound, 7, false, Som::default()));
+        assert!(!enabled(Tab::Sound, FIRST_SLIDER, false, Som::default()));
+    }
+
+    #[test]
     fn the_knob_gate_narrows_the_track_to_the_sprite() {
         // The track catches the pointer anywhere across 529 pixels; the knob
         // decides whether the widget answers at all.
@@ -360,5 +753,8 @@ mod tests {
         let p = pages(0);
         assert!(p.slider_grabbed(&dll, 0, 400.0, 410.0));
         assert!(!p.slider_grabbed(&dll, 0, 400.0, 419.0));
+        // Closed at both ends, which the record test is not.
+        assert!(p.slider_grabbed(&dll, 0, 400.0, 400.0));
+        assert!(p.slider_grabbed(&dll, 0, 400.0, 418.0));
     }
 }
