@@ -2970,10 +2970,10 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         .filter(|e| !e.is_empty())
     {
         let (action, label) = match event {
-            "down" => (menu.navigate(Dir::Down), "down".to_string()),
-            "up" => (menu.navigate(Dir::Up), "up".to_string()),
-            "left" => (menu.navigate(Dir::Left), "left".to_string()),
-            "right" => (menu.navigate(Dir::Right), "right".to_string()),
+            "down" => (menu.navigate(&vfs, &dll, Dir::Down)?, "down".to_string()),
+            "up" => (menu.navigate(&vfs, &dll, Dir::Up)?, "up".to_string()),
+            "left" => (menu.navigate(&vfs, &dll, Dir::Left)?, "left".to_string()),
+            "right" => (menu.navigate(&vfs, &dll, Dir::Right)?, "right".to_string()),
             "enter" => (menu.confirm(&vfs, &dll)?, "enter".to_string()),
             "esc" => (menu.cancel(&vfs, &dll)?, "esc".to_string()),
             "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),

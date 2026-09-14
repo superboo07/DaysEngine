@@ -1858,6 +1858,17 @@ impl Menu {
                 }?;
                 (extra < self.screen.atlas().extras.len()).then_some(extra)
             }
+            // A page module has no alternate widget states on this screen at
+            // all. `FUN_10006110` draws the frame last and draws exactly two
+            // things there: the tab highlight, which is record `tab + 4` and
+            // belongs to no widget, and then — for each of the four frame
+            // widgets — that widget's **own** record, if it is the one under
+            // the pointer. There is no withholding and no second run, so the
+            // open tab's header draws its ordinary hover art like any other
+            // widget. The page's own widgets are the same: `FUN_1000adc0`,
+            // `FUN_1000af90` and `FUN_1000b1d0` take one record per widget out
+            // of the run behind the tab's, which is [`option_pages::Pages::hover`].
+            Mode::OPTION if self.option_page.is_some() => None,
             // The value in force is not a widget state — it is a sprite of
             // its own, drawn in [`Menu::sprites`]. What a widget can carry here
             // is the *second* alternate run: the same highlight art with the
@@ -2040,23 +2051,15 @@ impl Menu {
     /// not indexed the way the rest of that function implies or the arm does
     /// something else; until that is settled, the grid gets the fallback rather
     /// than a transition table that looks recovered and is not.
-    pub fn navigate(&mut self, dir: Dir) -> Action {
+    pub fn navigate(&mut self, vfs: &Vfs, dll: &[u8], dir: Dir) -> Result<Action, Error> {
         let next = match self.mode {
-            // A page module's tables are **decompiled but not transcribed**:
-            // `FUN_100099b0` (Def), `FUN_10009f40` (Sound) and `FUN_1000a330`
-            // (SomCon) are the three, each moving `+0x168` itself and each
-            // with its own wrap rules — the SomCon one swaps within a pair
-            // sideways, cycles the three headers and drops anything else on
-            // CLOSE. Until they are transcribed the fallback walks the tab's
-            // widgets in order, which is at least reachable.
-            Mode::OPTION if self.option_page.is_some() => {
-                let delta = match dir {
-                    Dir::Up | Dir::Left => -1,
-                    Dir::Down | Dir::Right => 1,
-                };
-                let count = option_pages::FIRST + option_pages::records(self.tab);
-                step(count, self.selection, delta, |i| self.enabled(i))
-            }
+            Mode::OPTION if self.option_page.is_some() => Some(option_pages::navigate(
+                self.tab,
+                self.selection.unwrap_or(3),
+                dir,
+                self.session.save.trial,
+                self.session.som,
+            )),
             Mode::OPTION => Some(options::navigate(
                 self.tab,
                 self.selection.unwrap_or(3),
@@ -2075,17 +2078,29 @@ impl Menu {
             }
         };
         let Some(index) = next else {
-            return Action::Stay;
+            return Ok(Action::Stay);
         };
+        // A page module opens a tab the moment a sideways step lands on its
+        // header, rather than waiting for a press: see
+        // [`option_pages::opens_tab`].
+        if self.mode == Mode::OPTION && self.option_page.is_some() && self.enabled(index) {
+            if let Some(next) = option_pages::opens_tab(dir, index).filter(|t| *t != self.tab) {
+                self.tab = next;
+                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+                self.selection = Some(index);
+                self.refresh();
+                return Ok(Action::Opened(Mode::OPTION));
+            }
+        }
         if self.selection == Some(index) {
-            return Action::Stay;
+            return Ok(Action::Stay);
         }
         self.selection = Some(index);
         self.refresh();
-        Action::Sound(match dir {
+        Ok(Action::Sound(match dir {
             Dir::Up | Dir::Left => SystemSe::Up,
             Dir::Down | Dir::Right => SystemSe::Down,
-        })
+        }))
     }
 
     /// How many widgets keyboard navigation wraps over.

@@ -1542,10 +1542,10 @@ fn run_menu(
         }
         for control in asked {
             actions.push(match control {
-                Control::Up => menu.navigate(Dir::Up),
-                Control::Down => menu.navigate(Dir::Down),
-                Control::Left => menu.navigate(Dir::Left),
-                Control::Right => menu.navigate(Dir::Right),
+                Control::Up => menu.navigate(player.vfs, &player.dll, Dir::Up)?,
+                Control::Down => menu.navigate(player.vfs, &player.dll, Dir::Down)?,
+                Control::Left => menu.navigate(player.vfs, &player.dll, Dir::Left)?,
+                Control::Right => menu.navigate(player.vfs, &player.dll, Dir::Right)?,
                 Control::Confirm => confirm(&mut menu, player)?,
                 Control::Cancel => menu.cancel(player.vfs, &player.dll)?,
                 _ => Action::Stay,

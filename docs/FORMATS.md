@@ -464,12 +464,50 @@ The three backgrounds are `FUN_10007d10`'s literals and the three sheets are
 All six are 800x450 RGBA: a page covers the layout and the frame shows through
 it.
 
-**The per-tab keyboard tables are decompiled but not transcribed.**
+### The per-tab keyboard tables
+
 `FUN_100099b0` (Def), `FUN_10009f40` (Sound) and `FUN_1000a330` (SomCon) are
-called from the input pump on the four direction members `+0x60` to `+0x6c`, and
-each moves `+0x168` itself: the SomCon one swaps within a pair sideways, cycles
-the three headers, and drops anything else on CLOSE. Until they are transcribed
-this engine walks the tab's widgets in order instead.
+called from the input pump `FUN_10009760` on the tab showing, and each moves
+`+0x168` — the cursor, which the hit test writes too — itself.
+`src/ui/option_pages.rs`'s `navigate` is the transcription.
+
+**The four direction members are `+0x60` up, `+0x64` down, `+0x68` left and
+`+0x6c` right.** Host slot `+0xb4` (`FUN_00417030`) fills them from
+`FUN_00447c60(0..=3)`, whose bindings at `PTR_DAT_004a2850` default to the
+virtual-key codes `0x26`, `0x28`, `0x25`, `0x27` — `VK_UP`, `VK_DOWN`,
+`VK_LEFT`, `VK_RIGHT`. The record tables agree independently: the Def page's
+three rows sit at y 162, 269 and 375, and `+0x60` is the arm that steps a
+widget back by four.
+
+Each page's geometry is what its table walks:
+
+| tab | rows, top to bottom |
+| --- | --- |
+| Def | 4-7 at y 162, 8-0xb at y 269, 0xc-0xd at y 375 |
+| Sound | sliders 8-0xa at y 177/219/261, toggles 4-7 at y 376 |
+| SomCon | ports 8-0x11 at y 200, test 6-7 at y 245, enable 4-5 at y 327 |
+
+So the Def tab steps four widgets vertically and wraps inside a row sideways;
+the Sound tab's keyboard never reaches a slider, which only the pointer can
+select; and the SomCon tab reads bottom-up, swaps within a pair sideways
+whichever way you press, and has no keyboard step onto the port row at all.
+
+All three end their **sideways** arms with the same guard —
+`if (-1 < c && c < 3 && FUN_10008e60(this, c)) FUN_1000bcb0(this, c)` — so a
+left or right step onto a tab header opens that tab there and then, with no
+press. `FUN_1000bcb0` sets `+0x244` and aims the carousel. The vertical arms
+return before the guard.
+
+**The Sound tab's up arm is a shipped bug: it goes to the tab header from
+everywhere.** Its test is `if (c < 4 && c > 7)`, which no integer satisfies. At
+`0x10009f5f` the `JGE` for `c < 4` already jumps into the block that assigns the
+header, and the `JG` for `c > 7` below it is only reached when `c < 4`, so the
+block it guards — `c == 3 ? 7 : 3`, at `0x10009f88` — cannot be entered.
+`FUN_100099b0` writes the same test `||` (`JL` and `JG` to one block at
+`0x100099fc`) and does step a row. It is a live difference in the two
+functions' machine code, not a reading of one into the other, so it is
+reproduced. The practical effect is that up out of CLOSE lands on the header
+rather than on widget 7.
 
 **There is a menu mode School Days HQ does not have.** `_SystemInit@8` in
 `SysMenuSD.dll` switches the same mode integers onto the same screens —

@@ -88,7 +88,7 @@
 //! between tabs; `docs/FORMATS.md` has the carousel.
 
 use crate::install::config::{Channel, Config, Flag};
-use crate::ui::options::{self, Act, Display, DisplayRequest, Som, Tab};
+use crate::ui::options::{self, Act, Dir, Display, DisplayRequest, Som, Tab};
 use days_ui::atlas::{self, Widget};
 use days_ui::cmap::Rect;
 
@@ -531,6 +531,230 @@ fn somcon_action(widget: usize) -> Act {
     }
 }
 
+/// One step of keyboard navigation on a page module's Option screen.
+///
+/// Transcriptions of `FUN_100099b0` (Def), `FUN_10009f40` (Sound) and
+/// `FUN_1000a330` (SomCon), which the input pump `FUN_10009760` dispatches on
+/// the tab showing. Each moves `+0x168` — the cursor, which the hit test
+/// writes too — itself, and each is a hand-written table rather than a rule
+/// fitted to the layout, so the three disagree with each other in places.
+///
+/// The four direction members are `+0x60` up, `+0x64` down, `+0x68` left and
+/// `+0x6c` right. Host slot `+0xb4` (`FUN_00417030`) fills them from
+/// `FUN_00447c60(0..=3)`, whose bindings at `PTR_DAT_004a2850` default to the
+/// virtual-key codes `0x26`, `0x28`, `0x25` and `0x27` — `VK_UP`, `VK_DOWN`,
+/// `VK_LEFT`, `VK_RIGHT`, in that order. The record tables say the same thing
+/// independently: the Def tab's three rows sit at y 162, 269 and 375, and the
+/// `+0x60` arm is the one that steps a widget back by four.
+pub fn navigate(tab: Tab, current: usize, dir: Dir, trial: bool, som: Som) -> usize {
+    let c = current as i32;
+    // `+0x16c`, the tab the carousel is resting on.
+    let showing = tab.index() as i32;
+    let next = match tab {
+        Tab::Def => def_navigate(c, dir, trial, showing),
+        Tab::Sound => sound_navigate(c, dir, trial, showing),
+        Tab::SomCon => som_navigate(c, dir, som, showing),
+    };
+    next.max(0) as usize
+}
+
+/// Whether a keyboard step also opens the tab it landed on.
+///
+/// All three tables end their sideways arms with the same guard —
+/// `if (-1 < c && c < 3 && FUN_10008e60(this, c)) FUN_1000bcb0(this, c)` — and
+/// `FUN_1000bcb0` sets `+0x244` and aims the carousel at that tab. So a left or
+/// right step onto a tab header opens that tab there and then, with no press.
+/// The up and down arms return before the guard and never do.
+pub fn opens_tab(dir: Dir, next: usize) -> Option<Tab> {
+    match dir {
+        Dir::Left | Dir::Right => Tab::from_widget(next),
+        Dir::Up | Dir::Down => None,
+    }
+}
+
+/// `FUN_100099b0`.
+///
+/// The Def page is three rows — widgets 4 to 7 at y 162, 8 to 0xb at y 269 and
+/// 0xc to 0xd at y 375 — so up and down are a step of four and sideways wraps
+/// inside the row. The bottom row is two wide, which is why down out of 0xa and
+/// 0xb is a step of two rather than four.
+fn def_navigate(c: i32, dir: Dir, trial: bool, showing: i32) -> i32 {
+    match dir {
+        Dir::Up => match c {
+            4..=7 => showing,
+            8..=0xd => c - 4,
+            3 => 0xd,
+            _ => 3,
+        },
+        Dir::Down => match c {
+            // Each header drops into the column it sits over, and the third
+            // one lands on widget 7 rather than 6.
+            0 => 4,
+            1 => 5,
+            2 => 7,
+            4..=9 => c + 4,
+            0xa | 0xb => c + 2,
+            3 => showing,
+            _ => 3,
+        },
+        Dir::Left => match c {
+            4..=7 => {
+                if c == 4 {
+                    7
+                } else {
+                    c - 1
+                }
+            }
+            8..=0xb => {
+                if c == 8 {
+                    0xb
+                } else {
+                    c - 1
+                }
+            }
+            0xc | 0xd => {
+                if c == 0xc {
+                    0xd
+                } else {
+                    c - 1
+                }
+            }
+            0..=2 => options::header_step(c, false, trial),
+            _ => 3,
+        },
+        Dir::Right => match c {
+            4..=7 => {
+                if c == 7 {
+                    4
+                } else {
+                    c + 1
+                }
+            }
+            8..=0xb => {
+                if c == 0xb {
+                    8
+                } else {
+                    c + 1
+                }
+            }
+            0xc | 0xd => {
+                if c == 0xd {
+                    0xc
+                } else {
+                    c + 1
+                }
+            }
+            0..=2 => options::header_step(c, true, trial),
+            _ => 3,
+        },
+    }
+}
+
+/// `FUN_10009f40`.
+///
+/// The Sound page is one row of four toggles at y 376 with the three sliders
+/// above it at y 177, 219 and 261. The keyboard never reaches a slider: down
+/// out of a header lands on widget 4 and up out of the toggle row goes back to
+/// the headers, so the only way onto one is the pointer, which writes the same
+/// cursor.
+fn sound_navigate(c: i32, dir: Dir, trial: bool, showing: i32) -> i32 {
+    match dir {
+        // **The shipped up arm goes to the tab header from anywhere.** Its
+        // test is `if (c < 4 && c > 7)`, which no integer satisfies: at
+        // `0x10009f5f` the `JGE` for `c < 4` already jumps into the block that
+        // assigns the header, and the `JG` for `c > 7` below it is reached only
+        // when `c < 4`, so the block it guards — `c == 3 ? 7 : 3`, at
+        // `0x10009f88` — cannot be entered. `FUN_100099b0` has the same shape
+        // written `||` (`JL` and `JG` to one block at `0x100099fc`), and with
+        // `||` this arm would read the way every other one does: 4 to 7 up to
+        // the headers, CLOSE up to 7, a header or a slider up to CLOSE. It is
+        // a live difference in the two functions' machine code, not a tidying
+        // of one into the other, so it is reproduced.
+        Dir::Up => showing,
+        Dir::Down => match c {
+            3 => showing,
+            0..=2 => 4,
+            _ => 3,
+        },
+        Dir::Left => match c {
+            0..=2 => options::header_step(c, false, trial),
+            4..=7 => {
+                if c == 4 {
+                    7
+                } else {
+                    c - 1
+                }
+            }
+            _ => 3,
+        },
+        Dir::Right => match c {
+            0..=2 => options::header_step(c, true, trial),
+            // A slider holds the cursor where it is. Left out of one drops it
+            // on CLOSE instead; the two arms really are written differently.
+            8..=0xa => c,
+            4..=7 => {
+                if c == 7 {
+                    4
+                } else {
+                    c + 1
+                }
+            }
+            _ => 3,
+        },
+    }
+}
+
+/// `FUN_1000a330`.
+///
+/// The SomCon page reads bottom-up: the enable row is widgets 4 and 5 at
+/// y 327, the test row 6 and 7 at y 245, and the ten `Port number` buttons sit
+/// above both at y 200. Sideways never leaves a pair — both arms are the same
+/// swap — and the port row has no keyboard step at all, so the pointer is the
+/// only way onto it and anything sideways from there lands on CLOSE.
+fn som_navigate(c: i32, dir: Dir, som: Som, showing: i32) -> i32 {
+    match dir {
+        Dir::Up => match c {
+            4 | 5 if !som.enabled => showing,
+            // Chosen by the test state rather than by which of the pair the
+            // cursor was on, and it lands on the button the value is *not*
+            // showing on: `SETNZ AL; ADD EAX,0x6` at `0x1000a380`.
+            4 | 5 => 6 + i32::from(som.testing),
+            6 | 7 if som.enabled => showing,
+            // The test row with the toy off holds the cursor where it is: the
+            // arm has no else.
+            6 | 7 => c,
+            3 => 4,
+            _ => 3,
+        },
+        Dir::Down => match c {
+            0 | 1 if som.enabled => 6,
+            0 | 1 => 4,
+            2 if som.enabled => 7,
+            2 => 5,
+            6 | 7 if som.enabled => 4 + i32::from(c != 6),
+            6 | 7 => c,
+            3 => showing,
+            _ => 3,
+        },
+        // Off the header row the two sideways arms are the same code: swap
+        // within the pair, and drop everything else — CLOSE and the whole port
+        // row — on CLOSE. On the header row they cycle opposite ways, and
+        // neither asks the trial question the other two tabs ask.
+        Dir::Left | Dir::Right => match c {
+            0..=2 => match dir {
+                Dir::Right if c == 2 => 0,
+                Dir::Right => c + 1,
+                _ if c == 0 => 2,
+                _ => c - 1,
+            },
+            4 | 5 => 4 + i32::from(c == 4),
+            6 | 7 if som.enabled => 6 + i32::from(c == 6),
+            6 | 7 => c,
+            _ => 3,
+        },
+    }
+}
+
 /// How far a knob may travel: the track less the knob's own width.
 fn travel(track: &Widget, knob: &Widget) -> f32 {
     (track.dst.width.saturating_sub(knob.dst.width)) as f32
@@ -711,6 +935,91 @@ mod tests {
         assert_eq!(p.widgets(&dll, Tab::Sound)[0].dst.x, 78);
         assert_eq!((hovers[0].src_x, hovers[0].src_y), (0, 9));
         assert_eq!(hovers[6].src_x, 6);
+    }
+
+    #[test]
+    fn the_sound_tabs_up_goes_to_the_tab_header_from_everywhere() {
+        // `FUN_10009f40`'s up arm tests `c < 4 && c > 7`, which nothing
+        // satisfies, so the block that would step off CLOSE onto widget 7 is
+        // unreachable and every widget goes to the header instead. Its sibling
+        // `FUN_100099b0` writes the same test `||` and does step a row, which
+        // is what makes this a difference in the two functions rather than a
+        // reading of one.
+        let som = Som::default();
+        for c in [0, 3, 4, 7, 8, 0xa] {
+            assert_eq!(navigate(Tab::Sound, c, Dir::Up, false, som), 1);
+        }
+        assert_eq!(navigate(Tab::Def, 3, Dir::Up, false, som), 0xd);
+        assert_eq!(navigate(Tab::Def, 0xc, Dir::Up, false, som), 8);
+    }
+
+    #[test]
+    fn the_def_tabs_rows_are_four_four_and_two() {
+        // Down steps a whole row, which is four widgets — except out of the
+        // second row's right half, where the third row is only two wide and the
+        // step is two.
+        let som = Som::default();
+        assert_eq!(navigate(Tab::Def, 4, Dir::Down, false, som), 8);
+        assert_eq!(navigate(Tab::Def, 9, Dir::Down, false, som), 0xd);
+        assert_eq!(navigate(Tab::Def, 0xa, Dir::Down, false, som), 0xc);
+        assert_eq!(navigate(Tab::Def, 0xd, Dir::Down, false, som), 3);
+        // The third header drops onto the row's right end rather than its own
+        // column's third widget.
+        assert_eq!(navigate(Tab::Def, 2, Dir::Down, false, som), 7);
+    }
+
+    #[test]
+    fn a_sideways_step_opens_the_header_it_lands_on_and_a_vertical_one_never_does() {
+        assert_eq!(opens_tab(Dir::Right, 1), Some(Tab::Sound));
+        assert_eq!(opens_tab(Dir::Left, 0), Some(Tab::Def));
+        // CLOSE is widget 3 and opens nothing, and the vertical arms return
+        // before the guard even on a header.
+        assert_eq!(opens_tab(Dir::Right, 3), None);
+        assert_eq!(opens_tab(Dir::Up, 1), None);
+        assert_eq!(opens_tab(Dir::Down, 1), None);
+    }
+
+    #[test]
+    fn the_somcon_tab_swaps_within_a_pair_sideways_and_leaves_the_ports_alone() {
+        let on = Som {
+            enabled: true,
+            attached: true,
+            port: 0,
+            testing: false,
+        };
+        // Both arms are the same swap off the header row.
+        for dir in [Dir::Left, Dir::Right] {
+            assert_eq!(navigate(Tab::SomCon, 4, dir, false, on), 5);
+            assert_eq!(navigate(Tab::SomCon, 5, dir, false, on), 4);
+            assert_eq!(navigate(Tab::SomCon, 6, dir, false, on), 7);
+            // The port row has no step of its own, so it lands on CLOSE.
+            assert_eq!(navigate(Tab::SomCon, FIRST_PORT, dir, false, on), 3);
+        }
+        // The header row is the one place they differ.
+        assert_eq!(navigate(Tab::SomCon, 0, Dir::Left, false, on), 2);
+        assert_eq!(navigate(Tab::SomCon, 0, Dir::Right, false, on), 1);
+    }
+
+    #[test]
+    fn the_somcon_tab_reads_bottom_up_and_skips_the_test_row_with_the_toy_off() {
+        // The enable row is at y 327 and the test row above it at y 245, so up
+        // out of 4 or 5 is a step onto the test row, not off the page.
+        let mut som = Som {
+            enabled: true,
+            attached: true,
+            port: 0,
+            testing: false,
+        };
+        assert_eq!(navigate(Tab::SomCon, 4, Dir::Up, false, som), 6);
+        // Chosen by the test state, and it lands on the button the value is
+        // not showing on.
+        som.testing = true;
+        assert_eq!(navigate(Tab::SomCon, 5, Dir::Up, false, som), 7);
+        // With the toy off the test row is dead and up goes straight to the
+        // header.
+        som.enabled = false;
+        assert_eq!(navigate(Tab::SomCon, 4, Dir::Up, false, som), 2);
+        assert_eq!(navigate(Tab::SomCon, 0, Dir::Down, false, som), 4);
     }
 
     #[test]

@@ -617,7 +617,7 @@ pub fn navigate(tab: Tab, current: usize, dir: Dir, trial: bool, som: Som) -> us
 
 /// The header row wraps over three tabs, or two when the trial build hides the
 /// SOMCON one. Def and Sound share this; the SOMCON tab does not ask.
-fn header_step(c: i32, forward: bool, trial: bool) -> i32 {
+pub(crate) fn header_step(c: i32, forward: bool, trial: bool) -> i32 {
     let last = if trial { 1 } else { 2 };
     if forward {
         if c == last {
