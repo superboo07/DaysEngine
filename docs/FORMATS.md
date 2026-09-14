@@ -561,6 +561,63 @@ same scene run `src/ui/replay.rs` already recovers** as the longest run of
 scene-flag names in the module — so the grid is three pages of twelve over the
 scene table, and a thumbnail is live exactly when its h-scene has been seen.
 
+### The Shiny Days scene table
+
+Same three runs, same shapes, one run of 50 script lists in `.data`:
+
+```text
+0x10057868  50 script lists   36 scenes, then 14 version lists
+0x10057930  36 scene flags    REP02_28_A20 .. REP04_K7_D99
+0x10057600  14 version flags  REP03_3O_A06A .. REP04_YX_A01B
+```
+
+`FUN_1002ddf0` registers every one of those names with the host and settles how
+the tables are indexed: one counter, `0` to `0x24`, reads
+`PTR_u_REP02_28_A20_10057930[scene]` for the flag and `PTR_PTR_10057868[scene]`
+for the scripts. Thirty-six is therefore the scene count from the code as well
+as from the flag run, and it agrees with the grid — three pages of twelve, with
+`FUN_1002a4a0` clamping the page at 2 and `FUN_10028260` refusing a slot at 36.
+
+Seven entries of the script run point into zero-filled `.data`: scenes 6, 8, 9,
+10, 0x10, 0x11 and 0x19. Those are exactly the seven `FUN_1002a4a0` special-
+cases, each raising `FUN_100018b0(0, n)` for `n` = 0 to 6 in that order —
+`FUN_100238b0` stores the pair on the popup singleton, and the `0` is the
+variant, so all seven raise `Pop_Replay_2` and every one of them has **two**
+versions. That is the whole of the 14 that follow the scenes in the run, and
+their per-scene sub-tables are consecutive: `0x100578f8`, `0x10057900`,
+`0x10057908`, `0x10057910`, `0x10057918`, `0x10057920`, `0x10057928`, as
+`FUN_1002bb70`, `FUN_1002bda0` and `FUN_1002c020` index them.
+
+The version flags are built rather than read here: `FUN_1002ddf0` formats
+`L"%s%C"` from the scene's flag and `0x41 + (k != 0)` — `A` for version 0 and
+`B` for version 1, which is the run at `0x10057600` spelled out. Picking one is
+`FUN_1002c020`: it stores the version at `+0x61c`, sets the step at `+0x614` to
+zero and plays element zero of that version's list. For five of the seven that
+is the same script either way. For `REP04_S1_B03` and `REP04_YX_A01` it is not —
+version A opens `04/Z4-S1-B03` and `04/Z4-YX-A01`, version B opens
+`04/04-S1-B03` and `04/04-YX-A01` — and those are the two scenes the uniform
+choice reaches through `RouteProcSD.dll` (`FUN_1004da70`, `FUN_100515e0`; see
+the DressSelect section).
+
+`FUN_1002bd00` is this module's `FUN_1001ee20`, and it has one branching scene
+rather than eleven, so MSVC wrote a compare instead of a jump table:
+
+```text
+MOV  r1, [this + 0x610]        the scene
+CMP  r1, 0x15                  scene 21, REP04_K2_A11
+JZ   / JMP default
+MOV  r2, [this + 0x614]        the step index
+IMUL r2, r2, 0xc
+MOV  r3, [EBP+column]
+MOV  r4, [r2 + r3*4 + 0x100579c0]
+```
+
+Four rows of three at `0x100579c0` — `2 1 0`, `3 0 0`, `3 0 0`, `4 0 0` — one
+per script in scene 21's four-script list, and the floats of the next table
+begin at `0x100579f0`. The engine's branch-table scan looks for the switch shape
+and does not match a compare, so this table is **not recovered** by it and scene
+21 is walked straight down its list instead.
+
 ### How a Replay view is drawn
 
 `FUN_10024480` is the order, and it is `FUN_10006110`'s: the view's background
@@ -1455,10 +1512,15 @@ knows; they are found by content:
 - a run of 8 pointers to **version flags**, each a scene's own flag plus a
   trailing letter (`REP03_KB_N00A`…`D`), and a matching run of 8 script lists.
 
-A scene's flag implies its script path: `REPnn_XX_Ymm` is `nn/nn-XX-Ymm`. That
-rule holds for all forty-one and agrees with all thirty-eight table entries that
-exist, and it is used to *place* the script window, because the scene run and
-the version run are adjacent in `.data` and read as one.
+The scene run and the version run are adjacent in `.data` and read as one run
+of 49. Where the scenes end in it is not guessed: both runs are indexed from
+their own base by the same scene number, so the scenes are the **first** 41 and
+the versions are what follows. `FUN_1002ddf0` in `SysMenuSD.dll` is the plainest
+statement of that — one loop counter over the flag table and the script table
+together — and the click dispatches, `FUN_1001de10` here and `FUN_1002a4a0`
+there, index the script table the same way. The engine then checks that the
+version groups name exactly the scenes whose script entry is empty, in order,
+and that their counts use up exactly what is left of the run.
 
 Clicking a thumbnail hands the scene's **first** script to the host (`+0xa4`).
 The rest of a list are the steps after it, fetched by `FUN_1001f0d0`, which
@@ -1520,10 +1582,12 @@ Scenes 11, 22 and 30 raise `Pop_Replay` instead (`FUN_10001830`, which sets
 `+0xc8` and `+0xc4` on the popup singleton). `+0xc8` picks `Pop_Replay_2` or
 `Pop_Replay_4` — two or four versions. A version is pickable only once its own
 flag is set (`FUN_100195d0`), and picking one sets the step index to zero and
-plays element zero of its list (`FUN_1001f270`) — which is the **same script in
-every version**, so the choice cannot change what starts. For scene 11 it
-selects which of four branch tables the rest of the scene walks; scenes 22 and
-30 have no table and differ only in the list the version names.
+plays element zero of its list (`FUN_1001f270`). In this module every version of
+a scene names the same script first, so the choice here cannot change what
+starts: for scene 11 it selects which of four branch tables the rest of the
+scene walks, and scenes 22 and 30 have no table and differ only in the list the
+version names. That is this module's data rather than a rule — see the Shiny
+Days tables below, where two of the seven open on different scripts.
 
 The thumbnails themselves come from `System/Replay/Replay_Thm%02d.png`, one
 sheet per page, page number plus one (`FUN_1001b3f0`). A second record table

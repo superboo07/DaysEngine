@@ -1028,12 +1028,19 @@ impl Menu {
 
     /// Loads the thumbnail sheet for the page the replay grid is showing.
     ///
+    /// This is the grid of the module that gives each view its own hit map; the
+    /// other module draws its grid from [`Self::load_replay_page`] instead, out
+    /// of one sheet for every page, so the two are exclusive.
+    ///
     /// A page whose art or table will not load leaves the frames empty and the
     /// grid still usable, which is the same rule every other missing asset
     /// follows.
     fn load_thumbnails(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.thumbnails = None;
-        if self.mode != Mode::REPLAY || self.view != replay::View::HScene {
+        if self.mode != Mode::REPLAY
+            || self.view != replay::View::HScene
+            || self.paths.replay_has_pages()
+        {
             return;
         }
         let path = replay::thumbnail_sheet(self.page);

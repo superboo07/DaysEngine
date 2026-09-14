@@ -18,15 +18,35 @@
 //! [`HSCENE_PAGES`] = 48 slots for 41 scenes. `FUN_1001de10` is that dispatch
 //! and `FUN_1001dd40` its enablement.
 //!
+//! `SysMenuSD.dll` lays the same screen out differently. `FUN_1002a4a0` makes
+//! widget 3 a previous-page arrow, widget 4 a next-page arrow, widgets 5 to 7
+//! three page buttons and widgets 8 to 0x13 the twelve thumbnails, and clamps
+//! the page to 0..=2 — 36 slots for its 36 scenes, with no short last page.
+//! That module ships no hit map for the grid, so its widgets are rectangles in
+//! a record table instead; [`crate::ui::replay_pages`] is that half of the
+//! screen and carries the dispatch for it. [`hscene_action`] and
+//! [`hscene_enabled`] below are the School Days HQ layout only. The scene table
+//! underneath is the same recovery for both.
+//!
 //! # The scene table is the user's, not ours
 //!
-//! The forty-one scenes are three tables in `SysMenuSDHQ.dll`: a run of
-//! pointers to the save-flag name of each scene, a run of pointers to each
-//! scene's list of scripts, and a shorter run for the scenes that ask a
-//! question first. None of that is embedded here. [`Scenes::recover`] finds the
-//! runs **by content** in the player's own DLL, the way
-//! [`days_ui::atlas`] finds the widget tables — see
+//! A module's scenes are three tables: a run of pointers to the save-flag name
+//! of each scene, a run of pointers to each scene's list of scripts, and a
+//! shorter run of the flag names of the versions that the scenes which ask a
+//! question offer. `SysMenuSDHQ.dll` has forty-one scenes and eight versions;
+//! `SysMenuSD.dll` has thirty-six and fourteen. None of it is embedded here.
+//! [`Scenes::recover`] finds the runs **by content** in the player's own DLL,
+//! the way [`days_ui::atlas`] finds the widget tables — see
 //! [`Scenes::recover`] for how each run is identified and checked.
+//!
+//! The two runs are indexed by the same scene number, from their own bases.
+//! `FUN_1002ddf0` registers every name the module owns with the host and is the
+//! plainest statement of it: one loop counter, `0` to `0x24`, feeds
+//! `PTR_u_REP02_28_A20_10057930[scene]` for the flag and
+//! `PTR_PTR_10057868[scene]` for the scripts. `FUN_1001de10` and
+//! `FUN_1002a4a0` — the click dispatches — index the script table the same way,
+//! from the same base. So scene zero is the **first** entry of each run, and
+//! the version lists are what follows the scenes in the script run.
 //!
 //! # What a click plays
 //!
@@ -72,6 +92,15 @@
 //! branch rule itself, written in instructions. [`branch_switches`] scans the
 //! image for a switch of that shape and takes the addresses out of its arms.
 //!
+//! `SysMenuSD.dll` writes the same rule without a switch, because it has only
+//! one branching scene to write: `FUN_1002bd00` compares its scene member
+//! `+0x610` against `0x15` and, when it matches, reads `+0x614 * 0xc +
+//! column * 4` from `0x100579c0` — four rows for scene 21's four scripts, which
+//! is the whole of that module's branching. [`branch_switches`] does not see
+//! it, since it is a compare and a jump rather than a jump table, so scene 21
+//! is walked straight down its list here and the table it should walk instead
+//! is **not recovered**.
+//!
 //! Against the retail DLL exactly one switch matches, and it yields the eleven
 //! scenes and scene 11's four version tables that the decompile shows. Each
 //! table is then read as one row per script in the scene's list and refused
@@ -83,11 +112,22 @@
 //! Scenes 11, 22 and 30 do not start playing when clicked. The dispatch
 //! special-cases them and raises `Pop_Replay`, whose two or four widgets are
 //! versions of the scene, each with its own save flag. Whichever the player
-//! picks, `FUN_1001f270` sets the step index to zero and plays element zero of
-//! that version's script list — and element zero is the same script in every
-//! version, so **the choice does not change what starts**. Scene 11 is the one
-//! whose versions then walk different tables; 22 and 30 have no table at all
-//! and differ only in the list the version names.
+//! picks, `FUN_1001f270` — `FUN_1002c020` in `SysMenuSD.dll` — sets the step
+//! index to zero and plays element zero of that version's script list.
+//!
+//! What that element is, is per-scene data rather than a rule. In
+//! `SysMenuSDHQ.dll` every version of a scene names the same script first, so
+//! the choice there changes only what comes after it; scene 11's versions then
+//! walk different tables and 22's and 30's differ only in the list. In
+//! `SysMenuSD.dll` five of the seven behave the same way, and the two the
+//! uniform choice reaches — `REP04_S1_B03` and `REP04_YX_A01`, see
+//! [`crate::ui::dress`] — name `04/Z4-…` and `04/04-…` respectively, so for
+//! those two the version picked does change what starts.
+//!
+//! The version flags are the scene's flag and one more letter. That is a shape
+//! `SysMenuSDHQ.dll`'s own run spells out and `SysMenuSD.dll`'s code builds:
+//! `FUN_1002ddf0` formats `L"%s%C"` from the scene's flag and `0x41 + (k != 0)`
+//! — `A` for the first version and `B` for the second.
 
 use days_save::FlagStore;
 
@@ -376,29 +416,29 @@ impl Scenes {
     /// 1. **Scene flags.** A run of consecutive pointers, each to a
     ///    NUL-terminated UTF-16 name shaped like `REP02_2S_W03`. The longest
     ///    such run is the scene list; there is one other, which is shorter.
-    /// 2. **Scripts.** A window of pointers to script-path arrays, as long as
-    ///    the scene list, positioned so that **every entry's first script is
-    ///    the one its scene's name implies** — see [`implied_script`]. A window
-    ///    has to be matched rather than simply taken, because the scene run and
-    ///    the version run below sit next to each other in the image and read as
-    ///    one. Three entries point into zero-initialised data and carry no list
-    ///    at all; those are the scenes that ask a question, and they are
-    ///    allowed to be empty rather than breaking the window.
+    /// 2. **Scripts.** The run of pointers to script-path arrays that is at
+    ///    least as long as the scene list. Its **first** entries are the
+    ///    scenes, one apiece and in the same order, because that is how the
+    ///    module reads it: `FUN_1002ddf0` walks one counter from zero over the
+    ///    flag run and the script run together, and both click dispatches index
+    ///    the script run from its base by the scene number. Some entries point
+    ///    into zero-initialised data and carry no list at all; those are the
+    ///    scenes that ask a question.
     /// 3. **Versions.** The shorter name run holds the versions' flags, each of
     ///    which is a scene's own flag plus one trailing letter. Grouping it by
     ///    that prefix recovers which scene each belongs to and how many
     ///    versions it has, with no reliance on where any of it sits.
-    /// 4. **Version scripts.** A window as long as the version run, matched the
-    ///    same way against the scene each group belongs to.
+    /// 4. **Version scripts.** What is left of the script run after the scenes,
+    ///    handed to the groups in order.
     ///
-    /// Steps 2 and 4 lean on [`implied_script`], which is a rule read off the
-    /// data rather than out of the code, so be clear about what that does and
-    /// does not buy: it places the window, which means **the first script of
-    /// each list is confirmed by construction and not independently**. The rest
-    /// of each list — the sequence after the first, which is the part this
-    /// module reports and does not yet use — is read from the image and is not
-    /// implied by anything. The rule itself holds for all forty-one names and
-    /// is checked against the thirty-eight table entries that exist.
+    /// Three things are then checked rather than assumed, and each one has to
+    /// hold for the versions to be kept: the groups have to name exactly the
+    /// scenes whose own entry is empty, in the same order; their counts have to
+    /// add up to exactly what is left of the script run; and no group may name
+    /// a scene that has a list of its own. Against both retail modules all
+    /// three hold — 41 scenes and 4 + 2 + 2 versions in `SysMenuSDHQ.dll`, 36
+    /// and seven twos in `SysMenuSD.dll` — and a module where they do not keeps
+    /// its scenes and reports its versions as not recovered.
     pub fn recover(dll: &[u8]) -> Result<Scenes, Error> {
         let image = Image::parse(dll).ok_or(Error::NotAPeImage)?;
 
@@ -420,18 +460,20 @@ impl Scenes {
                 .map(|_| ())
                 .or_else(|| img.points_into_zero_fill(va).then_some(()))
         });
-        let wanted: Vec<Option<String>> = flags.iter().map(|f| implied_script(f)).collect();
-        let scripts =
-            image
-                .match_window(&script_runs, &wanted)
-                .ok_or_else(|| Error::Mismatched {
-                    names: flags.len(),
-                    scripts: script_runs.iter().map(Vec::len).max().unwrap_or(0),
-                })?;
+        let table = script_runs
+            .iter()
+            .filter(|run| run.len() >= flags.len())
+            .max_by_key(|run| run.len())
+            .ok_or_else(|| Error::Mismatched {
+                names: flags.len(),
+                scripts: script_runs.iter().map(Vec::len).max().unwrap_or(0),
+            })?;
+        let (listed, extra) = table.split_at(flags.len());
+        let read = |va: &u32| image.script_list(*va).unwrap_or_default();
 
         let mut scenes: Vec<Scene> = flags
             .into_iter()
-            .zip(scripts)
+            .zip(listed.iter().map(read))
             .map(|(flag, scripts)| Scene {
                 flag,
                 scripts,
@@ -447,19 +489,28 @@ impl Scenes {
                 .map(|va| image.wide_string(*va).expect("matched above"))
                 .collect();
             let groups = group_versions(&versions, &scenes);
-            // Every version of a scene starts the same script, so the whole
-            // window is expected to read as that scene's implied script,
-            // repeated once per version.
-            let wanted: Vec<Option<String>> = groups
+            let counted: usize = groups.iter().map(|(_, count)| count).sum();
+            let asking: Vec<usize> = scenes
                 .iter()
-                .flat_map(|(scene, count)| {
-                    let want = scenes.get(*scene).and_then(|s| implied_script(&s.flag));
-                    std::iter::repeat_n(want, *count)
-                })
+                .enumerate()
+                .filter(|(_, scene)| scene.scripts.is_empty())
+                .map(|(index, _)| index)
                 .collect();
-            let lists = image
-                .match_window(&script_runs, &wanted)
-                .unwrap_or_default();
+            let named: Vec<usize> = groups.iter().map(|(scene, _)| *scene).collect();
+            let lists: Vec<Vec<String>> = if counted == extra.len() && named == asking {
+                extra.iter().map(read).collect()
+            } else {
+                log::warn!(
+                    "the menu module's {counted} replay versions over {} scenes do not \
+                     account for the {} script lists left after its {} scenes, which have \
+                     {} that ask a question; treating the versions' scripts as not recovered",
+                    named.len(),
+                    extra.len(),
+                    scenes.len(),
+                    asking.len(),
+                );
+                Vec::new()
+            };
             attach_versions(&mut scenes, &groups, &lists);
         }
         attach_branches(&mut scenes, &image);
@@ -693,27 +744,6 @@ fn is_script_path(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The script stem a scene's flag implies.
-///
-/// Public because [`Scenes::recover`] leans on it and a caller reading that
-/// method's contract needs to be able to see exactly what it leans on.
-///
-/// `REP02_2S_W03` names the script `02/02-2S-W03`: the two digits after `REP`
-/// are the folder, and the rest of the name is the stem with underscores turned
-/// into dashes. This is a *check*, not the source — the scripts come from the
-/// DLL's own table. It exists because the three scenes that ask a question have
-/// no entry in that table, so their versions have to be matched by order, and
-/// an ordering assumption needs something to verify it against. The rule is
-/// confirmed by the thirty-eight scenes that do have an entry.
-pub fn implied_script(flag: &str) -> Option<String> {
-    let rest = flag.strip_prefix("REP")?;
-    let episode = rest.get(..2)?;
-    if !episode.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("{episode}/{}", rest.replace('_', "-")))
-}
-
 /// Splits the version flags into one group per scene, by the scene flag each
 /// one is built from.
 ///
@@ -739,8 +769,9 @@ fn group_versions(versions: &[String], scenes: &[Scene]) -> Vec<(usize, usize)> 
 /// Attaches each group of versions to its scene, with the script list that sits
 /// at the matching place in the version script run.
 ///
-/// The pairing is by order, which is why every group is checked against
-/// [`implied_script`] before it is kept.
+/// The pairing is by order — [`Scenes::recover`] has already checked that the
+/// groups name exactly the scenes with no list of their own, in that order, and
+/// that their counts use up exactly the lists there are to give.
 fn attach_versions(scenes: &mut [Scene], groups: &[(usize, usize)], lists: &[Vec<String>]) {
     let mut at = 0usize;
     for (scene_index, count) in groups {
@@ -767,14 +798,10 @@ fn attach_versions(scenes: &mut [Scene], groups: &[(usize, usize)], lists: &[Vec
                 .collect();
             continue;
         };
-        let want = implied_script(&scene.flag);
-        if slice
-            .iter()
-            .any(|list| list.first().map(String::as_str) != want.as_deref())
-        {
+        if !scene.scripts.is_empty() {
             log::warn!(
-                "the version script lists for {} do not match the scene; \
-                 treating its scripts as not recovered",
+                "replay scene {} has a script list of its own and versions as well; \
+                 treating the versions' scripts as not recovered",
                 scene.flag
             );
             scene.choices = flags
@@ -1186,41 +1213,6 @@ impl<'a> Image<'a> {
             .any(|&(sva, vsize, _, raw_size)| rva >= sva + raw_size && rva < sva + vsize)
     }
 
-    /// Reads the window of script lists that matches `wanted`.
-    ///
-    /// `wanted[i]` is the first script entry `i` must have. An entry with no
-    /// list at all — a hole — matches anything, since there is nothing there to
-    /// disagree with; a window made only of holes is refused, because it would
-    /// match every position equally and so identifies nothing.
-    fn match_window(
-        &self,
-        runs: &[Vec<u32>],
-        wanted: &[Option<String>],
-    ) -> Option<Vec<Vec<String>>> {
-        for run in runs {
-            let Some(last) = run.len().checked_sub(wanted.len()) else {
-                continue;
-            };
-            for start in 0..=last {
-                let lists: Vec<Vec<String>> = run[start..start + wanted.len()]
-                    .iter()
-                    .map(|va| self.script_list(*va).unwrap_or_default())
-                    .collect();
-                let filled = lists.iter().filter(|l| !l.is_empty()).count();
-                if filled == 0 {
-                    continue;
-                }
-                let agrees = lists.iter().zip(wanted).all(|(list, want)| {
-                    list.is_empty() || list.first().map(String::as_str) == want.as_deref()
-                });
-                if agrees {
-                    return Some(lists);
-                }
-            }
-        }
-        None
-    }
-
     /// A NUL-terminated UTF-16 string at a virtual address.
     fn wide_string(&self, va: u32) -> Option<String> {
         let mut at = self.offset(va)?;
@@ -1461,10 +1453,10 @@ mod tests {
         assert_eq!(popup_variant(4), "4");
     }
 
-    /// A version can only be picked once the player has seen it, and whichever
-    /// they pick starts the same script.
+    /// A version can only be picked once the player has seen it, and what it
+    /// plays is its own list from element zero.
     #[test]
-    fn a_version_needs_its_own_flag_and_they_all_start_the_same_script() {
+    fn a_version_needs_its_own_flag_and_plays_its_own_list() {
         let scenes = table();
         let scene = scenes.get(11).unwrap();
         let seen = unlocked(&["REP03_KB_N00B"]);
@@ -1473,14 +1465,33 @@ mod tests {
         assert!(popup_enabled(scene, 1, &seen));
         assert!(!popup_enabled(scene, 3, &seen));
 
-        // Every version starts on the same script — the choice picks a branch
-        // for later, not a different opening — so what differs between them is
-        // the rest of the list, and the popup hands back the whole list.
-        for choice in 0..scene.choices.len() {
-            let run = popup_action(scene, choice).expect("every version plays something");
-            assert_eq!(run.script(0), Some("03/03-KB-N00"));
-        }
-        assert_eq!(popup_action(scene, 9), None);
+        // `FUN_1002c020` sets the step to zero and plays element zero of the
+        // chosen version's list, so a version whose list opens on a different
+        // script opens on a different script. Both of `SysMenuSD.dll`'s uniform
+        // scenes are that shape.
+        let scene = Scene {
+            flag: "REP04_S1_B03".to_string(),
+            scripts: Vec::new(),
+            choices: ["04/Z4-S1-B03", "04/04-S1-B03"]
+                .iter()
+                .enumerate()
+                .map(|(k, script)| Choice {
+                    flag: format!("REP04_S1_B03{}", (b'A' + k as u8) as char),
+                    scripts: vec![script.to_string()],
+                    branch: None,
+                })
+                .collect(),
+            branch: None,
+        };
+        assert_eq!(
+            popup_action(&scene, 0).and_then(|r| r.script(0).map(str::to_owned)),
+            Some("04/Z4-S1-B03".to_string())
+        );
+        assert_eq!(
+            popup_action(&scene, 1).and_then(|r| r.script(0).map(str::to_owned)),
+            Some("04/04-S1-B03".to_string())
+        );
+        assert_eq!(popup_action(&scene, 9), None);
     }
 
     /// `FUN_1001ee20` + `FUN_1001f0d0`: the column is the last choice, the
@@ -1546,20 +1557,6 @@ mod tests {
         assert!(!is_script_path("System/Replay/Replay_Thm01.png"));
     }
 
-    /// The naming rule the version matching is checked against.
-    #[test]
-    fn a_scene_flag_implies_its_script_path() {
-        assert_eq!(
-            implied_script("REP02_2S_W03").as_deref(),
-            Some("02/02-2S-W03")
-        );
-        assert_eq!(
-            implied_script("REP05_5H_D00").as_deref(),
-            Some("05/05-5H-D00")
-        );
-        assert_eq!(implied_script("NOTASCENE"), None);
-    }
-
     /// Version flags are grouped by the scene name they are built from, not by
     /// where they sit, so a run holding several scenes' versions splits right.
     #[test]
@@ -1585,21 +1582,24 @@ mod tests {
         assert_eq!(group_versions(&versions, &scenes), [(0, 4), (1, 2), (2, 2)]);
     }
 
-    /// The version script lists are paired by order, so a pairing that does not
-    /// match the scene is dropped rather than believed.
+    /// Versions belong to the scenes with no list of their own — the entry in
+    /// the script run that is a hole. A scene that has both is a pairing that
+    /// has gone wrong somewhere, so its versions keep their flags and lose
+    /// their scripts rather than being believed.
     #[test]
-    fn version_scripts_that_do_not_match_their_scene_are_refused() {
-        let mut scenes = vec![scene("REP03_KB_N00", &[]), scene("REP04_C1_A00", &[])];
-        let right = vec!["03/03-KB-N00".to_string()];
-        let wrong = vec!["04/04-C1-A00".to_string()];
-
-        attach_versions(&mut scenes, &[(0, 2)], &[right.clone(), right.clone()]);
-        assert_eq!(scenes[0].choices.len(), 2);
-        assert_eq!(scenes[0].choices[0].flag, "REP03_KB_N00A");
-        assert_eq!(scenes[0].choices[1].scripts, right);
+    fn versions_on_a_scene_that_already_has_scripts_are_refused() {
+        let first = vec!["03/03-KB-N00".to_string()];
+        let second = vec!["03/03-KB-N01".to_string()];
 
         let mut scenes = vec![scene("REP03_KB_N00", &[])];
-        attach_versions(&mut scenes, &[(0, 2)], &[right, wrong]);
+        attach_versions(&mut scenes, &[(0, 2)], &[first.clone(), second.clone()]);
+        assert_eq!(scenes[0].choices.len(), 2);
+        assert_eq!(scenes[0].choices[0].flag, "REP03_KB_N00A");
+        assert_eq!(scenes[0].choices[0].scripts, first);
+        assert_eq!(scenes[0].choices[1].scripts, second);
+
+        let mut scenes = vec![scene("REP03_KB_N00", &["03/03-KB-N00"])];
+        attach_versions(&mut scenes, &[(0, 2)], &[first, second]);
         assert_eq!(scenes[0].choices.len(), 2, "the versions still exist");
         assert!(
             scenes[0].choices.iter().all(|c| c.scripts.is_empty()),
