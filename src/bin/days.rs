@@ -420,6 +420,14 @@ struct MenuArgs {
     /// `Opened(Mode(2))`.
     #[arg(long, value_name = "CODE")]
     from_bar: Option<u32>,
+    /// Open this menu mode directly instead of starting at the title.
+    ///
+    /// An inspection entry, not a route the game has: it says nothing about
+    /// how the original reaches the mode. It is the only way in to
+    /// `--mode 9`, the dress-select screen, because what raises that mode in
+    /// `SHINYDAYS.exe` is not recovered — see [`daysengine::ui::dress`].
+    #[arg(long, value_name = "N", conflicts_with = "from_bar")]
+    mode: Option<i32>,
     /// Stand in a playthrough loaded from this slot, so the screens that ask
     /// what the *run* has done have something to answer from.
     ///
@@ -2756,6 +2764,9 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             log::warn!("no replay scene table: {err}");
             Scenes::from_scenes(Vec::new())
         }),
+        // No run has answered the dress-select screen at the point either of
+        // these is built; the host object's constructor leaves the same zero.
+        dress: None,
         display: Display {
             wide: resolution != Resolution::Standard,
             full_screen: false,
@@ -2813,6 +2824,31 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 Err(err) => println!("  mode {:>2}  {name:<14} {stem:<34} {err}", mode.0),
             }
         }
+        // The dress-select popup is not a mode, so it cannot be opened like
+        // one: it is the second hit map inside mode 9, and the only way to it
+        // is to commit to a dress. See `daysengine::ui::dress`.
+        match Menu::open(&vfs, &dll, Mode::DRESS_SELECT, session(), resolution) {
+            Ok(mut menu) => {
+                // Point at the first dress the way a player would, then
+                // confirm: `Menu::confirm` acts on the selection.
+                if let Some((x, y)) = menu.screen().widget_point(0) {
+                    menu.point_at(x, y);
+                }
+                let acted = menu.confirm(&vfs, &dll);
+                println!(
+                    "  mode  9  dress popup   {:<34} {}",
+                    paths.dress_select_popup().unwrap_or_default(),
+                    match acted {
+                        Ok(action) => format!(
+                            "ok, {} widgets, committing -> {action:?}",
+                            menu.screen().widget_count()
+                        ),
+                        Err(err) => err.to_string(),
+                    }
+                );
+            }
+            Err(err) => println!("  mode  9  dress popup   {:<34} {err}", ""),
+        }
         // The same screens again, opened the way the control bar opens them.
         // These are a separate entry, not a separate screen: the art is the
         // same and what differs is where Close goes, so both have to be walked.
@@ -2843,8 +2879,11 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // goes. Without it every run here is title-rooted, which is exactly the
     // blind spot that let a bar-opened Close land on the title.
     let mut menu = match args.from_bar {
-        None => Menu::open(&vfs, &dll, Mode::TITLE, session(), resolution)
-            .context("opening the title screen")?,
+        None => {
+            let mode = args.mode.map_or(Mode::TITLE, Mode);
+            Menu::open(&vfs, &dll, mode, session(), resolution)
+                .with_context(|| format!("opening menu mode {}", mode.0))?
+        }
         Some(code) => {
             let (mode, kind) = match code {
                 4 => (Mode::SAVELOAD, Kind::Save),

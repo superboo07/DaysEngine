@@ -81,9 +81,24 @@ const TITLE_CLEAR: (&str, &str) = (
 /// — the full-screen transparent plate every install ships, because the moving
 /// background is `STARTSCRIPT.INI`'s `[DressBG]` movie playing behind it. The
 /// screen's own `DressSelect_Text.png` is drawn over that afterwards, by
-/// `FUN_1000cce0`, and is a caption rather than the background; this engine
-/// does not draw it yet.
+/// `FUN_1000cce0`, and is a caption rather than the background — see
+/// [`DRESS_SELECT_TEXT`].
 const DRESS_SELECT_BASE: &str = "System/Screen/Transparence.png";
+
+/// The dress-select screen's caption plate, drawn over its base art.
+///
+/// `FUN_1000d980` hands this literal to `FUN_1000cce0`, which builds it as a
+/// full-screen sprite rather than a widget; `FUN_1000c740` draws it only while
+/// the main hit map is loaded. See [`crate::ui::dress`].
+const DRESS_SELECT_TEXT: &str = "System/DressSelect/DressSelect_Text.png";
+
+/// The dress-select screen's confirm popup, which is not a mode of its own.
+///
+/// `MENU::DressSelect` swaps its one hit map between `FUN_1000d7f0`'s and this,
+/// which `FUN_1000d8c0` loads — so the popup has no `SystemInit` code and
+/// cannot be a [`crate::ui::menu::Mode`]. Its art is named after the stem like
+/// any other screen's, so only the stem is needed here.
+const DRESS_SELECT_POPUP: &str = "System/DressSelect/Popup/Popup_Select.cmap";
 
 /// The two view backgrounds a one-map replay screen draws **inside** its frame.
 ///
@@ -114,6 +129,11 @@ pub struct Paths {
     /// Set when the module has a dress-select screen, whose background is
     /// [`DRESS_SELECT_BASE`] rather than art named after its stem.
     dress_select_base: bool,
+    /// Set when the module also holds that screen's caption plate.
+    dress_select_text: bool,
+    /// Set when the module also holds that screen's confirm popup, which has
+    /// no mode of its own to key off.
+    dress_select_popup: bool,
 }
 
 impl Paths {
@@ -149,6 +169,8 @@ impl Paths {
             title_clear: holds(TITLE_CLEAR.0).then_some(TITLE_CLEAR),
             replay_pages: REPLAY_PAGE_BACKGROUNDS.iter().all(|path| holds(path)),
             dress_select_base: holds(DRESS_SELECT_BASE),
+            dress_select_text: holds(DRESS_SELECT_TEXT),
+            dress_select_popup: holds(DRESS_SELECT_POPUP),
         }
     }
 
@@ -200,6 +222,24 @@ impl Paths {
     /// such screen.
     pub fn dress_select_art(&self) -> Option<&'static str> {
         self.dress_select_base.then_some(DRESS_SELECT_BASE)
+    }
+
+    /// The dress-select screen's caption plate, or `None` when this module has
+    /// no such screen.
+    pub fn dress_select_text(&self) -> Option<&'static str> {
+        self.dress_select_text.then_some(DRESS_SELECT_TEXT)
+    }
+
+    /// The stem of that screen's confirm popup, or `None` when this module has
+    /// no such popup.
+    ///
+    /// The popup is a second hit map inside mode 9 rather than a mode of its
+    /// own, so it is not in [`CANDIDATES`] and does not go through
+    /// [`Paths::stem`].
+    pub fn dress_select_popup(&self) -> Option<&'static str> {
+        self.dress_select_popup
+            .then(|| DRESS_SELECT_POPUP.strip_suffix(".cmap"))
+            .flatten()
     }
 
     /// Whether the module's Option screen keeps each tab's widgets in a hit map
@@ -275,6 +315,11 @@ mod tests {
             None,
             "no dress-select screen in that module"
         );
+        // The popup is keyed off its own literal rather than a mode, because
+        // it is a second hit map inside mode 9 — so a module without the
+        // screen must not report one either.
+        assert_eq!(hq.dress_select_popup(), None);
+        assert_eq!(hq.dress_select_text(), None);
 
         let sd = module(&[
             "System/Title/%s.cmap",
@@ -295,6 +340,17 @@ mod tests {
         ] {
             assert_eq!(sd.stem(mode, variant).as_deref(), Some(stem));
         }
+        // The popup's stem carries no variant placeholder, so it is the same
+        // string whatever the display mode — the four spellings are the
+        // `_Wide*` suffixes `Screen::load_with_art` appends, not stems.
+        let sd_popup = module(&[
+            "System/DressSelect/DressSelect.cmap",
+            "System/DressSelect/Popup/Popup_Select.cmap",
+        ]);
+        assert_eq!(
+            sd_popup.dress_select_popup(),
+            Some("System/DressSelect/Popup/Popup_Select")
+        );
         // That module ships no save/load or confirm literal in this fixture,
         // so those modes have no screen — the answer for a mode a module really
         // does not have, rather than a path nothing resolves.

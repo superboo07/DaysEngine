@@ -14,6 +14,7 @@
 
 pub mod bar;
 pub mod comment;
+pub mod dress;
 pub mod ending;
 pub mod menu;
 pub mod option_pages;

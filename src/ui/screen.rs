@@ -661,6 +661,20 @@ impl Screen {
         out
     }
 
+    /// Draws cuts from a sheet that is not this screen's onto `out`.
+    ///
+    /// For a layer that is drawn in this screen's layout space but cut from
+    /// another screen's art: the dress-select popup covers the two dresses,
+    /// which `FUN_1000c740` keeps drawing from `DressSelect_Chip.png` while the
+    /// popup's own map and sheet are the ones loaded. They are [`Cut`]s rather
+    /// than widgets because the slide leaves them on a half pixel — see
+    /// [`crate::ui::dress::committed`].
+    pub fn draw_cuts_from(&self, out: &mut Image, sheet: &Image, cuts: &[Cut]) {
+        for cut in cuts {
+            self.blit_cut(out, sheet, cut);
+        }
+    }
+
     /// Composites the screen over a backdrop, with extra sprites on top.
     ///
     /// Two things a screen draws are not widget states and so cannot be

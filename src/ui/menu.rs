@@ -53,6 +53,7 @@
 use crate::install::config::Config;
 use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
+use crate::ui::dress;
 use crate::ui::option_pages;
 use crate::ui::options;
 use crate::ui::options::Dir;
@@ -96,6 +97,10 @@ impl Mode {
     /// constructor `FUN_1000c470`, which installs `MENU::DressSelect::vftable`.
     /// `SysMenuSDHQ.dll` has no case for 9 at all, so on that module
     /// [`Paths::stem`] finds no screen for it and the mode is unavailable.
+    ///
+    /// Its confirm popup is a second hit map inside this mode rather than a
+    /// mode of its own, and what raises the mode at all is not recovered. See
+    /// [`crate::ui::dress`] for both.
     pub const DRESS_SELECT: Mode = Mode(9);
 
     /// The variant a module opens with the first time it is entered.
@@ -431,6 +436,17 @@ pub struct Session {
     /// passed it in the run they are in. There is no run from the title, and
     /// `FUN_1000c740` does not ask there either — see [`crate::ui::routemap`].
     pub run: Option<FlagStore>,
+    /// Which dress the player picked, which is what host `+0x44` answers.
+    ///
+    /// `FUN_1000ded0` reports the choice the moment it is committed, through
+    /// host `+0x48` — `FUN_0041dc50` in `SHINYDAYS.exe`, which stores the
+    /// argument and raises a flag beside it. The reader is slot `+0x44`, and
+    /// its callers are in `RouteProcSD.dll`: `FUN_1004da70` and `FUN_100515e0`
+    /// append `A` to a scene block's name when this is non-zero and `B` when it
+    /// is zero. `None` is a run in which the screen has not been answered,
+    /// which is the zero the host object's constructor leaves — see
+    /// [`crate::ui::dress`].
+    pub dress: Option<u32>,
     /// `FILMENGINE.INI [TextInput]`, which is what host `+0xd8` answers.
     ///
     /// It gates the save row's comment column and the expanded comment behind
@@ -459,6 +475,7 @@ impl Session {
             som: options::Som::default(),
             slots: Slots::default(),
             run: None,
+            dress: None,
             english: false,
             text_input: false,
         }
@@ -596,6 +613,14 @@ pub struct Menu {
     /// the module that does, and on any other screen.
     option_page: Option<OptionPage>,
     replay_page: Option<ReplayPage>,
+    /// Which of the dress-select screen's two hit maps is loaded:
+    /// `MENU::DressSelect` `+0x140`. Meaningless on every other screen, and
+    /// kept across a display-mode change because `FUN_1000ef80` keeps it.
+    dress_phase: dress::Phase,
+    /// That screen's art that is not the loaded map's own: the caption plate
+    /// and, while the popup is up, the sheet the two dresses under it are cut
+    /// from. Absent on every other screen.
+    dress: Option<DressScreen>,
     /// The player's own font, for the text a screen draws itself rather than
     /// picking out of its art. Absent when the install has no readable
     /// `FONTDATA`, which leaves that text undrawn and the screen usable.
@@ -684,6 +709,7 @@ impl Menu {
             tab,
             kind,
             &session,
+            dress::Phase::default(),
             resolution,
         )?;
         let mut menu = Menu {
@@ -708,6 +734,8 @@ impl Menu {
             thumbnails: None,
             option_page: None,
             replay_page: None,
+            dress_phase: dress::Phase::default(),
+            dress: None,
             font: load_font(vfs),
             rows: None,
             pending_save: None,
@@ -716,12 +744,21 @@ impl Menu {
         menu.load_thumbnails(vfs, dll);
         menu.load_page(vfs, dll);
         menu.load_replay_page(vfs, dll);
+        menu.load_dress(vfs, dll);
         menu.refresh();
         Ok(menu)
     }
 
     /// Loads `mode`'s screen into this menu, keeping the session.
     fn enter(&mut self, vfs: &Vfs, dll: &[u8], mode: Mode, return_to: Mode) -> Result<(), Error> {
+        // Arriving at the dress-select screen starts it on its own hit map,
+        // which is the module's `+0x140` coming up zero from the constructor.
+        // Reloading the screen that is already showing — which is what a
+        // display-mode change is — keeps whichever map is loaded, the way
+        // `FUN_1000ef80` re-lays the popup out rather than dismissing it.
+        if self.mode != mode {
+            self.dress_phase = dress::Phase::default();
+        }
         let variant = variant_for(
             &self.session,
             mode,
@@ -740,6 +777,7 @@ impl Menu {
             self.tab,
             self.kind,
             &self.session,
+            self.dress_phase,
             self.resolution,
         )?;
         self.states = vec![WidgetState::Resting; screen.widget_count()];
@@ -752,9 +790,101 @@ impl Menu {
         self.load_thumbnails(vfs, dll);
         self.load_page(vfs, dll);
         self.load_replay_page(vfs, dll);
+        self.load_dress(vfs, dll);
         self.refresh();
         Ok(())
     }
+
+    /// Loads the dress-select screen's art that is not the loaded map's own.
+    ///
+    /// Two things: the caption `FUN_1000cce0` builds as a full-screen plate, and
+    /// — while the popup's map is loaded — `DressSelect_Chip.png`, because
+    /// `FUN_1000c740` keeps drawing the two dresses from it under the popup.
+    /// Either missing leaves the rest of the screen drawn, which is the rule
+    /// for every asset in this engine.
+    fn load_dress(&mut self, vfs: &Vfs, dll: &[u8]) {
+        self.dress = None;
+        if self.mode != Mode::DRESS_SELECT {
+            return;
+        }
+        let caption = self.paths.dress_select_text().and_then(|path| {
+            let decoded = vfs
+                .read_path(path)
+                .map_err(|err| err.to_string())
+                .and_then(|bytes| {
+                    days_ui::Image::decode_png(&bytes).map_err(|err| err.to_string())
+                });
+            match decoded {
+                Ok(image) => Some(image),
+                Err(err) => {
+                    log::warn!("dress select caption {path}: {err}");
+                    None
+                }
+            }
+        });
+        // The dresses are only a layer of their own while the popup's map is
+        // the loaded one; on the main map they are that screen's own widgets.
+        // Loading the main screen again is what gets at both the records and
+        // the sheet, since the popup's atlas describes the popup.
+        let under = match self.dress_phase {
+            dress::Phase::Choosing => None,
+            dress::Phase::Confirming { .. } => {
+                match self.load_dress_main(vfs, dll) {
+                    Ok(screen) => Some(screen),
+                    Err(err) => {
+                        // The popup still draws; what is lost is the two
+                        // dresses showing through it.
+                        log::warn!("dress select: cannot draw the dresses under the popup: {err}");
+                        None
+                    }
+                }
+            }
+        };
+        self.dress = Some(DressScreen {
+            caption,
+            scaled: None,
+            at: (0, 0),
+            under,
+        });
+    }
+
+    /// The dress-select screen's own map and sheet, loaded beside the popup's.
+    fn load_dress_main(&self, vfs: &Vfs, dll: &[u8]) -> Result<Screen, Error> {
+        let mut screen = load_screen(
+            vfs,
+            dll,
+            &self.paths,
+            Mode::DRESS_SELECT,
+            &self.variant,
+            self.return_to,
+            self.tab,
+            self.kind,
+            &self.session,
+            dress::Phase::Choosing,
+            self.resolution,
+        )?;
+        screen.fit_to(self.screen.size().0, self.screen.size().1);
+        Ok(screen)
+    }
+}
+
+/// The dress-select screen's art that is not the loaded hit map's own.
+///
+/// Neither piece is a page layer: the caption goes **over** the screen's own
+/// sprites and the dresses go **under** the popup's base art, which is the two
+/// ends `FUN_1000c740` draws them at. See [`crate::ui::dress`].
+struct DressScreen {
+    /// `DressSelect_Text.png` in native layout space, absent when the module
+    /// names none or it will not decode.
+    caption: Option<days_ui::Image>,
+    /// The same at the size the screen composites at, kept until [`Self::at`]
+    /// moves — the caption covers the whole layout, so resampling it costs what
+    /// the base art's own resample costs.
+    scaled: Option<days_ui::Image>,
+    at: (u32, u32),
+    /// The screen's own map and sheet, loaded beside the popup's while the
+    /// popup is up so the two dresses can still be drawn under it.
+    under: Option<Screen>,
 }
 
 /// The Option screen's page for one tab: the records it draws from, read once
@@ -1206,9 +1336,29 @@ impl Menu {
             art,
             sprites: &page_sprites,
         });
+        // The two dresses go *under* the popup's own base art, which is the
+        // only thing on any screen that does — `FUN_1000c740` draws them from
+        // the previous map's sheet before it draws the popup. So they are part
+        // of what the popup is composited over rather than a layer inside it.
+        let under = self.dress_under(backdrop);
+        let backdrop = under.as_ref().or(backdrop);
         let mut out = self
             .screen
             .compose_over_page(backdrop, page, &self.states, &sprites);
+        // The caption is the other way round: `FUN_1000c740` draws it after the
+        // dresses and their highlight, and only while the main map is loaded,
+        // so the popup covers it rather than sitting under it.
+        if let (dress::Phase::Choosing, Some(caption)) = (
+            self.dress_phase,
+            self.dress.as_ref().and_then(|d| d.scaled.as_ref()),
+        ) {
+            let (w, h) = (caption.width, caption.height);
+            out.blit_scaled(
+                caption,
+                (0, 0, w, h),
+                (0, self.screen.letterbox().round() as i64, w, h),
+            );
+        }
         // The save/load rows are not widget sprites: their source is twice the
         // size of their destination, so they are blitted with the averaging
         // downscale.
@@ -1258,6 +1408,39 @@ impl Menu {
                 page.at = size;
             }
         }
+        if let Some(dress) = &mut self.dress {
+            if dress.at != size {
+                dress.scaled = dress
+                    .caption
+                    .as_ref()
+                    .map(|art| self.screen.to_display(art));
+                dress.at = size;
+            }
+        }
+    }
+
+    /// What the dress-select popup is composited over: the two dresses, slid
+    /// together, cut from the sheet the previous hit map came with.
+    ///
+    /// `None` on every other screen and while the main map is loaded, where the
+    /// dresses are the loaded screen's own widgets instead.
+    fn dress_under(&self, backdrop: Option<&days_ui::Image>) -> Option<days_ui::Image> {
+        let dress::Phase::Confirming { chosen } = self.dress_phase else {
+            return None;
+        };
+        let under = self.dress.as_ref()?.under.as_ref()?;
+        let cuts = dress::committed(under.atlas(), chosen);
+        let (width, height) = self.screen.size();
+        let mut out = days_ui::Image::empty(width, height);
+        if let Some(back) = backdrop {
+            out.blit_scaled(
+                back,
+                (0, 0, back.width, back.height),
+                (0, 0, back.width, back.height),
+            );
+        }
+        under.draw_cuts_from(&mut out, under.chip(), &cuts);
+        Some(out)
     }
 
     /// The art of whichever page layer this screen has, at display scale.
@@ -1397,6 +1580,15 @@ impl Menu {
         // A page module draws one of these and only one: the tab's own header,
         // which `FUN_100083b0` takes from the frame table at record `tab + 4`.
         // Everything else on its screen belongs to the page.
+        // The dress under the pointer, drawn over the two resting ones.
+        if self.mode == Mode::DRESS_SELECT && self.dress_phase == dress::Phase::Choosing {
+            if let Some(lit) = self
+                .selection
+                .and_then(|widget| dress::lit(self.screen.atlas(), widget))
+            {
+                out.push((self.screen.chip(), lit));
+            }
+        }
         if self.mode == Mode::OPTION && self.option_page.is_some() {
             if let Some(header) = self.screen.atlas().extras.get(self.tab.index()) {
                 out.push((self.screen.chip(), *header));
@@ -1663,6 +1855,14 @@ impl Menu {
             })
             .collect();
         self.states = states;
+        // The dress-select screen's base art is the shared transparent plate,
+        // so its two widgets are not revealed by their base art the way every
+        // other screen's are — they are sprites `FUN_1000c740` draws every
+        // frame, before it looks at the selection at all. The lit record goes
+        // over the one under the pointer; see `Menu::sprites`.
+        if self.mode == Mode::DRESS_SELECT && self.dress_phase == dress::Phase::Choosing {
+            self.states = vec![WidgetState::Active; self.states.len()];
+        }
         self.dirty = true;
     }
 
@@ -1854,6 +2054,7 @@ impl Menu {
             Mode::SAVELOAD if self.pending_save.is_some() => Ok(Action::Stay),
             Mode::SAVELOAD => self.confirm_saveload(vfs, dll, widget),
             Mode::ROUTEMAP => self.confirm_routemap(vfs, dll, widget),
+            Mode::DRESS_SELECT => self.confirm_dress(vfs, dll, widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
@@ -1868,6 +2069,50 @@ impl Menu {
             },
             _ => Ok(Action::Stay),
         }
+    }
+
+    /// The dress-select screen's dispatch, from `FUN_1000ded0`.
+    ///
+    /// Committing to a dress tells the host at once — host `+0x48`, which
+    /// [`Session::dress`] is this engine's side of — and then swaps the hit map
+    /// for the popup's, which is what `FUN_1000e440` phase 1 does once the
+    /// slide has run. Answering the popup yes sets the module's `+0xfc`, and
+    /// `getNextMode` case 9 reads that as mode 1: leave the menus and play.
+    /// Answering it no puts the first map back.
+    fn confirm_dress(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        match dress::action(self.dress_phase, widget) {
+            dress::Act::None => Ok(Action::Stay),
+            dress::Act::Commit(chosen) => {
+                self.session.dress = Some(dress::host_value(chosen));
+                self.set_dress_phase(vfs, dll, dress::Phase::Confirming { chosen })
+            }
+            // `FUN_1000ded0` returns 0 here, which the update pump reads as
+            // "this screen is finished"; the mode it leaves for is
+            // `getNextMode`'s, and for mode 1 that is playback.
+            dress::Act::Accept => Ok(Action::Play),
+            dress::Act::Cancel => self.set_dress_phase(vfs, dll, dress::Phase::Choosing),
+        }
+    }
+
+    /// Swaps the dress-select screen's hit map, keeping the mode.
+    ///
+    /// A map that will not load leaves the one that is up, the same answer
+    /// [`Action::Unavailable`] gives for a whole screen.
+    fn set_dress_phase(
+        &mut self,
+        vfs: &Vfs,
+        dll: &[u8],
+        phase: dress::Phase,
+    ) -> Result<Action, Error> {
+        let was = self.dress_phase;
+        self.dress_phase = phase;
+        let (mode, back) = (self.mode, self.return_to);
+        if let Err(err) = self.enter(vfs, dll, mode, back) {
+            log::warn!("dress select: cannot load the other hit map: {err}");
+            self.dress_phase = was;
+            return Ok(Action::Stay);
+        }
+        Ok(Action::Sound(SystemSe::Click))
     }
 
     /// The save/load screen's dispatch, from `FUN_10014990`.
@@ -2523,8 +2768,22 @@ fn load_screen(
     tab: options::Tab,
     kind: Kind,
     session: &Session,
+    dress_phase: dress::Phase,
     resolution: Resolution,
 ) -> Result<Screen, Error> {
+    // The dress-select screen's confirm popup is a second hit map inside mode
+    // 9 rather than a mode of its own — `MENU::DressSelect` swaps the one
+    // member between `FUN_1000d7f0`'s map and `FUN_1000d8c0`'s — so it is the
+    // one screen whose stem does not come from the mode. Its art is named
+    // after that stem like any other screen's.
+    let popup =
+        matches!(dress_phase, dress::Phase::Confirming { .. }) && mode == Mode::DRESS_SELECT;
+    if popup {
+        let stem = paths
+            .dress_select_popup()
+            .ok_or_else(|| Error::MissingAsset("the dress-select popup".to_string()))?;
+        return Screen::load_with_art(vfs, dll, stem, None, None, resolution);
+    }
     let stem_variant = match mode {
         Mode::TITLE => paths.title_stem_variant(variant),
         _ => variant,

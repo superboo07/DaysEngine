@@ -1349,6 +1349,9 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
         // this has to be the engine's real mode rather than a fixed answer.
         // The original asks the same two questions through host `+0xb8` and
         // `+0xbc`.
+        // No run has answered the dress-select screen at the point either of
+        // these is built; the host object's constructor leaves the same zero.
+        dress: None,
         display: player.display,
         // The SOMCON tab shows what the engine is really holding, the way
         // `FUN_100073a0` draws it from `_GetSomFlag@0` and `+0x324` rather

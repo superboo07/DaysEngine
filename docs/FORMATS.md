@@ -60,8 +60,8 @@ to know which title an install is: `src/ui/paths.rs` tries the spellings it
 knows for each mode and keeps whichever the player's own module holds. The
 Shiny Days loaders are `FUN_10007c50` (Option), `FUN_100295e0` (Replay),
 `FUN_100125b0` (RouteMap), `FUN_1001b0f0` (SaveLoad), `FUN_1002f3f0` (Title),
-`FUN_1000faf0` (Exit), `FUN_1002e950` (Pop_Som), `FUN_10022d80` (Pop_Replay)
-and `FUN_1000d7f0` (DressSelect).
+`FUN_1000faf0` (Exit), `FUN_1002e950` (Pop_Som), `FUN_10022d80` (Pop_Replay),
+`FUN_1000d7f0` (DressSelect) and `FUN_1000d8c0` (its `Popup_Select`).
 
 **Shiny Days' cleared title has no hit map of its own.** `FUN_1002f3f0` fills
 the `%s` of `System/Title/%s.cmap` from a literal at `0x1004ddf8`, which is
@@ -407,24 +407,100 @@ each moves `+0x168` itself: the SomCon one swaps within a pair sideways, cycles
 the three headers, and drops anything else on CLOSE. Until they are transcribed
 this engine walks the tab's widgets in order instead.
 
-**Shiny Days' dress-select screen draws over the `[DressBG]` movie.**
-`FUN_1000d980` hands the loader `System/Screen/Transparence.png` and
-`System/DressSelect/DressSelect_Chip.png` — the background is
-`STARTSCRIPT.INI`'s `[DressBG]` playing behind a transparent plate. Its own
-`DressSelect_Text.png` is a caption drawn afterwards by `FUN_1000cce0`, which
-this engine does not draw yet.
-
 **There is a menu mode School Days HQ does not have.** `_SystemInit@8` in
 `SysMenuSD.dll` switches the same mode integers onto the same screens —
 2 title, 3 save/load, 4 option, 5 replay, 6 route map, 7 SOM config, 8 replay
 popup, -1 confirm — and adds **mode 9**. Mode 9 is the dress-select screen: the
 switch hands it the static object at `DAT_1005b898`, whose static-init thunk
 `FUN_10048860` calls the constructor `FUN_1000c470`, which installs
-`MENU::DressSelect::vftable`. `getNextMode` reaches mode 1 (play) or -1
-(confirm) from it. It is almost certainly what `RouteProcSD.dll`'s
-`_CheckUniformBlock@4` and `STARTSCRIPT.INI`'s new `[DressBG]` key
-(`System/DressSelect/sentakuBG_03.wmv`) serve, but that link is **not
-recovered**.
+`MENU::DressSelect::vftable` at `0x1004a6ec`. `getNextMode` case 9 reaches mode
+1 (play) through `FUN_10001a10`, which returns the module's `+0xfc`, and mode -1
+(confirm) through `FUN_10001950`, which returns `+0x88`; anything else falls
+through to mode 2, the title.
+
+**The dress-select screen is one object with two hit maps.** `FUN_1000d7f0`
+loads `System/DressSelect/DressSelect*.cmap` and `FUN_1000d8c0` loads
+`System/DressSelect/Popup/Popup_Select*.cmap` into the same member, each
+picking its widescreen variant from host `+0xcc`, `+0xd0` and `+0xe4`. So the
+popup has no `SystemInit` code and is not a mode — it is the module's `+0x140`,
+raised once `FUN_1000e440` phase 1 has swapped the map. `src/ui/dress.rs` is
+that screen.
+
+Its background is not art of its own: `FUN_1000d980` hands `FUN_10010620`
+`System/Screen/Transparence.png` paired with
+`System/DressSelect/DressSelect_Chip.png`, because `STARTSCRIPT.INI`'s
+`[DressBG]` — `System/DressSelect/sentakuBG_03.wmv` — plays behind the plate.
+This engine does not play that movie yet: the screen composites over whatever
+backdrop it is handed, and there is nowhere to start it from while what raises
+mode 9 is unrecovered.
+That makes it the one screen whose widgets are **always drawn**: `FUN_1000c740`
+walks `+0xc8` and `+0xcc` before it looks at the selection at all, where every
+other screen leaves a resting widget to its opaque base art.
+`DressSelect_Text.png` is a caption `FUN_1000cce0` builds as a full-screen
+plate and `FUN_1000c740` draws *after* the dresses, only while the main map is
+loaded. The player's own art reads `Please select a uniform`.
+
+**Its widget table is six records at `DAT_10054920`**, the usual
+`x y w h src_x src_y` floats:
+
+```text
+rec 0   ( 64,   0) 273x450   src (  1,   1)   left dress, resting
+rec 1   (463,   0) 273x450   src (275,   1)   right dress, resting
+rec 2   ( 64,   0) 273x450   src (  1, 452)   left dress, lit
+rec 3   (463,   0) 273x450   src (275, 452)   right dress, lit
+rec 4   (274, 398) 115x26    src (  1,   1)   popup, YES
+rec 5   (411, 398) 115x26    src (117,   1)   popup, NO
+```
+
+Records 2 and 3 hold the *same destination* as 0 and 1 and differ only in
+`src_y`, which is why `FUN_1000d980`, `FUN_1000ded0`, `FUN_1000ef80` and
+`FUN_1000e440` can anchor the same sprite to different records and still place
+it identically. The player's sheets confirm the shape independently:
+`DressSelect_Chip.png` is 548x902 — two columns of 273, two rows of 450 — and
+`Popup_Select_Chip.png` is 232x27, one row with no lit variant. So does the
+shipped `Popup_Select.cmap`, whose two regions this engine matches to records 4
+and 5 at DLL offset `0x53180`, which is where `DAT_10054980` lands in the file.
+
+Committing slides both dresses together over 30 frames (`_DAT_1004a750`), the
+left to x 258.5 (`_DAT_1004a740`) and the right to 268.5 (`_DAT_1004a748`)
+whichever was chosen; the chosen one is drawn last, from its lit record, so it
+ends on top. `FUN_1000dea0` is the availability test and is `0 <= widget <= 1`
+on both maps — neither dress is ever locked.
+
+**What the screen selects reaches `RouteProcSD.dll`.** `FUN_1000ded0` reports
+the choice the moment it is committed, through host `+0x48(1)` for widget 0 and
+`+0x48(0)` for widget 1. That slot is `FUN_0041dc50` in `SHINYDAYS.exe`, which
+stores the argument and raises a flag beside it. The host interface is a
+secondary base subobject installed at `[object + 0x2c]` — `FUN_0041d660` writes
+the vtable `0x0048e50c` there and `FUN_004167e0` hands the DLL `this + 0x2c` —
+so the member the setter spells `+0x7d0` is the object's `+0x7fc`. Slot `+0x44`
+is the matching reader, `FUN_0041dc40`, and its only callers are route scripts:
+
+```text
+FUN_1004da70   REP04_S1_B03  ->  REP04_S1_B03A / REP04_S1_B03B
+FUN_100515e0   REP04_YX_A01  ->  REP04_YX_A01A / REP04_YX_A01B
+```
+
+Each plays the un-suffixed block and then appends `A` when the value is
+non-zero and `B` when it is zero, so **widget 0 is the `A` uniform** and exactly
+two scenes in the shipped route branch on it. That `RouteProcSD` holds this same
+interface is confirmed by its use of the neighbouring slots: `+0x8(wstr)`,
+`+0xc(wstr, int)`, `+0x10(wstr) -> int` and `+0x1c(wstr, int)` match the
+signatures at `0x0048e50c` exactly. `_CheckUniformBlock@4` is a different
+question and does not read this value: it takes a block name and answers whether
+it is one of 288 listed at `PTR_u_01_00_A01_100890f8`.
+
+**How mode 9 is entered is not recovered.** `getNextMode` never returns 9, so
+the host raises it. `FUN_00413250` in `SHINYDAYS.exe` handles mode 9 specially —
+it is one of the two modes, with the confirm popup, that skip the call silencing
+what is already playing — but nothing found so far *writes* 9 into the pump
+state `FUN_004158c0` switches on. That state, `+0x2d8`, is written only from the
+return values of `FUN_00412330`, `FUN_00412c10`, `FUN_00412f60`, `FUN_004129d0`
+and `FUN_00413250`; a decompile of each, plus a scan of that region for the
+literal 9, found no producer. The blind spot is that a data-driven raise — a
+script opcode or a table — would not spell 9 in code. Until it is recovered the
+screen is reachable only through `days menu --mode 9`, which is an inspection
+entry and not a claim about the original.
 
 **`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
 `[FeedTime]`, `[Select1]` and `[Select2]`. `STARTSCRIPT.INI` adds `[SystemBGM2]`
