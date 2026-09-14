@@ -359,6 +359,10 @@ struct UiArgs {
     /// Report the recovered widget table instead of drawing.
     #[arg(long)]
     table: bool,
+    /// Report the Option screen's per-tab page tables, for a module that ships
+    /// one hit map for the whole screen and lays its pages out in records.
+    #[arg(long)]
+    pages: bool,
     /// Composite at this window size, e.g. "1920x1080", the way the player's
     /// window does rather than at the hit map's own size. This is the pass a
     /// change of `[UI] Scaler` shows up in.
@@ -1559,6 +1563,67 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
     Ok(())
 }
 
+/// Reports the Option screen's three page tables, found from the frame table
+/// this screen's hit map already anchored.
+fn ui_pages(dll: &[u8], frame: usize) {
+    use daysengine::ui::option_pages::{self, Pages};
+    use daysengine::ui::options::Tab;
+
+    let Some(pages) = Pages::locate(dll, frame) else {
+        println!("no Option page tables in this module");
+        return;
+    };
+    for tab in Tab::ALL {
+        let base = pages.base(tab);
+        let count = option_pages::records(tab);
+        println!(
+            "{} page: {count} records at DLL offset {base:#x}, widgets {}..={}",
+            tab.variant(),
+            option_pages::FIRST,
+            option_pages::FIRST + count - 1,
+        );
+        for widget in option_pages::FIRST..option_pages::FIRST + count {
+            let Some(w) = pages.widget(dll, tab, widget) else {
+                println!("  widget {widget:3}  unreadable");
+                continue;
+            };
+            // The pointer lands on the last pixel of a record, not the first:
+            // the shipped test is half-open low and closed high.
+            let back = pages.hit(dll, tab, w.dst.x + w.dst.width, w.dst.y + w.dst.height);
+            println!(
+                "  widget {widget:3}  dst ({:4},{:4}) {:4}x{:<3}  src ({:4},{:4})  hit -> {}",
+                w.dst.x,
+                w.dst.y,
+                w.dst.width,
+                w.dst.height,
+                w.src_x,
+                w.src_y,
+                back.map_or_else(|| "none".to_string(), |n| n.to_string()),
+            );
+        }
+        if tab == Tab::Sound {
+            for slider in 0..option_pages::SLIDERS {
+                let (Some(track), Some(knob)) = (pages.track(dll, slider), pages.knob(dll, slider))
+                else {
+                    continue;
+                };
+                let half = option_pages::slider_knob_x(&track, &knob, 0.5);
+                println!(
+                    "  slider {slider}  widget {}  track {}x{} at ({},{})  knob {}x{}  half -> x {half}, reads back {:.3}",
+                    option_pages::FIRST_SLIDER + slider,
+                    track.dst.width,
+                    track.dst.height,
+                    track.dst.x,
+                    track.dst.y,
+                    knob.dst.width,
+                    knob.dst.height,
+                    option_pages::slider_value(&track, &knob, half),
+                );
+            }
+        }
+    }
+}
+
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
     use daysengine::ui::screen::{Resolution, Screen, WidgetState};
 
@@ -1620,6 +1685,13 @@ fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
                 i, wgt.dst.x, wgt.dst.y, wgt.dst.width, wgt.dst.height, wgt.src_x, wgt.src_y
             );
         }
+        if args.out.is_none() && !args.pages {
+            return Ok(());
+        }
+    }
+
+    if args.pages {
+        ui_pages(&dll, screen.atlas().offset);
         if args.out.is_none() {
             return Ok(());
         }

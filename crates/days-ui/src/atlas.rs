@@ -465,6 +465,73 @@ pub fn table_at(dll: &[u8], anchors: &[(usize, Rect)]) -> Option<usize> {
     None
 }
 
+/// The layout every stored rect is authored in, so a run that leaves it is not
+/// one of these tables. See the module doc's note on native resolution.
+const LAYOUT: (u32, u32) = (800, 450);
+
+/// Finds a table of `count` records by the **shape** of the records themselves,
+/// for a table no hit map can anchor.
+///
+/// [`table_at`] needs a box to match a record against. A screen whose widgets
+/// are rectangles rather than map regions has none — Shiny Days' Option pages
+/// ship a hit map covering only the frame — so the run has to be recognised by
+/// how it is built instead: a row of equally spaced buttons of one size, a
+/// column of tracks at one pitch, pairs sharing a baseline.
+///
+/// **This search is ours, not theirs.** The shipped code reaches every one of
+/// these tables by hardcoded address and never matches anything; nothing in the
+/// data marks a table's start. So the result is only believed when it is
+/// unambiguous, and two rules do the discriminating:
+///
+/// * every record of the run must be a rect inside the [`LAYOUT`] the tables
+///   are authored in, which is what rejects a window straddling two unrelated
+///   tables, and
+/// * exactly one position in the image may match. A run that is itself preceded
+///   by a matching run is dropped first, because these tables are two runs of
+///   the same geometry at different `src_y` and it is the first that is the
+///   table; anything still ambiguous after that returns `None` rather than a
+///   guess.
+pub fn table_by_shape(
+    dll: &[u8],
+    count: usize,
+    shape: impl Fn(&[Widget]) -> bool,
+) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let span = count.checked_mul(RECORD)?;
+    let mut run: Vec<Widget> = Vec::with_capacity(count);
+    let mut hits: Vec<usize> = Vec::new();
+    for base in 0..=dll.len().checked_sub(span)? {
+        run.clear();
+        if (0..count).any(|i| match record(dll, base + i * RECORD) {
+            Some(w) if in_layout(&w.dst) => {
+                run.push(w);
+                false
+            }
+            _ => true,
+        }) {
+            continue;
+        }
+        if shape(&run) {
+            hits.push(base);
+        }
+    }
+    let mut first = hits
+        .iter()
+        .copied()
+        .filter(|base| base.checked_sub(span).is_none_or(|p| !hits.contains(&p)));
+    match (first.next(), first.next()) {
+        (Some(base), None) => Some(base),
+        _ => None,
+    }
+}
+
+/// Whether a rect lies inside the layout the tables are authored in.
+fn in_layout(rect: &Rect) -> bool {
+    rect.x + rect.width <= LAYOUT.0 && rect.y + rect.height <= LAYOUT.1
+}
+
 /// One record of a table whose base offset is already known.
 pub fn record_at(dll: &[u8], base: usize, index: usize) -> Option<Widget> {
     record(dll, base.checked_add(index.checked_mul(RECORD)?)?)
@@ -693,5 +760,53 @@ mod tests {
     fn no_match_is_an_error_rather_than_an_empty_atlas() {
         let dll = vec![0u8; 256];
         assert!(find(&dll, &boxes(&[[10, 20, 30, 40]]), (64, 64)).is_err());
+    }
+
+    /// A pair of records on one baseline, for the shape tests below.
+    fn pair(y: f32) -> Vec<u8> {
+        let mut v = rec([10.0, y, 30.0, 20.0, 1.0, 1.0]);
+        v.extend(rec([50.0, y, 30.0, 20.0, 32.0, 1.0]));
+        v
+    }
+
+    /// Stands in for a real shape: a left-to-right pair of 30x20 buttons on one
+    /// baseline. The real shapes are seven and fourteen records and constrain
+    /// size, pitch and sheet packing; a toy predicate has to say enough to tell
+    /// a run start from a window straddling two of them, which is why this one
+    /// pins the size as well as the line.
+    fn on_one_line(run: &[Widget]) -> bool {
+        run.iter()
+            .all(|w| (w.dst.y, w.dst.width, w.dst.height) == (run[0].dst.y, 30, 20))
+            && run[0].dst.x < run[1].dst.x
+    }
+
+    #[test]
+    fn a_shape_matched_twice_over_is_refused_rather_than_guessed() {
+        // Two runs that are not adjacent: nothing says which is the table, so
+        // the honest answer is that it was not found.
+        let mut dll = pair(40.0);
+        dll.extend(vec![0u8; 64]);
+        dll.extend(pair(40.0));
+        assert_eq!(table_by_shape(&dll, 2, on_one_line), None);
+    }
+
+    #[test]
+    fn the_first_of_two_adjacent_runs_is_the_table() {
+        // These tables are the same geometry twice at different `src_y`, and
+        // it is the first run that the code indexes.
+        let mut dll = vec![0u8; 8];
+        dll.extend(pair(40.0));
+        dll.extend(pair(40.0));
+        assert_eq!(table_by_shape(&dll, 2, on_one_line), Some(8));
+    }
+
+    #[test]
+    fn a_run_that_leaves_the_layout_is_not_one_of_these_tables() {
+        // `SysMenuSD.dll` really does hold a window like this — a straddle of
+        // two unrelated tables whose rects run off the bottom of the 800x450
+        // the records are authored in. Without the bound it matches.
+        let mut dll = rec([10.0, 453.0, 30.0, 288.0, 1.0, 1.0]);
+        dll.extend(rec([50.0, 453.0, 30.0, 288.0, 32.0, 1.0]));
+        assert_eq!(table_by_shape(&dll, 2, on_one_line), None);
     }
 }

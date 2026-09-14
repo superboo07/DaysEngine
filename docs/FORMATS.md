@@ -328,6 +328,15 @@ rec.x < px <= rec.x + rec.w   and   rec.y < py <= rec.y + rec.h
 The first record that contains the pointer wins; there is no z-order and no
 best match.
 
+A third confirmation comes from the art. Every one of these records names a
+sprite in the page's `_Chip` sheet, and read at `record = widget - 4` they tile
+the player's own sheets exactly: the Def page's ten fill `Option_Def_Chip.png`
+to its right edge at 516 and fill the top 120 of its 240 rows, the other 120
+being the second run; the SomCon page's fourteen fill `Option_SomCon_Chip.png`
+to 590 of 590 across and, with the second run, 146 of 146 down. An index out by
+one anywhere would run a sprite off the sheet. `days ui <stem> --pages` is the
+check.
+
 This is also what records 4, 5 and 6 of the Sound table are for. They are the
 slider **tracks**, and nothing draws them — they exist so that widgets 8, 9 and
 10 have something 529 pixels wide to be hit against. `FUN_10008f50` then puts

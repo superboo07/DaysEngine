@@ -16,6 +16,7 @@ pub mod bar;
 pub mod comment;
 pub mod ending;
 pub mod menu;
+pub mod option_pages;
 pub mod options;
 pub mod paths;
 pub mod playdata;
