@@ -113,7 +113,9 @@ GPL-only component nor a library that merely happened to be installed on the
 build machine can end up in a shipped binary. Every archive carries
 `FFMPEG-SOURCE.txt` (upstream commit and the full configure line) and
 `COPYING.LGPLv2.1` beside the libraries; that pair is the compliance artifact
-and an archive must not be published without it.
+and an archive must not be published without it. It also carries `SOURCE.zip` —
+the engine's own source as it was when the binary was built, working-tree
+changes included — and is named after the commit it came from.
 
 These submodules are **not** in the developer path. `cargo build`, the tests and
 the `daysengine` inspection subcommands never touch them, and the pins bump the same way

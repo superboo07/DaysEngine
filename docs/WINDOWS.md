@@ -6,7 +6,7 @@ in this project's loop and no CI to borrow one from, so the target is
 would need `link.exe` and a Windows SDK, neither of which exists here.
 
 The result is `daysengine.exe` and the DLLs it needs, in
-`target/dist/daysengine-windows-x86_64/`.
+`target/dist/daysengine-windows-x86_64-<commit>/`.
 
 ## What you need on the build machine
 
@@ -66,10 +66,30 @@ An archive is a drag-and-drop, so it is flat and as short as the licences allow:
 daysengine.exe
 avcodec-63.dll  avfilter-12.dll  avformat-63.dll
 avutil-61.dll   swresample-7.dll swscale-10.dll
+SOURCE.zip
 FFMPEG-SOURCE.txt  COPYING.LGPLv2.1
 SDL-SOURCE.txt     SDL-LICENSE.txt
 LICENSE
 ```
+
+### The archive is named after the commit it was built from
+
+`daysengine-windows-x86_64-519a889.zip`, and
+`daysengine-windows-x86_64-519a889-dirty.zip` when the working tree had changes
+git did not: anything at all in `git status --porcelain` makes it dirty.
+
+### SOURCE.zip is the engine's source, as built
+
+Not as committed. It is the tracked files taken from the **working tree**, plus
+untracked ones git is not ignoring, so a `-dirty` build ships exactly what went
+into it — which is the build whose source is otherwise impossible to reconstruct,
+and the reason the source travels with the binary rather than being pointed at.
+A `SOURCE.txt` inside says which commit and when.
+
+The vendored SDL3 and ffmpeg sources are not in it. They are submodules, so
+`git ls-files` sees a gitlink and not their contents, and `FFMPEG-SOURCE.txt`
+already names ffmpeg's exact upstream commit — which is what LGPL 2.1 asks for,
+and a better answer than a copy that could drift.
 
 **One binary, and there is only one to ship.** The inspection tools are
 subcommands of `daysengine` rather than a second program: `daysengine menu`,
