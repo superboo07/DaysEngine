@@ -102,6 +102,29 @@ way the save/load tooltip's two uninitialised floats stay — that one is
 established by reading the branches that never write them. What is forbidden is
 reaching for it as the explanation.
 
+### A bug that really is one gets fixed
+
+The bar above is about *identifying* a bug, not about what to do with it. Once
+one is established to that standard, **fix it**. The player gets the quality of
+life; parity is about the game working, not about carrying Overflow's slips
+forward.
+
+Two things are owed in exchange, and neither is optional:
+
+- **Write the original's behaviour down anyway**, next to the fix, with the
+  provenance that established it. A divergence nobody recorded is
+  indistinguishable from a gap nobody recovered, which is the failure the
+  delete-wrong-claims rule exists to prevent. Say what the shipped code does,
+  say what this engine does instead, and say why.
+- **Keep the evidence bar.** "I think this is a bug" is not a licence to change
+  behaviour. The three questions and the second, non-decompiler method still
+  have to be satisfied first — every fix of this kind so far has rested on the
+  shipped data agreeing with the disassembly.
+
+Some findings of this kind are not fixable, and those stay reproduced and
+labelled: the save/load tooltip's two uninitialised floats have no right value
+to substitute, only invented ones.
+
 ### Never fabricate a value
 
 If something is not recovered, the code and the docs say **"not recovered"**.

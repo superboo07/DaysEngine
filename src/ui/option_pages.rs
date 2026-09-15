@@ -368,19 +368,24 @@ pub const PORT_BUTTONS: usize = 10;
 /// The port a `Port number` button asks for, or `None` when it asks for one
 /// this engine has not got.
 ///
-/// **The shipped handler stores `widget - 6`**, which is two past the button's
-/// own place in the row: `FUN_100095c0` opens that port and keeps it in the
-/// member `FUN_100070f0` draws the row's highlight from. The scan in
-/// `FUN_10008760` writes the same member with a real 0-based index, so the two
-/// writers disagree and the click is the one that is out by two — the first
-/// button takes the third port, the first two ports cannot be clicked at all,
-/// and the last two buttons ask for ports past the nine there are. That is
-/// reproduced here rather than tidied: the highlight sitting two buttons right
-/// of the press is what the retail screen shows, and it follows from this one
-/// store. The two buttons that run off the end are refused, the way
-/// [`crate::ui::options::SOM_PORTS`] refuses the other module's tenth.
+/// **The shipped handler stores `widget - 6`, and this engine stores
+/// `widget - 8`.** `FUN_100095c0` opens the port it works out and keeps it in
+/// the member `FUN_100070f0` draws the row's highlight from, and the row starts
+/// at widget 8 — so `widget - 6` is two past the button's own place. The scan
+/// in `FUN_10008760` fills that same member with a real 0-based index, so the
+/// two writers disagree and the click is the one that is out: in the retail
+/// build the first button opens the third port, the first two ports cannot be
+/// reached by clicking at all, the last two buttons ask for ports past the nine
+/// there are, and the highlight lands two buttons right of the press.
+///
+/// Fixed here, because a port the player cannot reach is a port the player
+/// cannot use. With the subtraction corrected both writers agree again and the
+/// highlight sits under the press, which is what [`values`] already draws —
+/// `port + FIRST_PORT` needed no change. The tenth button still has no port
+/// behind it and is refused, the way [`crate::ui::options::SOM_PORTS`] refuses
+/// the other module's tenth.
 pub fn port_of(widget: usize) -> Option<usize> {
-    let port = widget.checked_sub(6)?;
+    let port = widget.checked_sub(FIRST_PORT)?;
     (FIRST_PORT..FIRST_PORT + PORT_BUTTONS)
         .contains(&widget)
         .then_some(port)
@@ -659,18 +664,23 @@ fn def_navigate(c: i32, dir: Dir, trial: bool, showing: i32) -> i32 {
 /// cursor.
 fn sound_navigate(c: i32, dir: Dir, trial: bool, showing: i32) -> i32 {
     match dir {
-        // **The shipped up arm goes to the tab header from anywhere.** Its
-        // test is `if (c < 4 && c > 7)`, which no integer satisfies: at
-        // `0x10009f5f` the `JGE` for `c < 4` already jumps into the block that
-        // assigns the header, and the `JG` for `c > 7` below it is reached only
-        // when `c < 4`, so the block it guards — `c == 3 ? 7 : 3`, at
-        // `0x10009f88` — cannot be entered. `FUN_100099b0` has the same shape
-        // written `||` (`JL` and `JG` to one block at `0x100099fc`), and with
-        // `||` this arm would read the way every other one does: 4 to 7 up to
-        // the headers, CLOSE up to 7, a header or a slider up to CLOSE. It is
-        // a live difference in the two functions' machine code, not a tidying
-        // of one into the other, so it is reproduced.
-        Dir::Up => showing,
+        // **The shipped up arm goes to the tab header from anywhere, and this
+        // engine does not.** Its test is `if (c < 4 && c > 7)`, which no
+        // integer satisfies: at `0x10009f5f` the `JGE` for `c < 4` already
+        // jumps into the block that assigns the header, and the `JG` for
+        // `c > 7` below it is only reached when `c < 4`, so the block it
+        // guards — `c == 3 ? 7 : 3`, at `0x10009f88` — cannot be entered.
+        // `FUN_100099b0` writes the same test `||` (`JL` and `JG` to one block
+        // at `0x100099fc`) and does step a row, so the two functions really
+        // differ and the block that cannot be entered says what was meant.
+        // Fixed to that, which is what the other two tabs do: the toggle row up
+        // to the headers, CLOSE up to the last toggle, a header or a slider up
+        // to CLOSE.
+        Dir::Up => match c {
+            4..=7 => showing,
+            3 => 7,
+            _ => 3,
+        },
         Dir::Down => match c {
             3 => showing,
             0..=2 => 4,
@@ -911,18 +921,19 @@ mod tests {
     }
 
     #[test]
-    fn a_port_button_asks_for_the_port_two_past_its_own_place() {
+    fn a_port_button_asks_for_its_own_port_and_lights_under_the_press() {
         // `FUN_100095c0` opens and stores `widget - 6` where the row of ten
-        // starts at widget 8, so the first button takes the third port, the
-        // first two ports cannot be clicked at all, and the last two buttons
-        // ask for ports there are no names for.
-        assert_eq!(port_of(FIRST_PORT), Some(2));
-        assert_eq!(port_of(FIRST_PORT + 6), Some(8));
-        assert_eq!(port_of(FIRST_PORT + 7), None);
+        // starts at widget 8, so in the retail build the first button takes the
+        // third port and the first two are unreachable. Corrected here, so the
+        // button and the port agree.
+        assert_eq!(port_of(FIRST_PORT), Some(0));
+        assert_eq!(port_of(FIRST_PORT + 6), Some(6));
+        // The tenth button still has no port behind it.
+        assert_eq!(port_of(FIRST_PORT + options::SOM_PORTS), None);
         assert_eq!(port_of(FIRST_PORT + PORT_BUTTONS), None);
         // The row's highlight is drawn at `port + 4` records in, which is the
-        // widget `port + 8`: the same store, so the lit button sits two right
-        // of the pressed one. Bug and all — see `port_of`.
+        // widget `port + 8`, so with the store corrected the lit button is the
+        // pressed one.
         let som = Som {
             enabled: true,
             attached: true,
@@ -966,17 +977,23 @@ mod tests {
     }
 
     #[test]
-    fn the_sound_tabs_up_goes_to_the_tab_header_from_everywhere() {
+    fn the_sound_tabs_up_steps_a_row_where_the_shipped_one_could_not() {
         // `FUN_10009f40`'s up arm tests `c < 4 && c > 7`, which nothing
-        // satisfies, so the block that would step off CLOSE onto widget 7 is
-        // unreachable and every widget goes to the header instead. Its sibling
-        // `FUN_100099b0` writes the same test `||` and does step a row, which
-        // is what makes this a difference in the two functions rather than a
-        // reading of one.
+        // satisfies, so in the retail build the block that steps off CLOSE onto
+        // widget 7 is unreachable and every widget goes to the header instead.
+        // The sibling `FUN_100099b0` writes the same test `||`, so the
+        // unreachable block says what was meant and that is what runs here.
         let som = Som::default();
-        for c in [0, 3, 4, 7, 8, 0xa] {
+        // The toggle row still goes up to the header, which both readings agree
+        // on.
+        for c in [4, 7] {
             assert_eq!(navigate(Tab::Sound, c, Dir::Up, false, som), 1);
         }
+        // These three are the ones the shipped arm could not reach.
+        assert_eq!(navigate(Tab::Sound, 3, Dir::Up, false, som), 7);
+        assert_eq!(navigate(Tab::Sound, 0, Dir::Up, false, som), 3);
+        assert_eq!(navigate(Tab::Sound, 8, Dir::Up, false, som), 3);
+        // Which is the shape the Def tab already had.
         assert_eq!(navigate(Tab::Def, 3, Dir::Up, false, som), 0xd);
         assert_eq!(navigate(Tab::Def, 0xc, Dir::Up, false, som), 8);
     }

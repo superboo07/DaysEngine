@@ -77,6 +77,7 @@
 //! `FUN_1001c850` cuts the sprites at `row * 48 + 2` and `row * 48 + 514`. The
 //! save/load pair agree; these two do not, and the two-pixel offset is theirs.
 
+use crate::ui::options::Dir;
 use crate::ui::replay::View;
 use crate::ui::saveload::{
     self, Column, Line, Quad, Rows, Slots, Tooltip, DEST_HEIGHT, DEST_Y, LAST_ROW_OPENING_DOWN,
@@ -96,6 +97,67 @@ pub const FIRST_PAGE: usize = 0xd;
 
 /// The first widget of the right band — the comment column.
 pub const FIRST_COMMENT: usize = 0x17;
+
+/// One step of keyboard navigation on the play-data list: `FUN_1001e7e0`, the
+/// sibling `FUN_1001e200` dispatches to when `+0x2b0` says this view is
+/// showing. See [`crate::ui::replay::navigate`] for the members.
+///
+/// This view is a list, not a grid, so it has no `% 4` guard and nothing to
+/// fix. Vertically it is a ring: CLOSE, the page button of the page showing,
+/// the ten rows in order, back to CLOSE. Sideways is the top strip's ring
+/// alone — the two view tabs and then the ten page buttons — and a row has no
+/// sideways move, which is why the comment column at [`FIRST_COMMENT`] is not
+/// in any arm: the pointer is the only thing that reaches it.
+pub fn navigate(current: usize, dir: Dir, page: usize) -> usize {
+    let c = current;
+    let rows = FIRST_ROW..FIRST_ROW + PER_PAGE;
+    let pages = FIRST_PAGE..FIRST_PAGE + PER_PAGE;
+    let last_row = FIRST_ROW + PER_PAGE - 1;
+    let last_page = FIRST_PAGE + PER_PAGE - 1;
+    match dir {
+        Dir::Up => match c {
+            CLOSE => last_row,
+            FIRST_ROW => FIRST_PAGE + page,
+            _ if rows.contains(&c) => c - 1,
+            _ => CLOSE,
+        },
+        Dir::Down => match c {
+            CLOSE => FIRST_PAGE + page,
+            _ if c == last_row => CLOSE,
+            _ if rows.contains(&c) => c + 1,
+            _ => FIRST_ROW,
+        },
+        Dir::Left => match c {
+            0 => last_page,
+            1 => 0,
+            FIRST_PAGE => 1,
+            _ if pages.contains(&c) => c - 1,
+            _ => c,
+        },
+        Dir::Right => match c {
+            0 => 1,
+            1 => FIRST_PAGE,
+            _ if c == last_page => 0,
+            _ if pages.contains(&c) => c + 1,
+            _ => c,
+        },
+    }
+}
+
+/// CLOSE, which this table treats as a place of its own.
+const CLOSE: usize = 2;
+
+/// The page a keyboard step opens, if it landed on a page button.
+///
+/// The same guard the other view has, on `c - 0xd` against `+0x2a4`.
+pub fn opens_page(dir: Dir, next: usize) -> Option<usize> {
+    match dir {
+        Dir::Left | Dir::Right => (FIRST_PAGE..FIRST_PAGE + PER_PAGE)
+            .contains(&next)
+            .then(|| next - FIRST_PAGE),
+        Dir::Up | Dir::Down => None,
+    }
+}
 
 /// Record indices, from the functions named in the module doc.
 const PAGE_RECORD: usize = 7;

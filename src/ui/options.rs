@@ -415,13 +415,17 @@ pub fn withholds_hover_art(
             0xd => !config.flag(Flag::TextView),
             _ => false,
         },
-        // `FUN_1000a190` tests `widget == 10` in both of its first two arms, so
-        // widget 10 always withholds its hover art and widget 11 never does,
-        // whatever `MenVoice` says. That is the shipped behaviour, bug and all,
-        // and it costs only the outline on those two buttons — the value in
-        // force is drawn by the tab, not here.
+        // `FUN_1000a190` compares the widget against `0xa` in **both** of its
+        // first two arms — `CMP dword ptr [EBP + 0x8],0xa` at `0x1000a1a0` and
+        // again at `0x1000a1bb` — where the `Mute` pair below it compares
+        // against `0xc` and then `0xd`. So in the retail build widget 0xa
+        // withholds its hover art whatever `MenVoice` says and widget 0xb never
+        // withholds. The second arm's constant should be `0xb`, which is what
+        // runs here; it costs only the outline on those two buttons, since the
+        // value in force is drawn by the tab rather than here.
         Tab::Sound => match widget {
-            0xa => true,
+            0xa => config.flag(Flag::MenVoice),
+            0xb => !config.flag(Flag::MenVoice),
             0xc => config.flag(Flag::Mute),
             0xd => !config.flag(Flag::Mute),
             _ => false,
@@ -1224,22 +1228,23 @@ mod tests {
         );
     }
 
-    /// The shipped arm that tests widget 10 twice. It decides only whether the
-    /// hovered button keeps its own hover art, so widget 10 never shows its
-    /// outline and widget 11 always does — and neither can move the value.
+    /// `FUN_1000a190` compares the widget against `0xa` in both of its first
+    /// two arms, so in the retail build widget 0xa withholds its hover art
+    /// whatever `MenVoice` says and 0xb never does. Corrected here to the
+    /// shape the `Mute` pair in the same function already has.
     #[test]
-    fn the_sound_tabs_hover_test_is_stuck_where_the_dll_leaves_it() {
+    fn the_sound_tabs_two_pairs_both_read_their_own_setting() {
         let mut config = cfg();
         let d = Display::default();
         let som = Som::default();
         config.set_flag(Flag::MenVoice, false);
-        assert!(
-            withholds_hover_art(Tab::Sound, 0xa, &config, d, som),
-            "still widget 10: the DLL never tests widget 11"
-        );
+        assert!(!withholds_hover_art(Tab::Sound, 0xa, &config, d, som));
+        assert!(withholds_hover_art(Tab::Sound, 0xb, &config, d, som));
+        config.set_flag(Flag::MenVoice, true);
+        assert!(withholds_hover_art(Tab::Sound, 0xa, &config, d, som));
         assert!(!withholds_hover_art(Tab::Sound, 0xb, &config, d, som));
 
-        // Mute's pair, in the same function, does read its setting.
+        // Mute's pair, in the same function, always did read its setting.
         assert!(withholds_hover_art(Tab::Sound, 0xd, &config, d, som));
         config.set_flag(Flag::Mute, true);
         assert!(withholds_hover_art(Tab::Sound, 0xc, &config, d, som));

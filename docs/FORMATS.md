@@ -1705,12 +1705,15 @@ is both the value in force and under the pointer. `FUN_10009fd0`,
 `FUN_1000a190` and `FUN_1000a250` choose between it and the widget's own hover
 sprite, and the hovered widget draws its own only when they answer false:
 `if (FUN_10009f30(this, widget) == 0) { widget_sprite->draw(); }`.
-`FUN_1000a190` tests `widget == 10` in **both** of its first two arms, so on the
-Sound tab widget 10 always takes the second run and widget 11 never does,
-whatever `MenVoice` says; that is a bug in the shipped DLL and the engine
-reproduces it. It costs an outline on those two buttons and nothing else — the
-value in force comes from the first run and is unaffected. The SOMCON tab's
-port buttons have no second-run record, so a held port shows no outline.
+`FUN_1000a190` compares the widget against `0xa` in **both** of its first two
+arms — `CMP dword ptr [EBP + 0x8],0xa` at `0x1000a1a0` and again at
+`0x1000a1bb`, where the `Mute` pair below it compares against `0xc` and then
+`0xd`. So in the retail build widget 0xa always takes the second run and widget
+0xb never does, whatever `MenVoice` says. The second arm's constant should be
+`0xb`, and **this engine runs it that way**; it costs an outline on those two
+buttons and nothing else, since the value in force comes from the first run and
+is unaffected either way. The SOMCON tab's port buttons have no second-run
+record, so a held port shows no outline.
 
 Keyboard navigation is a hand-written transition table per tab —
 `FUN_10008da0`, `FUN_100092d0`, `FUN_100098a0` — on `+0x50`/`+0x54`/`+0x58`/
@@ -1907,12 +1910,46 @@ selected slot draws, the last twelve what every live slot draws — and that
 doubled shape is what tells it apart from the chip sheet's run, which
 reproduces the same twelve boxes once and then carries on.
 
-The grid's keyboard transition table is `FUN_1001e3a0`. It is decompiled but
-**not transcribed**: one arm guards the horizontal move on `c % 4 != 0` over
-widgets 8 to 17, which blocks the second column rather than the last, and
-widgets 7 and 18 fall through every arm. Until that reads consistently the grid
-gets a plain walk over its widgets rather than a table that looks recovered and
-is not.
+### The Replay screen's keyboard tables
+
+`FUN_1001e200` is the input pump. It writes the cursor `+0x2a0` from the hit
+test when the pointer moved and the keyboard has not just claimed it (`+0x6c`
+is the claim), and dispatches on `+0x2b0` to `FUN_1001e3a0` for the H-scene
+grid or `FUN_1001e7e0` for the play-data list. `+0x2a4` is the page. The
+direction members are `+0x50` up, `+0x54` down, `+0x58` left and `+0x5c` right
+— School Days HQ's base class puts them sixteen lower than Shiny Days'.
+
+| view | tabs | CLOSE | body | page buttons |
+| --- | --- | --- | --- | --- |
+| H-scene | 0, 1 | 2 | 7–0x12, twelve thumbnails four across | 3–6, page is `c - 3` |
+| Play data | 0, 1 | 2 | 3–0xc, ten rows | 0xd–0x16, page is `c - 0xd` |
+
+Both are a vertical ring — CLOSE, the page button of the page showing, the body
+in order, back to CLOSE — with a sideways ring across the top strip. Both end
+their **sideways** arms with the same guard, `if (live(c) && page(c) != +0x2a4)
+{ +0x2a4 = page(c); turn }`, so a left or right step onto a page button turns
+the page there and then; the vertical arms land on the button of the page
+already showing and never turn one. CLOSE has no sideways move in either, which
+is not a slip — it sits alone above the strip. Neither table steps onto the
+play-data comment column at 0x17, so the pointer is the only way there.
+
+**The grid's sideways guard is off by two in the shipped code, and this engine
+corrects it.** `FUN_1001e3a0` takes `c % 4` — `AND EAX,0x80000003` with the
+signed fixup, at `0x1001e59e` and `0x1001e715` — over `7 < c < 0x12`, and blocks
+right when it is `0` and left when it is `1`. For a grid whose first widget is 7
+the row edges are `c % 4 == 2` on the right and `c % 4 == 3` on the left, so the
+shipped constants are right for a grid starting at **9**. In the retail build
+that puts a wall between the second and third column of every row, lets widget
+10 step across a row boundary into 11, and leaves 7 and 18 — the range's own
+ends — with no sideways move at all.
+
+That the grid starts at 7 and is four across is settled outside the decompiler:
+`Replay_HScene`'s hit map gives ids 8 to 19, so widgets 7 to 0x12, as `164x94`
+boxes at y 107, 213 and 318 and x 55, 230, 406 and 581. The same function's
+vertical arms step by four over exactly that range, its page arm stores `c - 3`
+against the four page buttons at ids 4 to 7, nothing normalises `+0x2a0` per
+frame, and the sibling `FUN_1001e7e0` is a plain list with no `% 4` to have been
+copied from.
 
 `Replay_PlayData` is the save/load list over again. `FUN_1001b6d0` asks the host
 `+0x9c` — `FUN_0042a980`, the very call the save/load screen uses — for each

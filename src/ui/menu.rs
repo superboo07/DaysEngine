@@ -2189,14 +2189,13 @@ impl Menu {
     /// screen with no transcribed table falls back to walking its widgets in
     /// order, which is at least reachable.
     ///
-    /// The replay grid's table is **decompiled but not transcribed**. It is
-    /// `FUN_1001e3a0`, and one of its arms does not yet read consistently with
-    /// a grid four thumbnails across: the horizontal move guards on `c % 4 != 0`
-    /// over widgets 8 to 17, which blocks the second column rather than the
-    /// last, and widgets 7 and 18 fall through every arm. Either the grid is
-    /// not indexed the way the rest of that function implies or the arm does
-    /// something else; until that is settled, the grid gets the fallback rather
-    /// than a transition table that looks recovered and is not.
+    /// Both Replay views on the module with its own per-view hit maps have
+    /// tables too — `FUN_1001e3a0` for the grid and `FUN_1001e7e0` for the
+    /// list, dispatched on `+0x2b0` by `FUN_1001e200`. The grid's sideways
+    /// guard is off by two in the shipped code and this engine fixes it; see
+    /// [`replay::navigate`], which carries the evidence and what the original
+    /// does. A page module's Replay screen has no transcribed table and still
+    /// falls back.
     pub fn navigate(&mut self, vfs: &Vfs, dll: &[u8], dir: Dir) -> Result<Action, Error> {
         let next = match self.mode {
             Mode::OPTION if self.option_page.is_some() => Some(option_pages::navigate(
@@ -2206,6 +2205,15 @@ impl Menu {
                 self.session.save.trial,
                 self.session.som,
             )),
+            // A page module's Replay screen is a different recovery and has no
+            // table here yet, so it keeps the fallback.
+            Mode::REPLAY if self.replay_page.is_none() => {
+                let current = self.selection.unwrap_or(2);
+                Some(match self.view {
+                    replay::View::HScene => replay::navigate(current, dir, self.page),
+                    replay::View::PlayData => playdata::navigate(current, dir, self.page),
+                })
+            }
             Mode::OPTION => Some(options::navigate(
                 self.tab,
                 self.selection.unwrap_or(3),
@@ -2236,6 +2244,18 @@ impl Menu {
                 self.selection = Some(index);
                 self.refresh();
                 return Ok(Action::Opened(Mode::OPTION));
+            }
+        }
+        // Both Replay tables turn the page the same way, on the sideways arms
+        // only and only when the button is live.
+        if self.mode == Mode::REPLAY && self.replay_page.is_none() && self.enabled(index) {
+            let opened = match self.view {
+                replay::View::HScene => replay::opens_page(dir, index),
+                replay::View::PlayData => playdata::opens_page(dir, index),
+            };
+            if let Some(page) = opened.filter(|page| *page != self.page) {
+                self.page = page;
+                self.dirty = true;
             }
         }
         if self.selection == Some(index) {

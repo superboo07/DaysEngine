@@ -137,6 +137,7 @@
 //! `FUN_1002ddf0` formats `L"%s%C"` from the scene's flag and `0x41 + (k != 0)`
 //! — `A` for the first version and `B` for the second.
 
+use crate::ui::options::Dir;
 use days_save::FlagStore;
 
 /// Thumbnails on one page of the scene grid: widgets 7 to 18.
@@ -190,6 +191,108 @@ impl View {
 /// record `page + 0xf`, the same pair for the page button. Record `0x13` is the
 /// first thumbnail, which is a widget rather than an alternate, so the
 /// alternates are records 3 to 0x12.
+/// How many thumbnails the H-scene grid is across, from its own hit map: the
+/// twelve boxes of `Replay_HScene` sit at three distinct `y` values, four to a
+/// row.
+pub const HSCENE_COLUMNS: usize = 4;
+
+/// The last thumbnail, so the grid is [`HSCENE_FIRST_THUMBNAIL`]`..=` this.
+pub const HSCENE_LAST_THUMBNAIL: usize = HSCENE_FIRST_THUMBNAIL + HSCENE_PER_PAGE - 1;
+
+/// One step of keyboard navigation on the H-scene grid: `FUN_1001e3a0`, which
+/// `FUN_1001e200` dispatches to when `+0x2b0` says this view is showing.
+///
+/// The cursor is `+0x2a0` — the same member the hit test writes when the
+/// pointer moves and the keyboard has not just claimed it, `+0x6c` being the
+/// claim — and `+0x2a4` is the page. The direction members are `+0x50` up,
+/// `+0x54` down, `+0x58` left and `+0x5c` right.
+///
+/// The screen is the two view tabs (0, 1), CLOSE (2), four page buttons
+/// (3 to 6, and the table's own `c - 3` is the page, which is
+/// [`HSCENE_FIRST_PAGE`]) and the twelve thumbnails (7 to 0x12). Vertically it
+/// is a ring: CLOSE, the page button of the page showing, the three rows, back
+/// to CLOSE. Sideways the top strip is a ring of its own — 0, 1, 3, 4, 5, 6 —
+/// and the grid steps within a row. CLOSE has no sideways move, which is the
+/// shipped behaviour and not a slip: it sits alone above the strip.
+///
+/// **The shipped sideways guard on the grid is off by two, and this engine
+/// fixes it.** `FUN_1001e3a0` takes `c % 4` (`AND EAX,0x80000003` with the
+/// signed fixup, at `0x1001e59e` and `0x1001e715`) over the range `7 < c <
+/// 0x12`, and blocks right when it is `0` and left when it is `1`. For a grid
+/// whose first widget is 7 the row edges are `c % 4 == 2` on the right and
+/// `c % 4 == 3` on the left, so the shipped constants are correct for a grid
+/// starting at **9**: they put a wall between the second and third column of
+/// every row, let 10 step across a row boundary into 11, and leave 7 and 18 —
+/// the range's own ends — with no sideways move at all.
+///
+/// That the grid starts at 7 and is four across is settled outside the
+/// decompiler: `Replay_HScene`'s hit map gives ids 8 to 19, so widgets 7 to
+/// 0x12, as `164x94` boxes at y 107, 213 and 318 and x 55, 230, 406 and 581.
+/// The same function's own vertical arms step by four over exactly that range,
+/// and its page arm stores `c - 3` against the four page buttons at ids 4 to 7.
+/// Nothing normalises `+0x2a0` per frame — `FUN_1001e200` only ever writes it
+/// from the hit test — and the sibling table `FUN_1001e7e0` is a plain list
+/// with no `% 4` to have been copied from.
+pub fn navigate(current: usize, dir: Dir, page: usize) -> usize {
+    let c = current;
+    let grid = HSCENE_FIRST_THUMBNAIL..=HSCENE_LAST_THUMBNAIL;
+    let column = c.saturating_sub(HSCENE_FIRST_THUMBNAIL) % HSCENE_COLUMNS;
+    match dir {
+        Dir::Up => match c {
+            CLOSE => HSCENE_LAST_THUMBNAIL,
+            _ if grid.contains(&c) && c < HSCENE_FIRST_THUMBNAIL + HSCENE_COLUMNS => {
+                HSCENE_FIRST_PAGE + page
+            }
+            _ if grid.contains(&c) => c - HSCENE_COLUMNS,
+            _ => CLOSE,
+        },
+        Dir::Down => match c {
+            CLOSE => HSCENE_FIRST_PAGE + page,
+            _ if grid.contains(&c) && c + HSCENE_COLUMNS <= HSCENE_LAST_THUMBNAIL => {
+                c + HSCENE_COLUMNS
+            }
+            _ if grid.contains(&c) => CLOSE,
+            _ => HSCENE_FIRST_THUMBNAIL,
+        },
+        // The top strip's ring is 0, 1, then the page buttons, then back to 0.
+        Dir::Left => match c {
+            _ if grid.contains(&c) && column > 0 => c - 1,
+            0 => HSCENE_FIRST_PAGE + HSCENE_PAGES - 1,
+            1 => 0,
+            HSCENE_FIRST_PAGE => 1,
+            _ if (HSCENE_FIRST_PAGE..HSCENE_FIRST_PAGE + HSCENE_PAGES).contains(&c) => c - 1,
+            _ => c,
+        },
+        Dir::Right => match c {
+            _ if grid.contains(&c) && column + 1 < HSCENE_COLUMNS => c + 1,
+            1 => HSCENE_FIRST_PAGE,
+            0 => 1,
+            _ if c + 1 == HSCENE_FIRST_PAGE + HSCENE_PAGES => 0,
+            _ if (HSCENE_FIRST_PAGE..HSCENE_FIRST_PAGE + HSCENE_PAGES).contains(&c) => c + 1,
+            _ => c,
+        },
+    }
+}
+
+/// CLOSE, which both of this screen's tables treat as a place of its own.
+const CLOSE: usize = 2;
+
+/// The page a keyboard step opens, if it landed on a page button.
+///
+/// Both sideways arms end with the same guard — the move is taken, and then
+/// `if (live(c) && c - 3 != +0x2a4) { +0x2a4 = c - 3; FUN_1001c1f0(); }` — so a
+/// left or right step onto a page button turns the page there and then. The
+/// vertical arms land on `+0x2a4 + 3`, the button of the page already showing,
+/// so they never turn one.
+pub fn opens_page(dir: Dir, next: usize) -> Option<usize> {
+    match dir {
+        Dir::Left | Dir::Right => (HSCENE_FIRST_PAGE..HSCENE_FIRST_PAGE + HSCENE_PAGES)
+            .contains(&next)
+            .then(|| next - HSCENE_FIRST_PAGE),
+        Dir::Up | Dir::Down => None,
+    }
+}
+
 const PAGE_RECORD: usize = 7;
 const TAB_CURRENT: usize = 3;
 const TAB_SELECTED: usize = 5;
@@ -1391,6 +1494,52 @@ fn u32le(b: &[u8], o: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        navigate, opens_page, Dir, HSCENE_COLUMNS, HSCENE_FIRST_PAGE, HSCENE_FIRST_THUMBNAIL,
+        HSCENE_LAST_THUMBNAIL, HSCENE_PAGES,
+    };
+
+    #[test]
+    fn the_grid_steps_within_a_row_and_stops_at_both_edges() {
+        // The shipped guard blocks right at `c % 4 == 0` and left at
+        // `c % 4 == 1`, which for a grid starting at 7 is a wall between the
+        // second and third column of every row; it also lets 10 step into 11
+        // across a row boundary and leaves 7 and 18 unable to move sideways at
+        // all. Corrected to the real edges — see `navigate`.
+        let first = HSCENE_FIRST_THUMBNAIL;
+        // Across a row, including over the wall the shipped guard put at 8|9.
+        for c in first..first + HSCENE_COLUMNS - 1 {
+            assert_eq!(navigate(c, Dir::Right, 0), c + 1);
+            assert_eq!(navigate(c + 1, Dir::Left, 0), c);
+        }
+        // The row's own edges hold, so 10 no longer wraps into the next row.
+        let row_end = first + HSCENE_COLUMNS - 1;
+        assert_eq!(navigate(row_end, Dir::Right, 0), row_end);
+        assert_eq!(navigate(first, Dir::Left, 0), first);
+        // And the range's ends move like anything else now.
+        assert_eq!(
+            navigate(HSCENE_LAST_THUMBNAIL, Dir::Left, 0),
+            HSCENE_LAST_THUMBNAIL - 1
+        );
+    }
+
+    #[test]
+    fn the_grid_is_a_vertical_ring_through_the_page_button_of_the_page_showing() {
+        let first = HSCENE_FIRST_THUMBNAIL;
+        // Up out of the top row lands on the button of the page already
+        // showing, so it never turns one.
+        assert_eq!(navigate(first, Dir::Up, 2), HSCENE_FIRST_PAGE + 2);
+        assert_eq!(opens_page(Dir::Up, HSCENE_FIRST_PAGE + 2), None);
+        // Down a row, and off the bottom row to CLOSE.
+        assert_eq!(navigate(first, Dir::Down, 0), first + HSCENE_COLUMNS);
+        assert_eq!(navigate(HSCENE_LAST_THUMBNAIL, Dir::Down, 0), 2);
+        assert_eq!(navigate(2, Dir::Up, 0), HSCENE_LAST_THUMBNAIL);
+        // A sideways step onto a page button does turn the page.
+        assert_eq!(
+            opens_page(Dir::Right, HSCENE_FIRST_PAGE + HSCENE_PAGES - 1),
+            Some(HSCENE_PAGES - 1)
+        );
+    }
 
     /// A click dispatches the scene, and what the engine plays is the scene's
     /// whole list. `FUN_1001f0d0` is asked for the next script each time one
