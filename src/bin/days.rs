@@ -211,6 +211,11 @@ enum Cmd {
         /// How many scripts to play before stopping.
         #[arg(long, default_value_t = 40)]
         steps: usize,
+        /// The dress to walk in, as the dress-select screen commits it. Only
+        /// Shiny Days has the mechanism; non-zero is the left dress, which is
+        /// the one the `Z` recordings are of.
+        #[arg(long, default_value_t = 0)]
+        dress: u32,
     },
     /// Decode every movie referenced by a script, checking frame counts against
     /// the timeline the script declares.
@@ -618,8 +623,9 @@ fn main() -> Result<()> {
             play,
             choices,
             steps,
+            dress,
         } => match play {
-            Some(from) => cmd_route_play(&game, &from, &choices, steps)?,
+            Some(from) => cmd_route_play(&game, &from, &choices, steps, dress)?,
             None => cmd_route(&game, name.as_deref(), scenes, edges)?,
         },
         Cmd::Bar(args) => cmd_bar(&game, &args)?,
@@ -3357,7 +3363,7 @@ fn route_dll(game: &Path) -> Result<Vec<u8>> {
 /// This drives the same [`Progress`] the game does — `enter` to place the
 /// player, `decide` when a choice settles, `advance` when a script ends — so
 /// what it prints is what would be played.
-fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Result<()> {
+fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize, dress: u32) -> Result<()> {
     use daysengine::install::progress::Progress;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -3370,6 +3376,9 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
         .collect::<std::result::Result<_, _>>()
         .context("--choices takes a comma-separated list of numbers")?;
 
+    // The dress goes in before the run starts: `film_start` is what puts it
+    // into the store, after `_ZeroReset@4` has emptied everything else.
+    progress.set_dress(dress);
     // A walk starts where a film run starts, so the store carries what
     // `_ZeroReset@4` seeds and nothing else. See `Progress::film_start`.
     progress.film_start();
@@ -3386,6 +3395,17 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // What the player's own store carries before the walk touches it, so the
+    // read record the walk builds can be held against what the retail game
+    // actually wrote. See `Progress::mark_read`.
+    let was_read: std::collections::BTreeSet<String> = progress
+        .global()
+        .iter()
+        .filter(|(_, value)| matches!(value, days_save::Value::Bool(true)))
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let mut walked: Vec<String> = Vec::new();
+
     let mut answers = answers.into_iter();
     let mut played = from.to_string();
     for step in 0..steps {
@@ -3398,16 +3418,55 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize) -> Resul
         // A choice box settles before the script ends, so the answer is given
         // first and the transition taken after.
         progress.decide(answers.next().unwrap_or(-1), true);
+        // What the engine will mark, which is the qualified name after the
+        // swap, not the spelling the walk was asked for.
+        walked.push(progress.script().to_owned());
         match progress.advance() {
             Some(next) => played = next,
             None => {
                 println!("     the graph names nothing after this");
+                read_record(&progress, &was_read, &walked);
                 return Ok(());
             }
         }
     }
     println!("     stopped after {steps} scripts");
+    read_record(&progress, &was_read, &walked);
     Ok(())
+}
+
+/// Reports the per-script read record the walk built, against the record the
+/// player's own game wrote.
+///
+/// Every name marked should be a name the retail engine spells the same way,
+/// so one this engine set that the player's store has never carried is either
+/// a scene they have not reached or a spelling this engine got wrong. A walk
+/// over ground the player has covered separates the two: if the whole walk
+/// comes back unknown, the spelling is wrong.
+fn read_record(
+    progress: &daysengine::install::progress::Progress,
+    was_read: &std::collections::BTreeSet<String>,
+    walked: &[String],
+) {
+    let marked: std::collections::BTreeSet<&str> = progress
+        .global()
+        .iter()
+        .filter(|(name, value)| {
+            matches!(value, days_save::Value::Bool(true)) && !was_read.contains(*name)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    let known = walked.iter().filter(|n| was_read.contains(*n)).count();
+    println!(
+        "\nthe read record: {} scripts played, {known} of them already read in the player's \
+         own store, {} name{} newly marked",
+        walked.len(),
+        marked.len(),
+        if marked.len() == 1 { "" } else { "s" }
+    );
+    for name in &marked {
+        println!("  newly marked  {name}");
+    }
 }
 
 /// Prints the branch graph and the affection tables that drive it.

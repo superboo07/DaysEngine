@@ -1197,6 +1197,16 @@ fn main() -> Result<()> {
         }
     }
 
+    // Leaving playback is the film run ending, which is one of the three
+    // points the shipped engine writes `GlobalFlag.DAT` at. The read record
+    // this run built up lives only in memory until here — see
+    // `Progress::mark_read`.
+    if let Some(p) = progress.as_ref() {
+        if let Err(err) = p.flush_flags(&player.game, player.film) {
+            log::warn!("writing the global flags: {err}");
+        }
+    }
+
     // Never leave a controller buzzing. The effect lapses on its own inside
     // [`RUMBLE_MS`], but an engine that closed cleanly should not need it to.
     player.pads.close();

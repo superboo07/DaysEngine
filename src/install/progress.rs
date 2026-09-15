@@ -142,6 +142,17 @@ pub struct Progress {
     /// choices are filed under, and the name a slot carries. See
     /// [`Progress::uniform_block`].
     script: String,
+    /// The name [`Progress::script`] was swapped **from**, as the engine keeps
+    /// it at `engine + 0x1d8`, or empty when the swap did not fire.
+    ///
+    /// `FUN_0041b830` writes it: where `_CheckUniformBlock@4` matches, it puts
+    /// the original name here and hands the `Z` spelling to host `+0x144`, so
+    /// the engine plays one name while remembering the other. Both are then
+    /// marked read at the end of the script — see [`Progress::mark_read`].
+    ///
+    /// The same function writes it empty on every script the swap does not
+    /// fire on, so it never outlives the scene it belongs to.
+    twin: String,
     /// The scenes that have a second recording, out of `_CheckUniformBlock@4`.
     /// Empty for a title whose route module does not export it.
     uniform: Vec<String>,
@@ -215,6 +226,7 @@ impl Progress {
             version: retail_version(route_dll),
             gauge_raised: false,
             script: String::new(),
+            twin: String::new(),
             uniform: days_route::pe::Image::parse(route_dll)
                 .map(|img| img.uniform_block())
                 .unwrap_or_default(),
@@ -283,6 +295,7 @@ impl Progress {
         // rest of the engine passes the trailing name around.
         let full = qualify(script);
         self.script = full.clone();
+        self.twin.clear();
         match self.routes.find(&full) {
             Some((route, scene)) => {
                 self.stores.save.set_int(ROUTE, route as i32);
@@ -360,6 +373,15 @@ impl Progress {
         log::info!("choice {choice} credits the deltas of {script}");
     }
 
+    /// The script now playing, in the spelling the route tables use.
+    ///
+    /// `engine + 0x188` in `SCHOOLDAYS HQ.exe` and `engine + 0x1a0` in
+    /// `SHINYDAYS.exe`, after the uniform-block swap. This is the name the
+    /// read record is filed under — see [`Progress::mark_read`].
+    pub fn script(&self) -> &str {
+        &self.script
+    }
+
     /// The answer the slot recorded at the script now playing, if it has one.
     ///
     /// `FUN_00428a80` looks the current script's name up in the same store
@@ -370,11 +392,78 @@ impl Progress {
         self.choices.get(&self.script).copied()
     }
 
+    /// Records that the player has read the script now playing.
+    ///
+    /// This is the per-script read record: one global flag per script, named
+    /// by its route-table spelling — `00/00-00-A00`, the same name the tables
+    /// hold — and set to `true`. The player's own stores carry 1,854 of them
+    /// in School Days HQ and 2,585 in Shiny Days, and it is what the route map
+    /// and the replay list read a scene's "seen" state out of.
+    ///
+    /// **Who writes it.** Host slot `+0x1c`, the global store's boolean
+    /// setter (`FUN_00428800`, a `FUN_0045d180` on the map at host `+0x10`;
+    /// `+0x18` is the matching getter). The end-of-script block calls it with
+    /// the name the engine was told to play, held at `engine + 0x188` in
+    /// `SCHOOLDAYS HQ.exe` and `engine + 0x1a0` in `SHINYDAYS.exe`, and only
+    /// then asks the route module what follows. HQ does it in `FUN_00424020`;
+    /// Shiny in `FUN_0041c440` and in `FUN_0041cb60`'s state 7. So a script is
+    /// marked when it **ends**, not when it starts, and the last script of a
+    /// route is marked even though nothing follows it.
+    ///
+    /// **When it is not written.** Two gates sit above the call, and both are
+    /// reproduced by where this is called from rather than by a flag here:
+    ///
+    /// - `vt[0x104]` (HQ) / `vt[0x120]` (Shiny) — `engine + 0x150`, raised by
+    ///   `vt[0xa4]`/`FUN_004280b0` when a named script is played on its own.
+    ///   That is the replay path, which takes `_GetNextChapter@8` instead and
+    ///   never reaches the mark. A replay here returns before
+    ///   [`Progress::advance`] is ever called.
+    /// - `engine + 0x560` (HQ) / `+0x5b8` (Shiny), raised by `vt[0x124]`
+    ///   together with a reset of the moving flag. That is a rewind or a
+    ///   route-map jump, which goes to `_GetBackScriptFile@12` or `searchRoot`
+    ///   and, again, past the mark. Neither path here runs through `advance`.
+    ///
+    /// **The twin.** Shiny marks a second name when the uniform-block swap has
+    /// fired: `engine + 0x7fc` set and the string at `engine + 0x1d8`
+    /// non-empty, at `0x0041c642` and `0x0041cf87`. `FUN_0041b830` is what
+    /// fills it — under the `NewRadish` flag it hands the `Z` spelling to host
+    /// `+0x144` and keeps the original here — so the pair is credited
+    /// together, which is the same rule `_GetReadScriptCount@4` counts by.
+    /// School Days HQ has no such second call.
+    ///
+    /// The player's own `GlobalFlag.DAT` agrees: Shiny's carries both
+    /// `01/01-00-A01` and `01/Z1-00-A01`, and the `Z` sits at character 3,
+    /// exactly where `FUN_0041a090(name, 3, 1, L"Z", 1)` puts it.
+    ///
+    /// Nothing is written to disk here. The shipped engine flushes the store
+    /// at three boundaries and no others — saving a slot (host `vt[0xa0]`,
+    /// `FUN_0042aea0`), the film run ending (`FUN_004236f0`, off the run
+    /// thread in `FUN_00427780`) and the engine tearing down (`FUN_00422e10`)
+    /// — all three through `FUN_0042b5f0`, the writer for the `FlagFileName`
+    /// the film INI names. See [`Progress::save_to`].
+    /// **The blank entry is not recovered.** Both players' stores carry one
+    /// entry whose name is the empty string, set `true`, and this engine does
+    /// not write it: [`mark_read`] takes an empty name as nothing to record.
+    /// The shipped call is unconditional — neither `0x0041c633` nor
+    /// `0x0041cf5e` checks the string first — so the original does write it
+    /// whenever the name is empty at an end of script, but **what leaves it
+    /// empty there has not been followed**. Two branches of `FUN_00424020`
+    /// blank `engine + 0x188`, and both set the moving and stop flags beside
+    /// it, which should keep the block from running again.
+    fn mark_read(&mut self) {
+        let (script, twin) = (self.script.clone(), self.twin.clone());
+        mark_read(&mut self.stores.global, &script, &twin);
+    }
+
     /// Runs the branch graph and moves to whatever it names.
     ///
     /// Returns the script to play next, or `None` when the route ends or the
     /// position is not in the graph.
     pub fn advance(&mut self) -> Option<String> {
+        // Before the graph is asked anything: the shipped order is mark, then
+        // `_GetNextScriptFile@12`, so a script that ends a route is recorded
+        // even though the call below answers `None`.
+        self.mark_read();
         let (route, scene) = self.position();
         let scene = u16::try_from(scene).ok()?;
         let (acts, next) = self
@@ -408,8 +497,14 @@ impl Progress {
             Next::Nothing => return None,
         };
         // Every name the route module produces goes through the swap before
-        // anything else sees it.
-        let played = self.uniform_block(&played);
+        // anything else sees it, and the name it was swapped from is kept
+        // beside it — `FUN_0041b830` writes both, or writes the second empty.
+        let swapped = self.uniform_block(&played);
+        self.twin = match swapped == played {
+            true => String::new(),
+            false => played,
+        };
+        let played = swapped;
         self.script = played.clone();
         self.stores.choice = -1;
         log::info!("{}", {
@@ -470,6 +565,7 @@ impl Progress {
         self.stores.choice = -1;
         self.gauge_raised = false;
         self.script.clear();
+        self.twin.clear();
         feeling::zero_reset(&mut self.stores.save, self.deltas.names());
         self.stores.save.set_int(ROUTE, 0);
         self.stores.save.set_int(SCENE, 0);
@@ -507,6 +603,10 @@ impl Progress {
         self.stores.choice = -1;
         self.gauge_raised = false;
         self.script = slot.script.clone();
+        // A slot carries the name the swap already produced, which is in no
+        // table, so `FUN_0041b830` finds nothing to match and writes the twin
+        // empty. It fills again at the next script. See [`Progress::mark_read`].
+        self.twin.clear();
         self.new_radish = self.stores.save.flag(NEW_RADISH);
         let (route, scene) = self.position();
         // The store is the position; this only says whether the name agrees
@@ -559,6 +659,7 @@ impl Progress {
         let script = mark.script.clone();
         self.stores.save = mark.store.clone();
         self.script = script.clone();
+        self.twin.clear();
         self.new_radish = self.stores.save.flag(NEW_RADISH);
         self.marks.split_off(&name);
         self.stores.choice = -1;
@@ -633,6 +734,18 @@ impl Progress {
         self.stores.global.set(&sub, Value::Str(comment));
 
         save::write_slot(game, film, slot, &self.to_slot())?;
+        save::write_flags(game, film, &self.stores.global)
+    }
+
+    /// Writes the global store out, without touching a slot.
+    ///
+    /// The read record [`Progress::mark_read`] keeps is in memory until one of
+    /// the shipped engine's three flush points, and two of them are not saves:
+    /// `FUN_004236f0` runs when the film run ends and `FUN_00422e10` when the
+    /// engine tears down, both calling the same `FUN_0042b5f0` that
+    /// [`Progress::save_to`] reaches through host `vt[0xa0]`. Leaving playback
+    /// is where this engine has that boundary.
+    pub fn flush_flags(&self, game: &Path, film: &Ini) -> std::io::Result<()> {
         save::write_flags(game, film, &self.stores.global)
     }
 
@@ -718,6 +831,24 @@ impl Progress {
     }
 }
 
+/// The marking itself, out of [`Progress::mark_read`].
+///
+/// `script` is the name the engine was told to play and `twin` the name the
+/// uniform-block swap fired from, empty when it did not fire. Both go in as
+/// `VT_BOOL` true, which is what host `+0x1c` writes.
+fn mark_read(global: &mut FlagStore, script: &str, twin: &str) {
+    if script.is_empty() {
+        return;
+    }
+    global.set_flag(script, true);
+    if twin.is_empty() {
+        log::info!("{script} is read");
+    } else {
+        global.set_flag(twin, true);
+        log::info!("{script} is read, and so is {twin} beside it");
+    }
+}
+
 /// The swap itself, out of [`Progress::uniform_block`].
 fn uniform_block(table: &[String], on: bool, name: &str) -> String {
     // `wcsstr`, so a table entry matches anywhere in the name: the table holds
@@ -767,6 +898,23 @@ mod tests {
         // checks for first.
         assert_eq!(uniform_block(&table, true, "02/02-22-B05"), "02/02-22-B05");
         assert_eq!(uniform_block(&table, true, ""), "");
+    }
+
+    /// A scene the uniform swap fired on is read under both spellings, which
+    /// is the pair `_GetReadScriptCount@4` counts as one. A scene it did not
+    /// fire on has no second name to credit, and School Days HQ never has one
+    /// because its route module exports no `_CheckUniformBlock@4`.
+    #[test]
+    fn a_swapped_scene_is_read_under_both_of_its_names() {
+        let mut store = FlagStore::default();
+        mark_read(&mut store, "02/Z2-22-B04", "02/02-22-B04");
+        assert!(store.flag("02/Z2-22-B04"));
+        assert!(store.flag("02/02-22-B04"));
+
+        mark_read(&mut store, "00/00-00-A00", "");
+        assert!(store.flag("00/00-00-A00"));
+        // Nothing else went in: an empty twin is not a name.
+        assert_eq!(store.iter().count(), 3);
     }
 
     /// The counters, the numbered gate flags and the bookmarks are one map,

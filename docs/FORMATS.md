@@ -3675,6 +3675,95 @@ read the container, `FUN_0042b490` / `FUN_0042b5f0` locate it through the
 is the string reader that applies the cipher, and `FUN_0045c890` switches on
 the value tag.
 
+### The per-script read record
+
+Most of the store is this: one flag per script the player has read, named by
+the script's **route-table spelling** — `00/00-00-A00`, the same name the 55
+name tables hold — and set to `VT_BOOL` true. The player's own stores carry
+1,854 of them in School Days HQ and 2,585 in Shiny Days.
+
+A name that is only ever *asked about* is in the file too, as `VT_I4` zero:
+`FUN_00460810` creates a missing name on demand, so a lookup leaves an entry
+behind. True means read; zero means something queried it and the player has
+not been there.
+
+**The write is host slot `+0x1c`** — `FUN_00428800`, a `FUN_0045d180` on the
+map at host `+0x10`, with `+0x18` (`FUN_00428770`) the matching getter. It is
+called from the end-of-script block with the name the engine was told to play,
+which lives at `engine + 0x188` in `SCHOOLDAYS HQ.exe` and `engine + 0x1a0` in
+`SHINYDAYS.exe`, and only then does the block ask the route module what
+follows. So **a script is recorded when it ends, not when it starts**, and the
+last script of a route is recorded even though nothing comes after it.
+
+```text
+HQ      FUN_00424020    the frame-advance end-of-script block
+Shiny   FUN_0041c440    the same, and FUN_0041cb60 state 7
+```
+
+The name reaching that member is worth following, because it is not the
+script's own: the block marks `+0x188`, *then* replaces it. `FUN_0043d4c0` is
+the statement scheduler, and at `[Next]` it calls `_GetNextScriptFile@12` and
+stores the answer at the script object's `+0x114`; `[Exit]` stores an empty
+string there instead. The end-of-script block reads that member into `+0x188`
+after marking, and `+0x188` is then what gets loaded. So `+0x188` holds the
+name of the script *now playing* for the whole of its run, and marking it at
+the end is marking the right one.
+
+**Two gates sit above the call**, and both keep a screen the player did not
+read out of the record:
+
+| gate | HQ | Shiny | raised by | what it is |
+|---|---|---|---|---|
+| replay | `vt[0x104]` → `engine + 0x150` | `vt[0x120]` | `vt[0xa4]` / `FUN_004280b0` | a named script played on its own; the block takes `_GetNextChapter@8` instead and never reaches the mark |
+| rewind | `engine + 0x560` | `engine + 0x5b8` | `vt[0x124]` / `FUN_0042bfd0` | a rewind or a route-map jump; the block goes to `_GetBackScriptFile@12` or `searchRoot`, again past the mark |
+
+`vt[0x124]` also clears the moving flag beside it (`engine + 0x210`), which is
+what makes the block run on the next frame at all.
+
+Note that `engine + 0x560` looks unwritten if you scan for it at the
+executable's own offsets: the one write is `mov byte ptr [eax + 0x534], 1`,
+through the host subobject at `engine + 0x2c`.
+
+### Shiny Days credits the uniform twin beside it
+
+`SHINYDAYS.exe` calls the setter **twice**, at `0x0041c642` and `0x0041cf87`,
+when `engine + 0x7fc` is set and the string at `engine + 0x1d8` is non-empty.
+That second string is the uniform-block swap's other half. `FUN_0041b830` fills
+it: under the global flag `NewRadish`, where `_CheckUniformBlock@4` matches the
+scene, it puts the **original** name at `engine + 0x1d8` and hands the `Z`
+spelling to host `+0x144`, so the engine plays one name and remembers the
+other. Both are then marked, which is the same pairing `_GetReadScriptCount@4`
+counts by — it checks a scene's `Z` twin through `FUN_10014220(name, 3, 1,
+L"Z")` and credits the base name when the twin has been read.
+
+The shipped data agrees. A Shiny store carries both `01/01-00-A01` and
+`01/Z1-00-A01`, with the `Z` at character 3 — exactly where
+`FUN_0041a090(name, 3, 1, L"Z", 1)` puts it. School Days HQ has no second call
+and its route module exports no `_CheckUniformBlock@4`.
+
+### When the file is written
+
+Never on a mark. The store is held in memory and flushed at three boundaries
+and no others, all of them through `FUN_0042b5f0`:
+
+```text
+FUN_0042aea0    host vt[0xa0], saving a slot
+FUN_004236f0    the film run ending, off the run thread in FUN_00427780
+FUN_00422e10    the engine tearing down
+```
+
+DaysEngine writes at the first two: `Progress::save_to` and, when playback is
+left, `Progress::flush_flags`.
+
+**One thing here is not recovered.** Both players' stores carry a single entry
+whose name is the **empty string**, set true. The shipped call is
+unconditional — neither `0x0041c633` nor `0x0041cf5e` looks at the string
+first — so the original writes it whenever the name is empty at an end of
+script. What leaves it empty there has not been followed: two branches of
+`FUN_00424020` blank `engine + 0x188`, and both raise the moving and stop flags
+beside it, which should stop the block running again. This engine does not
+write the blank entry.
+
 ### What the title screen reads
 
 The DLL decides nothing itself: it asks the host three questions through a
