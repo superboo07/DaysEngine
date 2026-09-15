@@ -2642,14 +2642,23 @@ slots a script is spelled with `Z` **exactly** when the table matches its
 un-swapped name, 376 of the recorded choices are filed under `Z` names, and the
 slot whose script is `02/Z2-22-B04` is the one the player captioned `nude`.
 
-The 288 names line up 1:1 with the 288 `Z` scripts in the pack, with two
-exceptions on either side:
+The 288 names line up 1:1 with the 288 `Z` scripts in the pack, with one
+exception on either side. **Neither costs the player anything**, and the second
+is the reason to check before calling a gap a slip:
 
 ```text
 04-00-F00      in the table; no 04/04-00-F00 and no 04/Z4-00-F00 ships, and
-               the name is in no route table either
-04/Z4-I0-D07   ships, with its EventZ4 art; 04-I0-D07 is not in the table, so
-               nothing can select it. 04/04-I0-D07 is ROUTE 68 SCENE 21
+               the name is in no route table either. A name that never occurs
+               can never be the wcsstr hit, so the entry is inert
+04/Z4-I0-D07   ships, and so does its EventZ4 still, but 04-I0-D07 is not in
+               the table. MovieZ4/Z4-I0/Z4-I0-D07/Z4-I0-D07-003.wmv does not
+               ship -- it is the only Z asset any script references and no
+               pack holds -- and that clip is the last six seconds of the
+               scene. So the name's absence is what keeps the swap from
+               choosing a recording that would play its ending with no
+               picture; 04/04-I0-D07 (ROUTE 68 SCENE 21) plays instead, the
+               way D03 to D06 either side of it do, none of which has a Z
+               recording at all
 ```
 
 #### `NewRadish` is the dress the player picked
