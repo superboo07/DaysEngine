@@ -57,7 +57,7 @@
 
     {
       "label": "dist: windows",
-      "detail": "Cross-compile daysengine.exe and days.exe and package them. Builds the vendored SDL3 and ffmpeg first if needed.",
+      "detail": "Cross-compile daysengine.exe and package it with its DLLs. Builds the vendored SDL3 and ffmpeg first if needed.",
       "type": "shell",
       "command": "./tools/build-sdl.sh windows && ./tools/build-ffmpeg.sh windows && ./tools/dist.sh windows",
       "group": "build",
@@ -90,41 +90,49 @@
     },
 
     {
-      "// The `days` inspection tools": "These are the verification path. They run headless against a real install and print what they found; the game itself is not a test harness.",
-      "label": "days: menu",
-      "detail": "Compose a menu screen headlessly and report the widgets it chose.",
+      "// The inspection subcommands": "These are the verification path. They run headless against a real install and print what they found; the game itself is not a test harness. The same binary with no subcommand opens a window instead.",
+      "label": "inspect: menu",
+      "detail": "Drive the menu state machine headlessly and report where each event lands.",
       "type": "shell",
-      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" menu ${input:menuMode}",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" menu --events \"${input:menuEvents}\"",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "days: ui",
+      "label": "inspect: menu --check-all",
+      "detail": "Open every screen of the install and report which ones this engine can draw.",
       "type": "shell",
-      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" ui",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" menu --check-all",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "days: save",
+      "label": "inspect: ui",
       "type": "shell",
-      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" save",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" ui",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "days: scripts",
+      "label": "inspect: save",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" save",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "inspect: scripts",
       "detail": "Parse every .ORS and report anything the parser cannot handle.",
       "type": "shell",
-      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" scripts --stats",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" scripts --stats",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "days: assets",
+      "label": "inspect: assets",
       "detail": "Check that every asset path referenced by every script resolves.",
       "type": "shell",
-      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" assets",
+      "command": "cargo run --locked --release --bin daysengine -- --game \"${input:gameDir}\" assets",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     }
@@ -138,20 +146,11 @@
       "default": "${env:DAYS_GAME_DIR}"
     },
     {
-      "id": "menuMode",
-      "// The game's own integers": "Menu modes stay the original's numbers because they cross the engine/menu boundary that way. See ui::menu::Mode.",
-      "type": "pickString",
-      "description": "Menu mode",
-      "options": [
-        { "label": "2 - title", "value": "2" },
-        { "label": "3 - save/load", "value": "3" },
-        { "label": "4 - option", "value": "4" },
-        { "label": "5 - replay", "value": "5" },
-        { "label": "6 - route map", "value": "6" },
-        { "label": "7 - SOMCON", "value": "7" },
-        { "label": "9 - dress select", "value": "9" }
-      ],
-      "default": "2"
+      "id": "menuEvents",
+      "// How a screen is reached": "`menu` starts at the title and is driven by events, because that is how a player reaches a screen. There is no mode argument: the state machine decides, which is the thing being verified.",
+      "type": "promptString",
+      "description": "Menu events, comma separated (down, up, enter, esc, click:X:Y, ...). Empty for the title as it opens.",
+      "default": ""
     }
   ]
 }

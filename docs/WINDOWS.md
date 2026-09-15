@@ -6,8 +6,7 @@ in this project's loop and no CI to borrow one from, so the target is
 would need `link.exe` and a Windows SDK, neither of which exists here.
 
 The result is `daysengine.exe` and the DLLs it needs, in
-`target/dist/daysengine-windows-x86_64/`. `just windows-release` builds `days.exe`
-as well; only `dist-windows` narrows it to the one binary a player wants.
+`target/dist/daysengine-windows-x86_64/`.
 
 ## What you need on the build machine
 
@@ -50,8 +49,8 @@ LGPL workable; see below.
 
 ```bash
 just windows-deps      # SDL3 + ffmpeg for MinGW-w64. Slow; once per checkout.
-just windows-release   # daysengine.exe and days.exe, unpackaged
-just dist-windows      # daysengine.exe alone, packaged with its DLLs and licences
+just windows-release   # daysengine.exe, unpackaged
+just dist-windows      # the above, packaged with its DLLs and licences
 ```
 
 `windows-release` sets `PKG_CONFIG_LIBDIR` to **only** the two vendored
@@ -72,10 +71,10 @@ SDL-SOURCE.txt     SDL-LICENSE.txt
 LICENSE
 ```
 
-**One binary.** `days` is not in an archive: it verifies a recovery against a
-real install, which is what this project's contributors do and what a player
-never does. Build it when you want it, with
-`cargo build --locked --release --bin days`.
+**One binary, and there is only one to ship.** The inspection tools are
+subcommands of `daysengine` rather than a second program: `daysengine menu`,
+`daysengine save --roundtrip`, `daysengine assets`. Running it with no
+subcommand plays the game.
 
 The player drops these into their own install beside `SCHOOLDAYS HQ.exe`. As
 everywhere else in this project, **no game data is bundled**: the archive key

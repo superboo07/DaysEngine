@@ -56,7 +56,7 @@
 //! The out buffer then becomes a C string. So the file has to fit in 1024
 //! bytes, the inflated text has to fit with room for its terminator, the stream
 //! has to finish in that single pass, and a NUL anywhere ends the text.
-//! `days config --roundtrip` checks a file this engine writes against all of
+//! `daysengine config --roundtrip` checks a file this engine writes against all of
 //! it.
 //!
 //! # Keys, defaults and ranges

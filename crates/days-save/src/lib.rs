@@ -293,7 +293,7 @@ impl FlagStore {
     /// Byte for byte: the varint writer picks the shortest of its five lengths
     /// and the entries come out in the `std::map`'s sorted order, so a store
     /// read from a file and written back reproduces the file exactly. That is
-    /// checked against the player's own saves by `days save --roundtrip`.
+    /// checked against the player's own saves by `daysengine save --roundtrip`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::default();
         self.write_into(&mut w);

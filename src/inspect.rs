@@ -1,9 +1,17 @@
-//! `days` — offline inspection tools for a School Days HQ install.
+//! The inspection tools — `daysengine <subcommand>`, when the engine is asked
+//! to report on an install rather than play it.
 //!
 //! Nothing here is needed to play; it exists so the archive and script formats
-//! can be checked against real data rather than against our assumptions.
-
-#![forbid(unsafe_code)]
+//! can be checked against real data rather than against our assumptions. It is
+//! **the verification path**: a screen composed here can be diffed, and a claim
+//! about a recovered format can be checked against the player's own files,
+//! neither of which a window on a desktop allows.
+//!
+//! These were a second binary, `days`, until they were not. One program does
+//! one job; two programs built from one library, differing only in which half
+//! of it they call, is an extra artifact to ship and a second place for an
+//! argument to be spelled differently. [`run`] is the whole entry point, and
+//! `main` hands over to it when the first argument names a subcommand.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,14 +21,21 @@ use daysengine::ui::ending;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "days", about = "Inspect a School Days HQ installation")]
-struct Cli {
+#[command(
+    name = "daysengine",
+    about = "Inspect a School Days HQ or Shiny Days installation"
+)]
+pub struct Cli {
     /// Game directory: the one holding `Packs`, the game executable and the
     /// menu and route modules.
     ///
     /// Defaults to wherever this binary lives, so dropping it into the game
     /// folder and running it works with no arguments.
-    #[arg(long, short = 'g', env = "DAYS_GAME_DIR")]
+    ///
+    /// Global, so it reads the same either side of the subcommand:
+    /// `daysengine --game DIR key` and `daysengine key --game DIR` are one
+    /// command.
+    #[arg(long, short = 'g', env = "DAYS_GAME_DIR", global = true)]
     game: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -28,7 +43,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+pub enum Cmd {
     /// Print the archive key recovered from the game executable.
     Key,
     /// List entries in one pack, or across all packs with no argument.
@@ -141,7 +156,7 @@ enum Cmd {
     ///
     /// These are the engine's choices, not the game's: which filter scales a
     /// movie frame, which scales the UI art. The game's own settings are
-    /// `days config`.
+    /// `daysengine config`.
     Settings {
         /// Print a commented file of the defaults, to redirect into place.
         #[arg(long)]
@@ -238,7 +253,7 @@ enum Cmd {
 }
 
 #[derive(clap::Args)]
-struct BarArgs {
+pub struct BarArgs {
     /// Resolution: standard, wide, note or full.
     #[arg(long, short = 'r', default_value = "wide")]
     resolution: String,
@@ -312,7 +327,7 @@ struct BarArgs {
 }
 
 #[derive(clap::Args)]
-struct SelectArgs {
+pub struct SelectArgs {
     /// First choice label.
     label: String,
     /// Second choice label. Omit, or pass `null`, for a one-choice box.
@@ -330,7 +345,7 @@ struct SelectArgs {
 }
 
 #[derive(clap::Args)]
-struct RenderArgs {
+pub struct RenderArgs {
     /// Script name, e.g. "00-00-A00".
     name: String,
     /// Timecodes to render, as MM:SS:FF. Repeatable.
@@ -360,7 +375,7 @@ struct RenderArgs {
 }
 
 #[derive(clap::Args)]
-struct UiArgs {
+pub struct UiArgs {
     /// Screen path stem as the DLL spells it, e.g. "System/Title/Title".
     screen: String,
     /// Resolution: standard, wide, note or full.
@@ -398,8 +413,8 @@ struct UiArgs {
 }
 
 #[derive(clap::Args)]
-struct BacklogArgs {
-    /// Script whose `[PrintText]` lines fill the log, as `days script` names
+pub struct BacklogArgs {
+    /// Script whose `[PrintText]` lines fill the log, as `daysengine script` names
     /// it, e.g. "05-SH-A00".
     script: String,
     /// Resolution: standard, wide, note or full.
@@ -421,7 +436,7 @@ struct BacklogArgs {
 }
 
 #[derive(clap::Args)]
-struct MenuArgs {
+pub struct MenuArgs {
     /// Composite and hit-test at this window size, e.g. "1920x1080", the way
     /// the player's window does rather than at the hit map's own size.
     #[arg(long, value_name = "WxH")]
@@ -501,8 +516,12 @@ struct MenuArgs {
     som_port: Option<usize>,
 }
 
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+/// Runs whichever inspection subcommand the command line names.
+///
+/// Parses the whole command line itself rather than taking an already-parsed
+/// `Cli`, so that clap owns every error message and `--help` a subcommand can
+/// produce. `main` decides only *whether* to come here.
+pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // The engine's own settings are the one thing here that is not about the
@@ -2134,7 +2153,7 @@ fn pack_name(p: &Path) -> String {
 /// The overlays are `System.GPK.000` .. `System.GPK.009`, so they are not
 /// `.GPK` files by extension and have to be recognised by shape. They are pack
 /// files all the same, which is why `verify` reads them and `extract` can name
-/// one — `days extract System.000`.
+/// one — `daysengine extract System.000`.
 fn packs(dir: &Path) -> Result<Vec<PathBuf>> {
     let packs_dir = dir.join("Packs");
     let mut out = Vec::new();

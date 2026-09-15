@@ -4,7 +4,7 @@
   "configurations": [
     {
       "name": "daysengine (the game)",
-      "// Opens a window": "This is the one thing the headless tools cannot verify, and the one thing that takes over the desktop. Prefer a `days` configuration below unless you are debugging the window, the GPU path or input.",
+      "// Opens a window": "One binary does both: with no subcommand it plays, and takes over the desktop. Prefer an inspection configuration below unless you are debugging the window, the GPU path or input.",
       "type": "lldb",
       "request": "launch",
       "cargo": {
@@ -28,31 +28,32 @@
       "env": { "RUST_LOG": "info" }
     },
     {
-      "name": "days (inspection tools)",
+      "name": "daysengine (inspection subcommands)",
       "// The verification path": "Headless: composites a screen, parses a script, reads the save, and prints what it found. Everything here can be checked from a test or a diff.",
       "type": "lldb",
       "request": "launch",
       "cargo": {
-        "args": ["build", "--locked", "--bin=days"],
-        "filter": { "name": "days", "kind": "bin" }
+        "args": ["build", "--locked", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
       },
       "args": ["--game", "${input:gameDir}", "${input:daysCmd}"],
       "cwd": "${workspaceFolder}",
       "env": { "RUST_LOG": "debug" }
     },
     {
-      "name": "days menu (one screen)",
+      "name": "daysengine menu (compose one screen)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
-        "args": ["build", "--locked", "--bin=days"],
-        "filter": { "name": "days", "kind": "bin" }
+        "args": ["build", "--locked", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
       },
       "args": [
         "--game",
         "${input:gameDir}",
         "menu",
-        "${input:menuMode}",
+        "--events",
+        "${input:menuEvents}",
         "--out",
         "${workspaceFolder}/target/menu.png"
       ],
@@ -87,19 +88,11 @@
       "default": "ui"
     },
     {
-      "id": "menuMode",
-      "type": "pickString",
-      "description": "Menu mode",
-      "options": [
-        { "label": "2 - title", "value": "2" },
-        { "label": "3 - save/load", "value": "3" },
-        { "label": "4 - option", "value": "4" },
-        { "label": "5 - replay", "value": "5" },
-        { "label": "6 - route map", "value": "6" },
-        { "label": "7 - SOMCON", "value": "7" },
-        { "label": "9 - dress select", "value": "9" }
-      ],
-      "default": "2"
+      "id": "menuEvents",
+      "// How a screen is reached": "`menu` starts at the title and is driven by events, because that is how a player reaches a screen. There is no mode argument: the state machine decides, which is the thing being verified.",
+      "type": "promptString",
+      "description": "Menu events, comma separated (down, up, enter, esc, click:X:Y, ...). Empty for the title as it opens.",
+      "default": ""
     }
   ]
 }

@@ -116,7 +116,7 @@ build machine can end up in a shipped binary. Every archive carries
 and an archive must not be published without it.
 
 These submodules are **not** in the developer path. `cargo build`, the tests and
-the `days` inspection commands never touch them, and the pins bump the same way
+the `daysengine` inspection subcommands never touch them, and the pins bump the same way
 a dependency does: deliberately, with the diff reviewed.
 
 `docs/WINDOWS.md` has the cross-build, the toolchain it needs, and the component

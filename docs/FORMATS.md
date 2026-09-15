@@ -443,7 +443,7 @@ the player's own sheets exactly: the Def page's ten fill `Option_Def_Chip.png`
 to its right edge at 516 and fill the top 120 of its 240 rows, the other 120
 being the second run; the SomCon page's fourteen fill `Option_SomCon_Chip.png`
 to 590 of 590 across and, with the second run, 146 of 146 down. An index out by
-one anywhere would run a sprite off the sheet. `days ui <stem> --pages` is the
+one anywhere would run a sprite off the sheet. `daysengine ui <stem> --pages` is the
 check.
 
 This is also what records 4, 5 and 6 of the Sound table are for. They are the
@@ -648,7 +648,7 @@ return values of `FUN_00412330`, `FUN_00412c10`, `FUN_00412f60`, `FUN_004129d0`
 and `FUN_00413250`; a decompile of each, plus a scan of that region for the
 literal 9, found no producer. The blind spot is that a data-driven raise — a
 script opcode or a table — would not spell 9 in code. Until it is recovered the
-screen is reachable only through `days menu --mode 9`, which is an inspection
+screen is reachable only through `daysengine menu --mode 9`, which is an inspection
 entry and not a claim about the original.
 
 **`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
@@ -874,7 +874,7 @@ two. That is `page - 2` held inside `0 ..= 4`, so the page showing sits third of
 the six wherever there is room either side and the strip stops at the last page
 rather than running past it. All ten buttons work, and each has its own lit
 sprite at an even 54-pixel pitch down the chip sheet;
-`days ui System/Replay/ReplayBase --pages` prints the window each page opens.
+`daysengine ui System/Replay/ReplayBase --pages` prints the window each page opens.
 
 The panels are one scrolling strip per view rather than a stack of
 backgrounds. `FUN_10025770` gives the grid's three one texture each and puts
@@ -972,7 +972,7 @@ shapes are two flanking arrows plus a header strip plus a three-by-four grid of
 one cell size, and two ten-row columns at one pitch sharing ten baselines plus a
 strip of buttons. Each matches exactly one place in `SysMenuSD.dll` and nothing
 at all in `SysMenuSDHQ.dll`; checked both with a plain scan over the raw file and
-through the shipped locator. `days ui System/Replay/ReplayBase --pages` is the
+through the shipped locator. `daysengine ui System/Replay/ReplayBase --pages` is the
 check.
 
 #### The list's text
@@ -3071,7 +3071,7 @@ faster playback is. The bar fades in over 300ms and out over 1000ms
 `pause` while playing — and `FUN_10024100` and `FUN_100258f0` pick the same pair
 independently.
 
-See `daysengine::ui::bar`, and `days bar` to print the whole table against a
+See `daysengine::ui::bar`, and `daysengine bar` to print the whole table against a
 real install.
 
 ### `System/Select` — the choice box
@@ -3176,7 +3176,7 @@ in the stacked English case. `daysengine::ui::select` records that formula but
 does not use it yet: it centres each label in the box the shipped `.CMAP` gives,
 which is exact data and agrees with the hit testing.
 
-See `daysengine::ui::select`, and `days select` to print the map and metrics a
+See `daysengine::ui::select`, and `daysengine select` to print the map and metrics a
 resolution really gets.
 
 ---
@@ -3455,8 +3455,8 @@ them.
 `daysengine::ui::backlog` carries all of this and `daysengine::ui::menu` opens
 it: `Showing::BackLog` is the screen key for the one screen with no mode
 integer, because `Menu` is otherwise keyed on `SystemInit`'s own numbers and
-`setSystemInit`'s 3 is already mode 3 there. `days backlog <script>` draws the
-screen over one script's lines and `days menu --from-bar 3` drives it.
+`setSystemInit`'s 3 is already mode 3 there. `daysengine backlog <script>` draws the
+screen over one script's lines and `daysengine menu --from-bar 3` drives it.
 
 ---
 
@@ -3620,7 +3620,7 @@ lookalike: `FUN_004a2370` is the one function in the image that references
 lengths"` and `"unknown compression method"`, and `FUN_004a2350` is a one-line
 `inflateInit2_(strm, 15, version, size)`. So the file must fit in 1024 bytes, the inflated text must
 fit with room for its terminator, the stream must finish in that single pass,
-and a NUL anywhere in the text ends it. `days config --roundtrip` checks a file
+and a NUL anywhere in the text ends it. `daysengine config --roundtrip` checks a file
 this engine writes against all of that.
 
 The ten settings the Option screen loads, with the defaults it passes the
@@ -3927,7 +3927,7 @@ FUN_10005a50(host, buf, len, flag):
 
 `days-route` reaches the same function from the other side without reading it:
 `Helper::Stop` is classified by the `ROUTE <- imm` argument alone, and
-`Next::Stop` is what `days route --edges` reports as a route with nothing after
+`Next::Stop` is what `daysengine route --edges` reports as a route with nothing after
 it. Some arms call the emitter and still `return 1`, so a **successful**
 `_GetNextScriptFile@12` can hand back an empty name.
 
@@ -4086,7 +4086,7 @@ The keys are 1-based but are pushed into a vector in order, so **slot `n` holds
 
 The per-ending flags are named for the INI key syntax, punctuation and all —
 `[End00]="` through `[End21]="`, 0-based, one per ending. `FUN_00420040` counts
-how many are set and compares against `[EndingMax]`; `days save --grep "[End"`
+how many are set and compares against `[EndingMax]`; `daysengine save --grep "[End"`
 lists them. So `EndNo` is an **index**, not a tally: `EndNo = 20` means the most
 recent ending was slot 20, i.e. `[Ending21]`.
 
@@ -4104,7 +4104,7 @@ Branch 3 is the one that writes, and this engine does not write save data yet,
 so it recomputes the answer on every launch instead. The picture is the same
 either way; the player's file is left alone.
 
-`days save` reports the whole chain, and `days menu` reports the backdrop
+`daysengine save` reports the whole chain, and `daysengine menu` reports the backdrop
 alongside the widget table, which is how the two halves of "which title" get
 checked together.
 
@@ -4207,7 +4207,7 @@ Every one of the player's 22 save files — the 63KB global store with its 2,174
 flags and all 21 slots — **reads and writes back byte for byte identical**, and
 each slot also survives a pass through the engine's own model of it unchanged.
 That is the standard the writer is held to: a save DaysEngine writes is a save
-the original game reads. `days save --roundtrip` is that check.
+the original game reads. `daysengine save --roundtrip` is that check.
 
 ---
 

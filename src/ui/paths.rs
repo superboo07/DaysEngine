@@ -336,7 +336,7 @@ mod tests {
     }
 
     /// The two spellings recovered so far, each resolving to the stems their
-    /// own install ships. `days menu --check-all` checks these against the real
+    /// own install ships. `daysengine menu --check-all` checks these against the real
     /// packs; this pins that neither spelling's substitution drifts.
     #[test]
     fn each_spelling_resolves_to_the_stems_its_own_install_ships() {

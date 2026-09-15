@@ -80,8 +80,8 @@ pub fn civil_from_unix(secs: i64) -> Civil {
 /// field is used: the civil fields are recomputed by [`civil_from_unix`], whose
 /// weekday counts from Sunday the way `SYSTEMTIME.wDayOfWeek` does.
 ///
-/// It needs no initialised subsystem, so the headless `days` tools get the same
-/// answer the game does.
+/// It needs no initialised subsystem, so the headless inspection subcommands
+/// get the same answer the game does.
 ///
 /// Zero when SDL declines to convert, which is honest rather than silent: a
 /// timestamp an hour out is better than no save line, and the log says why.

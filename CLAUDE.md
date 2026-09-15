@@ -160,17 +160,20 @@ they stay. What gets deleted is the claim that is false.
 
 ### Verify against the real install before claiming it works
 
-The headless tools exist for this: `days menu`, `days ui`, `days save`,
-`days render`. Run them against the user's install and look at the output.
+The headless tools exist for this: `daysengine menu`, `daysengine ui`,
+`daysengine save`, `daysengine render`. Run them against the user's install and
+look at the output.
 "The tests pass" is not the same as "the screen is right" — the widget tables
 were correct while the screen it chose was wrong, and only a screenshot of the
 real game caught it.
 
-**Verify with the headless tools, never by launching the game.** Do not run
-`daysengine` unless the user asks for it in so many words. It opens a window on
-their desktop and takes over their machine, and playing the game is the part
-they want to do themselves. Build it — `cargo build --release` — and tell them
-it is ready; the run is theirs.
+**Verify with the headless tools, never by launching the game.** One binary now
+does both, so the distinction is the argument rather than the name:
+`daysengine <subcommand>` inspects and prints, and is the verification path;
+**`daysengine` with no subcommand opens a window** on the user's desktop and
+takes over their machine. Do not run that form unless the user asks for it in so
+many words — playing the game is the part they want to do themselves. Build it
+— `cargo build --release` — and tell them it is ready; the run is theirs.
 
 ### Record the provenance next to the behaviour
 
@@ -190,8 +193,8 @@ files, and this project ships no game data. Everyone who does RE work here
 builds their own project from their own install.
 
 Nothing in the engine depends on that project existing — it is a research
-tool, not part of the build. `cargo build`, the tests and the `days` inspection
-commands all work without it.
+tool, not part of the build. `cargo build`, the tests and the
+`daysengine` inspection subcommands all work without it.
 
 ### Creating one
 
@@ -267,8 +270,9 @@ src/install/      the player's install: vfs, ini, config, save
 src/media/        audio + video decode through system ffmpeg
 src/playback/     stage, mixer, lipsync, text, compose
 src/ui/           menu, screen, options, replay, ending
-src/main.rs       `daysengine` — the game (SDL3)
-src/bin/days.rs   `days` — offline inspection tools
+src/main.rs       `daysengine` — the game (SDL3), and the dispatch that
+                  decides whether this run plays or inspects
+src/inspect.rs    the `daysengine <subcommand>` inspection tools
 
 crates/days-gpk     GPK archives
 crates/days-script  .ORS timelines
@@ -277,9 +281,13 @@ crates/days-save    Save/GlobalFlag.DAT flag store
 crates/days-ui      CMAP hit maps + _CHIP atlas recovery
 ```
 
-**This is one ordinary crate, not a pile of them.** New engine functionality is
-a module in one of those four `src/` groups — find the group it belongs to
-rather than dropping another file at the top level. Only add a crate for a
+**This is one ordinary crate, not a pile of them, and it builds one binary.**
+New engine functionality is a module in one of those four `src/` groups — find
+the group it belongs to rather than dropping another file at the top level. A
+new *command* is a variant of `inspect::Cmd`, not a second binary: two programs
+built from one library that differ only in which half of it they call is an
+extra artifact to ship and a second place for an argument to be spelled
+differently. Only add a crate for a
 standalone reader of a format the game ships, and say why in the commit.
 
 **One engine, not one per title.** A second game is not a second copy of the

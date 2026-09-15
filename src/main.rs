@@ -1,4 +1,5 @@
-//! `daysengine` — plays a School Days HQ script.
+//! `daysengine` — plays a School Days HQ script, and inspects the install it
+//! plays from.
 //!
 //! Drop this next to `SCHOOLDAYS HQ.exe` and run it. It reads the start script
 //! out of the game's own `STARTSCRIPT.INI`, so with no arguments it does what
@@ -6,8 +7,20 @@
 //!
 //! Naming a script on the command line skips the menus and plays it directly,
 //! which is the development path.
+//!
+//! Naming a **subcommand** runs the inspection tools in [`inspect`] instead:
+//! `daysengine menu 2`, `daysengine save --roundtrip`, `daysengine assets`.
+//! Those used to be a separate `days` binary. They are not any more — one
+//! program does one job, and two programs built from one library that differ
+//! only in which half of it they call is an extra artifact to ship and a second
+//! place for an argument to be spelled differently.
+//!
+//! The two are told apart by the first argument and nothing else; see
+//! [`wants_inspection`].
 
 #![forbid(unsafe_code)]
+
+mod inspect;
 
 use anyhow::{bail, Context, Result};
 use days_font::Font;
@@ -737,8 +750,64 @@ impl Player<'_> {
     }
 }
 
+/// Whether a command line names an inspection subcommand rather than a script to
+/// play.
+///
+/// The **first positional** argument decides: a bare `daysengine` plays,
+/// `daysengine <script>` plays that script, and `daysengine <subcommand>` does
+/// not play at all.
+///
+/// Finding that positional means stepping over the options that come before it,
+/// and over the values they take -- `daysengine --game DIR key` is an
+/// inspection run, and answering on `--game` alone would open a window instead.
+/// Which options take a value is asked of clap rather than listed here, so an
+/// option added to [`inspect::Cli`] cannot silently break this.
+///
+/// A script name could in principle collide with a subcommand name. None does:
+/// scripts are spelled `00-00-A00`, and no subcommand looks like one.
+fn wants_inspection(args: impl IntoIterator<Item = String>) -> bool {
+    use clap::CommandFactory;
+    let command = inspect::Cli::command();
+    let takes_value = |flag: &str| {
+        command.get_arguments().any(|arg| {
+            arg.get_num_args().is_none_or(|n| n.takes_values())
+                && (arg.get_long().is_some_and(|l| flag == format!("--{l}"))
+                    || arg.get_short().is_some_and(|c| flag == format!("-{c}")))
+        })
+    };
+
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        // Everything after a bare `--` is positional, so the next one decides.
+        if arg == "--" {
+            return args.next().is_some_and(|a| is_subcommand(&command, &a));
+        }
+        if arg.starts_with('-') {
+            // `--opt=value` carries its own value; `--opt value` eats the next.
+            if !arg.contains('=') && takes_value(&arg) {
+                args.next();
+            }
+            continue;
+        }
+        return is_subcommand(&command, &arg);
+    }
+    false
+}
+
+fn is_subcommand(command: &clap::Command, name: &str) -> bool {
+    command
+        .get_subcommands()
+        .any(|sub| sub.get_name() == name || sub.get_all_aliases().any(|a| a == name))
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Before anything is mounted or any window is opened: this may not be a run
+    // of the game at all.
+    if wants_inspection(std::env::args().skip(1)) {
+        return inspect::run();
+    }
 
     let mut args = std::env::args().skip(1);
     let mut game: Option<PathBuf> = None;
@@ -748,6 +817,7 @@ fn main() -> Result<()> {
             "--game" | "-g" => game = args.next().map(PathBuf::from),
             "--help" | "-h" => {
                 println!("daysengine [--game <dir>] [<script name>]");
+                println!("daysengine <subcommand> [...]      inspect an install; try --help");
                 println!();
                 println!("With no script name, starts where STARTSCRIPT.INI says — the");
                 println!("title screen, unless it names another start mode.");
@@ -758,6 +828,21 @@ fn main() -> Result<()> {
                 println!("confirm, B to back out, Up for the control bar, right stick for the");
                 println!("pointer. During playback A pauses, unless the bar has the selection");
                 println!("or a choice is up. Every binding is in DaysEngine.ini under [Input].");
+                // Listed from clap rather than written out, so a subcommand
+                // added to inspect::Cmd appears here without anything changing.
+                println!();
+                println!("Subcommands, which inspect an install instead of playing it:");
+                {
+                    use clap::CommandFactory;
+                    let command = inspect::Cli::command();
+                    let mut names: Vec<_> =
+                        command.get_subcommands().map(|s| s.get_name()).collect();
+                    names.sort_unstable();
+                    for row in names.chunks(6) {
+                        println!("  {}", row.join("  "));
+                    }
+                }
+                println!("`daysengine <subcommand> --help` says what each one takes.");
                 return Ok(());
             }
             other if other.starts_with('-') => bail!("unknown option {other}"),
@@ -3963,5 +4048,39 @@ mod tests {
             },
         );
         assert!(config.dirty());
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::wants_inspection;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// The case that decides whether a window opens. `--game` takes a value, so
+    /// a scan that answered on the first argument alone would see `--game`,
+    /// find no subcommand and start the game against the player's install.
+    #[test]
+    fn an_option_before_the_subcommand_does_not_hide_it() {
+        assert!(wants_inspection(args("--game /some/dir key")));
+        assert!(wants_inspection(args("-g /some/dir menu 2")));
+        assert!(wants_inspection(args("--game=/some/dir key")));
+    }
+
+    #[test]
+    fn a_script_name_plays_and_a_subcommand_does_not() {
+        assert!(!wants_inspection(args("00-00-A00")));
+        assert!(!wants_inspection(args("--game /some/dir 00-00-A00")));
+        assert!(!wants_inspection(args("")));
+        assert!(wants_inspection(args("assets")));
+    }
+
+    /// A directory that happens to be named like a subcommand is a value, not a
+    /// subcommand, because the option before it is known to take one.
+    #[test]
+    fn an_option_value_is_never_read_as_a_subcommand() {
+        assert!(!wants_inspection(args("--game menu")));
     }
 }

@@ -39,13 +39,11 @@ env_logger.workspace = true
 # licensing note at the top of tools/build-ffmpeg.sh.
 static-sdl = ["sdl3/static-link"]
 
+# One binary. The inspection tools used to be a second one, `days`; they are
+# subcommands of this now (see the note atop src/inspect.rs).
 [[bin]]
 name = "daysengine"
 path = "src/main.rs"
-
-[[bin]]
-name = "days"
-path = "src/bin/days.rs"
 
 [workspace]
 resolver = "2"

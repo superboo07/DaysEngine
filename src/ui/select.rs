@@ -221,7 +221,7 @@ pub const ANCHOR_TWO_STACKED: [f64; 2] = [-418.7, -118.0];
 
 /// The choice box's hit map at one resolution.
 pub struct Select {
-    /// Path of the map actually loaded, for logging and for `days select`.
+    /// Path of the map actually loaded, for logging and for `daysengine select`.
     pub path: String,
     pub layout: Layout,
     pub choices: usize,

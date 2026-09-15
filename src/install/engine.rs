@@ -453,7 +453,7 @@ impl Settings {
 /// including the header.
 ///
 /// The blocks are read back out of the generated template rather than kept
-/// beside it, so the two cannot drift: whatever `days settings --template`
+/// beside it, so the two cannot drift: whatever `daysengine settings --template`
 /// prints is exactly what a file missing a section is given.
 fn template_blocks() -> Vec<(String, Vec<String>)> {
     let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
@@ -584,7 +584,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 /// A commented file of the defaults, for a player who wants somewhere to start.
-/// Never used by the game itself — this is what `days settings` prints.
+/// Never used by the game itself — this is what `daysengine settings` prints.
 pub fn template() -> String {
     format!(
         "; {FILE} — DaysEngine's own settings. Not the game's: nothing in here\n\

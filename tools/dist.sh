@@ -9,10 +9,9 @@
 # beside the game executable and runs it. So it is FLAT -- no subdirectories on
 # either platform -- and it contains as few files as the licences allow.
 #
-# It ships ONE binary. `days` is the developer-facing inspection tool -- it
-# verifies a recovery against a real install, which is a thing this project's
-# contributors do and a player never does -- so it is not in an archive. Anyone
-# who wants it builds it: `cargo build --release --bin days`.
+# There is one binary to ship, because there is only one: the inspection tools
+# are subcommands of daysengine rather than a second program. Running it with no
+# subcommand plays the game, which is what a player unpacking this wants.
 #
 # The archive carries no game data. The archive key still comes from their
 # executable and the widget tables still come from their menu DLL.
