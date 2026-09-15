@@ -2189,13 +2189,13 @@ impl Menu {
     /// screen with no transcribed table falls back to walking its widgets in
     /// order, which is at least reachable.
     ///
-    /// Both Replay views on the module with its own per-view hit maps have
-    /// tables too — `FUN_1001e3a0` for the grid and `FUN_1001e7e0` for the
-    /// list, dispatched on `+0x2b0` by `FUN_1001e200`. The grid's sideways
-    /// guard is off by two in the shipped code and this engine fixes it; see
-    /// [`replay::navigate`], which carries the evidence and what the original
-    /// does. A page module's Replay screen has no transcribed table and still
-    /// falls back.
+    /// Both Replay views have tables too, on both modules. The module with its
+    /// own per-view hit maps writes them as `FUN_1001e3a0` for the grid and
+    /// `FUN_1001e7e0` for the list, dispatched on `+0x2b0` by `FUN_1001e200`;
+    /// its grid's sideways guard is off by two in the shipped code and this
+    /// engine fixes it, which [`replay::navigate`] carries the evidence for.
+    /// The page module's are `FUN_1002abc0` and `FUN_1002b040`, dispatched on
+    /// `+0x618` by `FUN_1002a9a0` — see [`replay_pages::navigate`].
     pub fn navigate(&mut self, vfs: &Vfs, dll: &[u8], dir: Dir) -> Result<Action, Error> {
         let next = match self.mode {
             Mode::OPTION if self.option_page.is_some() => Some(option_pages::navigate(
@@ -2205,9 +2205,14 @@ impl Menu {
                 self.session.save.trial,
                 self.session.som,
             )),
-            // A page module's Replay screen is a different recovery and has no
-            // table here yet, so it keeps the fallback.
-            Mode::REPLAY if self.replay_page.is_none() => {
+            // A page module's Replay screen is a different recovery, with its
+            // own pair of tables.
+            Mode::REPLAY if self.replay_page.is_some() => Some(replay_pages::navigate(
+                self.view,
+                self.selection.unwrap_or(2),
+                dir,
+            )),
+            Mode::REPLAY => {
                 let current = self.selection.unwrap_or(2);
                 Some(match self.view {
                     replay::View::HScene => replay::navigate(current, dir, self.page),
@@ -2246,16 +2251,23 @@ impl Menu {
                 return Ok(Action::Opened(Mode::OPTION));
             }
         }
-        // Both Replay tables turn the page the same way, on the sideways arms
+        // Every Replay table turns the page the same way, on the sideways arms
         // only and only when the button is live.
-        if self.mode == Mode::REPLAY && self.replay_page.is_none() && self.enabled(index) {
-            let opened = match self.view {
-                replay::View::HScene => replay::opens_page(dir, index),
-                replay::View::PlayData => playdata::opens_page(dir, index),
+        if self.mode == Mode::REPLAY && self.enabled(index) {
+            let opened = match (self.replay_page.is_some(), self.view) {
+                (true, view) => replay_pages::opens_page(view, dir, index),
+                (false, replay::View::HScene) => replay::opens_page(dir, index),
+                (false, replay::View::PlayData) => playdata::opens_page(dir, index),
             };
             if let Some(page) = opened.filter(|page| *page != self.page) {
                 self.page = page;
                 self.dirty = true;
+                // A page module draws the page as a layer of its own, so the
+                // art has to be rebuilt for the page turned to; the screen
+                // with its own hit maps redraws from the atlas it already has.
+                if self.replay_page.is_some() {
+                    self.load_replay_page(vfs, dll);
+                }
             }
         }
         if self.selection == Some(index) {

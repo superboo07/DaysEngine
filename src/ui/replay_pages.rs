@@ -208,6 +208,7 @@
 //! of those shifts is read before it is written, where the save/load screen's
 //! pair are.
 
+use crate::ui::options::Dir;
 use crate::ui::replay::View;
 use crate::ui::saveload::{self, Column, Line, Quad, Rows, Slots, Tooltip};
 use days_ui::atlas::{self, Widget};
@@ -745,6 +746,182 @@ pub fn action(view: View, widget: usize, page: usize) -> Act {
     }
 }
 
+/// CLOSE, which both of this module's tables treat as a place of its own.
+const CLOSE: usize = 2;
+
+/// The grid's forward arrow, which sits on the other side of the thumbnails
+/// from [`FIRST_ARROW`].
+const LAST_ARROW: usize = FIRST_ARROW + ARROWS - 1;
+
+/// How many thumbnails the grid is across.
+///
+/// `FUN_1002abc0`'s sideways arms take `c % 4` over the twelve, and the record
+/// table says the same thing on its own: the twelve rectangles sit at three
+/// distinct `y`, four to a row.
+pub const COLUMNS: usize = 4;
+
+/// The header widget of a view — widget 0 for the grid and widget 1 for the
+/// list, which is the switch at the top of [`action`].
+///
+/// The tables reach it as `+0x618`, the member the input pump `FUN_1002a9a0`
+/// dispatches on: zero picks the grid's table and anything else the list's, and
+/// the arms that step off the top of a view store that same member as the
+/// widget to land on. So it is the view and its header widget at once.
+fn header(view: View) -> usize {
+    match view {
+        View::HScene => 0,
+        View::PlayData => 1,
+    }
+}
+
+/// One step of keyboard navigation on a page module's Replay screen.
+///
+/// Transcriptions of `FUN_1002abc0` (grid) and `FUN_1002b040` (list), which the
+/// input pump `FUN_1002a9a0` dispatches on `+0x618`. The cursor is `+0x608` —
+/// the same member the hit test writes — `+0x60c` is the page, and every arm
+/// sets `+0x7c` to claim the cursor back from the pointer. The four direction
+/// members are the base class's `+0x60` up, `+0x64` down, `+0x68` left and
+/// `+0x6c` right, anchored in [`crate::ui::option_pages::navigate`].
+///
+/// Each view is a vertical ring through its own header — the grid's runs
+/// header, the three thumbnail rows, CLOSE; the list's header, the ten rows,
+/// CLOSE — with a sideways ring across the top strip. School Days HQ's two
+/// tables ([`crate::ui::replay::navigate`] and [`crate::ui::playdata::navigate`])
+/// put the page button of the page showing where these put the header, and are
+/// otherwise the same shape.
+///
+/// The grid's sideways guard is `c % 4` (`AND EDX,0x80000003` with the signed
+/// fixup, at `0x1002ad3f` and `0x1002aed9`) over `8 <= c <= 0x13`, blocking
+/// left at `0` and right at `3`. For a grid whose first widget is 8 those are
+/// exactly the row edges, so unlike School Days HQ's — which carries the same
+/// two constants over a grid starting at 7 — this one is right as shipped.
+///
+/// **The list's comment column cannot be reached from the keyboard**, and that
+/// is the shipped design rather than a slip. Neither sideways arm has an arm
+/// for a row at all, and the vertical arms step within the left band only.
+/// School Days HQ's list agrees independently: its own comment column, at
+/// different widget numbers, is equally unreachable. Two separately written
+/// tables leaving the same column out is the column being a pointer
+/// affordance. The tail of `FUN_1002b040` looks at first like evidence against
+/// that — it plays host sound `6` whenever the selection is `0xd ..= 0x16` and
+/// differs from `+0x620` — but `+0x620` is the previous frame's selection,
+/// which `FUN_1002a9a0` stores after the hit test has already written `+0x608`,
+/// so that block is the column's pointer-hover sound and fires for the mouse.
+pub fn navigate(view: View, current: usize, dir: Dir) -> usize {
+    match view {
+        View::HScene => hscene_navigate(current, dir),
+        View::PlayData => playdata_navigate(current, dir),
+    }
+}
+
+/// `FUN_1002abc0`.
+///
+/// The grid is [`COLUMNS`] across and three down, so up and down are a step of
+/// four within `8 ..= 0x13`. Sideways, a row edge steps out onto the arrow on
+/// that side, and the arrows step back onto the first and last thumbnail, so
+/// the grid and both arrows are one horizontal ring. The top strip is a ring of
+/// its own: the two headers, then the three page buttons.
+fn hscene_navigate(c: usize, dir: Dir) -> usize {
+    let grid = FIRST_THUMBNAIL..FIRST_THUMBNAIL + THUMBNAILS;
+    let last = FIRST_THUMBNAIL + THUMBNAILS - 1;
+    let pages = FIRST_HSCENE_PAGE..FIRST_HSCENE_PAGE + HSCENE_PAGES;
+    let column = c.saturating_sub(FIRST_THUMBNAIL) % COLUMNS;
+    match dir {
+        Dir::Up => match c {
+            CLOSE => last,
+            _ if grid.contains(&c) && c < FIRST_THUMBNAIL + COLUMNS => header(View::HScene),
+            _ if grid.contains(&c) => c - COLUMNS,
+            _ => CLOSE,
+        },
+        Dir::Down => match c {
+            CLOSE => header(View::HScene),
+            _ if grid.contains(&c) && c + COLUMNS <= last => c + COLUMNS,
+            _ if grid.contains(&c) => CLOSE,
+            _ => FIRST_THUMBNAIL,
+        },
+        Dir::Left => match c {
+            _ if grid.contains(&c) && column == 0 => FIRST_ARROW,
+            _ if grid.contains(&c) => c - 1,
+            0 => pages.end - 1,
+            1 => 0,
+            FIRST_HSCENE_PAGE => 1,
+            _ if pages.contains(&c) => c - 1,
+            LAST_ARROW => last,
+            FIRST_ARROW => LAST_ARROW,
+            _ => c,
+        },
+        Dir::Right => match c {
+            _ if grid.contains(&c) && column + 1 == COLUMNS => LAST_ARROW,
+            _ if grid.contains(&c) => c + 1,
+            0 => 1,
+            1 => FIRST_HSCENE_PAGE,
+            _ if c + 1 == pages.end => 0,
+            _ if pages.contains(&c) => c + 1,
+            LAST_ARROW => FIRST_ARROW,
+            FIRST_ARROW => FIRST_THUMBNAIL,
+            _ => c,
+        },
+    }
+}
+
+/// `FUN_1002b040`.
+///
+/// The left band is the whole vertical ring and the page buttons the whole
+/// sideways one; the comment column is in neither, which is the shipped
+/// behaviour — see [`navigate`].
+fn playdata_navigate(c: usize, dir: Dir) -> usize {
+    let rows = FIRST_ROW..FIRST_ROW + PER_PAGE;
+    let last_row = FIRST_ROW + PER_PAGE - 1;
+    let pages = FIRST_PLAYDATA_PAGE..FIRST_PLAYDATA_PAGE + PLAYDATA_PAGES;
+    match dir {
+        Dir::Up => match c {
+            CLOSE => last_row,
+            FIRST_ROW => header(View::PlayData),
+            _ if rows.contains(&c) => c - 1,
+            _ => CLOSE,
+        },
+        Dir::Down => match c {
+            CLOSE => header(View::PlayData),
+            _ if c == last_row => CLOSE,
+            _ if rows.contains(&c) => c + 1,
+            _ => FIRST_ROW,
+        },
+        Dir::Left => match c {
+            0 => pages.end - 1,
+            1 => 0,
+            FIRST_PLAYDATA_PAGE => 1,
+            _ if pages.contains(&c) => c - 1,
+            _ => c,
+        },
+        Dir::Right => match c {
+            0 => 1,
+            1 => FIRST_PLAYDATA_PAGE,
+            _ if c + 1 == pages.end => 0,
+            _ if pages.contains(&c) => c + 1,
+            _ => c,
+        },
+    }
+}
+
+/// The page a keyboard step opens, if it landed on a page button.
+///
+/// Both tables end their sideways arms with the same guard — the move is taken,
+/// and then `if (live(c) && c - first != +0x60c) turn(c - first)` — so a left or
+/// right step onto a page button turns the page there and then. The vertical
+/// arms never land on one. The list picks between `FUN_1002d060` and
+/// `FUN_1002d260` by whether the page is adjacent, which is the animated scroll
+/// against the jump and not a difference in where it ends up.
+pub fn opens_page(view: View, dir: Dir, next: usize) -> Option<usize> {
+    let (first, count) = match view {
+        View::HScene => (FIRST_HSCENE_PAGE, HSCENE_PAGES),
+        View::PlayData => (FIRST_PLAYDATA_PAGE, PLAYDATA_PAGES),
+    };
+    match dir {
+        Dir::Left | Dir::Right => (first..first + count).contains(&next).then(|| next - first),
+        Dir::Up | Dir::Down => None,
+    }
+}
+
 /// The widget a point lands on among records already read out of the image.
 pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
     records
@@ -1169,6 +1346,118 @@ fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grid's sideways guard is `c % 4` over a grid whose first widget is
+    /// 8, so unlike School Days HQ's it lands on the real row edges — and a row
+    /// edge steps out onto the arrow beside it rather than stopping.
+    #[test]
+    fn the_grid_steps_within_a_row_and_out_onto_the_arrows() {
+        let first = FIRST_THUMBNAIL;
+        let last = FIRST_THUMBNAIL + THUMBNAILS - 1;
+        for row in 0..THUMBNAILS / COLUMNS {
+            let left = first + row * COLUMNS;
+            let right = left + COLUMNS - 1;
+            for c in left..right {
+                assert_eq!(hscene_navigate(c, Dir::Right), c + 1);
+                assert_eq!(hscene_navigate(c + 1, Dir::Left), c);
+            }
+            // No row runs into the next: both ends leave for an arrow.
+            assert_eq!(hscene_navigate(left, Dir::Left), FIRST_ARROW);
+            assert_eq!(hscene_navigate(right, Dir::Right), LAST_ARROW);
+        }
+        // And the arrows close the ring at the grid's own ends.
+        assert_eq!(hscene_navigate(FIRST_ARROW, Dir::Right), first);
+        assert_eq!(hscene_navigate(LAST_ARROW, Dir::Left), last);
+    }
+
+    /// Both views ring vertically through their own header rather than through
+    /// the page button School Days HQ's tables use, so a vertical step never
+    /// turns a page.
+    #[test]
+    fn each_view_rings_vertically_through_its_own_header() {
+        let last_thumbnail = FIRST_THUMBNAIL + THUMBNAILS - 1;
+        assert_eq!(hscene_navigate(FIRST_THUMBNAIL, Dir::Up), 0);
+        assert_eq!(hscene_navigate(last_thumbnail, Dir::Down), CLOSE);
+        assert_eq!(hscene_navigate(CLOSE, Dir::Down), 0);
+        assert_eq!(hscene_navigate(CLOSE, Dir::Up), last_thumbnail);
+
+        let last_row = FIRST_ROW + PER_PAGE - 1;
+        assert_eq!(playdata_navigate(FIRST_ROW, Dir::Up), 1);
+        assert_eq!(playdata_navigate(last_row, Dir::Down), CLOSE);
+        assert_eq!(playdata_navigate(CLOSE, Dir::Down), 1);
+        assert_eq!(playdata_navigate(CLOSE, Dir::Up), last_row);
+
+        for view in [View::HScene, View::PlayData] {
+            for dir in [Dir::Up, Dir::Down] {
+                assert_eq!(opens_page(view, dir, FIRST_HSCENE_PAGE), None);
+                assert_eq!(opens_page(view, dir, FIRST_PLAYDATA_PAGE), None);
+            }
+        }
+    }
+
+    /// The list's comment column is a pointer affordance: no arm of
+    /// `FUN_1002b040` produces one, and a row never moves sideways. School Days
+    /// HQ's list leaves its own column out the same way.
+    #[test]
+    fn the_lists_comment_column_is_not_in_the_keyboard_ring() {
+        let comments = FIRST_COMMENT..FIRST_PLAYDATA_PAGE;
+        for c in 0..=0x20 {
+            for dir in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+                let next = playdata_navigate(c, dir);
+                // Sideways out of the column is the only move that stays in
+                // it, because a row has no sideways arm at all and so holds
+                // where it is; nothing ever steps in.
+                assert!(!comments.contains(&next) || next == c);
+            }
+        }
+        // The column is left by either vertical arm.
+        for c in comments.clone() {
+            assert_eq!(playdata_navigate(c, Dir::Up), CLOSE);
+            assert_eq!(playdata_navigate(c, Dir::Down), FIRST_ROW);
+        }
+        for c in FIRST_ROW..FIRST_PLAYDATA_PAGE {
+            assert_eq!(playdata_navigate(c, Dir::Left), c);
+            assert_eq!(playdata_navigate(c, Dir::Right), c);
+        }
+    }
+
+    /// A sideways step onto a page button turns the page there and then, on
+    /// both views and at both ends of each view's strip.
+    #[test]
+    fn a_sideways_step_onto_a_page_button_turns_the_page() {
+        assert_eq!(hscene_navigate(1, Dir::Right), FIRST_HSCENE_PAGE);
+        assert_eq!(
+            opens_page(View::HScene, Dir::Right, FIRST_HSCENE_PAGE),
+            Some(0)
+        );
+        assert_eq!(
+            hscene_navigate(0, Dir::Left),
+            FIRST_HSCENE_PAGE + HSCENE_PAGES - 1
+        );
+        assert_eq!(
+            opens_page(
+                View::HScene,
+                Dir::Left,
+                FIRST_HSCENE_PAGE + HSCENE_PAGES - 1
+            ),
+            Some(HSCENE_PAGES - 1)
+        );
+        assert_eq!(playdata_navigate(1, Dir::Right), FIRST_PLAYDATA_PAGE);
+        assert_eq!(
+            opens_page(
+                View::PlayData,
+                Dir::Left,
+                FIRST_PLAYDATA_PAGE + PLAYDATA_PAGES - 1
+            ),
+            Some(PLAYDATA_PAGES - 1)
+        );
+        // The grid's three buttons are not ten: a widget past its own run is
+        // not a page of it.
+        assert_eq!(
+            opens_page(View::HScene, Dir::Right, FIRST_HSCENE_PAGE + HSCENE_PAGES),
+            None
+        );
+    }
 
     fn rec(v: [f32; 6]) -> Vec<u8> {
         v.iter().flat_map(|f| f.to_le_bytes()).collect()

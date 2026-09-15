@@ -1056,6 +1056,57 @@ back another 3 and is pushed down by what it did not use, and its pen drops
 zeroed before the branches that set them, where School Days HQ's `FUN_10012900`
 leaves two of its own uninitialised.
 
+### The Shiny Days Replay screen's keyboard tables
+
+`FUN_1002a9a0` is the input pump. It writes the cursor `+0x608` from the hit
+test, and dispatches on `+0x618` to `FUN_1002abc0` for the H-scene grid or
+`FUN_1002b040` for the play-data list. `+0x60c` is the page and each arm sets
+`+0x7c` to claim the cursor back from the pointer. The direction members are
+the base class's `+0x60` up, `+0x64` down, `+0x68` left and `+0x6c` right —
+sixteen above School Days HQ's.
+
+`+0x618` is the view **and** its header widget at once: zero picks the grid's
+table and one the list's, and the arms that step off the top of a view store
+that same member as the widget to land on, which is the view's own header.
+
+| view | headers | CLOSE | body | page buttons |
+| --- | --- | --- | --- | --- |
+| H-scene | 0, 1 | 2 | 8–0x13, twelve thumbnails four across, arrows 3 and 4 either side | 5–7, page is `c - 5` |
+| Play data | 0, 1 | 2 | 3–0xc, ten rows | 0x17–0x20, page is `c - 0x17` |
+
+Each view is a vertical ring through its own header — header, the body in
+order, CLOSE, back to the header — where School Days HQ's two tables ring
+through the page button of the page showing instead. Sideways the top strip is
+a ring of its own (0, 1, then the page buttons), and on the grid the twelve
+thumbnails and the two arrows are a second horizontal ring: a row edge steps out
+onto the arrow beside it, `FIRST_ARROW` steps back onto thumbnail 8 and the
+forward arrow onto thumbnail 0x13. CLOSE has no sideways move in either view.
+
+Both end their **sideways** arms with the same guard, `if (live(c) && page(c) !=
++0x60c) turn(page(c))`, so a left or right step onto a page button turns the
+page there and then; no vertical arm ever lands on one. The list picks between
+`FUN_1002d060` and `FUN_1002d260` by whether the page is adjacent, which is the
+animated scroll against the jump.
+
+The grid's sideways guard is `c % 4` — `AND EDX,0x80000003` with the signed
+fixup, at `0x1002ad3f` and `0x1002aed9` — over `8 <= c <= 0x13`, blocking left
+at `0` and right at `3`. For a grid whose first widget is **8** those are
+exactly the row edges, so unlike School Days HQ's `FUN_1001e3a0`, which carries
+the same two constants over a grid starting at 7, this one is right as shipped.
+The record table says the same geometry independently: the twelve rectangles
+sit at three distinct `y`, four to a row.
+
+**The list's comment column cannot be reached from the keyboard**, and that is
+the shipped design rather than a slip. Neither sideways arm has an arm for a row
+at all, so a row holds where it is, and the vertical arms step within the left
+band only. School Days HQ's list agrees independently — its own comment column,
+at different widget numbers, is equally unreachable — so two separately written
+tables leave the same column to the pointer. The tail of `FUN_1002b040` looks at
+first like evidence against that, since it plays host sound `6` whenever the
+selection is `0xd ..= 0x16` and differs from `+0x620`; but `+0x620` is the
+previous frame's selection, which `FUN_1002a9a0` stores after the hit test has
+already written `+0x608`, so that block is the column's pointer-hover sound.
+
 ---
 
 ## `.GPK` — STKFile0 archive
@@ -1931,7 +1982,9 @@ their **sideways** arms with the same guard, `if (live(c) && page(c) != +0x2a4)
 the page there and then; the vertical arms land on the button of the page
 already showing and never turn one. CLOSE has no sideways move in either, which
 is not a slip — it sits alone above the strip. Neither table steps onto the
-play-data comment column at 0x17, so the pointer is the only way there.
+play-data comment column at 0x17, so the pointer is the only way there; Shiny
+Days' pair leave their own column out the same way, and two separately written
+tables agreeing is what settles it as the design.
 
 **The grid's sideways guard is off by two in the shipped code, and this engine
 corrects it.** `FUN_1001e3a0` takes `c % 4` — `AND EAX,0x80000003` with the
