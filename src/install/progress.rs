@@ -41,6 +41,11 @@ use std::path::Path;
 const ROUTE: &str = "ROUTE";
 const SCENE: &str = "SCENE";
 
+/// The save flag that turns the Radish-uniform recordings on.
+/// `FUN_0041b830` reads it through host slot `+0x10`, which is the save's own
+/// store — see [`Progress::uniform_block`].
+const NEW_RADISH: &str = "NewRadish";
+
 /// The version a retail slot carries, and the one the shipped executable
 /// compares against.
 ///
@@ -130,6 +135,33 @@ pub struct Progress {
     /// Whether the affection gauge should be showing, which the DLL raises
     /// through host slot `+0x30` after a delta that moved `001` or `002`.
     gauge_raised: bool,
+    /// The script now playing, as the engine keeps it at `engine + 0x1a0`.
+    ///
+    /// This is the name **after** the uniform-block swap, which is what the
+    /// rest of the engine reads: the file that is opened, the key the recorded
+    /// choices are filed under, and the name a slot carries. See
+    /// [`Progress::uniform_block`].
+    script: String,
+    /// The scenes that have a second recording, out of `_CheckUniformBlock@4`.
+    /// Empty for a title whose route module does not export it.
+    uniform: Vec<String>,
+    /// The engine's own copy of the `NewRadish` flag, `engine + 0x7fc`.
+    ///
+    /// It is read out of the store with host slot `+0x10` whenever a slot or a
+    /// story point is put back (`FUN_0041eb10`), and written back with
+    /// `+0x14` after anything empties the store — the start of a film run in
+    /// the same function, and the rewind in `FUN_0041c440`. So the flag
+    /// outlives `_ZeroReset@4` where nothing else in the save's store does.
+    ///
+    /// **What first sets it is not recovered.** `engine + 0x7fc` is zeroed by
+    /// the constructor (`FUN_0041d660`) and the only thing that ever raises it
+    /// is the read above, so within the three shipped binaries the flag can
+    /// only come from a slot that already carries it. Checked by scanning
+    /// `.text` for every reference to the literal and for every write to
+    /// `+0x7fc`, and by searching `SysMenuSD.dll` and `RouteProcSD.dll` for
+    /// the name, which neither holds. A name built at run time, or a patch
+    /// this has not read, would not show up either way.
+    new_radish: bool,
 }
 
 impl Progress {
@@ -169,7 +201,48 @@ impl Progress {
             choices: Default::default(),
             version: retail_version(route_dll),
             gauge_raised: false,
+            script: String::new(),
+            uniform: days_route::pe::Image::parse(route_dll)
+                .map(|img| img.uniform_block())
+                .unwrap_or_default(),
+            new_radish: false,
         })
+    }
+
+    /// Swaps a script for its Radish-uniform recording, the way
+    /// `FUN_0041b830` does.
+    ///
+    /// Every name the route module hands over goes through this before
+    /// anything else sees it — `FUN_0041cb60` case 7 after
+    /// `_GetNextScriptFile@12`, `FUN_0041c440` after `_GetBackScriptFile@12`,
+    /// `FUN_0041eb10` after `_LoadInitScript@4`. All three store the name at
+    /// `engine + 0x1a0` and then call `FUN_0041b830` with it. It swaps when
+    /// three things hold:
+    ///
+    /// ```text
+    /// host slot +0x10 says the save's flag NewRadish is set
+    /// the name is not the empty string
+    /// _CheckUniformBlock@4 finds one of its 288 names inside it
+    /// ```
+    ///
+    /// and the swap is one character: `replace(3, 1, L"Z")`, so
+    /// `02/02-22-B04` becomes `02/Z2-22-B04`. The result goes back over
+    /// `engine + 0x1a0` through host slot `+0x144` (`FUN_0041a4f0`, which
+    /// assigns it to the subobject's `+0x174`), and the name it replaced is
+    /// kept at `engine + 0x1d8`.
+    ///
+    /// So the `Z` name is the script that plays, the key the recorded choices
+    /// are filed under, and the name the slot's tag-1 record carries. The
+    /// player's own saves say so from the other side: across all 77 Shiny
+    /// slots a script is spelled with `Z` exactly when
+    /// `_CheckUniformBlock@4`'s table matches it, and 376 of the recorded
+    /// choices are filed under `Z` names.
+    ///
+    /// `School Days HQ` never swaps: its route module exports no
+    /// `_CheckUniformBlock@4`, so the table is empty, and its packs hold no
+    /// `Z` scripts to swap to.
+    fn uniform_block(&self, name: &str) -> String {
+        uniform_block(&self.uniform, self.stores.save.flag(NEW_RADISH), name)
     }
 
     /// Puts the player at a named script, the way `searchRoot` does.
@@ -181,6 +254,7 @@ impl Progress {
         // Both spellings are in use: the tables store `00/00-00-A00` and the
         // rest of the engine passes the trailing name around.
         let full = qualify(script);
+        self.script = full.clone();
         match self.routes.find(&full) {
             Some((route, scene)) => {
                 self.stores.save.set_int(ROUTE, route as i32);
@@ -215,14 +289,10 @@ impl Progress {
     pub fn decide(&mut self, choice: i32, record: bool) {
         self.stores.choice = choice;
         let (route, scene) = self.position();
-        // The engine records the answer against the script it was asked at,
-        // which is what a slot carries and what replaying reads back.
-        if let Some(here) = self
-            .routes
-            .script(route.max(0) as usize, scene.max(0) as usize)
-            .filter(|_| record)
-        {
-            self.choices.insert(here.to_owned(), choice);
+        // The engine records the answer against the script it was asked at --
+        // host `+0x1a4`, so the uniform-block swap's name and not the table's.
+        if record && !self.script.is_empty() {
+            self.choices.insert(self.script.clone(), choice);
         }
         let Ok(scene) = u16::try_from(scene) else {
             return;
@@ -246,11 +316,7 @@ impl Progress {
     /// `+0x1a4`, the script in play. The play-data list is what reads it back:
     /// a choice box that nobody answers resolves to this instead of to -1.
     pub fn recorded_choice(&self) -> Option<i32> {
-        let (route, scene) = self.position();
-        let here = self
-            .routes
-            .script(route.max(0) as usize, scene.max(0) as usize)?;
-        self.choices.get(here).copied()
+        self.choices.get(&self.script).copied()
     }
 
     /// Runs the branch graph and moves to whatever it names.
@@ -263,11 +329,7 @@ impl Progress {
         let (acts, next) = self
             .machine
             .next(usize::try_from(route).ok()?, scene, &self.stores)?;
-        let here = self
-            .routes
-            .script(route.max(0) as usize, scene as usize)
-            .unwrap_or_default()
-            .to_owned();
+        let here = self.script.clone();
         for act in &acts {
             self.apply(act, &here);
         }
@@ -294,6 +356,10 @@ impl Progress {
             }
             Next::Nothing => return None,
         };
+        // Every name the route module produces goes through the swap before
+        // anything else sees it.
+        let played = self.uniform_block(&played);
+        self.script = played.clone();
         self.stores.choice = -1;
         log::info!("{}", {
             let (r, s) = self.position();
@@ -308,14 +374,15 @@ impl Progress {
     /// the choices. The version is the one the slot was loaded with, so a slot
     /// written back still matches what the shipped executable compares it
     /// against and the original game still reads it.
+    ///
+    /// The script is the one in play — `engine + 0x1a0` — and not a lookup of
+    /// `(ROUTE, SCENE)` in the tables. The two differ whenever the
+    /// uniform-block swap has fired: the tables hold `02/02-22-B04` and the
+    /// slot has to carry `02/Z2-22-B04`, which is the file the original
+    /// reopens. See [`Progress::uniform_block`].
     pub fn to_slot(&self) -> Slot {
-        let (route, scene) = self.position();
         Slot {
-            script: self
-                .routes
-                .script(route.max(0) as usize, scene.max(0) as usize)
-                .unwrap_or_default()
-                .to_owned(),
+            script: self.script.clone(),
             version: self.version.clone(),
             store: self.stores.save.clone(),
             marks: self.marks.clone(),
@@ -351,9 +418,17 @@ impl Progress {
         self.choices.clear();
         self.stores.choice = -1;
         self.gauge_raised = false;
+        self.script.clear();
         feeling::zero_reset(&mut self.stores.save, self.deltas.names());
         self.stores.save.set_int(ROUTE, 0);
         self.stores.save.set_int(SCENE, 0);
+        // The one thing a New Game carries over: see `Progress::new_radish`.
+        // Only where the title has the mechanism at all — the write-back is
+        // `SHINYDAYS.exe`'s, and `SCHOOLDAYS HQ.exe` holds the name nowhere,
+        // so an HQ slot written from nothing must not grow it.
+        if !self.uniform.is_empty() {
+            self.stores.save.set_flag(NEW_RADISH, self.new_radish);
+        }
     }
 
     /// Puts a slot back, as loading one does.
@@ -379,17 +454,29 @@ impl Progress {
         self.choices = slot.choices;
         self.stores.choice = -1;
         self.gauge_raised = false;
+        self.script = slot.script.clone();
+        self.new_radish = self.stores.save.flag(NEW_RADISH);
         let (route, scene) = self.position();
-        match self.routes.find(&qualify(&slot.script)) {
-            Some(table) if table == (route as usize, scene as usize) => {
+        // The store is the position; this only says whether the name agrees
+        // with it. A slot written while the uniform-block swap was on carries
+        // the `Z` name, which is in no table, so the table's name is put
+        // through the same swap before the two are compared.
+        let here = self
+            .routes
+            .script(route.max(0) as usize, scene.max(0) as usize)
+            .map(|name| self.uniform_block(name));
+        match here {
+            Some(name) if name == slot.script => {
                 log::info!("{} is ROUTE {route} SCENE {scene}", slot.script);
             }
-            Some((r, s)) => log::warn!(
-                "{} sits at ROUTE {r} SCENE {s} in the tables, but the slot stored                  ROUTE {route} SCENE {scene}; playing on from the slot",
+            Some(name) => log::warn!(
+                "the slot puts the player at ROUTE {route} SCENE {scene}, which is {name}, \
+                 but its script is {}; playing on from the slot",
                 slot.script
             ),
             None => log::warn!(
-                "{} is in no route table; the slot puts the player at ROUTE {route} SCENE {scene}",
+                "the slot puts the player at ROUTE {route} SCENE {scene}, which is in no \
+                 route table; playing on from {}",
                 slot.script
             ),
         }
@@ -419,6 +506,8 @@ impl Progress {
         let mark = self.marks.get(&name)?;
         let script = mark.script.clone();
         self.stores.save = mark.store.clone();
+        self.script = script.clone();
+        self.new_radish = self.stores.save.flag(NEW_RADISH);
         self.marks.split_off(&name);
         self.stores.choice = -1;
         self.gauge_raised = false;
@@ -577,6 +666,19 @@ impl Progress {
     }
 }
 
+/// The swap itself, out of [`Progress::uniform_block`].
+fn uniform_block(table: &[String], on: bool, name: &str) -> String {
+    // `wcsstr`, so a table entry matches anywhere in the name: the table holds
+    // `02-22-B04` and the engine passes `02/02-22-B04`.
+    if !on || name.len() < 4 || !table.iter().any(|scene| name.contains(scene)) {
+        return name.to_owned();
+    }
+    let mut out = name.to_owned();
+    out.replace_range(3..4, "Z");
+    log::info!("{name} has a Radish-uniform recording, so {out} plays instead");
+    out
+}
+
 /// A bare script name as the route tables spell it: `A00` stays, `00-00-A00`
 /// gains its chapter directory.
 fn qualify(name: &str) -> String {
@@ -596,6 +698,23 @@ mod tests {
         assert_eq!(qualify("00-00-A00"), "00/00-00-A00");
         assert_eq!(qualify("00/00-00-A00"), "00/00-00-A00");
         assert_eq!(qualify(""), "");
+    }
+
+    /// The table `_CheckUniformBlock@4` searches holds bare scene names and
+    /// the engine passes qualified ones, so the match has to be the `wcsstr`
+    /// the export does; and the swap is a single character at index 3, which
+    /// is the chapter digit the qualified name repeats.
+    #[test]
+    fn the_uniform_swap_matches_a_bare_name_inside_a_qualified_one() {
+        let table = [String::from("02-22-B04")];
+        assert_eq!(uniform_block(&table, true, "02/02-22-B04"), "02/Z2-22-B04");
+        // The flag is what turns it on; without it the scene plays as shot.
+        assert_eq!(uniform_block(&table, false, "02/02-22-B04"), "02/02-22-B04");
+        // A scene with no second recording is left alone, and so is a name
+        // too short to have an index 3 -- the empty name `FUN_0041b830`
+        // checks for first.
+        assert_eq!(uniform_block(&table, true, "02/02-22-B05"), "02/02-22-B05");
+        assert_eq!(uniform_block(&table, true, ""), "");
     }
 
     /// The counters, the numbered gate flags and the bookmarks are one map,

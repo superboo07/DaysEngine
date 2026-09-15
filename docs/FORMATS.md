@@ -2557,11 +2557,13 @@ restoring the position**, and nothing re-derives it from the script name:
 `FUN_0042a760` takes that name to `FUN_00430d20` and opens the file, and
 touches neither name on the way.
 
-This matters because the two could disagree, and the store is what wins. They
-cannot disagree in a save this game wrote — all 1857 script names across the 55
-route tables are unique, so a name resolves to exactly one scene, and every one
-of a player's slots round-trips through `Progress` byte for byte with the
-position taken from the store.
+This matters because the two could disagree, and the store is what wins. In
+`School Days HQ` they never do: all 1857 script names across the 55 route
+tables are unique, so a name resolves to exactly one scene. In Shiny Days they
+disagree whenever the uniform swap below has fired — the slot carries
+`02/Z2-22-B04` and the tables hold `02/02-22-B04` for the same `(ROUTE,
+SCENE)`. Either way every one of a player's slots round-trips through
+`Progress` byte for byte with the position taken from the store.
 
 `FUN_0045fcd0`, which is how that map goes in, is a **merge** — it walks the
 slot's entries and calls `FUN_004603f0`, find-or-insert, for each — but the
@@ -2570,6 +2572,96 @@ first. Its two opening calls are `FUN_00432850`, which empties the marks and
 the recorded choices at `engine + 0xac`, and host `+0x28` — `FUN_004289b0`,
 which is `FUN_0045f690` on `engine + 0x40`, the store. Nothing of the
 playthrough that was running reaches the loaded one.
+
+### Shiny Days swaps in the Radish-uniform recording
+
+Shiny Days ships 288 scenes twice. `Script/ENGLISH/02/02-22-B04.ENG.ORS` and
+`Script/ENGLISH/02/Z2-22-B04.ENG.ORS` are the same length and the same lines in
+the same voices; what differs is the art, which the second draws from the
+`EventZ2` and `MovieZ2` packs instead of `Event02` and `Movie02`. The name of
+the second is the name of the first with **one character replaced**: index 3,
+the chapter digit the qualified name repeats, becomes `Z`.
+
+Nothing writes those names down. `RouteProcSD.dll` holds no string containing
+one, and neither does `SHINYDAYS.exe`; the swap is made at run time, and the
+route tables only ever name the first recording.
+
+**Every name the route module produces goes through it.** The three producers
+each store what they got at `engine + 0x1a0` and then call `FUN_0041b830` with
+it:
+
+```text
+FUN_0041cb60 case 7   after _GetNextScriptFile@12
+FUN_0041c440          after _GetBackScriptFile@12
+FUN_0041eb10          after _LoadInitScript@4
+```
+
+`FUN_0041b830` swaps when three things hold, in this order:
+
+```text
+host slot +0x10 says the save's flag NewRadish is set
+the name is not the empty string      (wcscmp against L"")
+_CheckUniformBlock@4 finds one of its names inside it
+```
+
+and the swap is `replace(3, 1, L"Z")`. The result goes back over
+`engine + 0x1a0` through host slot `+0x144` — `FUN_0041a4f0`, which assigns it
+to the interface subobject's `+0x174`, and `0x2c + 0x174` is `0x1a0` — and the
+name it replaced is kept at `engine + 0x1d8`. Everything downstream reads
+`engine + 0x1a0`: the file that is opened, the key the recorded choices are
+filed under (host `+0x1a4`, `FUN_00428a80`), and the script a slot's tag-1
+record carries.
+
+`_CheckUniformBlock@4` is the one export `RouteProcSD.dll` has that
+`RouteProcSDHQ.dll` does not, and it is a plain table search:
+
+```text
+_CheckUniformBlock(name):
+    if wcscmp(name, L"") == 0: return 0
+    for i in 0 .. 0x120:
+        if wcsstr(name, table[i]): return 1
+    return 0
+```
+
+The 288 entries are **bare** scene names — `02-22-B04`, not `02/02-22-B04` —
+and the test is `wcsstr`, so a bare name matches inside the qualified one the
+engine passes. Both the count and the table's address are immediates in the
+export's own code, so `days_route::pe::Image::uniform_block` reads them from
+there rather than from a written-down address. `School Days HQ` never swaps:
+its route module exports nothing of the kind and its packs hold no `Z` scripts.
+
+The player's own saves say all of this from the other side. Across all 77 Shiny
+slots a script is spelled with `Z` **exactly** when the table matches its
+un-swapped name, 376 of the recorded choices are filed under `Z` names, and the
+slot whose script is `02/Z2-22-B04` is the one the player captioned `nude`.
+
+The 288 names line up 1:1 with the 288 `Z` scripts in the pack, with two
+exceptions on either side:
+
+```text
+04-00-F00      in the table; no 04/04-00-F00 and no 04/Z4-00-F00 ships, and
+               the name is in no route table either
+04/Z4-I0-D07   ships, with its EventZ4 art; 04-I0-D07 is not in the table, so
+               nothing can select it. 04/04-I0-D07 is ROUTE 68 SCENE 21
+```
+
+#### What first sets `NewRadish` is not recovered
+
+The flag is a name in the save's own store, not the global one — host
+`+0x10`/`+0x14`, and the player's `GlobalFlag.DAT` does not carry it. The
+engine keeps a copy at `engine + 0x7fc`: `FUN_0041eb10` reads the flag into it
+when a slot or a story point is put back, and writes it out again after
+anything empties the store — the start of a film run in the same function, and
+the rewind in `FUN_0041c440`. So `NewRadish` outlives `_ZeroReset@4` where
+nothing else in the save's store does.
+
+Nothing raises it. `engine + 0x7fc` is zeroed by the constructor
+(`FUN_0041d660`) and the only other write to it is the read above, so within
+the three shipped binaries the flag can only arrive in a slot that already
+carries it. Checked by scanning `.text` for every reference to the literal and
+for every access at `+0x7fc`, and by searching `SysMenuSD.dll` and
+`RouteProcSD.dll` for the name, which neither holds. A name built at run time,
+or a patch this has not read, would not show up either way.
 
 ### A film run starts from nothing
 
@@ -3390,9 +3482,12 @@ uses, cipher and all.
 
 Where each record comes from:
 
-- **tag 1** is the position. The loader hands the script and the version to
-  `FUN_0042a760`, which is what puts the player back — so a slot whose store
-  disagrees with its script follows the script.
+- **tag 1** is the script to reopen, and its `FlgH` store is the position: the
+  loader hands the map to the engine's own store, where `ROUTE` and `SCENE`
+  live, and the name only to `FUN_0042a760`, which opens the file. In Shiny
+  Days the name is the one that was playing **after** the uniform swap, so it
+  can be a `Z` twin that appears in no route table — see *Shiny Days swaps in
+  the Radish-uniform recording*.
 - **tag 3** is written by the story marker, host slot `+0x00` (`FUN_00428480`)
   — the same call that sets `SP%03d` in both stores. `order` is the map's size
   when the point was **first** recorded, so it is the order the player reached

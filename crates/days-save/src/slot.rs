@@ -13,7 +13,7 @@
 //! "SLog"                      4 bytes, compared on read
 //! records, until a 0 tag:
 //!     varint tag
-//!     tag 1   wstring script     where the player is
+//!     tag 1   wstring script     the file to reopen
 //!             version            checked against _GetVersionToRoute@4;
 //!                                an f32 in School Days HQ, a wstring in
 //!                                Shiny Days -- see [`Version`]
@@ -32,8 +32,12 @@
 //!
 //! # Where each record comes from
 //!
-//! - **tag 1** is written once. The engine hands the script and the version to
-//!   `FUN_0042a760` on load, which is what puts the player back.
+//! - **tag 1** is written once. Its `FlgH` store is the position — `ROUTE` and
+//!   `SCENE` are two of its names — and the script is only the file to reopen:
+//!   the engine hands it to `FUN_0042a760`, which opens it and touches
+//!   neither name. In Shiny Days that is the name **after** the uniform swap,
+//!   so it can be a `Z` twin (`02/Z2-22-B04`) that appears in no route table;
+//!   see `Progress::uniform_block` in the engine.
 //! - **tag 3** is written by the story marker, host slot `+0x00`
 //!   (`FUN_00428480`) — the same call that sets `SP%03d` in both flag stores.
 //!   Its `order` is the size the map had when the point was first recorded, so

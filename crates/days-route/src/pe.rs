@@ -241,3 +241,72 @@ impl Image<'_> {
         }
     }
 }
+
+impl Image<'_> {
+    /// The scenes that have a second, "Radish uniform" recording, out of
+    /// `_CheckUniformBlock@4`.
+    ///
+    /// `RouteProcSD.dll` exports one more entry point than
+    /// `RouteProcSDHQ.dll` does, and it is a plain table search:
+    ///
+    /// ```text
+    /// _CheckUniformBlock(name):
+    ///     if wcscmp(name, L"") == 0: return 0
+    ///     for i in 0 .. 0x120:
+    ///         if wcsstr(name, table[i]): return 1
+    ///     return 0
+    /// ```
+    ///
+    /// It is a **substring** test against 288 bare scene names —
+    /// `02-22-B04`, not `02/02-22-B04` — and the executable uses the answer
+    /// to decide whether to swap the script for its `Z` twin; see
+    /// `Progress::uniform_block` for that half.
+    ///
+    /// Both the count and the table's address are read out of the export's own
+    /// code — the `cmp dword ptr [ebp-4], imm32` that bounds the loop and the
+    /// `mov eax, [edx*4 + imm32]` that indexes it — so no address is written
+    /// down here. An empty vector for a module that does not export it, which
+    /// is every `School Days HQ` install: that title ships no `Z` scripts.
+    pub fn uniform_block(&self) -> Vec<String> {
+        let Some(&at) = self.exports.get("_CheckUniformBlock@4") else {
+            return Vec::new();
+        };
+        let Some(start) = self.at(at) else {
+            return Vec::new();
+        };
+        // The whole function is 0x5e bytes of straight-line code at fixed
+        // offsets. Everything below is matched; the two `call` displacements,
+        // the `L""` pointer and the two short jumps are the only bytes that
+        // could differ in another build, so they are skipped.
+        const SHAPE: [(usize, &[u8]); 8] = [
+            (0x00, &[0x55, 0x8b, 0xec, 0x51, 0x68]),
+            (0x09, &[0x8b, 0x45, 0x08, 0x50, 0xe8]),
+            (0x12, &[0x83, 0xc4, 0x08, 0x85, 0xc0, 0x74]),
+            (0x19, &[0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0xeb]),
+            (
+                0x22,
+                &[0x8b, 0x4d, 0xfc, 0x83, 0xc1, 0x01, 0x89, 0x4d, 0xfc],
+            ),
+            (0x2b, &[0x81, 0x7d, 0xfc]),
+            (0x32, &[0x7d]),
+            (0x34, &[0x8b, 0x55, 0xfc, 0x8b, 0x04, 0x95]),
+        ];
+        for (off, want) in SHAPE {
+            if self.bytes.get(start + off..start + off + want.len()) != Some(want) {
+                return Vec::new();
+            }
+        }
+        let (Some(count), Some(table)) = (
+            u32le(self.bytes, start + 0x2e),
+            u32le(self.bytes, start + 0x3a),
+        ) else {
+            return Vec::new();
+        };
+        (0..count)
+            .map_while(|i| {
+                let entry = self.u32(table.checked_add(i.checked_mul(4)?)?)?;
+                self.wide_ascii(entry)
+            })
+            .collect()
+    }
+}
