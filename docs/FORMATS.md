@@ -1200,6 +1200,24 @@ Notes:
   male-voice and speaker-tag fields were left blank, which reads as a scripter
   marking "no clip for this line". One background PNG is likewise absent
   (`Event01/01-00/01-00-T00/01-00-T00-009`). A missing asset must not be fatal.
+- **A fade is a layer with the statement's own window, and nothing after it.**
+  `FUN_0042b770`'s fade arm builds a `FILMOBJ::Mono` through
+  `FUN_00436b70(clip, start, rate, end)`, and `FILM::objectBase`'s constructor
+  `FUN_00437e60` puts those two frames at the clip's `+0x48` and `+0x4c` — the
+  same pair every clip in the film gets. Its z is `0x1d4c`, 7500, above the
+  `1000 + n` a picture takes and above the ending card's 7000, so a fade in
+  progress washes over all of them. Its colour is `vt[0x7c]`'s ARGB: alpha
+  `0xff000000` when the direction token is `OUT`, plus `0xffffff` for
+  `WhiteFade` and nothing for `BlackFade`.
+
+  The shipped scripts are written for the window and not for a wash that stays.
+  Of Shiny Days' 1,131 `Fade OUT` statements, 589 end at the script's own
+  `[Next]` and 524 have a `[CreateBG]`, `[PlayMovie]` or `[EndRoll]` starting on
+  the very frame they end — 351 of those with a `Fade IN` starting there too,
+  which is the ordinary cut-and-fade-up. The remaining 18 have a picture within
+  six frames either side. Holding the overlay past its end instead blanks the 45
+  of the game's 66 end rolls that begin where one finishes, which is what this
+  engine used to do.
 - `MoveSom` drives the SOMCON peripheral. See
   [MoveSom](#movesom--the-levels-a-script-asks-for).
 - **`Next` and `SetSELECT` carry no targets.** The branch graph is not here.

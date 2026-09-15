@@ -148,6 +148,21 @@ pub struct SelectWindow<'a> {
 }
 
 /// Tracks a fade in progress.
+///
+/// The overlay is a layer with the statement's own `[start, end)` window and
+/// nothing more: `FUN_0042b770`'s fade arm builds a `FILMOBJ::Mono` through
+/// `FUN_00436b70(clip, start, rate, end)`, and `FILM::objectBase`'s
+/// constructor `FUN_00437e60` puts those two frames at `+0x48` and `+0x4c` —
+/// the same pair every clip in the film gets. Its z is `0x1d4c`, 7500, which
+/// is why a fade covers the end roll's picture and the ending card both.
+///
+/// So it stops at `end`, and the shipped scripts are written for exactly that:
+/// of Shiny Days' 1,131 `Fade OUT` statements, 589 end at the script's own
+/// `[Next]` and 524 have a `[CreateBG]`, `[PlayMovie]` or `[EndRoll]` starting
+/// on the very frame they end — 351 of those with a `Fade IN` starting there
+/// too, which is the ordinary cut-and-fade-up. The other 18 have one within
+/// six frames either side. Holding the overlay past its window instead blanks
+/// 45 of the game's 66 end rolls, which is what this engine used to do.
 struct FadeState {
     colour: [u8; 3],
     start: Frame,
@@ -159,9 +174,7 @@ impl FadeState {
     /// Opacity of the overlay at `at`.
     ///
     /// `IN` means "fade from the colour into the scene", so the overlay starts
-    /// opaque and clears; `OUT` is the reverse. Past the window the fade holds
-    /// its final value rather than snapping back, because scripts rely on a
-    /// `BlackFade OUT` leaving the screen black until the next statement paints.
+    /// opaque and clears; `OUT` is the reverse.
     fn opacity(&self, at: Frame) -> f32 {
         let span = self.end.0.saturating_sub(self.start.0);
         let progress = if span == 0 {
@@ -757,7 +770,11 @@ impl Stage {
             movie: movie.map(|(_, frame)| frame),
             movie_id: movie.map(|(clip, frame)| (clip.path.as_str(), frame.index)),
             still: self.still.as_ref(),
-            fade: self.fade.as_ref().map(|f| (f.colour, f.opacity(at))),
+            fade: self
+                .fade
+                .as_ref()
+                .filter(|f| at < f.end)
+                .map(|f| (f.colour, f.opacity(at))),
             ..Default::default()
         };
 
@@ -926,6 +943,24 @@ mod tests {
                 command: Command::EndRoll { path: path.into() },
             }],
         }
+    }
+
+    /// A fade is a layer with the statement's own window, not a wash that
+    /// stays. Holding a `[WhiteFade] OUT` past its end whited out the 45 of
+    /// Shiny Days' 66 end rolls that start on the frame one ends.
+    #[test]
+    fn a_fade_stops_at_the_end_of_its_own_window() {
+        let mut stage = Stage::new(Script::default());
+        stage.fade = Some(FadeState {
+            colour: [255, 255, 255],
+            start: Frame::parse("00:15:07").unwrap(),
+            end: Frame::parse("00:16:07").unwrap(),
+            direction: Fade::Out,
+        });
+        let mut at = |t: &str| stage.visual_at(Frame::parse(t).unwrap()).fade.is_some();
+        assert!(at("00:15:07"), "the frame it starts on");
+        assert!(at("00:16:06"), "the last frame of the window");
+        assert!(!at("00:16:07"), "the frame the next picture takes over");
     }
 
     /// Skip lands one second before the choice, not on it: `FUN_00425bf0`'s
