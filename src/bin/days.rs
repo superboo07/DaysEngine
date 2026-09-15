@@ -3378,6 +3378,65 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
                     println!("  credits on the way out: {line}");
                 }
             }
+            // What the three ending exports answer here, under a save whose
+            // flags are all clear and then all set. A position they do not
+            // name answers the same either way and prints nothing.
+            struct Flags(bool);
+            impl days_route::Context for Flags {
+                fn choice(&self) -> i32 {
+                    -1
+                }
+                fn int(&self, _: &str) -> i32 {
+                    0
+                }
+                fn flag(&self, _: &str) -> bool {
+                    self.0
+                }
+                fn global_flag(&self, _: &str) -> bool {
+                    self.0
+                }
+                fn threshold(&self, _: &str) -> bool {
+                    self.0
+                }
+            }
+            let (clear, set) = (Flags(false), Flags(true));
+            let scene = scene as u16;
+            let view = (
+                machine.end_roll_view(route, scene, &clear),
+                machine.end_roll_view(route, scene, &set),
+            );
+            if view != (true, true) {
+                println!(
+                    "  end roll: plays with the flags clear {}, with them set {}",
+                    view.0, view.1
+                );
+            }
+            let letter = |pick: Option<bool>| match pick {
+                Some(true) => "A",
+                Some(false) => "B",
+                None => "the path as written",
+            };
+            let pair = (
+                machine.end_roll_select(route, scene, &clear),
+                machine.end_roll_select(route, scene, &set),
+            );
+            if pair != (None, None) {
+                println!(
+                    "  end roll pair: {} with the flags clear, {} with them set",
+                    letter(pair.0),
+                    letter(pair.1)
+                );
+            }
+            let card = (
+                machine.change_subtitle(route, scene, &clear),
+                machine.change_subtitle(route, scene, &set),
+            );
+            if card != (false, false) {
+                println!(
+                    "  ending card: the Ex01 one with the flags clear {}, with them set {}",
+                    card.0, card.1
+                );
+            }
         }
         return Ok(());
     }

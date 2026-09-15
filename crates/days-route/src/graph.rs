@@ -42,9 +42,18 @@
 //!   three scenes where the shipped DLL has two arms swapped.
 //! - The story numbers the markers assign account for every `SP***` flag in
 //!   the player's real saves.
+//!
+//! # The ending exports
+//!
+//! Shiny Days' module exports three more functions, and they are decoded the
+//! same way — [`Machine::end_roll_view`], [`Machine::end_roll_select`] and
+//! [`Machine::change_subtitle`]. They switch on `ROUTE` as well as `SCENE`,
+//! so both are seeded, and they take the host as their first argument rather
+//! than their third. A module without them answers what School Days HQ's
+//! engine does: the `[EndRoll]` plays, as the script wrote it.
 
 use crate::pe::{Image, Section};
-use crate::walk::{self, slot, Effect, Node as Raw, Val};
+use crate::walk::{self, slot, Effect, Leaf, Node as Raw, Val};
 use crate::x86::{decode, Alu, Cc, Insn, Op};
 use crate::Error;
 use std::collections::{BTreeMap, HashMap};
@@ -203,6 +212,28 @@ enum Helper {
     Other,
 }
 
+/// The three exports Shiny Days' `RouteProcSD.dll` has and School Days HQ's
+/// `RouteProcSDHQ.dll` does not. Each is `None` for a module without it, and
+/// the answer then falls back to what the shipped HQ engine does: the
+/// `[EndRoll]` plays, as written, with no card over it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Endings {
+    /// `_CheckEndRollView@4`.
+    view: Option<u32>,
+    /// `_CheckEndRollSelect@8`.
+    select: Option<u32>,
+    /// `_ChangeSubtitle@4`.
+    subtitle: Option<u32>,
+}
+
+impl Endings {
+    fn all(self) -> impl Iterator<Item = u32> {
+        [self.view, self.select, self.subtitle]
+            .into_iter()
+            .flatten()
+    }
+}
+
 /// The branch graph, recovered from the player's own `RouteProcSDHQ.dll`.
 #[derive(Debug, Clone)]
 pub struct Machine {
@@ -215,6 +246,9 @@ pub struct Machine {
     feeling: Vec<u32>,
     /// `_GetStory@4`, which is one function rather than a dispatch.
     chapters: Option<u32>,
+    /// The three ending exports, each absent in a route module that does not
+    /// have it. See [`Machine::end_roll_view`].
+    endings: Endings,
     helpers: HashMap<u32, Helper>,
     /// `scene -> story number`, per route.
     story: Vec<BTreeMap<u16, u32>>,
@@ -238,6 +272,11 @@ impl Machine {
         };
 
         let chapters = img.exports.get("_GetStory@4").copied();
+        let endings = Endings {
+            view: img.exports.get("_CheckEndRollView@4").copied(),
+            select: img.exports.get("_CheckEndRollSelect@8").copied(),
+            subtitle: img.exports.get("_ChangeSubtitle@4").copied(),
+        };
 
         let mut m = Machine {
             dll: dll.to_vec(),
@@ -246,12 +285,25 @@ impl Machine {
             handlers,
             feeling,
             chapters,
+            endings,
             helpers: HashMap::new(),
             story: Vec::new(),
         };
         // Classify every helper any handler calls, then read the story maps
         // out of the markers among them.
-        let calls = m.collect_calls();
+        let mut calls = m.collect_calls();
+        // The ending exports call the same `StanderdScript.ini` gate a
+        // handler does, and it has to be classified for their trees to name
+        // it. Their own calls are collected by decoding them straight
+        // through rather than by walking every position: they hold no jump
+        // table, so a linear decode does not desynchronise on them.
+        for at in m.endings.all() {
+            for va in calls_in(&img, at) {
+                if !calls.contains(&va) {
+                    calls.push(va);
+                }
+            }
+        }
         for va in calls {
             let k = classify(&m.image(), va);
             m.helpers.insert(va, k);
@@ -302,7 +354,7 @@ impl Machine {
     /// The decision tree a route runs for one scene.
     pub fn step(&self, route: usize, scene: u16) -> Option<Transition> {
         let raw = self.step_raw(route, scene)?;
-        Some(self.build(&raw, route, scene, Vec::new(), &|e| self.next_of(e)))
+        Some(self.build(&raw, route, scene, Vec::new(), &|l| self.next_of(l)))
     }
 
     /// What `_SetFeeling@8` credits at one scene, as a decision tree.
@@ -327,7 +379,7 @@ impl Machine {
             &[("SCENE", scene as i32)],
             &[(8, Val::Host), (0xc, Val::Imm(1))],
         );
-        Some(self.build(&raw, route, scene, Vec::new(), &|e| self.credit_of(e)))
+        Some(self.build(&raw, route, scene, Vec::new(), &|l| self.credit_of(l)))
     }
 
     /// The chapter a route belongs to — the `N` in the save screen's
@@ -496,7 +548,7 @@ impl Machine {
         route: usize,
         scene: u16,
         mut acts: Vec<Act>,
-        leaf: &dyn Fn(&[&Effect]) -> L,
+        leaf: &dyn Fn(&Leaf) -> L,
     ) -> Step<L> {
         match raw {
             Raw::Unrecovered(why) => Step::Unrecovered(why.clone()),
@@ -530,7 +582,7 @@ impl Machine {
                 let all: Vec<&Effect> = done.effects.iter().collect();
                 self.acts_into(&all, route, scene, &mut acts);
                 Step::Do {
-                    next: leaf(&all),
+                    next: leaf(done),
                     acts,
                 }
             }
@@ -611,8 +663,8 @@ impl Machine {
     }
 
     /// The script a leaf credits, if it credits one.
-    fn credit_of(&self, effects: &[&Effect]) -> Option<String> {
-        effects.iter().rev().find_map(|e| {
+    fn credit_of(&self, leaf: &Leaf) -> Option<String> {
+        leaf.effects.iter().rev().find_map(|e| {
             let va = e.call?;
             if self.helpers.get(&va) != Some(&Helper::Credit) {
                 return None;
@@ -625,9 +677,9 @@ impl Machine {
     }
 
     /// The script a leaf's calls name, reading the last one that names any.
-    fn next_of(&self, effects: &[&Effect]) -> Next {
+    fn next_of(&self, leaf: &Leaf) -> Next {
         let mut next = Next::Nothing;
-        for e in effects {
+        for e in &leaf.effects {
             let Some(va) = e.call else { continue };
             match self.helpers.get(&va) {
                 Some(Helper::Emit { route }) => {
@@ -884,6 +936,37 @@ fn classify(img: &Image, entry: u32) -> Helper {
     Helper::Other
 }
 
+/// Every address a function calls directly, by decoding it from its entry.
+///
+/// Used for the ending exports, which are straight-line code with forward
+/// jumps and no jump table, so a linear decode does not desynchronise on them
+/// the way it would on a route handler's `switch`. The scan ends at the first
+/// `ret` no jump already seen reaches past, which is the function's own end.
+fn calls_in(img: &Image, entry: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut furthest = entry;
+    let mut va = entry;
+    for _ in 0..600 {
+        let Some(off) = img.at(va) else { return out };
+        let Some(d) = decode(img.bytes, off, va) else {
+            return out;
+        };
+        match d.insn {
+            Insn::Call(to) => {
+                if !out.contains(&to) {
+                    out.push(to);
+                }
+            }
+            Insn::Jmp(to) | Insn::Jcc { to, .. } => furthest = furthest.max(to),
+            Insn::Ret if va >= furthest => return out,
+            Insn::Unknown(_) => return out,
+            _ => {}
+        }
+        va += d.len as u32;
+    }
+    out
+}
+
 /// Whether a function holds the `SP%d` format the story marker writes through.
 fn formats_sp(img: &Image, entry: u32) -> bool {
     let mut va = entry;
@@ -944,6 +1027,127 @@ impl Machine {
     pub fn credited(&self, route: usize, scene: u16, cx: &dyn Context) -> Option<String> {
         let (_, credited) = self.decide(self.crediting(route, scene)?, route, scene, cx)?;
         credited
+    }
+
+    /// Whether the `[EndRoll]` at this position plays at all.
+    ///
+    /// `_CheckEndRollView@4` asks the host for `ROUTE` and `SCENE` and
+    /// answers 0 — do not play it — at three positions, each behind its own
+    /// condition: `(0x44, 0x0c)` when the save flag `878` is set, `(0x60,
+    /// 0x0b)` when the `StanderdScript.ini` gate for the script named in the
+    /// table at that scene passes, and `(0x64, 0x0c)` when the save flag
+    /// `890` is **clear**. Everywhere else it answers 1. None of that is
+    /// written down here: the export is decoded out of the player's own
+    /// module with `ROUTE` and `SCENE` seeded, the same as a route handler.
+    ///
+    /// `FUN_0042b770`'s `[EndRoll]` arm creates the movie only when this
+    /// answers non-zero, and `FUN_0042a8d0` — the pass that works out how
+    /// long the script is — cuts the script's length and its skip target to
+    /// the `[EndRoll]`'s own start frame when it answers 0, so a suppressed
+    /// end roll ends the film where it would have begun.
+    ///
+    /// The executable puts one more gate in front of both: host slot `+0x120`
+    /// (`FUN_0041d9f0`), which returns the member slot `+0xb0`
+    /// (`FUN_00420110`) raises when a screen hands the engine a script to
+    /// play. **Whether anything clears it, and so whether it can still be up
+    /// when an `[EndRoll]` is reached, is not recovered.** This engine has no
+    /// queued-play member at all — a menu screen's `Play` is acted on by the
+    /// tick that produces it — so nothing here stands in for that gate.
+    ///
+    /// A module with no such export plays every `[EndRoll]`, which is what
+    /// School Days HQ does.
+    pub fn end_roll_view(&self, route: usize, scene: u16, cx: &dyn Context) -> bool {
+        let Some(entry) = self.endings.view else {
+            return true;
+        };
+        self.ending(entry, route, scene, cx, &|l| l.returns)
+            .flatten()
+            != Some(0)
+    }
+
+    /// Which of a pair of end rolls plays: `Some(true)` for `A`, `Some(false)`
+    /// for `B`, and `None` at a position that has only one.
+    ///
+    /// `_CheckEndRollSelect@8` answers through an out-parameter at three
+    /// positions — `(0x3b, 0x02)`, `(0x4d, 0x04)` and `(0x57, 0x15)` — each
+    /// on one save flag, and returns 0 everywhere else. `FUN_0042b770` then
+    /// **replaces the last character** of the `[EndRoll]`'s path with `A` or
+    /// `B` (`erase(len - 1, 1)` at `0x0042c222`, then the literal at
+    /// `0x0048ed00` or `0x0048ecfc`).
+    ///
+    /// The shipped data agrees from the other side. Exactly three end rolls
+    /// ship as a pair — `03-M3-B00-ENDA`/`B`, `04-K2-A07-END1A`/`B` and
+    /// `04-L8-E04-ENDA`/`B` — and the three scripts whose `[EndRoll]` names
+    /// them sit at exactly those three positions. (A fourth pair,
+    /// `03-K4-B00-ENDA`/`B`, is named by two *different* scripts, one each,
+    /// so the branch graph picks between those and this export is not
+    /// involved.)
+    pub fn end_roll_select(&self, route: usize, scene: u16, cx: &dyn Context) -> Option<bool> {
+        let entry = self.endings.select?;
+        self.ending(entry, route, scene, cx, &|l| {
+            // The arms that answer store first and return 1; the fall-through
+            // returns 0 and stores nothing.
+            if l.returns != Some(1) {
+                return None;
+            }
+            l.effects
+                .iter()
+                .rev()
+                .find_map(|e| match (e.store, e.args.first()) {
+                    (Some("out"), Some(&Val::Imm(n))) => Some(n != 0),
+                    _ => None,
+                })
+        })
+        .flatten()
+    }
+
+    /// Whether the ending card over the end roll is swapped for the one in
+    /// the `Ex01` pack.
+    ///
+    /// `_ChangeSubtitle@4` answers 1 at one position only, `(0x33, 0x1d)` —
+    /// the script `03/03-K2-F01` — and only when the save flag `894` is set.
+    /// `Ex01` holds exactly one such asset, `System/EndRoll/03-K2-F01-END.png`,
+    /// for exactly that script.
+    ///
+    /// **What the executable does with the answer is only half recovered.**
+    /// `FUN_0042b770` builds a second clip from the literal `L"Ex01/"` and
+    /// runs it from the `[EndRoll]`'s start for a length chosen by host slot
+    /// `+0x134` (`FUN_0041dac0`, a float at the engine's `+0x594`): 0x2d0
+    /// frames at 24.0, 0x168 at 12.0 and 0x90 otherwise. Neither how the rest
+    /// of that path is built nor what the float is has been recovered, and
+    /// the arm is also reached when the engine's own `+0x38c` is set, which
+    /// has not been recovered either — so nothing acts on this answer yet.
+    pub fn change_subtitle(&self, route: usize, scene: u16, cx: &dyn Context) -> bool {
+        let Some(entry) = self.endings.subtitle else {
+            return false;
+        };
+        self.ending(entry, route, scene, cx, &|l| l.returns)
+            .flatten()
+            == Some(1)
+    }
+
+    /// Runs one of the ending exports for one position.
+    ///
+    /// They differ from a route handler in taking the host as their first
+    /// argument rather than their third, and in switching on `ROUTE` as well
+    /// as `SCENE`, so both are seeded. `0xc` is the out-parameter
+    /// `_CheckEndRollSelect@8` answers through; the other two ignore it.
+    fn ending<L>(
+        &self,
+        entry: u32,
+        route: usize,
+        scene: u16,
+        cx: &dyn Context,
+        leaf: &dyn Fn(&Leaf) -> L,
+    ) -> Option<L> {
+        let raw = walk::run(
+            &self.image(),
+            entry,
+            &[("ROUTE", route as i32), ("SCENE", scene as i32)],
+            &[(8, Val::Host), (0xc, Val::Arg("out"))],
+        );
+        let tree = self.build(&raw, route, scene, Vec::new(), leaf);
+        self.decide(tree, route, scene, cx).map(|(_, l)| l)
     }
 
     /// Walks a decision tree, answering each question from the context.

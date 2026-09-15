@@ -34,7 +34,9 @@ instead.
 **The module interfaces are supersets.** `SysMenuSD.dll` exports everything
 `SysMenuSDHQ.dll` does plus `_GetBGMVolume@0` and `_GetSEVolume@0`;
 `RouteProcSD.dll` adds `_ChangeSubtitle@4`, `_CheckEndRollSelect@8`,
-`_CheckEndRollView@4` and `_CheckUniformBlock@4`. Neither drops anything.
+`_CheckEndRollView@4` and `_CheckUniformBlock@4`. Neither drops anything. See
+*Shiny Days decides its own end rolls* for the first three and *Shiny Days
+swaps in the Radish-uniform recording* for the fourth.
 
 **`lua5.1.dll` ships beside the game and nothing uses it.** Not in the import
 directory of the executable or either module, and the string `lua` does not
@@ -2691,6 +2693,91 @@ because the host interface is a secondary base subobject at `[object + 0x2c]`,
 so a scan of `.text` for accesses at `+0x7fc` finds the reads and misses the
 write that matters. That scan was run, and it is what nearly produced the
 conclusion "nothing raises it".
+
+### Shiny Days decides its own end rolls
+
+`[EndRoll]` names a movie and the executable plays it, on School Days HQ with
+no question asked. Shiny Days' `RouteProcSD.dll` exports three more functions
+that `RouteProcSDHQ.dll` does not, and all three are asked at the moment the
+`[EndRoll]` is reached. Each takes the host and switches on `ROUTE` and
+`SCENE`, read back through host slot `+0x08`.
+
+`_CheckEndRollView@4` (`0x10013ee0`) answers whether the statement plays at
+all. It returns 1 everywhere except three positions:
+
+```text
+ROUTE 0x44 SCENE 0x0c   04/04-I0-B10   0 when the save flag 878 is set
+ROUTE 0x60 SCENE 0x0b   04/04-SY-G02   0 when the StanderdScript gate passes
+ROUTE 0x64 SCENE 0x0c   04/04-Y5-B00   0 when the save flag 890 is CLEAR
+```
+
+The middle one does not carry its script as a literal: it indexes a table at
+`0x1008def0` by `SCENE` and hands `[0x1008def0 + 0xb*4]` — `04/04-SY-G02`, the
+script that actually lives at that position — to `FUN_10005390`, the same
+`StanderdScript.ini` gate the route handlers use. The route handler for
+`(0x60, 0x0b)` branches on that same gate, and the handlers for the other two
+branch on flags `878` and `890`: the branch graph and this export agree about
+what each ending turns on, recovered by two different paths.
+
+Two callers act on the answer, and they have to agree or the film runs past
+its own picture:
+
+- `FUN_0042b770`, which runs the statements, creates the movie only when the
+  answer is non-zero.
+- `FUN_0042a8d0`, which works out how long the script is, normally takes the
+  length from `[Next]`. At an `[EndRoll]` the answer suppresses it sets the
+  length **and** the skip target to that statement's own start and latches
+  `this + 0x418`, which stops the later `[Next]` putting the length back.
+
+So a suppressed end roll ends the film where it would have begun.
+`src/playback/stage.rs`'s `apply_end_roll` reproduces both halves by removing
+the statement and cutting `length` and `skip_to` to its start.
+
+`_CheckEndRollSelect@8` (`0x10013fa0`) answers, through an out-parameter, which
+of a **pair** of recordings plays. It returns 1 at three positions and 0
+everywhere else:
+
+```text
+ROUTE 0x3b SCENE 0x02   03/03-M3-B00   flag 896 clear -> 1, set -> 0
+ROUTE 0x4d SCENE 0x04   04/04-K2-A07   flag 916 clear -> 0, set -> 1
+ROUTE 0x57 SCENE 0x15   04/04-L8-E04   flag 865 clear -> 0, set -> 1
+```
+
+`FUN_0042b770` then **replaces the path's last character**: `erase(len - 1, 1)`
+at `0x0042c222`, then `A` (`0x0048ed00`) for 1 and `B` (`0x0048ecfc`) for 0.
+Not a suffix — a replacement, which is why the scripts already name a letter.
+
+The shipped data says the same thing from the other side. Exactly three end
+rolls ship as a pair — `03-M3-B00-ENDA`/`B`, `04-K2-A07-END1A`/`B` and
+`04-L8-E04-ENDA`/`B` — and the three scripts whose `[EndRoll]` names them are
+the three scripts at those three positions. A fourth pair,
+`03-K4-B00-ENDA`/`B`, is named by two *different* scripts, `03/03-K4-C00` and
+`03/03-K4-C02`, one letter each, so the branch graph picks between those and
+this export is not involved.
+
+`_ChangeSubtitle@4` (`0x100140a0`) answers 1 at one position only — ROUTE
+0x33 SCENE 0x1d, the script `03/03-K2-F01` — and only when the save flag `894`
+is set. The `Ex01` pack holds exactly one asset for that script,
+`System/EndRoll/03-K2-F01-END.png`, and `FUN_0042b770` builds a second clip
+from the literal `L"Ex01/"` and runs it from the `[EndRoll]`'s start.
+
+**What that clip is has only been half recovered, and nothing acts on this
+answer yet.** Its length comes from host slot `+0x134` (`FUN_0041dac0`, a float
+at the engine's `+0x594`): `0x2d0` frames at 24.0, `0x168` at 12.0 and `0x90`
+otherwise. What that float is has not been recovered. Nor has the rest of the
+path build, nor the engine's `+0x38c`, which reaches the same arm on its own
+(`if (subtitle == 0 && this+0x38c == 0)` skips it).
+
+One more gate stands in front of all of this, and it is the executable's
+rather than the route module's. Both call sites ask host `+0x120`
+(`FUN_0041d9f0`) first and skip the end roll entirely when it is non-zero. That
+slot returns the member `+0xb0` (`FUN_00420110`) raises when a screen hands the
+engine a script to play, alongside the name it stores beside it — `+0x9c`
+(`FUN_0041da00`) is the only other writer, and the only reference to either
+function is its own vtable entry. **Whether anything clears it, and so whether
+it can still be up when an `[EndRoll]` is reached, is not recovered.** This
+engine has no queued-play member at all — a menu screen's `Play` is acted on by
+the tick that produces it — so nothing stands in for that gate here.
 
 ### A film run starts from nothing
 

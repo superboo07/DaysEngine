@@ -95,6 +95,9 @@ pub struct Effect {
     pub slot: Option<i32>,
     /// The address, for a direct call.
     pub call: Option<u32>,
+    /// The incoming argument written through, for a store to an
+    /// out-parameter. `args` then holds the one value stored.
+    pub store: Option<&'static str>,
     pub args: Vec<Val>,
 }
 
@@ -202,6 +205,20 @@ fn write(st: &mut State, op: &Op, v: Val) {
         }
         Op::Mem(5, d) => {
             st.stack.insert(d, v);
+        }
+        // A store straight through an incoming pointer argument is an
+        // out-parameter, which is how `_CheckEndRollSelect@8` answers *which*
+        // of a pair of end rolls to play. Recorded as an effect so it reaches
+        // the caller the way a host call does.
+        Op::Mem(r, 0) => {
+            if let Some(Val::Arg(name)) = st.regs.get(&r).cloned() {
+                st.effects.push(Effect {
+                    slot: None,
+                    call: None,
+                    store: Some(name),
+                    args: vec![v],
+                });
+            }
         }
         _ => {}
     }
@@ -320,6 +337,7 @@ fn step(img: &Image, mut va: u32, st: &mut State, known: &[(String, i32)], depth
                         st.effects.push(Effect {
                             slot: Some(s),
                             call: None,
+                            store: None,
                             args,
                         });
                         Val::HostSlot(s)
@@ -332,6 +350,7 @@ fn step(img: &Image, mut va: u32, st: &mut State, known: &[(String, i32)], depth
                 st.effects.push(Effect {
                     slot: None,
                     call: Some(*to),
+                    store: None,
                     args,
                 });
                 st.regs.insert(0, Val::Returned(*to));

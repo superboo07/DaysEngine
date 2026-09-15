@@ -164,6 +164,16 @@ pub struct Progress {
     new_radish: bool,
 }
 
+/// What the route module says about a script's `[EndRoll]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndRoll {
+    /// Whether the statement plays at all.
+    pub plays: bool,
+    /// The letter the movie path's last character becomes, at a position
+    /// whose end roll ships as a pair.
+    pub letter: Option<char>,
+}
+
 impl Progress {
     /// Reads the route DLL and the two affection tables out of the install.
     ///
@@ -281,6 +291,27 @@ impl Progress {
                 log::info!("{full} is in no route table, so nothing follows it");
                 false
             }
+        }
+    }
+
+    /// What the route module answers about the `[EndRoll]` of the script
+    /// playing here.
+    ///
+    /// Shiny Days' `RouteProcSD.dll` exports `_CheckEndRollView@4` and
+    /// `_CheckEndRollSelect@8`; `RouteProcSDHQ.dll` exports neither, so on
+    /// School Days HQ this always says "plays, as written", which is what
+    /// that engine does. See [`days_route::Machine::end_roll_view`] for how
+    /// both are decoded, and [`crate::playback::stage::apply_end_roll`] for
+    /// what the executable does with the answers.
+    pub fn end_roll(&self) -> EndRoll {
+        let (route, scene) = self.position();
+        let (route, scene) = (route.max(0) as usize, scene.max(0) as u16);
+        EndRoll {
+            plays: self.machine.end_roll_view(route, scene, &self.stores),
+            letter: self
+                .machine
+                .end_roll_select(route, scene, &self.stores)
+                .map(|a| if a { 'A' } else { 'B' }),
         }
     }
 

@@ -1012,7 +1012,15 @@ fn main() -> Result<()> {
         chained = false;
         let (name, path) = find_script(&vfs, &next, english)?;
         log::info!("playing {name} from {path}");
-        let script = Script::parse(&name, &vfs.read_path(&path)?)?;
+        let mut script = Script::parse(&name, &vfs.read_path(&path)?)?;
+        // Whether this script's `[EndRoll]` plays, and which of a pair it is,
+        // is the route module's answer for the position the engine is now at
+        // — which `enter` or `advance` has just set. It has to be applied
+        // before the length is read, because a suppressed end roll shortens
+        // the script.
+        if let Some(p) = progress.as_ref() {
+            daysengine::playback::stage::apply_end_roll(&mut script, p.end_roll());
+        }
         log::info!(
             "{} events, length {} ({:.1}s)",
             script.events.len(),

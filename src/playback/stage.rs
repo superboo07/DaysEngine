@@ -19,6 +19,54 @@ use std::sync::Arc;
 
 use crate::Mixer;
 
+/// Applies the route module's end-roll decision to a parsed script.
+///
+/// The executable does this in two places, and both have to agree or the film
+/// runs past its own picture. `FUN_0042a8d0`, the pass that works out how long
+/// a script is, normally takes the length from `[Next]`; at an `[EndRoll]`
+/// whose `_CheckEndRollView@4` answers 0 it sets the length **and** the skip
+/// target to that statement's own start and latches `this + 0x418`, which
+/// stops the later `[Next]` putting the length back. `FUN_0042b770`, which
+/// runs the statements, then never creates the movie. So a suppressed end roll
+/// ends the film where it would have begun, and that is what removing the
+/// statement and cutting the length to its start reproduces.
+///
+/// The letter is the other half: at a position whose end roll ships as a pair,
+/// `FUN_0042b770` erases the path's last character (`0x0042c222`) and appends
+/// `A` or `B` before opening it.
+///
+/// See [`crate::install::progress::Progress::end_roll`] for where the answers
+/// come from. A title whose route module exports neither always plays the
+/// statement as written, so this is a no-op on School Days HQ.
+pub fn apply_end_roll(script: &mut Script, decision: crate::install::progress::EndRoll) {
+    let Some(i) = script
+        .events
+        .iter()
+        .position(|e| matches!(e.command, Command::EndRoll { .. }))
+    else {
+        return;
+    };
+    if !decision.plays {
+        let at = script.events[i].start;
+        log::info!(
+            "{}: the route module suppresses the end roll at {at}",
+            script.name
+        );
+        script.events.remove(i);
+        script.length = at;
+        script.skip_to = at;
+        return;
+    }
+    let Some(letter) = decision.letter else {
+        return;
+    };
+    if let Command::EndRoll { path } = &mut script.events[i].command {
+        path.pop();
+        path.push(letter);
+        log::info!("{}: the route module picks end roll {path}", script.name);
+    }
+}
+
 /// A movie being played, with its position on the script timeline.
 struct Movie {
     decoder: VideoDecoder,
@@ -813,6 +861,63 @@ mod tests {
             length: Frame::parse(length).unwrap(),
             ..Default::default()
         })
+    }
+
+    /// Shiny Days' `03/03-M3-B00`, whose end roll ships as `-ENDA`/`-ENDB`:
+    /// the executable erases the path's last character and appends the letter
+    /// `_CheckEndRollSelect@8` chose, so it is a replacement and not a suffix.
+    #[test]
+    fn the_end_roll_letter_replaces_the_last_character() {
+        let mut script = ending_script("System/EndRoll/03-M3-B00-ENDA");
+        apply_end_roll(
+            &mut script,
+            crate::install::progress::EndRoll {
+                plays: true,
+                letter: Some('B'),
+            },
+        );
+        assert_eq!(
+            script.events[0].command,
+            Command::EndRoll {
+                path: "System/EndRoll/03-M3-B00-ENDB".into()
+            }
+        );
+        assert_eq!(script.length, Frame::parse("02:17:19").unwrap());
+    }
+
+    /// A suppressed end roll does not just go unplayed: `FUN_0042a8d0` latches
+    /// the length at the statement's own start, so the film ends where the
+    /// roll would have begun rather than running on to `[Next]` with nothing
+    /// on screen.
+    #[test]
+    fn a_suppressed_end_roll_shortens_the_script() {
+        let mut script = ending_script("System/EndRoll/04-Y5-B00-END");
+        apply_end_roll(
+            &mut script,
+            crate::install::progress::EndRoll {
+                plays: false,
+                letter: None,
+            },
+        );
+        let at = Frame::parse("00:46:06").unwrap();
+        assert!(script.events.is_empty());
+        assert_eq!(script.length, at);
+        assert_eq!(script.skip_to, at);
+    }
+
+    /// One `[EndRoll]` running to `[Next]`, laid out the way the ending
+    /// scripts are.
+    fn ending_script(path: &str) -> Script {
+        Script {
+            name: "ending".into(),
+            length: Frame::parse("02:17:19").unwrap(),
+            skip_to: Frame::parse("02:17:19").unwrap(),
+            events: vec![days_script::Event {
+                start: Frame::parse("00:46:06").unwrap(),
+                end: Frame::parse("02:17:19").unwrap(),
+                command: Command::EndRoll { path: path.into() },
+            }],
+        }
     }
 
     /// Skip lands one second before the choice, not on it: `FUN_00425bf0`'s
