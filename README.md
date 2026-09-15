@@ -1,5 +1,5 @@
 # DaysEngine
-Rust reimplemention of the FilmEngine used in School Days HQ, Shiny Days, and Cross Days. Heavily experimental, stay tuned!
+Rust reimplemention of the FilmEngine used in School Days HQ, Shiny Days, and Cross Days. Heavily experimental, stay tuned! For usage please drag and drop the binary alongside its corresponding libraries into your copy of the days game you would like to play (granted that it is on the support list)
 
 # Additions
 Controller support! (Accessibility controllers by extension should be supported now, if there any issues on that front please open an issue so that I can add support or fix.)
