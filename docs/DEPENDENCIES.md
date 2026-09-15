@@ -67,8 +67,15 @@ deliberately small and deliberately boring.
 `libSDL3` and `libav*` are linked from the system, not vendored. This is a
 deliberate trade: it means we inherit the distribution's security updates for
 two large C codebases that parse untrusted media, rather than freezing a copy
-that goes stale. It also means the build depends on the host having them —
-see the README for the per-distro package names.
+that goes stale. It also means the build depends on the host having them:
+
+```bash
+# Arch
+sudo pacman -S sdl3 ffmpeg clang
+# Debian / Ubuntu
+sudo apt install libsdl3-dev libavcodec-dev libavformat-dev libavutil-dev \
+                 libswscale-dev libswresample-dev clang pkg-config
+```
 
 **libswscale must be new enough for `sws_scale_frame`** (ffmpeg 5.0, 2022).
 That entry point, not the older `sws_scale`, is the one that honours the

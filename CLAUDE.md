@@ -346,3 +346,14 @@ Read `docs/DEPENDENCIES.md` before adding anything.
   compile. Use ```` ```text ```` fences.
 - **Never go through the user's personal files.** If something is needed that
   is not in the repo or the game install, ask for it.
+- **`README.md` is the user's, not yours.** README documentation is their
+  domain: unless they ask for a change in so many words, do not edit it, do not
+  add to it, and do not "keep it in sync" with a change elsewhere. If something
+  you did makes the README wrong or incomplete, say so in the commit message or
+  in chat and leave the file alone. Status tracking lives in `docs/STATUS.md`;
+  recovered behaviour lives in `docs/FORMATS.md` and in the doc comment next to
+  the code, which is where the provenance rules already put it.
+- **Stage the paths you actually edited.** `git add -A` sweeps up whatever the
+  user has in the working tree — it has already put their `LICENSE` and README
+  drafts into an unrelated commit. Name the files: `git add docs/FORMATS.md
+  src/...`.
