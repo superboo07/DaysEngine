@@ -3,7 +3,9 @@ Rust reimplemention of the FilmEngine used in School Days HQ, Shiny Days, and Cr
 
 # Additions
 Controller support! (Accessibility controllers by extension should be supported now, if there any issues on that front please open an issue so that I can add support or fix.)
+
 Video filtering! The stock filters are meant to cover up the poor WMV compression, but you can configure or disable them however you wish in the configs. (more documention soon™️)
+
 Cross platform! Both Windows, and Linux are supported. I do not have a mac so apple support will not be worked on, I do apologize however. Android support coming at the end of the project. 
 
 # Requirements
