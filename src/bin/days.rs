@@ -83,25 +83,7 @@ enum Cmd {
     ///
     /// This is the regression check for playback: timing, fades and text layout
     /// all show up as an image rather than as "it looked wrong when I ran it".
-    Render {
-        /// Script name, e.g. "00-00-A00".
-        name: String,
-        /// Timecodes to render, as MM:SS:FF. Repeatable.
-        #[arg(long = "at", required = true)]
-        at: Vec<String>,
-        /// Directory to write PNGs into.
-        #[arg(long, short = 'o', default_value = ".")]
-        out: PathBuf,
-        /// Also drop the in-game control bar over the frame, with the pointer
-        /// inside the strip. Without this the bar is off, which is what the
-        /// engine shows while the pointer is anywhere else.
-        #[arg(long)]
-        bar: bool,
-        /// Answer host `+0x98` true, so the REPLAYMODE indicator is on the
-        /// picture — what a row of the replay screen's play-data list starts.
-        #[arg(long)]
-        following_record: bool,
-    },
+    Render(RenderArgs),
     /// Composite a UI screen to PNG, without a display.
     ///
     /// The screen is drawn exactly as the game draws it: base art from the
@@ -343,6 +325,36 @@ struct SelectArgs {
 }
 
 #[derive(clap::Args)]
+struct RenderArgs {
+    /// Script name, e.g. "00-00-A00".
+    name: String,
+    /// Timecodes to render, as MM:SS:FF. Repeatable.
+    #[arg(long = "at", required = true)]
+    at: Vec<String>,
+    /// Directory to write PNGs into.
+    #[arg(long, short = 'o', default_value = ".")]
+    out: PathBuf,
+    /// Also drop the in-game control bar over the frame, with the pointer
+    /// inside the strip. Without this the bar is off, which is what the
+    /// engine shows while the pointer is anywhere else.
+    #[arg(long)]
+    bar: bool,
+    /// Answer host `+0x98` true, so the REPLAYMODE indicator is on the
+    /// picture — what a row of the replay screen's play-data list starts.
+    #[arg(long)]
+    following_record: bool,
+    /// Answer `_ChangeSubtitle@4` true, so the `Ex01` episode title card
+    /// goes over the start of the end roll. The route module only says
+    /// this at one position, and only for a save that has flag 894.
+    #[arg(long)]
+    ending_card: bool,
+    /// The rate the control bar's speed row is on, which is the only thing
+    /// that decides how long the ending card stays up.
+    #[arg(long, default_value_t = 1.0)]
+    rate: f32,
+}
+
+#[derive(clap::Args)]
 struct UiArgs {
     /// Screen path stem as the DLL spells it, e.g. "System/Title/Title".
     screen: String,
@@ -575,13 +587,7 @@ fn main() -> Result<()> {
             alpha,
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
-        Cmd::Render {
-            name,
-            at,
-            out,
-            bar,
-            following_record,
-        } => cmd_render(&game, &name, &at, &out, bar, following_record)?,
+        Cmd::Render(args) => cmd_render(&game, &args)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Backlog(args) => cmd_backlog(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
@@ -1028,15 +1034,19 @@ fn blend_at(
     }
 }
 
-fn cmd_render(
-    game: &Path,
-    name: &str,
-    at: &[String],
-    out: &Path,
-    bar: bool,
-    following_record: bool,
-) -> Result<()> {
+fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
     use days_script::Frame;
+
+    let RenderArgs {
+        name,
+        at,
+        out,
+        bar,
+        following_record,
+        ending_card,
+        rate,
+    } = args;
+    let (bar, following_record, ending_card, rate) = (*bar, *following_record, *ending_card, *rate);
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
@@ -1066,6 +1076,8 @@ fn cmd_render(
         use daysengine::install::config::{Config, Flag};
         stage.set_men_voice(Config::load(game).flag(Flag::MenVoice));
     }
+    stage.set_ending_card(ending_card);
+    stage.set_rate(rate);
     std::fs::create_dir_all(out)?;
 
     // Two answers only the install can give: the choice box's axis, and
@@ -1110,11 +1122,12 @@ fn cmd_render(
         stage.seek_to(target, &vfs, &mixer)?;
         let visual = stage.visual_at(target);
         let described = format!(
-            "movie={} still={} text={:?} fade={:?} select={:?}",
+            "movie={} still={} card={} text={:?} fade={:?} select={:?}",
             visual
                 .movie_id
                 .map_or("-".to_string(), |(clip, index)| format!("{clip}#{index}")),
             visual.still.map(|s| s.path.as_str()).unwrap_or("-"),
+            visual.card.map(|c| c.path.as_str()).unwrap_or("-"),
             visual.text.map(|(s, t)| format!("{s}: {t}")),
             visual.fade,
             visual

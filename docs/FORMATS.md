@@ -2779,15 +2779,50 @@ this export is not involved.
 `_ChangeSubtitle@4` (`0x100140a0`) answers 1 at one position only — ROUTE
 0x33 SCENE 0x1d, the script `03/03-K2-F01` — and only when the save flag `894`
 is set. The `Ex01` pack holds exactly one asset for that script,
-`System/EndRoll/03-K2-F01-END.png`, and `FUN_0042b770` builds a second clip
-from the literal `L"Ex01/"` and runs it from the `[EndRoll]`'s start.
+`System/EndRoll/03-K2-F01-END.png`: an opaque 800x452 card reading
+`Episode 3 "Banquet of Mothers"`. So it is the episode title card, laid over
+the start of the credits, and that is what the export's name means.
 
-**What that clip is has only been half recovered, and nothing acts on this
-answer yet.** Its length comes from host slot `+0x134` (`FUN_0041dac0`, a float
-at the engine's `+0x594`): `0x2d0` frames at 24.0, `0x168` at 12.0 and `0x90`
-otherwise. What that float is has not been recovered. Nor has the rest of the
-path build, nor the engine's `+0x38c`, which reaches the same arm on its own
-(`if (subtitle == 0 && this+0x38c == 0)` skips it).
+`FUN_0042b770` builds it as a **second clip over the same path string the movie
+was opened from**. `FUN_0041a300` at `0x0042c376` inserts the literal `L"Ex01/"`
+at position 0 of that string — the same object, after
+`_CheckEndRollSelect@8`'s letter has already been substituted into it, so the
+card follows whichever of a pair plays — and the clip is opened from the
+result, `Ex01/System/EndRoll/03-K2-F01-END`. The clip is a `FILMOBJ::ImageChar`
+(`operator new(0x2d4)` then `FUN_00434270`), the class `[CreateBG]` uses: its
+top-left is `(0, 0)` through `vt[0x58]` and its z is 7000 through `vt[0x70]`,
+above the end roll's own `1000 + n` and below the 7500 a fade layer takes. The
+one call `[CreateBG]` does not make is `vt[0x50]` (`FUN_00438130`), which
+copies the film object's `+0xc`, `+0x10` and `+0x14` onto the clip; **what
+those three are is not recovered**, and nothing about them shows in the shipped
+card.
+
+Its window runs from the `[EndRoll]`'s own start, for a length chosen by host
+slot `+0x134` — `FUN_0041dac0`, the float at the engine's `+0x594`: `0x2d0`
+frames when it is 24.0, `0x168` at 12.0 and `0x90` otherwise. **That float is
+the playback rate the control bar's speed row selects.** `FUN_00417780` and
+`FUN_00417870` are the two that write it, both storing `DAT_004a1b3c[index]`
+out of the five-rate table `1.0, 2.0, 4.0, 12.0, 24.0` that the bar's own
+`+0x98` (`FUN_004176a0`) indexes, and `FUN_0041e230` starts a run at 1.0. So
+the card holds for 6 seconds of wall clock at 1x, 3 at 2x, 1.5 at 4x and 1.25
+at each of the top two — the two fast widgets get the longer frame counts
+precisely because the clock is eating them 12 and 24 times as fast.
+
+The engine's `+0x38c` in that arm is the film object's **`+0x49c`**:
+`FUN_0042b770` is slot 0 of the secondary vftable installed at the object's
+`+0x110`, which `FUN_0042fa20` stores there and whose RTTI locator at
+`0x004974d0` gives the same offset. Its constructor zeroes `+0x49c`,
+`FUN_0042b770` sets it to 1 once the card is registered under the name `L"END"`
+(`FUN_00427800`), and **nothing else in the executable touches either
+spelling** — Ghidra's reference index and a raw scan of `.text` for the disp32
+agree, and the scan was run at both offsets because the shifted base is exactly
+the trap that hides a write. The gate it feeds is
+`if (subtitle == 0 && latch == 0) skip`, so a *second* `[EndRoll]` in the same
+script would get a card whether the route module asked for one or not. No
+shipped script reaches it: a fresh film object is built per script load
+(`FUN_00422520`, six call sites, every one of them a script name), the single
+position that answers 1 is `03/03-K2-F01`, and that script has exactly one
+`[EndRoll]`.
 
 One more gate stands in front of all of this, and it is the executable's
 rather than the route module's. Both call sites ask host `+0x120`

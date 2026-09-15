@@ -2505,6 +2505,8 @@ fn run_script(
     // that changes none of them reuses the texture.
     let mut still_texture: Option<StillFrame<'_>> = None;
     let mut movie_texture: Option<MovieFrame<'_>> = None;
+    // The ending card, which is one picture for its whole window.
+    let mut card_texture: Option<StillFrame<'_>> = None;
     // Stills go through libswscale, the same scaler and the same filter a movie
     // frame goes through — they are two ways of filling the same 800x452 stage,
     // and a still that went through a different filter did not match the clip
@@ -2516,6 +2518,13 @@ fn run_script(
     let mut choice_labels: Option<ChoiceLabels<'_>> = None;
 
     let mut stage = Stage::new(script);
+    // Whether the `Ex01` episode title card goes over this script's end roll.
+    // Asked here and not with the rest of the end-roll decision because the
+    // original decides it at the statement, not at the load: `FUN_0042b770`
+    // calls `_ChangeSubtitle@4` as it builds the clip.
+    if let Some(p) = progress.as_deref() {
+        stage.set_ending_card(p.end_roll().card);
+    }
     stage.set_video_scaler(player.settings.video_scaler);
     stage.set_video_filters(
         &player.settings.video_filters,
@@ -2594,6 +2603,9 @@ fn run_script(
         // once per frame because every use of the clock in this iteration has
         // to agree about it.
         let rate = bar::SPEEDS[bar_state.speed.min(bar::SPEEDS.len() - 1)];
+        // The film object carries the rate in the original too, and every clip
+        // it builds is handed it. Only the ending card reads it back.
+        stage.set_rate(rate);
 
         // What the player asked for this pass, and where it goes. A control
         // bar widget the selection is on is pressed by pushing its number
@@ -3358,6 +3370,44 @@ fn run_script(
                 canvas
                     .copy(&held.texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing background: {e}"))?;
+            }
+        }
+
+        // The episode title card, over the end roll: z 7000 against the
+        // movie's 1000-and-up, and under the fade layer's 7500. See
+        // `daysengine::playback::stage::Card`.
+        if let Some(card) = visual.card {
+            let at = if whole {
+                (card.width, card.height)
+            } else {
+                window_px
+            };
+            let stale = card_texture
+                .as_ref()
+                .is_none_or(|held| held.path != card.path || held.size != at);
+            if stale {
+                let src = (card.width, card.height);
+                let scaled = scaler
+                    .scale(&card.rgba, src, at)
+                    .context("scaling the ending card")?;
+                let (w, h, rgba) = match &scaled {
+                    Some(pixels) => (at.0, at.1, pixels.as_slice()),
+                    None => (card.width, card.height, card.rgba.as_slice()),
+                };
+                let mut texture = new_texture(creator, w, h, art)?;
+                texture.set_blend_mode(BlendMode::Blend);
+                texture.update(None, rgba, w as usize * 4)?;
+                card_texture = Some(StillFrame {
+                    path: card.path.clone(),
+                    size: at,
+                    mouths: Vec::new(),
+                    texture,
+                });
+            }
+            if let Some(held) = &card_texture {
+                canvas
+                    .copy(&held.texture, None, dst)
+                    .map_err(|e| anyhow::anyhow!("drawing the ending card: {e}"))?;
             }
         }
 

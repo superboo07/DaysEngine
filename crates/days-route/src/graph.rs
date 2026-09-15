@@ -1101,22 +1101,22 @@ impl Machine {
         .flatten()
     }
 
-    /// Whether the ending card over the end roll is swapped for the one in
-    /// the `Ex01` pack.
+    /// Whether the episode title card from the `Ex01` pack is laid over the
+    /// start of the end roll.
     ///
     /// `_ChangeSubtitle@4` answers 1 at one position only, `(0x33, 0x1d)` —
     /// the script `03/03-K2-F01` — and only when the save flag `894` is set.
     /// `Ex01` holds exactly one such asset, `System/EndRoll/03-K2-F01-END.png`,
-    /// for exactly that script.
+    /// for exactly that script: an opaque 800x452 card reading
+    /// `Episode 3 "Banquet of Mothers"`.
     ///
-    /// **What the executable does with the answer is only half recovered.**
-    /// `FUN_0042b770` builds a second clip from the literal `L"Ex01/"` and
-    /// runs it from the `[EndRoll]`'s start for a length chosen by host slot
-    /// `+0x134` (`FUN_0041dac0`, a float at the engine's `+0x594`): 0x2d0
-    /// frames at 24.0, 0x168 at 12.0 and 0x90 otherwise. Neither how the rest
-    /// of that path is built nor what the float is has been recovered, and
-    /// the arm is also reached when the engine's own `+0x38c` is set, which
-    /// has not been recovered either — so nothing acts on this answer yet.
+    /// `FUN_0042b770` acts on the answer by building a second clip —
+    /// `FILMOBJ::ImageChar`, the class `[CreateBG]` uses — over the same path
+    /// string the movie was opened from, with the literal `L"Ex01/"` inserted
+    /// at position 0 (`FUN_0041a300`, at `0x0042c376`). That string has
+    /// already had [`Machine::end_roll_select`]'s letter substituted, so the
+    /// card follows whichever of a pair plays. See
+    /// `daysengine::playback::stage` for the window and the layering.
     pub fn change_subtitle(&self, route: usize, scene: u16, cx: &dyn Context) -> bool {
         let Some(entry) = self.endings.subtitle else {
             return false;

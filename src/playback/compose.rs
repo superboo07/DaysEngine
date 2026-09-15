@@ -72,6 +72,24 @@ pub fn frame_rgba_with(
         );
     }
 
+    // The episode title card sits over both, at z 7000, and under the fade
+    // layer's 7500 -- so a `[WhiteFade] OUT` that has not finished still
+    // whitens it. See [`crate::playback::stage::Card`].
+    if let Some(card) = visual.card {
+        blit(
+            &mut out,
+            width,
+            height,
+            &Surface {
+                pixels: &card.rgba,
+                width: card.width as usize,
+                height: card.height as usize,
+            },
+            0,
+            0,
+        );
+    }
+
     if let Some((colour, opacity)) = visual.fade {
         let a = (opacity.clamp(0.0, 1.0) * 255.0) as u32;
         if a > 0 {

@@ -172,6 +172,9 @@ pub struct EndRoll {
     /// The letter the movie path's last character becomes, at a position
     /// whose end roll ships as a pair.
     pub letter: Option<char>,
+    /// Whether the `Ex01` episode title card is laid over the start of the
+    /// end roll. See [`days_route::Machine::change_subtitle`].
+    pub card: bool,
 }
 
 impl Progress {
@@ -297,9 +300,10 @@ impl Progress {
     /// What the route module answers about the `[EndRoll]` of the script
     /// playing here.
     ///
-    /// Shiny Days' `RouteProcSD.dll` exports `_CheckEndRollView@4` and
-    /// `_CheckEndRollSelect@8`; `RouteProcSDHQ.dll` exports neither, so on
-    /// School Days HQ this always says "plays, as written", which is what
+    /// Shiny Days' `RouteProcSD.dll` exports `_CheckEndRollView@4`,
+    /// `_CheckEndRollSelect@8` and `_ChangeSubtitle@4`; `RouteProcSDHQ.dll`
+    /// exports none of them, so on School Days HQ this always says "plays, as
+    /// written, with no card over it", which is what
     /// that engine does. See [`days_route::Machine::end_roll_view`] for how
     /// both are decoded, and [`crate::playback::stage::apply_end_roll`] for
     /// what the executable does with the answers.
@@ -312,6 +316,7 @@ impl Progress {
                 .machine
                 .end_roll_select(route, scene, &self.stores)
                 .map(|a| if a { 'A' } else { 'B' }),
+            card: self.machine.change_subtitle(route, scene, &self.stores),
         }
     }
 

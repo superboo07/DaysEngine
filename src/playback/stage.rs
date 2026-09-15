@@ -104,6 +104,9 @@ pub struct Visual<'a> {
     pub movie_id: Option<(&'a str, u64)>,
     /// The still background to show, if one is set and no movie covers it.
     pub still: Option<&'a Still>,
+    /// The `Ex01` episode title card, over both of them, while its window is
+    /// open. See [`crate::install::progress::Progress::end_roll`].
+    pub card: Option<&'a Still>,
     /// Speaker and line of the active `[PrintText]`.
     pub text: Option<(&'a str, &'a str)>,
     /// Which `[PrintText]` [`Self::text`] is: the statement's start frame.
@@ -242,6 +245,56 @@ pub struct Stage {
     /// a pass the frame was making anyway. See
     /// [`crate::media::VideoDecoder::set_output_size`].
     video_size: Option<(u32, u32)>,
+    /// The rate the control bar's speed widgets have selected, from
+    /// [`crate::ui::bar::SPEEDS`].
+    ///
+    /// It is a property of the film object in the original too, not of the
+    /// clock alone: `FUN_00422520` hands host slot `+0x134`'s answer to the
+    /// `FILMOBJ::BaseLayer` constructor, and every clip that object builds
+    /// carries it — `FILM::objectBase`'s `+0x54`, set by `FUN_00437e60`
+    /// alongside the clip's own `[start, end)` at `+0x48`/`+0x4c`. Only the
+    /// ending card reads it back here; see [`Stage::card_frames`].
+    rate: f32,
+    /// Whether the route module asks for the `Ex01` episode title card over
+    /// this script's end roll. See
+    /// [`crate::install::progress::Progress::end_roll`].
+    ending_card: bool,
+    /// The card, once the `[EndRoll]` has built it.
+    card: Option<Card>,
+    /// Whether a card has been built at all in this stage's life.
+    ///
+    /// The original's own latch, `FUN_0042b770`'s `this + 0x38c` — the film
+    /// object's `+0x49c`, because that handler is slot 0 of the secondary
+    /// vftable installed at the object's `+0x110`. Its constructor
+    /// `FUN_0042fa20` zeroes it, `FUN_0042b770` sets it to 1 once the card is
+    /// registered, and nothing else in the executable touches either offset
+    /// (Ghidra's reference index and a raw scan of `.text` for the disp32
+    /// agree). The gate it feeds is `subtitle == 0 && latch == 0` — so a
+    /// second `[EndRoll]` in the same script would get a card whether the
+    /// route module asked for one or not. No shipped script reaches that: the
+    /// one position that answers 1 is `03/03-K2-F01`, which has exactly one
+    /// `[EndRoll]`, and a fresh film object is built per script load
+    /// (`FUN_00422520`, from six call sites, all of them a script name).
+    /// [`Stage::reset`] leaves it alone for the same reason the original's
+    /// restart does: `FUN_0042a090` clears `+0x388` and `+0x38c` on the
+    /// complete object and never reaches `+0x49c`.
+    card_built: bool,
+}
+
+/// The `Ex01` episode title card, laid over the start of the end roll.
+///
+/// `FUN_0042b770` builds it as a `FILMOBJ::ImageChar` — the class `[CreateBG]`
+/// uses, `operator new(0x2d4)` then `FUN_00434270` — at the `[EndRoll]`'s own
+/// start, with its top-left at `(0, 0)` (`vt[0x58]`) and z 7000 (`vt[0x70]`),
+/// which is above the end roll's own `BGS` counter + 1000 and below the 7500
+/// the fade layer takes. The one call `[CreateBG]` does not make is
+/// `vt[0x50]` (`FUN_00438130`), which copies the film object's `+0xc`,
+/// `+0x10` and `+0x14` onto the clip; **what those three are is not
+/// recovered**, and nothing about them is visible in the shipped card.
+struct Card {
+    still: Still,
+    start: Frame,
+    end: Frame,
 }
 
 /// What this tick does with a held male voice line.
@@ -306,6 +359,42 @@ impl Stage {
             video_filters: (String::new(), String::new()),
             video_grain: 0,
             video_size: None,
+            rate: 1.0,
+            ending_card: false,
+            card: None,
+            card_built: false,
+        }
+    }
+
+    /// Sets the rate the control bar's speed widgets have selected.
+    pub fn set_rate(&mut self, rate: f32) {
+        self.rate = rate;
+    }
+
+    /// Says whether the route module wants the `Ex01` episode title card over
+    /// this script's end roll.
+    pub fn set_ending_card(&mut self, on: bool) {
+        self.ending_card = on;
+    }
+
+    /// How many frames the ending card is up for, at `rate`.
+    ///
+    /// `FUN_0042b770` asks host slot `+0x134` (`FUN_0041dac0`, the film
+    /// object's own rate at the engine's `+0x594`) and compares it against two
+    /// float constants: `0x2d0` frames at 24.0 (`_DAT_0048ddd0`), `0x168` at
+    /// 12.0 (`_DAT_0048eda8`) and `0x90` at anything else. The engine's
+    /// `+0x594` is the same value the bar's speed row stores — `FUN_00417780`
+    /// and `FUN_00417870` both write `DAT_004a1b3c[index]` there out of the
+    /// five-rate table [`crate::ui::bar::SPEEDS`] reads, and `FUN_0041e230`
+    /// starts a run at 1.0 — so the two fast widgets hold the card for the
+    /// same 1.25 seconds of wall clock the slower three give 6, 3 and 1.5.
+    fn card_frames(rate: f32) -> u32 {
+        if rate == 24.0 {
+            0x2d0
+        } else if rate == 12.0 {
+            0x168
+        } else {
+            0x90
         }
     }
 
@@ -515,6 +604,7 @@ impl Stage {
         mixer.stop_all();
         self.movie = None;
         self.still = None;
+        self.card = None;
         self.fade = None;
         self.played = None;
         self.voices.clear();
@@ -674,6 +764,28 @@ impl Stage {
                     current: None,
                     path: path.clone(),
                 });
+                // The card is built from the same string the movie was opened
+                // from -- `FUN_0041a300` inserts `L"Ex01/"` at position 0 of
+                // it, after `_CheckEndRollSelect@8`'s letter has already been
+                // substituted -- so it follows whichever of a pair plays.
+                if self.ending_card || self.card_built {
+                    let card = format!("Ex01/{path}");
+                    match load_still(vfs, &card) {
+                        Ok(still) => {
+                            let frames = Self::card_frames(self.rate);
+                            log::info!("the ending card {card} is up for {frames} frames");
+                            self.card = Some(Card {
+                                still,
+                                start,
+                                end: Frame(start.0.saturating_add(frames)),
+                            });
+                            self.card_built = true;
+                        }
+                        // `FUN_0042b770` logs `CreateError File "%s"` and
+                        // drops the clip; the end roll still plays.
+                        Err(err) => log::warn!("{err:#}"),
+                    }
+                }
             }
             // Text and choices are read out of the script by `visual_at` rather
             // than latched here, so seeking lands mid-line correctly.
@@ -770,6 +882,11 @@ impl Stage {
             movie: movie.map(|(_, frame)| frame),
             movie_id: movie.map(|(clip, frame)| (clip.path.as_str(), frame.index)),
             still: self.still.as_ref(),
+            card: self
+                .card
+                .as_ref()
+                .filter(|c| at >= c.start && at < c.end)
+                .map(|c| &c.still),
             fade: self
                 .fade
                 .as_ref()
@@ -899,6 +1016,7 @@ mod tests {
             crate::install::progress::EndRoll {
                 plays: true,
                 letter: Some('B'),
+                card: false,
             },
         );
         assert_eq!(
@@ -922,6 +1040,7 @@ mod tests {
             crate::install::progress::EndRoll {
                 plays: false,
                 letter: None,
+                card: false,
             },
         );
         let at = Frame::parse("00:46:06").unwrap();
@@ -943,6 +1062,19 @@ mod tests {
                 command: Command::EndRoll { path: path.into() },
             }],
         }
+    }
+
+    /// The two fast widgets hold the ending card longer, and 4x -- which is
+    /// still fast -- does not. `FUN_0042b770` compares the rate against 24.0
+    /// and 12.0 only, so the card is 720 frames at the top two rates and 144
+    /// at the other three: 1.25 seconds of wall clock against 6, 3 and 1.5.
+    #[test]
+    fn only_the_top_two_rates_lengthen_the_ending_card() {
+        let held: Vec<u32> = crate::ui::bar::SPEEDS
+            .iter()
+            .map(|&r| Stage::card_frames(r))
+            .collect();
+        assert_eq!(held, vec![0x90, 0x90, 0x90, 0x168, 0x2d0]);
     }
 
     /// A fade is a layer with the statement's own window, not a wash that
