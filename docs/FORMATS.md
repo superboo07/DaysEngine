@@ -3234,8 +3234,25 @@ eight strings at `this+0x5ec`. Both retail installs ship it off and no shipped
 line carries a ruby mark, so there is nothing to draw; the marks are still
 recognised by the wrap, because they change where a line breaks either way.
 
-`daysengine::ui::backlog` carries all of this, and `days backlog <script>` draws
-it over one script's lines.
+### The log's lifetime
+
+Nothing in `SysMenuSDHQ.dll` asks the host to empty the log. `FUN_0042c0e0` —
+host slot `+0x2c`, the only call to `FUN_004349f0` that is not the engine's own
+teardown — is referenced by nothing but its vtable entry, and a byte scan of the
+module for an indirect call at that offset finds none either. So the log runs
+for the whole session.
+
+What does trim it is the mark. `FUN_00432a10` records the player's position and
+sets `+0x98` to the log's length as it goes; `FUN_004348e0` erases from there,
+and `FUN_00425bf0` case 3 calls it when the seek code is 1 — a restart. So
+restarting a script drops the lines it had already shown rather than repeating
+them.
+
+`daysengine::ui::backlog` carries all of this and `daysengine::ui::menu` opens
+it: `Showing::BackLog` is the screen key for the one screen with no mode
+integer, because `Menu` is otherwise keyed on `SystemInit`'s own numbers and
+`setSystemInit`'s 3 is already mode 3 there. `days backlog <script>` draws the
+screen over one script's lines and `days menu --from-bar 3` drives it.
 
 ---
 

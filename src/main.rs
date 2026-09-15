@@ -23,10 +23,11 @@ use daysengine::media::AudioBuffer;
 use daysengine::media::ImageScaler;
 use daysengine::playback::lipsync::compose_mouths;
 use daysengine::playback::som::{self, Device};
+use daysengine::ui::backlog;
 use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::comment;
 use daysengine::ui::ending;
-use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, SystemSe};
+use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, Showing, SystemSe};
 use daysengine::ui::options::{self, Dir, Display, Som};
 use daysengine::ui::paths::Paths;
 use daysengine::ui::replay::{self, Scenes};
@@ -684,6 +685,27 @@ struct Player<'a> {
     /// choice box writes it after that — so it outlives the script it was made
     /// in, and lives as long as the session does.
     last_choice: i32,
+    /// Every line the player has been shown this session, oldest first — the
+    /// list the original keeps at `engine+0xac +0x08`.
+    ///
+    /// `FUN_0043dbe0` pushes one record per `[PrintText]` and nothing in the
+    /// menu module ever asks the host to empty it: `FUN_0042c0e0`, host slot
+    /// `+0x2c`, is the only clear, and `SysMenuSDHQ.dll` never calls it —
+    /// checked by Ghidra's reference index on the slot's function and by a byte
+    /// scan of the module for an indirect call at that offset. So the log runs
+    /// for the whole session, and only [`Player::backlog_mark`] trims it.
+    backlog: Vec<backlog::Entry>,
+    /// The log's length when the script that is playing started, which is the
+    /// original's `+0x98`.
+    ///
+    /// `FUN_00432a10` sets it as it records the player's position, and
+    /// `FUN_004348e0` erases from it — which `FUN_00425bf0` case 3 does when a
+    /// restart moves the timeline, so restarting a script drops the lines it
+    /// had already logged.
+    backlog_mark: usize,
+    /// Which `[PrintText]` was logged last, by its start frame, so a statement
+    /// is logged once however many times the loop samples it.
+    backlog_logged: Option<days_script::Frame>,
 }
 
 impl Player<'_> {
@@ -859,6 +881,9 @@ fn main() -> Result<()> {
             .is_some_and(|v| v.trim() != "0"),
         following_record: false,
         last_choice: replay::NO_CHOICE,
+        backlog: Vec::new(),
+        backlog_mark: 0,
+        backlog_logged: None,
         // Started only while the save-comment dialog is up, so ordinary key
         // presses stay key presses everywhere else.
         text_input: video.text_input(),
@@ -1190,7 +1215,7 @@ enum MenuEntry {
     /// The menus own the screen, starting at the title.
     Title,
     /// One screen over live playback, as host `+0xf8(code)` opens it.
-    OverPlayback(Mode, saveload::Kind),
+    OverPlayback(Showing, saveload::Kind),
 }
 
 /// How many scripts a skip will pass over before giving up and playing one.
@@ -1356,6 +1381,10 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
             Scenes::from_scenes(Vec::new())
         }
     };
+    let ruby_on = config.int_or(
+        backlog::RUBY_SETTING,
+        player.film.get_u32("AgateUsing").unwrap_or(0) as i32,
+    ) != 0;
     Session {
         save: SaveState::from_flags(&player.flags, start),
         flags: player.flags.clone(),
@@ -1389,6 +1418,14 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
         // The route map asks this one whether the run has passed a story
         // point. From the title there is no run and the screen does not ask.
         run: run.map(|p| p.store().clone()),
+        // `[BackLogType]` picks which of the backlog's two screens loads, and
+        // `[AgateUsing]` — overridden by `Config.DAT`'s `UseAgate`, which is
+        // what the engine really reads — whether it draws ruby.
+        flow: backlog::Flow::from_setting(player.film.get_u32("BackLogType").unwrap_or(0).into()),
+        ruby: ruby_on,
+        // The lines the player has been shown, which the engine keeps and the
+        // backlog screen only reads.
+        lines: player.backlog.clone(),
     }
 }
 
@@ -1446,15 +1483,22 @@ fn run_menu(
             player.resolution(),
         )
         .context("opening the title screen")?,
-        MenuEntry::OverPlayback(mode, kind) => Menu::open_over_playback(
-            player.vfs,
-            &player.dll,
-            mode,
-            kind,
-            session,
-            player.resolution(),
-        )
-        .with_context(|| format!("opening menu mode {} over playback", mode.0))?,
+        MenuEntry::OverPlayback(Showing::BackLog, _) => {
+            Menu::open_backlog(player.vfs, &player.dll, session, player.resolution())
+                .context("opening the backlog over playback")?
+        }
+        MenuEntry::OverPlayback(showing, kind) => {
+            let mode = showing.mode().expect("a mode, since BackLog is above");
+            Menu::open_over_playback(
+                player.vfs,
+                &player.dll,
+                mode,
+                kind,
+                session,
+                player.resolution(),
+            )
+            .with_context(|| format!("opening menu mode {} over playback", mode.0))?
+        }
     };
 
     let backdrop = load_title_backdrop(player, start);
@@ -1839,7 +1883,7 @@ fn run_menu(
             // The backdrop is only the title's; every other screen draws its own
             // background or sits over black.
             let image = menu.compose(
-                (menu.mode() == Mode::TITLE)
+                (menu.showing().is(Mode::TITLE))
                     .then_some(under.as_ref())
                     .flatten(),
             );
@@ -2449,6 +2493,12 @@ fn run_script(
     // A direction held on the way in would otherwise repeat into the first
     // frame of the script.
     player.controls.clear();
+    // Where the backlog stands as this script opens. `FUN_00432a10` records
+    // the player's position and sets the log's `+0x98` to its length as it
+    // goes; `FUN_004348e0` erases from there, which is what a restart does
+    // below. The log itself carries across scripts.
+    player.backlog_mark = player.backlog.len();
+    player.backlog_logged = None;
 
     // The background as it will be shown: mouth patches already in it, scaled
     // to the window. Keyed by everything that decides those pixels, so a pass
@@ -2729,6 +2779,20 @@ fn run_script(
         stage.seek_to(at, player.vfs, player.mixer)?;
         let visual = stage.visual_at(at);
 
+        // The backlog. `FUN_0043dbe0` logs a statement where it dispatches it,
+        // once; this loop samples the timeline far faster than 24 fps, so the
+        // statement's own start frame is what says whether it has been logged
+        // already. See `daysengine::ui::backlog`.
+        if let (Some(id), Some((speaker, line))) = (visual.text_id, visual.text) {
+            if player.backlog_logged != Some(id) {
+                player.backlog_logged = Some(id);
+                player.backlog.push(backlog::Entry {
+                    speaker: speaker.to_string(),
+                    text: line.to_string(),
+                });
+            }
+        }
+
         // The peripheral. `FUN_0043dbe0` asks two things of the host before it
         // moves it — the engine is on its playback tick, and the lit speed
         // widget is 1x — and the statement's own window is the rest:
@@ -2920,6 +2984,12 @@ fn run_script(
                         bar::Act::Seek(code) if code == bar::Seek::RESTART => {
                             offset = Frame::ZERO;
                             origin = now;
+                            // `FUN_00425bf0` case 3 calls `FUN_004348e0` on
+                            // the log, which erases from the mark this script
+                            // set — so the lines it had already shown go with
+                            // the restart rather than repeating in the backlog.
+                            player.backlog.truncate(player.backlog_mark);
+                            player.backlog_logged = None;
                         }
                         // Skip jumps to the choice this script raises, if it
                         // still has one ahead. `FUN_00425bf0`'s case 6 is the
@@ -2945,22 +3015,21 @@ fn run_script(
                         // along it, so this one goes back to the title.
                         bar::Act::Leave => return Ok(Outcome::Play),
                         // These are `setSystemInit`'s own codes: 4 opens the
-                        // save/load module to save, 5 to load and 2 the Option
-                        // screen. Code 3 selects `DAT_1004ffc8`, which is
-                        // `MENU::BackLogView` — the backlog screen. It is
-                        // recovered and drawn (`crate::ui::backlog`) but not
-                        // yet wired to a menu here, because the engine does not
-                        // keep the printed lines across a session the way
-                        // `engine+0xac` does.
+                        // save/load module to save, 5 to load, 2 the Option
+                        // screen and 3 the backlog — `DAT_1004ffc8`, whose
+                        // constructor installs `MENU::BackLogView::vftable`.
+                        // The backlog is the one with no `SystemInit` mode
+                        // behind it, which is what `Showing` carries.
                         bar::Act::Menu(request) => {
                             let opened = match request.0 {
-                                4 => Some((Mode::SAVELOAD, saveload::Kind::Save)),
-                                5 => Some((Mode::SAVELOAD, saveload::Kind::Load)),
-                                // The Option screen ignores the save/load job.
-                                2 => Some((Mode::OPTION, saveload::Kind::Load)),
+                                4 => Some((Showing::Mode(Mode::SAVELOAD), saveload::Kind::Save)),
+                                5 => Some((Showing::Mode(Mode::SAVELOAD), saveload::Kind::Load)),
+                                // Neither of these has a save/load job to do.
+                                2 => Some((Showing::Mode(Mode::OPTION), saveload::Kind::Load)),
+                                3 => Some((Showing::BackLog, saveload::Kind::Load)),
                                 _ => None,
                             };
-                            let Some((mode, kind)) = opened else {
+                            let Some((showing, kind)) = opened else {
                                 log::info!(
                                     "the bar asked for menu {}, which is not recovered",
                                     request.0
@@ -2986,7 +3055,7 @@ fn run_script(
                                 creator,
                                 events,
                                 start_ini,
-                                MenuEntry::OverPlayback(mode, kind),
+                                MenuEntry::OverPlayback(showing, kind),
                                 progress.as_deref_mut(),
                             )?;
                             player.mixer.resume_script();

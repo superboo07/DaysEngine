@@ -106,6 +106,13 @@ pub struct Visual<'a> {
     pub still: Option<&'a Still>,
     /// Speaker and line of the active `[PrintText]`.
     pub text: Option<(&'a str, &'a str)>,
+    /// Which `[PrintText]` [`Self::text`] is: the statement's start frame.
+    ///
+    /// Two visuals carrying the same value are the same statement. The backlog
+    /// needs that rather than the words: the original logs a statement once,
+    /// where `FUN_0043dbe0` dispatches it, and two statements in a row can
+    /// carry the same line — a `......` follows a `......` often enough.
+    pub text_id: Option<Frame>,
     /// The active `[SetSELECT]`, with the window it owns.
     ///
     /// The window is part of it because the choice box is driven by it: the
@@ -767,7 +774,8 @@ impl Stage {
         for event in self.script.events.iter().filter(|e| e.is_active_at(at)) {
             match &event.command {
                 Command::PrintText { speaker, text } => {
-                    visual.text = Some((speaker.as_str(), text.as_str()))
+                    visual.text = Some((speaker.as_str(), text.as_str()));
+                    visual.text_id = Some(event.start);
                 }
                 Command::SetSelect { a, b } => {
                     visual.select = Some(SelectWindow {

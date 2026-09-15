@@ -391,6 +391,10 @@ pub fn scrolled(at: usize, count: usize, widget: usize) -> Option<usize> {
     }
 }
 
+/// The Close widget, `FUN_100042d0`'s case 4 — `+0x4c(0)`, the same way out
+/// every screen the control bar opens offers.
+pub const CLOSE: usize = 4;
+
 /// The entry the screen opens on, `FUN_100039a0`'s
 /// `this+0x13c = this+0x138 - 1`: the last line logged.
 pub fn opening_entry(count: usize) -> usize {
@@ -454,8 +458,17 @@ pub fn draw(font: &Font, entries: &[Entry], at: usize, flow: Flow, english: bool
 /// widget is placed.
 pub fn compose(screen: &Screen, states: &[WidgetState], buffer: &Image) -> Image {
     let mut out = screen.compose(states);
-    out.blit_downscaled(buffer, (0, 0, VIEW.0, VIEW.1), screen.place_layout(DEST));
+    blit(&mut out, screen, buffer);
     out
+}
+
+/// Puts [`VIEW`] of the buffer onto [`DEST`] of an already-composited frame.
+///
+/// The half of [`compose`] a caller that has built the frame some other way
+/// still needs — [`crate::ui::menu`] composites through the screen's own page
+/// and sprite layers first.
+pub fn blit(out: &mut Image, screen: &Screen, buffer: &Image) {
+    out.blit_downscaled(buffer, (0, 0, VIEW.0, VIEW.1), screen.place_layout(DEST));
 }
 
 /// `FUN_100022a0`'s guard on one row: the vertical flow draws every row it is

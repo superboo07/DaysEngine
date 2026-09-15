@@ -440,10 +440,14 @@ struct MenuArgs {
     /// Try to open every mode and report which ones this engine can draw.
     #[arg(long)]
     check_all: bool,
+    /// Fill the backlog with one script's `[PrintText]` lines, as a run that
+    /// had played it would have. Only the backlog reads them.
+    #[arg(long, value_name = "SCRIPT")]
+    lines_from: Option<String>,
     /// Open the screen the way the in-game control bar opens it, over live
     /// playback, instead of starting at the title. Takes `setSystemInit`'s own
     /// code, which is what the bar passes host `+0xf8`: 4 for the save screen,
-    /// 5 for the load screen, 2 for the Option screen.
+    /// 5 for the load screen, 2 for the Option screen, 3 for the backlog.
     ///
     /// This is the entry that decides where Close goes, so it is the only way
     /// to check that from here. With it, `-e click:X:Y` on Close reports
@@ -2817,6 +2821,32 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     };
     let film = film_ini(&vfs);
     let english = film.get_bool("UseEnglish").unwrap_or(false);
+    // A run's worth of backlog, for the one screen that reads it. There is no
+    // playback here to have logged any, so a script stands in.
+    let lines = match &args.lines_from {
+        None => Vec::new(),
+        Some(name) => {
+            let wanted = name.to_uppercase();
+            let (_, path) = script_paths(&vfs)
+                .into_iter()
+                .find(|(n, _)| *n == wanted)
+                .with_context(|| format!("no script named {name}"))?;
+            let script = days_script::Script::parse(&wanted, &vfs.read_path(&path)?)?;
+            script
+                .events
+                .iter()
+                .filter_map(|e| match &e.command {
+                    days_script::Command::PrintText { speaker, text } => {
+                        Some(daysengine::ui::backlog::Entry {
+                            speaker: speaker.clone(),
+                            text: text.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    };
     let mut save = SaveState::from_flags(&flags, &start_script_ini(&vfs));
     save.all_clear |= args.all_clear;
     save.cleared_first |= args.cleared;
@@ -2859,6 +2889,17 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             }
             slot.map(|slot| slot.store)
         }),
+        // The backlog's two answers. There is no run here to have logged any
+        // lines, so the screen opens empty — which is what it does in the
+        // original before the first `[PrintText]` too.
+        flow: daysengine::ui::backlog::Flow::from_setting(
+            film.get_u32("BackLogType").unwrap_or(0).into(),
+        ),
+        ruby: Config::load(game).int_or(
+            daysengine::ui::backlog::RUBY_SETTING,
+            film.get_u32("AgateUsing").unwrap_or(0) as i32,
+        ) != 0,
+        lines: lines.clone(),
     };
 
     if args.check_all {
@@ -2940,6 +2981,23 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 Err(err) => println!("  code {code}  {name:<14} mode {:>2}  {err}", mode.0),
             }
         }
+        // The backlog is the fourth, and the one with no mode integer:
+        // `setSystemInit` code 3 selects `DAT_1004ffc8`, whose constructor
+        // installs `MENU::BackLogView::vftable`, and `SystemInit`'s switch has
+        // no case that reaches it. See `daysengine::ui::backlog`.
+        match Menu::open_backlog(&vfs, &dll, session(), resolution) {
+            Ok(mut menu) => {
+                let leaving = menu.leave(&vfs, &dll);
+                println!(
+                    "  code 3  {:<14} {:<8}  ok, {} widgets, leaving -> {:?}",
+                    "backlog",
+                    menu.variant(),
+                    menu.screen().widget_count(),
+                    leaving
+                );
+            }
+            Err(err) => println!("  code 3  {:<14} {err}", "backlog"),
+        }
         return Ok(());
     }
 
@@ -2953,6 +3011,9 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             Menu::open(&vfs, &dll, mode, session(), resolution)
                 .with_context(|| format!("opening menu mode {}", mode.0))?
         }
+        // Code 3 is the backlog, which has no mode integer of its own.
+        Some(3) => Menu::open_backlog(&vfs, &dll, session(), resolution)
+            .context("opening the backlog over playback")?,
         Some(code) => {
             let (mode, kind) = match code {
                 4 => (Mode::SAVELOAD, Kind::Save),
@@ -2960,7 +3021,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 // The Option screen has no save/load job to set.
                 2 => (Mode::OPTION, Kind::Load),
                 other => bail!(
-                    "--from-bar {other} is not a menu the control bar can open;                      it passes host +0xf8 code 4 (save), 5 (load) or 2 (option).                      Code 3 has a case in setSystemInit, selecting DAT_1004ffc8,                      but which screen that is has not been recovered."
+                    "--from-bar {other} is not a menu the control bar can open;                      it passes host +0xf8 code 4 (save), 5 (load), 2 (option) or                      3 (backlog)."
                 ),
             };
             Menu::open_over_playback(&vfs, &dll, mode, kind, session(), resolution)
@@ -2976,8 +3037,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         println!("driving at {w}x{h}");
     }
     println!(
-        "mode {} ({}) — {} widgets, entry {:?}",
-        menu.mode().0,
+        "{} ({}) — {} widgets, entry {:?}",
+        menu.showing().name(),
         menu.variant(),
         menu.screen().widget_count(),
         menu.entry()
@@ -3040,8 +3101,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             }
         };
         println!(
-            "  {label:<12} -> {action:?}  mode {} selection {:?}",
-            menu.mode().0,
+            "  {label:<12} -> {action:?}  {} selection {:?}",
+            menu.showing().name(),
             menu.selection()
         );
         match action {
@@ -3118,7 +3179,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // The save/load screen's rows carry text the composite draws itself rather
     // than cutting out of art. Print the lines, so what the screen shows is
     // checkable against the install without reading pixels.
-    if menu.mode() == Mode::SAVELOAD {
+    if menu.showing().is(Mode::SAVELOAD) {
         let slots = &menu.session().slots;
         println!(
             "  {:?} screen, page {} of {}, {} slots filled",
@@ -3151,7 +3212,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // The route map's cells are story points, and which of them are charted
     // and which can be picked is the whole of what the screen decides. Print
     // them, since neither is visible in a widget count.
-    if menu.mode() == Mode::ROUTEMAP {
+    if menu.showing().is(Mode::ROUTEMAP) {
         let (episode, page, chart) = menu.chart();
         let charted = menu.charted();
         let pickable = menu.pickable();
@@ -3187,7 +3248,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         // engine makes, so the PNG shows the title the player would see.
         let under = match &args.backdrop {
             Some(path) => Some(path.as_str()),
-            None if menu.mode() == Mode::TITLE => Some(chosen.path.as_str()),
+            None if menu.showing().is(Mode::TITLE) => Some(chosen.path.as_str()),
             None => None,
         };
         let backdrop = match under {

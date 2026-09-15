@@ -53,6 +53,7 @@
 use crate::install::config::{Config, Sound};
 use crate::install::ini::Ini;
 use crate::install::vfs::Vfs;
+use crate::ui::backlog;
 use crate::ui::dress;
 use crate::ui::option_pages;
 use crate::ui::options;
@@ -467,6 +468,20 @@ pub struct Session {
     /// character caps on a save row and where each column sits — so it is
     /// carried here rather than threaded through every call.
     pub english: bool,
+    /// `FILMENGINE.INI [BackLogType]`, which is what host `+0x64` answers.
+    ///
+    /// It picks which of the backlog's two screens is loaded and how its lines
+    /// are laid out — see [`crate::ui::backlog::Flow`].
+    pub flow: backlog::Flow,
+    /// Whether ruby is on: `[AgateUsing]` overridden by `Config.DAT`'s
+    /// `UseAgate`, which is host `+0x60`.
+    pub ruby: bool,
+    /// Every line the player has been shown this session, oldest first.
+    ///
+    /// The engine's own list, not a menu's: `FUN_0043dbe0` pushes to it from
+    /// playback and the backlog screen only reads it. See
+    /// [`crate::ui::backlog`].
+    pub lines: Vec<backlog::Entry>,
 }
 
 impl Session {
@@ -486,6 +501,9 @@ impl Session {
             dress: None,
             english: false,
             text_input: false,
+            flow: backlog::Flow::Horizontal,
+            ruby: false,
+            lines: Vec::new(),
         }
     }
 }
@@ -561,8 +579,12 @@ pub fn leaving(entry: Entry, return_to: Mode) -> Leaving {
 /// Everything else is the driver's question, and over playback the answer is
 /// the same as Close's, because `+0x4c(0)` is the only way out the modules the
 /// bar can open actually offer.
-pub fn backing_out(entry: Entry, mode: Mode, return_to: Mode) -> Leaving {
-    match mode {
+pub fn backing_out(entry: Entry, showing: Showing, return_to: Mode) -> Leaving {
+    // The backlog is the one screen with no mode integer, and it is one of the
+    // three with nothing but Close: `FUN_100042d0` case 4 is `+0x4c(0)`, the
+    // same way out the save/load and Option screens the bar opens offer, so it
+    // falls to the driver's answer below.
+    match showing.mode().unwrap_or(Mode::PLAY) {
         Mode::CONFIRM => Leaving::To(return_to),
         Mode::SOM_CONFIG => Leaving::To(Mode::OPTION),
         Mode::REPLAY_POPUP => Leaving::To(Mode::REPLAY),
@@ -574,9 +596,49 @@ pub fn backing_out(entry: Entry, mode: Mode, return_to: Mode) -> Leaving {
     }
 }
 
+/// Which screen a [`Menu`] is showing.
+///
+/// Almost every screen is one of `SystemInit`'s mode integers, and those stay
+/// the game's own numbers — see [`Mode`]. The backlog is the one that is not.
+/// `_SystemInit@8`'s switch has no case that selects `DAT_1004ffc8`, the object
+/// whose constructor installs `MENU::BackLogView::vftable`; the only numbering
+/// that names it is `setSystemInit`'s, whose 3 is already [`Mode::SAVELOAD`] in
+/// `SystemInit`'s. So it gets a variant of its own rather than an invented
+/// integer. See [`crate::ui::backlog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Showing {
+    /// A screen `SystemInit` has a mode for.
+    Mode(Mode),
+    /// The backlog, which it does not.
+    BackLog,
+}
+
+impl Showing {
+    /// The mode integer, or `None` for a screen that has none.
+    pub fn mode(self) -> Option<Mode> {
+        match self {
+            Showing::Mode(mode) => Some(mode),
+            Showing::BackLog => None,
+        }
+    }
+
+    /// Whether this is that mode's screen.
+    pub fn is(self, mode: Mode) -> bool {
+        self == Showing::Mode(mode)
+    }
+
+    /// What to call it in a log line.
+    pub fn name(self) -> String {
+        match self {
+            Showing::Mode(mode) => format!("mode {}", mode.0),
+            Showing::BackLog => "the backlog".to_string(),
+        }
+    }
+}
+
 /// The menu, as one screen plus the pointer state over it.
 pub struct Menu {
-    mode: Mode,
+    showing: Showing,
     /// Where this install's menu module puts each screen's art. Read once from
     /// the module's own literals — see [`crate::ui::paths`].
     paths: Paths,
@@ -607,6 +669,9 @@ pub struct Menu {
     episode: usize,
     /// Which page of it: `+0x3e0`.
     map_page: usize,
+    /// Which line the backlog is on: `MENU::BackLogView` `+0x13c`, which
+    /// `FUN_100039a0` opens at the last one logged.
+    backlog_at: usize,
     /// The scene the replay popup is asking about: `+0x2a8`.
     asked: Option<usize>,
     /// Which job the save/load screen is doing: its `+0x94`, which
@@ -661,7 +726,7 @@ impl Menu {
         Menu::open_with(
             vfs,
             dll,
-            mode,
+            Showing::Mode(mode),
             session,
             resolution,
             Entry::Title,
@@ -690,14 +755,44 @@ impl Menu {
         session: Session,
         resolution: Resolution,
     ) -> Result<Menu, Error> {
-        Menu::open_with(vfs, dll, mode, session, resolution, Entry::Playback, kind)
+        Menu::open_with(
+            vfs,
+            dll,
+            Showing::Mode(mode),
+            session,
+            resolution,
+            Entry::Playback,
+            kind,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Opens the backlog the way the control bar opens it.
+    ///
+    /// `setSystemInit`'s code 3 selects `DAT_1004ffc8`, and that object is
+    /// `MENU::BackLogView` — see [`Showing`]. There is no `SystemInit` mode for
+    /// it and no other way in, so it is always [`Entry::Playback`].
+    pub fn open_backlog(
+        vfs: &Vfs,
+        dll: &[u8],
+        session: Session,
+        resolution: Resolution,
+    ) -> Result<Menu, Error> {
+        Menu::open_with(
+            vfs,
+            dll,
+            Showing::BackLog,
+            session,
+            resolution,
+            Entry::Playback,
+            Kind::Load,
+        )
+    }
+
     fn open_with(
         vfs: &Vfs,
         dll: &[u8],
-        mode: Mode,
+        showing: Showing,
         session: Session,
         resolution: Resolution,
         entry: Entry,
@@ -706,12 +801,12 @@ impl Menu {
         let tab = options::Tab::DEFAULT;
         let view = replay::View::DEFAULT;
         let paths = Paths::from_module(dll);
-        let variant = variant_for(&session, mode, tab, view, None, (0, 0));
+        let variant = variant_for(&session, showing, tab, view, None, (0, 0));
         let screen = load_screen(
             vfs,
             dll,
             &paths,
-            mode,
+            showing,
             &variant,
             Mode::TITLE,
             tab,
@@ -720,8 +815,9 @@ impl Menu {
             dress::Phase::default(),
             resolution,
         )?;
+        let backlog_at = backlog::opening_entry(session.lines.len());
         let mut menu = Menu {
-            mode,
+            showing,
             paths,
             variant,
             states: vec![WidgetState::Resting; screen.widget_count()],
@@ -737,6 +833,7 @@ impl Menu {
             page: 0,
             episode: 0,
             map_page: 0,
+            backlog_at,
             asked: None,
             kind,
             thumbnails: None,
@@ -757,19 +854,25 @@ impl Menu {
         Ok(menu)
     }
 
-    /// Loads `mode`'s screen into this menu, keeping the session.
-    fn enter(&mut self, vfs: &Vfs, dll: &[u8], mode: Mode, return_to: Mode) -> Result<(), Error> {
+    /// Loads a screen into this menu, keeping the session.
+    fn enter(
+        &mut self,
+        vfs: &Vfs,
+        dll: &[u8],
+        showing: Showing,
+        return_to: Mode,
+    ) -> Result<(), Error> {
         // Arriving at the dress-select screen starts it on its own hit map,
         // which is the module's `+0x140` coming up zero from the constructor.
         // Reloading the screen that is already showing — which is what a
         // display-mode change is — keeps whichever map is loaded, the way
         // `FUN_1000ef80` re-lays the popup out rather than dismissing it.
-        if self.mode != mode {
+        if self.showing != showing {
             self.dress_phase = dress::Phase::default();
         }
         let variant = variant_for(
             &self.session,
-            mode,
+            showing,
             self.tab,
             self.view,
             self.asked,
@@ -779,7 +882,7 @@ impl Menu {
             vfs,
             dll,
             &self.paths,
-            mode,
+            showing,
             &variant,
             return_to,
             self.tab,
@@ -791,7 +894,7 @@ impl Menu {
         self.states = vec![WidgetState::Resting; screen.widget_count()];
         self.screen = screen;
         self.refit();
-        self.mode = mode;
+        self.showing = showing;
         self.variant = variant;
         self.return_to = return_to;
         self.selection = None;
@@ -812,7 +915,7 @@ impl Menu {
     /// for every asset in this engine.
     fn load_dress(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.dress = None;
-        if self.mode != Mode::DRESS_SELECT {
+        if !self.showing.is(Mode::DRESS_SELECT) {
             return;
         }
         let caption = self.paths.dress_select_text().and_then(|path| {
@@ -862,7 +965,7 @@ impl Menu {
             vfs,
             dll,
             &self.paths,
-            Mode::DRESS_SELECT,
+            Showing::Mode(Mode::DRESS_SELECT),
             &self.variant,
             self.return_to,
             self.tab,
@@ -1052,11 +1155,11 @@ impl Menu {
     /// shipped `FUN_10011ec0` runs: the surface holds one page at a time.
     pub fn load_rows(&mut self) {
         self.rows = None;
-        let list = match self.mode {
-            Mode::SAVELOAD => List::SaveLoad,
-            Mode::REPLAY if self.view != replay::View::PlayData => return,
-            Mode::REPLAY if self.paths.replay_has_pages() => List::ReplayPages,
-            Mode::REPLAY => List::PlayData,
+        let list = match self.showing {
+            Showing::Mode(Mode::SAVELOAD) => List::SaveLoad,
+            Showing::Mode(Mode::REPLAY) if self.view != replay::View::PlayData => return,
+            Showing::Mode(Mode::REPLAY) if self.paths.replay_has_pages() => List::ReplayPages,
+            Showing::Mode(Mode::REPLAY) => List::PlayData,
             _ => return,
         };
         let Some(font) = &self.font else {
@@ -1123,7 +1226,7 @@ impl Menu {
     /// follows.
     fn load_thumbnails(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.thumbnails = None;
-        if self.mode != Mode::REPLAY
+        if !self.showing.is(Mode::REPLAY)
             || self.view != replay::View::HScene
             || self.paths.replay_has_pages()
         {
@@ -1164,7 +1267,7 @@ impl Menu {
     /// follows.
     fn load_replay_page(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.replay_page = None;
-        if self.mode != Mode::REPLAY || !self.paths.replay_has_pages() {
+        if !self.showing.is(Mode::REPLAY) || !self.paths.replay_has_pages() {
             return;
         }
         let Some(pages) = replay_pages::Pages::locate(dll, self.screen.atlas().offset) else {
@@ -1303,7 +1406,7 @@ impl Menu {
     /// follows.
     fn load_page(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.option_page = None;
-        if self.mode != Mode::OPTION || self.paths.option_tabs_have_own_map() {
+        if !self.showing.is(Mode::OPTION) || self.paths.option_tabs_have_own_map() {
             return;
         }
         let Some(pages) = option_pages::Pages::locate(dll, self.screen.atlas().offset) else {
@@ -1386,8 +1489,14 @@ impl Menu {
         self.asked
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
+    /// Which screen is showing.
+    pub fn showing(&self) -> Showing {
+        self.showing
+    }
+
+    /// Its mode integer, or `None` for the one screen that has none.
+    pub fn mode(&self) -> Option<Mode> {
+        self.showing.mode()
     }
 
     /// The save/load screen's rasterised rows, for a tool that wants to report
@@ -1478,6 +1587,24 @@ impl Menu {
                 (0, 0, w, h),
                 (0, self.screen.letterbox().round() as i64, w, h),
             );
+        }
+        // The backlog's lines are drawn into a buffer of its own and shown by
+        // one sprite over the whole screen, created after the base art and the
+        // widget sprites and so on top of both. See [`crate::ui::backlog`].
+        if self.showing == Showing::BackLog {
+            match &self.font {
+                Some(font) => {
+                    let buffer = backlog::draw(
+                        font,
+                        &self.session.lines,
+                        self.backlog_at,
+                        self.session.flow,
+                        self.session.english,
+                    );
+                    backlog::blit(&mut out, &self.screen, &buffer);
+                }
+                None => log::warn!("no font, so the backlog's lines stay undrawn"),
+            }
         }
         // The save/load rows are not widget sprites: their source is twice the
         // size of their destination, so they are blitted with the averaging
@@ -1693,7 +1820,7 @@ impl Menu {
         // which `FUN_100083b0` takes from the frame table at record `tab + 4`.
         // Everything else on its screen belongs to the page.
         // The dress under the pointer, drawn over the two resting ones.
-        if self.mode == Mode::DRESS_SELECT && self.dress_phase == dress::Phase::Choosing {
+        if self.showing.is(Mode::DRESS_SELECT) && self.dress_phase == dress::Phase::Choosing {
             if let Some(lit) = self
                 .selection
                 .and_then(|widget| dress::lit(self.screen.atlas(), widget))
@@ -1701,12 +1828,12 @@ impl Menu {
                 out.push((self.screen.chip(), lit));
             }
         }
-        if self.mode == Mode::OPTION && self.option_page.is_some() {
+        if self.showing.is(Mode::OPTION) && self.option_page.is_some() {
             if let Some(header) = self.screen.atlas().extras.get(self.tab.index()) {
                 out.push((self.screen.chip(), *header));
             }
         }
-        if self.mode == Mode::OPTION && self.option_page.is_none() {
+        if self.showing.is(Mode::OPTION) && self.option_page.is_none() {
             let values = options::current_values(
                 self.tab,
                 &self.session.config,
@@ -1722,8 +1849,8 @@ impl Menu {
                 }
             }
         }
-        match self.mode {
-            Mode::OPTION if self.tab == options::Tab::Sound && self.option_page.is_none() => {
+        match self.mode() {
+            Some(Mode::OPTION) if self.tab == options::Tab::Sound && self.option_page.is_none() => {
                 for row in 0..options::VOLUME_ROW_COUNT {
                     let Some((channel, first)) = options::volume_row(row) else {
                         continue;
@@ -1740,7 +1867,7 @@ impl Menu {
                     }
                 }
             }
-            Mode::REPLAY if self.view == replay::View::HScene => {
+            Some(Mode::REPLAY) if self.view == replay::View::HScene => {
                 let Some((sheet, table)) = &self.thumbnails else {
                     return out;
                 };
@@ -1769,7 +1896,7 @@ impl Menu {
             // down in one pass before these sprites do, which puts the marker
             // on top of the hover art rather than under it; holding it back on
             // the cell the pointer is on is that order's visible half.
-            Mode::ROUTEMAP => {
+            Some(Mode::ROUTEMAP) => {
                 let page = self.chart_page();
                 if let Some(sprite) = self.marker().and_then(|cell| {
                     self.screen
@@ -1797,7 +1924,7 @@ impl Menu {
     pub fn enabled(&self, widget: usize) -> bool {
         // A page's widgets are numbered past the frame's four, so they are not
         // in `states` at all and the length test below would refuse every one.
-        if self.option_page.is_some() && self.mode == Mode::OPTION {
+        if self.option_page.is_some() && self.showing.is(Mode::OPTION) {
             return option_pages::enabled(
                 self.tab,
                 widget,
@@ -1805,32 +1932,32 @@ impl Menu {
                 self.session.som,
             );
         }
-        if self.replay_page.is_some() && self.mode == Mode::REPLAY {
+        if self.replay_page.is_some() && self.showing.is(Mode::REPLAY) {
             return replay_pages::enabled(self.view, widget, &self.unlocked_slots());
         }
         if widget >= self.states.len() {
             return false;
         }
-        match self.mode {
-            Mode::TITLE => match widget {
+        match self.mode() {
+            Some(Mode::TITLE) => match widget {
                 2 => self.session.save.replay_unlocked(),
                 5 => self.session.save.all_clear,
                 _ => true,
             },
-            Mode::OPTION => {
+            Some(Mode::OPTION) => {
                 options::enabled(self.tab, widget, self.session.save.trial, self.session.som)
             }
-            Mode::REPLAY if self.view == replay::View::HScene => {
+            Some(Mode::REPLAY) if self.view == replay::View::HScene => {
                 replay::hscene_enabled(&self.session.scenes, self.page, widget, &self.session.flags)
             }
-            Mode::REPLAY_POPUP => match self.asked.and_then(|s| self.session.scenes.get(s)) {
+            Some(Mode::REPLAY_POPUP) => match self.asked.and_then(|s| self.session.scenes.get(s)) {
                 Some(scene) => replay::popup_enabled(scene, widget, &self.session.flags),
                 None => false,
             },
             // Every widget, until the confirm popup goes up — which this
             // engine does not raise, so `popup_up` is always false here.
-            Mode::SAVELOAD => saveload::enabled(false, widget),
-            Mode::ROUTEMAP => {
+            Some(Mode::SAVELOAD) => saveload::enabled(false, widget),
+            Some(Mode::ROUTEMAP) => {
                 let page = self.chart_page();
                 routemap::enabled(
                     self.episode,
@@ -1864,8 +1991,8 @@ impl Menu {
     /// The alternate-state sprite a widget draws instead of its hover art, if
     /// any.
     fn extra_for(&self, widget: usize) -> Option<usize> {
-        match self.mode {
-            Mode::TITLE if widget == TITLE_REPLAY => {
+        match self.mode() {
+            Some(Mode::TITLE) if widget == TITLE_REPLAY => {
                 title_replay_caption(&self.screen.atlas().extras, widget).and_then(|both| {
                     let unlocked = self.session.save.replay_unlocked();
                     match both {
@@ -1882,7 +2009,7 @@ impl Menu {
             // resting/active pair can say. An index past the alternates the
             // screen actually placed draws nothing: see
             // [`replay::place_alternates`] for when that happens.
-            Mode::REPLAY => {
+            Some(Mode::REPLAY) => {
                 let selected = self.selection == Some(widget);
                 let extra = match self.view {
                     replay::View::HScene => {
@@ -1904,13 +2031,13 @@ impl Menu {
             // widget. The page's own widgets are the same: `FUN_1000adc0`,
             // `FUN_1000af90` and `FUN_1000b1d0` take one record per widget out
             // of the run behind the tab's, which is [`option_pages::Pages::hover`].
-            Mode::OPTION if self.option_page.is_some() => None,
+            Some(Mode::OPTION) if self.option_page.is_some() => None,
             // The value in force is not a widget state — it is a sprite of
             // its own, drawn in [`Menu::sprites`]. What a widget can carry here
             // is the *second* alternate run: the same highlight art with the
             // hover outline, which the pointer's own widget draws in place of
             // its hover sprite when it is already the value in force.
-            Mode::OPTION => {
+            Some(Mode::OPTION) => {
                 if self.selection != Some(widget)
                     || !options::withholds_hover_art(
                         self.tab,
@@ -1936,7 +2063,7 @@ impl Menu {
             // and not an alternate. The band between the two here is the "you
             // are here" marker, which is not a widget state: see
             // [`Menu::sprites`].
-            Mode::ROUTEMAP => {
+            Some(Mode::ROUTEMAP) => {
                 let cells = self.chart_page().cells;
                 let routemap::Act::Cell(cell) = routemap::action(cells, widget) else {
                     return None;
@@ -1966,9 +2093,11 @@ impl Menu {
     /// See [`saveload::highlight`] (`FUN_10011600`).
     fn lit(&self) -> Option<usize> {
         let selection = self.selection?;
-        match self.mode {
-            Mode::SAVELOAD => saveload::highlight(self.kind, selection),
-            Mode::REPLAY if self.view == replay::View::PlayData => playdata::highlight(selection),
+        match self.mode() {
+            Some(Mode::SAVELOAD) => saveload::highlight(self.kind, selection),
+            Some(Mode::REPLAY) if self.view == replay::View::PlayData => {
+                playdata::highlight(selection)
+            }
             _ => Some(selection),
         }
     }
@@ -1995,7 +2124,7 @@ impl Menu {
         // other screen's are — they are sprites `FUN_1000c740` draws every
         // frame, before it looks at the selection at all. The lit record goes
         // over the one under the pointer; see `Menu::sprites`.
-        if self.mode == Mode::DRESS_SELECT && self.dress_phase == dress::Phase::Choosing {
+        if self.showing.is(Mode::DRESS_SELECT) && self.dress_phase == dress::Phase::Choosing {
             self.states = vec![WidgetState::Active; self.states.len()];
         }
         self.dirty = true;
@@ -2197,8 +2326,8 @@ impl Menu {
     /// The page module's are `FUN_1002abc0` and `FUN_1002b040`, dispatched on
     /// `+0x618` by `FUN_1002a9a0` — see [`replay_pages::navigate`].
     pub fn navigate(&mut self, vfs: &Vfs, dll: &[u8], dir: Dir) -> Result<Action, Error> {
-        let next = match self.mode {
-            Mode::OPTION if self.option_page.is_some() => Some(option_pages::navigate(
+        let next = match self.mode() {
+            Some(Mode::OPTION) if self.option_page.is_some() => Some(option_pages::navigate(
                 self.tab,
                 self.selection.unwrap_or(3),
                 dir,
@@ -2207,19 +2336,19 @@ impl Menu {
             )),
             // A page module's Replay screen is a different recovery, with its
             // own pair of tables.
-            Mode::REPLAY if self.replay_page.is_some() => Some(replay_pages::navigate(
+            Some(Mode::REPLAY) if self.replay_page.is_some() => Some(replay_pages::navigate(
                 self.view,
                 self.selection.unwrap_or(2),
                 dir,
             )),
-            Mode::REPLAY => {
+            Some(Mode::REPLAY) => {
                 let current = self.selection.unwrap_or(2);
                 Some(match self.view {
                     replay::View::HScene => replay::navigate(current, dir, self.page),
                     replay::View::PlayData => playdata::navigate(current, dir, self.page),
                 })
             }
-            Mode::OPTION => Some(options::navigate(
+            Some(Mode::OPTION) => Some(options::navigate(
                 self.tab,
                 self.selection.unwrap_or(3),
                 dir,
@@ -2242,10 +2371,10 @@ impl Menu {
         // A page module opens a tab the moment a sideways step lands on its
         // header, rather than waiting for a press: see
         // [`option_pages::opens_tab`].
-        if self.mode == Mode::OPTION && self.option_page.is_some() && self.enabled(index) {
+        if self.showing.is(Mode::OPTION) && self.option_page.is_some() && self.enabled(index) {
             if let Some(next) = option_pages::opens_tab(dir, index).filter(|t| *t != self.tab) {
                 self.tab = next;
-                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+                self.enter(vfs, dll, Showing::Mode(Mode::OPTION), self.return_to)?;
                 self.selection = Some(index);
                 self.refresh();
                 return Ok(Action::Opened(Mode::OPTION));
@@ -2253,7 +2382,7 @@ impl Menu {
         }
         // Every Replay table turns the page the same way, on the sideways arms
         // only and only when the button is live.
-        if self.mode == Mode::REPLAY && self.enabled(index) {
+        if self.showing.is(Mode::REPLAY) && self.enabled(index) {
             let opened = match (self.replay_page.is_some(), self.view) {
                 (true, view) => replay_pages::opens_page(view, dir, index),
                 (false, replay::View::HScene) => replay::opens_page(dir, index),
@@ -2287,7 +2416,7 @@ impl Menu {
     /// wraps 0..=4 even on the all-clear screen, where it instead jumps to
     /// index 5 from outside that range.
     fn wrapping_count(&self) -> usize {
-        if self.mode == Mode::TITLE {
+        if self.showing.is(Mode::TITLE) {
             self.states.len().min(5)
         } else {
             self.states.len()
@@ -2308,8 +2437,11 @@ impl Menu {
         if !self.enabled(widget) {
             return Ok(Action::Stay);
         }
-        match self.mode {
-            Mode::TITLE => {
+        if self.showing == Showing::BackLog {
+            return self.confirm_backlog(vfs, dll, widget);
+        }
+        match self.mode() {
+            Some(Mode::TITLE) => {
                 let next = match widget {
                     0 | 5 => Mode::PLAY,
                     1 => Mode::SAVELOAD,
@@ -2320,27 +2452,27 @@ impl Menu {
                 };
                 self.advance(vfs, dll, next)
             }
-            Mode::OPTION => self.confirm_option(vfs, dll, widget),
-            Mode::REPLAY if self.replay_page.is_some() => {
+            Some(Mode::OPTION) => self.confirm_option(vfs, dll, widget),
+            Some(Mode::REPLAY) if self.replay_page.is_some() => {
                 self.confirm_replay_page(vfs, dll, widget)
             }
-            Mode::REPLAY if self.view == replay::View::HScene => {
+            Some(Mode::REPLAY) if self.view == replay::View::HScene => {
                 self.confirm_replay(vfs, dll, widget)
             }
-            Mode::REPLAY => self.confirm_playdata(vfs, dll, widget),
-            Mode::REPLAY_POPUP => Ok(self.confirm_replay_popup(widget)),
+            Some(Mode::REPLAY) => self.confirm_playdata(vfs, dll, widget),
+            Some(Mode::REPLAY_POPUP) => Ok(self.confirm_replay_popup(widget)),
             // `FUN_10014910` answers false for every widget while `+0x98` is
             // set, so a save that has been taken and not yet written swallows
             // clicks rather than stacking another one behind it.
-            Mode::SAVELOAD if self.pending_save.is_some() => Ok(Action::Stay),
-            Mode::SAVELOAD => self.confirm_saveload(vfs, dll, widget),
-            Mode::ROUTEMAP => self.confirm_routemap(vfs, dll, widget),
-            Mode::DRESS_SELECT => self.confirm_dress(vfs, dll, widget),
+            Some(Mode::SAVELOAD) if self.pending_save.is_some() => Ok(Action::Stay),
+            Some(Mode::SAVELOAD) => self.confirm_saveload(vfs, dll, widget),
+            Some(Mode::ROUTEMAP) => self.confirm_routemap(vfs, dll, widget),
+            Some(Mode::DRESS_SELECT) => self.confirm_dress(vfs, dll, widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
             // remembers.
-            Mode::CONFIRM => match widget {
+            Some(Mode::CONFIRM) => match widget {
                 0 => self.confirm_popup(vfs, dll),
                 1 => {
                     let back = self.return_to;
@@ -2387,8 +2519,8 @@ impl Menu {
     ) -> Result<Action, Error> {
         let was = self.dress_phase;
         self.dress_phase = phase;
-        let (mode, back) = (self.mode, self.return_to);
-        if let Err(err) = self.enter(vfs, dll, mode, back) {
+        let (showing, back) = (self.showing, self.return_to);
+        if let Err(err) = self.enter(vfs, dll, showing, back) {
             log::warn!("dress select: cannot load the other hit map: {err}");
             self.dress_phase = was;
             return Ok(Action::Stay);
@@ -2500,6 +2632,31 @@ impl Menu {
             .flatten()
     }
 
+    /// The backlog's dispatch, from `FUN_100042d0`.
+    ///
+    /// Widgets 0 and 3 are the double arrows and move three lines, 1 and 2 the
+    /// single arrows and move one; all four clamp, because `FUN_100042d0`
+    /// pins the index to `0` and to `count - 1` itself. Widget 4 is Close,
+    /// `+0x4c(0)`, which is the only way out this screen offers — so it goes
+    /// through the same rule every bar-opened screen's Close does.
+    ///
+    /// No arm reloads the screen's art: the lines are redrawn into the buffer
+    /// by `FUN_10003600` and nothing else moves, which is why this returns
+    /// [`Action::Stay`] rather than reopening.
+    fn confirm_backlog(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+        match backlog::scrolled(self.backlog_at, self.session.lines.len(), widget) {
+            Some(at) => {
+                if at != self.backlog_at {
+                    self.backlog_at = at;
+                    self.dirty = true;
+                }
+                Ok(Action::Stay)
+            }
+            None if widget == backlog::CLOSE => self.leave(vfs, dll),
+            None => Ok(Action::Stay),
+        }
+    }
+
     /// The route map's dispatch, from `FUN_1000e8b0`.
     ///
     /// Picking a cell leaves the menus the way the Load screen's rows do, with
@@ -2552,7 +2709,7 @@ impl Menu {
         self.episode = episode;
         self.map_page = map_page;
         let back = self.return_to;
-        match self.enter(vfs, dll, Mode::ROUTEMAP, back) {
+        match self.enter(vfs, dll, Showing::Mode(Mode::ROUTEMAP), back) {
             Ok(()) => Ok(Action::Opened(Mode::ROUTEMAP)),
             Err(err) => {
                 log::warn!(
@@ -2679,7 +2836,7 @@ impl Menu {
                     return Ok(Action::Stay);
                 }
                 self.tab = next;
-                self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+                self.enter(vfs, dll, Showing::Mode(Mode::OPTION), self.return_to)?;
                 Ok(Action::Opened(Mode::OPTION))
             }
             options::Act::Close => Ok(Action::SettingsSaved),
@@ -2734,8 +2891,8 @@ impl Menu {
         }
         let was = self.session.som;
         self.session.som = som;
-        if was.enabled != som.enabled && self.mode == Mode::OPTION {
-            self.enter(vfs, dll, Mode::OPTION, self.return_to)?;
+        if was.enabled != som.enabled && self.showing.is(Mode::OPTION) {
+            self.enter(vfs, dll, Showing::Mode(Mode::OPTION), self.return_to)?;
         } else {
             self.refresh();
         }
@@ -2912,7 +3069,7 @@ impl Menu {
     /// route map's own back button sets is not recovered**, and this engine
     /// does not depend on it.)
     pub fn cancel(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
-        match backing_out(self.entry, self.mode, self.return_to) {
+        match backing_out(self.entry, self.showing, self.return_to) {
             Leaving::Resume => Ok(Action::Play),
             Leaving::To(mode) => self.advance(vfs, dll, mode),
         }
@@ -2932,7 +3089,7 @@ impl Menu {
 
     /// Answers the confirm popup with "yes".
     pub fn confirm_popup(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
-        if self.mode != Mode::CONFIRM {
+        if !self.showing.is(Mode::CONFIRM) {
             return Ok(Action::Stay);
         }
         if self.return_to == Mode::TITLE {
@@ -2960,11 +3117,11 @@ impl Menu {
         }
         let was = self.resolution;
         self.resolution = resolution;
-        let (mode, back) = (self.mode, self.return_to);
-        if let Err(err) = self.enter(vfs, dll, mode, back) {
+        let (showing, back) = (self.showing, self.return_to);
+        if let Err(err) = self.enter(vfs, dll, showing, back) {
             log::warn!("cannot draw the menus at {}: {err}", resolution.name());
             self.resolution = was;
-            self.enter(vfs, dll, mode, back)?;
+            self.enter(vfs, dll, showing, back)?;
         }
         Ok(())
     }
@@ -3004,12 +3161,17 @@ impl Menu {
         // goes — that is `leave`, and reading this member as the answer
         // to that question is what sent a bar-opened screen to the title.
         let return_to = if next == Mode::CONFIRM {
-            self.mode
+            // The confirm popup is the only screen that remembers where it was
+            // raised from, and the backlog cannot raise it: over playback
+            // Escape resumes instead. So a showing with no mode never reaches
+            // here, and the title is the fallback for the same reason
+            // `SystemInit` records it for every other screen.
+            self.mode().unwrap_or(Mode::TITLE)
         } else {
             Mode::TITLE
         };
-        let was = (self.mode, self.variant.clone());
-        match self.enter(vfs, dll, next, return_to) {
+        let was = (self.showing, self.variant.clone());
+        match self.enter(vfs, dll, Showing::Mode(next), return_to) {
             Ok(()) => Ok(Action::Opened(next)),
             // A screen whose art, hit map or widget table will not read
             // cannot be drawn. Staying put is the right answer: a screen this
@@ -3020,7 +3182,7 @@ impl Menu {
                 // Put back whatever the failed load replaced. This cannot fail:
                 // it is the screen that was already up a moment ago.
                 if self.enter(vfs, dll, was.0, self.return_to).is_err() {
-                    log::error!("could not return to menu mode {}", was.0 .0);
+                    log::error!("could not return to {}", was.0.name());
                 }
                 Ok(Action::Unavailable(next))
             }
@@ -3033,20 +3195,24 @@ impl Menu {
     }
 }
 
-/// The variant a mode's screen loads with, given where the session has got to.
+/// The variant a screen loads with, given where the session has got to.
 ///
 /// Only the title picks from save state. The rest pick from the member each
 /// module keeps between visits — the Option tab, the Replay screen, and how
-/// many versions the scene the popup is asking about has — and a mode with
-/// neither keeps the DLL's own default.
+/// many versions the scene the popup is asking about has — and a screen with
+/// neither keeps the DLL's own default. The backlog's is its flow, which is
+/// `FILMENGINE.INI`'s `[BackLogType]` and not a member at all.
 fn variant_for(
     session: &Session,
-    mode: Mode,
+    showing: Showing,
     tab: options::Tab,
     view: replay::View,
     asked: Option<usize>,
     chart: (usize, usize),
 ) -> String {
+    let Some(mode) = showing.mode() else {
+        return session.flow.variant().to_string();
+    };
     match mode {
         Mode::TITLE => session.save.title_variant().to_string(),
         Mode::OPTION => tab.variant().to_string(),
@@ -3062,13 +3228,13 @@ fn variant_for(
     }
 }
 
-/// Loads the art for one mode.
+/// Loads the art for one screen.
 #[allow(clippy::too_many_arguments)]
 fn load_screen(
     vfs: &Vfs,
     dll: &[u8],
     paths: &Paths,
-    mode: Mode,
+    showing: Showing,
     variant: &str,
     return_to: Mode,
     tab: options::Tab,
@@ -3082,6 +3248,14 @@ fn load_screen(
     // member between `FUN_1000d7f0`'s map and `FUN_1000d8c0`'s — so it is the
     // one screen whose stem does not come from the mode. Its art is named
     // after that stem like any other screen's.
+    // The backlog has no mode integer to look a stem up by, so its pair of
+    // stems is asked for directly. See [`Showing`].
+    let Some(mode) = showing.mode() else {
+        let stem = paths
+            .backlog_stem(session.flow)
+            .ok_or_else(|| Error::MissingAsset("the backlog screen".to_string()))?;
+        return Screen::load_with_art(vfs, dll, stem, None, None, resolution);
+    };
     let popup =
         matches!(dress_phase, dress::Phase::Confirming { .. }) && mode == Mode::DRESS_SELECT;
     if popup {
@@ -3221,14 +3395,22 @@ mod tests {
 
     /// Backing out over playback is Close, because `+0x4c(0)` is the only exit
     /// the modules the bar can open offer.
+    ///
+    /// The backlog is in here because it is the one screen with no mode integer
+    /// to fall through the match on: nothing must read that as a reason to
+    /// raise the title popup over a script.
     #[test]
     fn backing_out_over_playback_resumes_rather_than_raising_the_popup() {
-        for mode in [Mode::SAVELOAD, Mode::OPTION] {
+        for showing in [
+            Showing::Mode(Mode::SAVELOAD),
+            Showing::Mode(Mode::OPTION),
+            Showing::BackLog,
+        ] {
             assert_eq!(
-                backing_out(Entry::Playback, mode, Mode::TITLE),
+                backing_out(Entry::Playback, showing, Mode::TITLE),
                 Leaving::Resume,
-                "mode {} must not raise the title popup over playback",
-                mode.0
+                "{} must not raise the title popup over playback",
+                showing.name()
             );
         }
     }
@@ -3237,11 +3419,11 @@ mod tests {
     #[test]
     fn backing_out_from_the_title_raises_the_popup() {
         assert_eq!(
-            backing_out(Entry::Title, Mode::SAVELOAD, Mode::TITLE),
+            backing_out(Entry::Title, Showing::Mode(Mode::SAVELOAD), Mode::TITLE),
             Leaving::To(Mode::CONFIRM)
         );
         assert_eq!(
-            backing_out(Entry::Title, Mode::REPLAY, Mode::TITLE),
+            backing_out(Entry::Title, Showing::Mode(Mode::REPLAY), Mode::TITLE),
             Leaving::To(Mode::CONFIRM)
         );
     }
@@ -3252,16 +3434,16 @@ mod tests {
     fn a_screen_opened_from_another_screen_goes_back_to_it() {
         for entry in [Entry::Title, Entry::Playback] {
             assert_eq!(
-                backing_out(entry, Mode::SOM_CONFIG, Mode::TITLE),
+                backing_out(entry, Showing::Mode(Mode::SOM_CONFIG), Mode::TITLE),
                 Leaving::To(Mode::OPTION)
             );
             assert_eq!(
-                backing_out(entry, Mode::REPLAY_POPUP, Mode::TITLE),
+                backing_out(entry, Showing::Mode(Mode::REPLAY_POPUP), Mode::TITLE),
                 Leaving::To(Mode::REPLAY)
             );
             // `_getNextMode@8` case 6 answers mode 3, never the title.
             assert_eq!(
-                backing_out(entry, Mode::ROUTEMAP, Mode::TITLE),
+                backing_out(entry, Showing::Mode(Mode::ROUTEMAP), Mode::TITLE),
                 Leaving::To(Mode::SAVELOAD)
             );
         }
@@ -3272,7 +3454,7 @@ mod tests {
     fn the_popup_returns_to_what_raised_it() {
         for entry in [Entry::Title, Entry::Playback] {
             assert_eq!(
-                backing_out(entry, Mode::CONFIRM, Mode::REPLAY),
+                backing_out(entry, Showing::Mode(Mode::CONFIRM), Mode::REPLAY),
                 Leaving::To(Mode::REPLAY)
             );
         }
@@ -3472,18 +3654,32 @@ mod tests {
         let hscene = replay::View::DEFAULT;
 
         assert_eq!(
-            variant_for(&session, Mode::TITLE, def, hscene, None, (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::TITLE),
+                def,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "Title_Clear",
             "the title is the one that picks from save state"
         );
         assert_eq!(
-            variant_for(&session, Mode::OPTION, def, hscene, None, (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::OPTION),
+                def,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "Def"
         );
         assert_eq!(
             variant_for(
                 &session,
-                Mode::OPTION,
+                Showing::Mode(Mode::OPTION),
                 options::Tab::SomCon,
                 hscene,
                 None,
@@ -3492,13 +3688,20 @@ mod tests {
             "SomCon"
         );
         assert_eq!(
-            variant_for(&session, Mode::REPLAY, def, hscene, None, (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::REPLAY),
+                def,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "HScene"
         );
         assert_eq!(
             variant_for(
                 &session,
-                Mode::REPLAY,
+                Showing::Mode(Mode::REPLAY),
                 def,
                 replay::View::PlayData,
                 None,
@@ -3508,7 +3711,14 @@ mod tests {
         );
         // A mode with no remembered state keeps the DLL's own default.
         assert_eq!(
-            variant_for(&session, Mode::ROUTEMAP, def, hscene, None, (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::ROUTEMAP),
+                def,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "01"
         );
     }
@@ -3539,16 +3749,37 @@ mod tests {
         let def = options::Tab::DEFAULT;
         let hscene = replay::View::DEFAULT;
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(0), (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::REPLAY_POPUP),
+                def,
+                hscene,
+                Some(0),
+                (0, 0)
+            ),
             "2"
         );
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, Some(1), (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::REPLAY_POPUP),
+                def,
+                hscene,
+                Some(1),
+                (0, 0)
+            ),
             "4"
         );
         // With nothing asked, the module's own zeroed member picks the small one.
         assert_eq!(
-            variant_for(&session, Mode::REPLAY_POPUP, def, hscene, None, (0, 0)),
+            variant_for(
+                &session,
+                Showing::Mode(Mode::REPLAY_POPUP),
+                def,
+                hscene,
+                None,
+                (0, 0)
+            ),
             "2"
         );
     }
