@@ -1,5 +1,9 @@
 # DaysEngine
-Rust reimplemention of the FilmEngine used in School Days HQ, Shiny Days, and Cross Days. Heavily experimental, stay tuned! For usage please drag and drop the binary alongside its corresponding libraries into your copy of the days game you would like to play (granted that it is on the support list)
+Rust reimplemention of the FilmEngine used in School Days HQ, Shiny Days, and Cross Days. Heavily experimental, stay tuned! For usage please drag and drop the binary alongside its corresponding libraries into your copy of the days game you would like to play (granted that it is on the support list) 
+
+**PLEASE BACKUP SAVE FILES**
+
+Save files are *meant* to work interchangably between the original game and this reimplemention, testing is **not** finished. *Please* just back them up in case something is broken, I haven't had corruption issues but as the saying goes once another user touches your project it **will** explode. 
 
 # Additions
 Controller support! (Accessibility controllers by extension should be supported now, if there any issues on that front please open an issue so that I can add support or fix.)
