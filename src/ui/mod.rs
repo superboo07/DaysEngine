@@ -6,12 +6,15 @@
 //! one screen is drawn: base art, `_CHIP` sprite sheet and hit map. [`ending`]
 //! supplies the backdrop the title screen picks from what the player has seen.
 //!
-//! Two of these are not menu modes at all but UI the engine puts over playback:
-//! [`bar`] is the control strip, which the executable drives through the DLL's
-//! `_SetMenuBar@4` object rather than through `SystemInit`, and [`select`] is
-//! the choice box, which the executable owns outright and which ships no art
-//! beyond its hit maps.
+//! Three of these are not menu modes at all but UI the engine puts over
+//! playback: [`bar`] is the control strip, which the executable drives through
+//! the DLL's `_SetMenuBar@4` object rather than through `SystemInit`;
+//! [`select`] is the choice box, which the executable owns outright and which
+//! ships no art beyond its hit maps; and [`backlog`] is the screen the bar's
+//! third menu button raises, which `setSystemInit` reaches by a code of its own
+//! and `SystemInit` has no number for.
 
+pub mod backlog;
 pub mod bar;
 pub mod comment;
 pub mod dress;

@@ -563,14 +563,18 @@ pub const RESTART_LATCH_FRAMES: u32 = 0x48;
 /// The slot puts the engine into state 3 and hands the number to
 /// `_SetReMenu@4`, so this is the DLL's own re-entry number rather than one of
 /// `SystemInit`'s mode integers. `setSystemInit` is the switch that consumes
-/// it, and three of the four the bar produces are known from it:
+/// it, and all four the bar produces are known from it:
 ///
 /// ```text
 /// 4  the save/load module, opened to save   (its +0x94 poked to 1)
 /// 5  the same module, opened to load        (+0x94 poked to 0)
 /// 2  the Option screen
-/// 3  an object `SystemInit` has no case for — not recovered
+/// 3  the backlog screen, which `SystemInit` has no mode for
 /// ```
+///
+/// Code 3 selects `DAT_1004ffc8`, whose static-init thunk `FUN_10038360` calls
+/// the constructor `FUN_10001cb0`, which installs `MENU::BackLogView::vftable`
+/// — see [`crate::ui::backlog`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuRequest(pub i32);
 

@@ -2452,8 +2452,11 @@ chaining codes are route-system territory.
 
 `+0xf8`'s numbers are `setSystemInit`'s own codes, so 4 is the save screen, 5
 the load screen and 2 the Option screen — the same three the title menu reaches.
-Code 3 has a case too, selecting the module object `DAT_1004ffc8`, but **which
-screen that object is has not been recovered**.
+Code 3 selects the module object `DAT_1004ffc8`, which is the **backlog
+screen**: that object's static-init thunk `FUN_10038360` calls the constructor
+`FUN_10001cb0`, and `FUN_10001cb0` installs `MENU::BackLogView::vftable`. So the
+bar's four menu buttons are Save, Load, Backlog and Option. See *The backlog
+screen* below.
 
 ### Leaving a menu the control bar opened
 
@@ -3072,12 +3075,167 @@ subtitles are that setting, off included.
 **The speaker is not drawn.** `[PrintText]` carries a speaker field and it never
 reaches the text layer: `FUN_0043dbe0`'s arm hands only the text field to
 `FUN_0043f600`, and `FUN_00431740`'s tail hands `FUN_0044c740` the line, its
-ruby and the ruby flag. The speaker goes to `FUN_00432cc0`, which wraps it and
-the text into a `0x10`-byte record and pushes it onto the list at `engine+0xac`
-— the backlog. `FUN_0044bf30` draws the lines, the ruby and the choice blocks
+ruby and the ruby flag. The statement goes to `FUN_00432cc0`, which wraps the
+script and the line's index in it into a `0x10`-byte `FILM::BLog_LogMessage`
+record and pushes it onto the list at `engine+0xac` — the backlog, where
+`FUN_00434820` resolves a record back to a speaker and a text. See *The backlog
+screen* below. `FUN_0044bf30` draws the lines, the ruby and the choice blocks
 and nothing else, so there is no name box.
 
 `daysengine::playback::text` carries all of this.
+
+---
+
+## The backlog screen — `System/BackLog/BackLog_%s`
+
+The lines the player has already been shown, over live playback. It is not a
+`SystemInit` mode: the control bar's third menu button asks host `+0xf8(3)` and
+`setSystemInit`'s case 3 selects the module object `DAT_1004ffc8`, whose
+static-init thunk `FUN_10038360` calls the constructor `FUN_10001cb0`, which
+installs `MENU::BackLogView::vftable`. `SysMenuSD.dll` holds the same class with
+the same constants — init `FUN_10003a60` against `FUN_100039a0`, host at `+0xb8`
+rather than `+0x90` — so one implementation serves both titles.
+
+### Where the lines live
+
+`FUN_0043dbe0`'s `[PrintText]` arm builds a `FILM::BLog_LogMessage`
+(`FUN_00432310`: a vtable, the type `2`, a shared pointer to the script and the
+line's index in it) and pushes it through `FUN_00432cc0` onto the vector at
+`engine+0xac +0x08`. `FUN_00434820` resolves a record back to a speaker and a
+text, so the record carries the line by reference.
+
+That vector holds nothing else. The same object's `+0x20` takes the position
+record `FUN_00432a10` writes when a script starts and `+0x78` the story points,
+and those two are what a save slot serialises — which is why
+`Save/SaveFileNNN.DAT` has tags 1, 3 and 4 and no text tag, and why its reader
+calls an unknown tag an "Undefined backlog entry". `+0x98` is the backlog's
+length at the last position record; `FUN_004348e0` erases from there on, so
+jumping back to a story point drops the lines logged since it. Host slot `+0x2c`
+(`FUN_0042c0e0`, `FUN_004349f0`) empties the whole thing. Only two places in the
+executable reach `engine+0xac` at all — `FUN_00432a10` and `FUN_00432cc0`.
+
+### Which screen, and how wide
+
+Three host slots decide, and all three are `FILMENGINE.INI` members read by
+`FUN_00422170` into the engine at `+0x30` from the host's own base:
+
+| DLL slot | member | key | what it decides |
+|---|---|---|---|
+| `+0x5c` | `engine+0xa4` | `[UseEnglish]` | columns, pitch, the row limit |
+| `+0x60` | `engine+0x8c` | `[AgateUsing]`, then `Config.DAT`'s `UseAgate` | ruby |
+| `+0x64` | `engine+0x94` | `[BackLogType]` | horizontal or vertical |
+
+`+0x58` is the glyph blit (`FUN_00428d20` → `FUN_00436c10` → `FUN_004367d0`,
+the max-blending one), `+0x68` a record's type, `+0x6c` the count and `+0x70`
+the speaker and text of one record. The host vtable at `0x004d2894` is the
+anchor: its `+0x6c` and `+0x70` both read `this+0x80`, which is `engine+0xac`,
+the list the executable pushes to from the other side.
+
+`[BackLogType]` is not a layout switch inside one screen. `FUN_10003820` and
+`FUN_100039a0` take a different hit map, base, chip sheet and widget table from
+it: `System/BackLog/BackLog_Horizon` or `..._Vertical`, each with the usual four
+resolution suffixes. Both retail installs ship `0`, the horizontal one, and
+`[AgateUsing]="0"`.
+
+### The buffer and where it goes
+
+`FUN_100039a0` builds a bitmap `(0x800, 0x400, 0x208888)` — `0x1000` wide when
+ruby is on — a `DX9Texture` over it and a `DX9Sprite2D` over that. The sprite's
+source rect is set from `texture->u(1280.0)` by `texture->v(720.0)`
+(`FUN_004134f0` and `FUN_00413530` divide by the texture's own size, so those
+are normalised UVs of a 1280x720 window on the buffer) and its destination is
+`(-0.5, -0.5, 801, 451)` in the 800x450 layout space, scaled and letterboxed the
+way a widget is. So the whole screen shows the buffer's top-left 1280x720.
+
+Everything below is in the buffer's own pixels.
+
+### The layout
+
+`FUN_100033c0` measures one entry and loads its wrapped lines; its return —
+which Ghidra drops, because every arm assigns through a stack temp — is
+`0x7e + 0x24 * (rows)`, where the speaker counts as a row if it is non-empty
+and each wrapped line as one.
+
+`FUN_10003600` clears the buffer and stacks the entries: the one the player is
+on is centred on `0x17c`, earlier entries are pushed up by their own heights
+until one starts above 0, later ones down until one starts past the row limit
+less three.
+
+`FUN_100022a0` draws one entry. The first row is `top + 0x15` and each row after
+is `+0x39` — larger than the `0x24` the height counts, which is the gap between
+entries. A speaker's pen runs from `0x4b` and draws at `pen - 0x4b`; a line's
+runs from `0x8c` and draws at `pen - 0x1e`, so text is indented by `0x6e`. The
+glyph row is `row - 6`. The advance is `0x24`, or `0x17` under `[UseEnglish]`,
+plus the same kerning table the dialogue box uses — `FUN_100021c0` here and
+`FUN_0044c660` there have the same arms in the same order.
+
+A row is drawn only while `0x59 < row < 0x2ef` in the horizontal flow, and in
+both while `5 < row < limit`, the limit being `DAT_100508b0`:
+
+| flow | `[UseEnglish]` | columns | row limit |
+|---|---|---|---|
+| horizontal | set | `0x30` | `0x4c9` |
+| horizontal | clear | `0x1b` | `0x2a9` |
+| vertical | either | `0xd` | `0x4b6` |
+
+The vertical flow runs each row down the buffer at `limit + 6 - row` with the
+pen as the y, shifts every row across by `0x15`, and does not kern.
+`FUN_10002110` is its per-character pass: `、` and `。` are drawn `0x12` back
+along both axes and the pen put straight again, and `ー`, `…` and `～` are
+replaced by `｜`, `：` and `｜`.
+
+### Where the line breaks
+
+`FUN_10002a90`, and **not** the dialogue box's `FUN_0043f600` — the two differ
+in four ways. At most eight lines; the ninth breaks the loop and the rest of the
+text is dropped.
+
+- `｜` is a ruby anchor: consumed, no column.
+- `《…》` is a ruby group: `FUN_10002eb0` consumes it whole.
+- `\n` is consumed and does **not** break the line, where the dialogue box
+  treats it as a hard break.
+- Under `[UseEnglish]`, a character whose predecessor was a space breaks the
+  line first when the column plus the run up to the next space **reaches** the
+  limit. The dialogue box counts from one past the word's first character and
+  tests `>`; this counts from the character in hand and tests `>=`.
+- Otherwise the line breaks once the column reaches the limit, unless the
+  character in hand is in `DAT_1004300c` (`、。？！）」』ー　・… . , ! ' ?`, the
+  17 that may not start a line) or its predecessor is in `DAT_10043120`
+  (`（「『―`, the four that may not end one). The dialogue box never breaks a
+  Japanese line at all.
+
+Two quirks are reproduced rather than tidied. The Japanese rule indexes the
+source string by the **column** rather than by the source index for the second
+of those tests, so the two walk apart once a line has broken; there is no retail
+Japanese screen to check a correction against. And the English rule reads one
+character before the start of the buffer on the first character of a line — a
+stack slot holding `0` or `0x24`, never a space, so the test simply fails.
+
+**One divergence.** `FUN_10002a90` does not advance its index for a `\` that is
+not followed by `n`, so such a line spins forever. Nothing shipped reaches it:
+0 of School Days HQ's 30,485 `[PrintText]` statements and 0 of Shiny Days'
+45,015 carry a lone backslash, and none carries a ruby mark either. DaysEngine
+consumes the backslash, which is what `FUN_0043f600` does with the same input.
+
+### The widgets
+
+Five, and all five are always live — `FUN_100042a0` answers yes for 0 through 4
+and no for anything else. `FUN_100042d0` is the dispatch: 0 and 3 are the double
+arrows and move three entries, 1 and 2 the single arrows and move one, both
+clamping; 4 is Close, which is `+0x4c(0)` and returns to playback like every
+other screen the bar opens. `FUN_100039a0` opens on `count - 1`, the last line
+logged.
+
+### Not reproduced
+
+The ruby. `[AgateUsing]`/`UseAgate` widens the buffer, builds 26 more sprites
+and turns on `FUN_100026b0`, which draws what `FUN_10002eb0` lays out into the
+eight strings at `this+0x5ec`. Both retail installs ship it off and no shipped
+line carries a ruby mark, so there is nothing to draw; the marks are still
+recognised by the wrap, because they change where a line breaks either way.
+
+`daysengine::ui::backlog` carries all of this, and `days backlog <script>` draws
+it over one script's lines.
 
 ---
 
@@ -3735,8 +3893,8 @@ executable ships exactly one of the two readers and never has to choose.
 One module does both jobs, chosen by its `+0x94`. `setSystemInit` — a **second
 dispatch**, with its own numbering, separate from `SystemInit`'s mode integers
 — pokes it: code 4 opens the module to save, code 5 to load. Those are two of
-the numbers the control bar's own menu buttons produce, so the bar's four menu
-widgets are Save, Load, something `SystemInit` has no case for, and Option.
+the numbers the control bar's own menu buttons produce; the other two are code 3,
+the backlog screen, and code 2, the Option screen.
 
 Ten slots to a page and ten page buttons, so a hundred slots. The widget table
 has two bands of ten for the rows, the left of a row and the right of it, and

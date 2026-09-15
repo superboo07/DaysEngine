@@ -34,11 +34,13 @@
 //! `[PrintText]` carries a speaker field, and it never reaches the text layer.
 //! `FUN_0043dbe0`'s arm hands only the *text* field to `FUN_0043f600` for
 //! wrapping, and `FUN_00431740`'s tail hands `FUN_0044c740` three things: the
-//! line, its ruby, and the ruby flag. The speaker goes somewhere else entirely
-//! — `FUN_00432cc0` wraps speaker and text into a `0x10`-byte record and pushes
-//! it onto the list at `engine+0xac`, which is what the control bar's backlog
-//! button asks for. `FUN_0044bf30` draws the lines, the ruby and the choice
-//! blocks and nothing else, so there is no name box to miss.
+//! line, its ruby, and the ruby flag. The statement goes somewhere else
+//! entirely — `FUN_00432cc0` wraps the script and the line's index in it into a
+//! `0x10`-byte `FILM::BLog_LogMessage` record (`FUN_00432310`) and pushes it
+//! onto the list at `engine+0xac`, where `FUN_00434820` resolves it back to a
+//! speaker and a text. That is the backlog the control bar's third menu button
+//! raises; see [`crate::ui::backlog`]. `FUN_0044bf30` draws the lines, the ruby
+//! and the choice blocks and nothing else, so there is no name box to miss.
 //!
 //! # Where the block sits, and how big
 //!

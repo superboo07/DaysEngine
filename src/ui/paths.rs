@@ -101,6 +101,19 @@ const DRESS_SELECT_TEXT: &str = "System/DressSelect/DressSelect_Text.png";
 /// any other screen's, so only the stem is needed here.
 const DRESS_SELECT_POPUP: &str = "System/DressSelect/Popup/Popup_Select.cmap";
 
+/// The backlog screen's two hit maps, horizontal first.
+///
+/// It has no `SystemInit` mode to key off — `setSystemInit` reaches it by a
+/// code of its own — and `FILMENGINE.INI`'s `[BackLogType]` picks between two
+/// whole screens rather than two layouts of one, so this is a pair rather than
+/// a `%s`. `FUN_10003820` is where the module spells all eight of them, and
+/// these two are the plain-resolution pair the rest are suffixes of. See
+/// [`crate::ui::backlog`].
+const BACKLOG: (&str, &str) = (
+    "System/BackLog/BackLog_Horizon.cmap",
+    "System/BackLog/BackLog_Vertical.cmap",
+);
+
 /// The two view backgrounds a one-map replay screen draws **inside** its frame.
 ///
 /// The frame itself is named after the stem like every other screen's:
@@ -135,6 +148,9 @@ pub struct Paths {
     /// Set when the module also holds that screen's confirm popup, which has
     /// no mode of its own to key off.
     dress_select_popup: bool,
+    /// Which of the backlog screen's two hit maps the module holds, horizontal
+    /// first. Both, in every module seen so far.
+    backlog: (bool, bool),
 }
 
 impl Paths {
@@ -172,6 +188,7 @@ impl Paths {
             dress_select_base: holds(DRESS_SELECT_BASE),
             dress_select_text: holds(DRESS_SELECT_TEXT),
             dress_select_popup: holds(DRESS_SELECT_POPUP),
+            backlog: (holds(BACKLOG.0), holds(BACKLOG.1)),
         }
     }
 
@@ -241,6 +258,20 @@ impl Paths {
         self.dress_select_popup
             .then(|| DRESS_SELECT_POPUP.strip_suffix(".cmap"))
             .flatten()
+    }
+
+    /// The stem of the backlog screen for one flow, or `None` when this module
+    /// has no such screen.
+    ///
+    /// Like the dress-select popup, this is not in [`CANDIDATES`] and does not
+    /// go through [`Paths::stem`]: the backlog has no `SystemInit` mode to be
+    /// keyed by.
+    pub fn backlog_stem(&self, flow: crate::ui::backlog::Flow) -> Option<&'static str> {
+        let (held, literal) = match flow {
+            crate::ui::backlog::Flow::Horizontal => (self.backlog.0, BACKLOG.0),
+            crate::ui::backlog::Flow::Vertical => (self.backlog.1, BACKLOG.1),
+        };
+        held.then(|| literal.strip_suffix(".cmap")).flatten()
     }
 
     /// Whether the module's Option screen keeps each tab's widgets in a hit map

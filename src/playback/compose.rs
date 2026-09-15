@@ -85,7 +85,8 @@ pub fn frame_rgba_with(
 
     // Dialogue: broken by `FUN_0043f600`'s rule, placed by `FUN_0044bf30`'s.
     // The speaker field is deliberately not drawn — the original never hands it
-    // to the text layer, it goes to the backlog instead.
+    // to the text layer; the statement goes to the backlog instead, where
+    // `crate::ui::backlog` draws it.
     if let Some((_speaker, line)) = visual.text {
         let lines = text::wrap(line, english);
         let geometry = text::Geometry::native(left_arrangement);

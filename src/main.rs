@@ -2946,10 +2946,12 @@ fn run_script(
                         bar::Act::Leave => return Ok(Outcome::Play),
                         // These are `setSystemInit`'s own codes: 4 opens the
                         // save/load module to save, 5 to load and 2 the Option
-                        // screen. Code 3 has a case too — it selects the module
-                        // object `DAT_1004ffc8` — but **which screen that is
-                        // has not been recovered**, so the bar's third menu
-                        // button is the one this engine cannot answer.
+                        // screen. Code 3 selects `DAT_1004ffc8`, which is
+                        // `MENU::BackLogView` — the backlog screen. It is
+                        // recovered and drawn (`crate::ui::backlog`) but not
+                        // yet wired to a menu here, because the engine does not
+                        // keep the printed lines across a session the way
+                        // `engine+0xac` does.
                         bar::Act::Menu(request) => {
                             let opened = match request.0 {
                                 4 => Some((Mode::SAVELOAD, saveload::Kind::Save)),

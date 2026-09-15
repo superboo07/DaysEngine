@@ -109,6 +109,13 @@ enum Cmd {
     /// the user's own menu module. `--active` selects widgets by 1-based
     /// region ID, matching the `.CMAP`.
     Ui(UiArgs),
+    /// Composite the backlog screen over one script's lines, without a display.
+    ///
+    /// The screen the control bar's third menu button raises. The lines are the
+    /// script's own `[PrintText]` statements in the order the engine would have
+    /// logged them, wrapped and laid out by the recovered rules, so this is how
+    /// the drawing is checked against the player's own install.
+    Backlog(BacklogArgs),
     /// Drive the menu state machine without a display.
     ///
     /// Replays a script of menu events against the real screens and reports
@@ -374,6 +381,29 @@ struct UiArgs {
 }
 
 #[derive(clap::Args)]
+struct BacklogArgs {
+    /// Script whose `[PrintText]` lines fill the log, as `days script` names
+    /// it, e.g. "05-SH-A00".
+    script: String,
+    /// Resolution: standard, wide, note or full.
+    #[arg(long, short = 'r', default_value = "wide")]
+    resolution: String,
+    /// Which entry the screen is on. The last one by default, which is where
+    /// `FUN_100039a0` opens it.
+    #[arg(long)]
+    at: Option<usize>,
+    /// Region IDs to draw in their active (hover/selected) state.
+    #[arg(long = "active")]
+    active: Vec<usize>,
+    /// Composite at this window size, e.g. "1920x1080".
+    #[arg(long, value_name = "WxH")]
+    at_size: Option<String>,
+    /// PNG to write.
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
 struct MenuArgs {
     /// Composite and hit-test at this window size, e.g. "1920x1080", the way
     /// the player's window does rather than at the hit map's own size.
@@ -549,6 +579,7 @@ fn main() -> Result<()> {
             following_record,
         } => cmd_render(&game, &name, &at, &out, bar, following_record)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
+        Cmd::Backlog(args) => cmd_backlog(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
         Cmd::Save {
             all,
@@ -3829,4 +3860,124 @@ fn slot_feeling(game: &Path) -> Option<(String, i32, i32, days_save::FlagStore)>
         return Some((name, route, scene, slot.store));
     }
     None
+}
+
+/// Reports and draws the backlog screen over one script's lines.
+///
+/// The lines are the script's own `[PrintText]` statements in timeline order,
+/// which is the order `FUN_0043dbe0` would have logged them in. The real log
+/// runs across scripts, so this is one script's worth of it rather than a
+/// session's — enough to check the wrap, the stacking and the placement against
+/// the player's own art and font.
+fn cmd_backlog(game: &Path, args: &BacklogArgs) -> Result<()> {
+    use daysengine::ui::backlog::{self, Entry, Flow};
+    use daysengine::ui::paths::Paths;
+    use daysengine::ui::screen::{Resolution, Screen, WidgetState};
+
+    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let film = film_ini(&vfs);
+    let config = daysengine::install::config::Config::load(game);
+    let english = film.get_bool("UseEnglish").unwrap_or(false);
+    let flow = Flow::from_setting(film.get_u32("BackLogType").unwrap_or(0).into());
+    // `[AgateUsing]` is the shipped default and `Config.DAT`'s `UseAgate` is
+    // what the engine actually reads, so the file wins where it has an answer.
+    let ruby = config.int_or(
+        backlog::RUBY_SETTING,
+        film.get_u32("AgateUsing").unwrap_or(0) as i32,
+    ) != 0;
+
+    let resolution = Resolution::from_name(&args.resolution)
+        .with_context(|| format!("unknown resolution {}", args.resolution))?;
+    let stem = Paths::from_module(&dll)
+        .backlog_stem(flow)
+        .context("the menu module holds no backlog screen")?;
+    let mut screen = Screen::load(&vfs, &dll, stem, resolution)?;
+    if let Some(size) = &args.at_size {
+        let (w, h) = parse_size(size)?;
+        screen.fit_to(w, h);
+    }
+
+    let wanted = args.script.to_uppercase();
+    let (_, path) = script_paths(&vfs)
+        .into_iter()
+        .find(|(n, _)| *n == wanted)
+        .with_context(|| format!("no script named {}", args.script))?;
+    let script = days_script::Script::parse(&wanted, &vfs.read_path(&path)?)?;
+    let entries: Vec<Entry> = script
+        .events
+        .iter()
+        .filter_map(|e| match &e.command {
+            days_script::Command::PrintText { speaker, text } => Some(Entry {
+                speaker: speaker.clone(),
+                text: text.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let at = args
+        .at
+        .unwrap_or_else(|| backlog::opening_entry(entries.len()));
+    let (w, h) = screen.size();
+    println!(
+        "{stem} at {} — {w}x{h}, {} lines, {} of them, entry {at} of {}",
+        resolution.name(),
+        if english { "English" } else { "Japanese" },
+        entries.len(),
+        entries.len().saturating_sub(1),
+    );
+    println!(
+        "  [BackLogType] {:?}, {} columns, rows to {}{}",
+        flow,
+        flow.columns(english),
+        flow.limit(english),
+        if ruby {
+            " — ruby is on, and this engine does not draw it"
+        } else {
+            ""
+        }
+    );
+    for (index, top) in backlog::visible(&entries, at, flow, english) {
+        let entry = &entries[index];
+        let lines = backlog::wrap(&entry.text, flow, english);
+        println!(
+            "  entry {index:4} at {top:5}, {:3} tall, {} {:?}",
+            backlog::height(entry, flow, english),
+            if entry.speaker.is_empty() {
+                "no speaker".to_string()
+            } else {
+                format!("speaker {:?}", entry.speaker)
+            },
+            lines,
+        );
+    }
+
+    if let Some(out) = &args.out {
+        let font = load_font(&vfs)?;
+        let mut states = vec![WidgetState::Resting; screen.widget_count()];
+        for id in &args.active {
+            if let Some(state) = states.get_mut(id.saturating_sub(1)) {
+                *state = WidgetState::Active;
+            }
+        }
+        let buffer = backlog::draw(&font, &entries, at, flow, english);
+        let image = backlog::compose(&screen, &states, &buffer);
+        write_png(out, &image.rgba, image.width, image.height)?;
+        println!(
+            "wrote {} at {}x{}",
+            out.display(),
+            image.width,
+            image.height
+        );
+    }
+    Ok(())
+}
+
+/// The glyph store, whichever of the two an install ships.
+fn load_font(vfs: &daysengine::install::vfs::Vfs) -> Result<days_font::Font> {
+    let bytes = vfs
+        .read_path("System/System/FONTDATA_ENG.DAT")
+        .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?;
+    Ok(days_font::Font::parse(bytes)?)
 }
