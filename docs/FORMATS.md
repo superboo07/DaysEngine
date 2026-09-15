@@ -3952,15 +3952,43 @@ Three paths carry that empty name into the member the mark reads:
 which made it the obvious candidate, but no script ships one: zero of School
 Days HQ's 1,857 and zero of Shiny Days' 2,587.
 
-**What is still not recovered** is which tick actually marks the empty name.
-The end-of-script block reads the member *first* and replaces it *second*, and
-on the branch that matters its only latch — `engine + 0x210` (`+ 0x244` in
-Shiny) — is set either by the `ROUTE == -1` test a few lines below the mark or
-at the end of the "load the next script" branch, which the emptiness guard
-(`FUN_004201c0`, a plain `size == 0`; Shiny tests `engine + 0x1b4` directly)
-skips. Both of those should latch on the same pass that empties the member, so
-the exact sequence that gets one — and only one — blank mark written is not
-settled. **DaysEngine does not write the blank entry**: the name is the route
+**The mark can never be the same pass that empties the member.** Every mark
+site marks *first* and replaces *second*: HQ's `FUN_00424020` and Shiny's
+`FUN_0041c440` both call the setter at the top of their normal branch, before
+taking the script object's parked `[Next]` name, and Shiny's `FUN_0041cb60`
+case 7 marks before it calls `_GetNextScriptFile@12` at all. So the blank is
+written by a tick that reaches a mark with the member *already* empty, left
+that way by an earlier pass. What is still not recovered is which tick that is.
+
+What is recovered is the shape of the gap. The latch `engine + 0x210`
+(`+ 0x244` in Shiny) is cleared in exactly two places in `SCHOOLDAYS HQ.exe`:
+
+- `FUN_00423f40`, and only when the staging script object at `engine + 0x1f4`
+  is ready (`FUN_00431560`) and gets swapped into the playing slot at
+  `+ 0x1e4`. A pass that leaves the member empty skips the load — the guard is
+  `FUN_004201c0`, a plain `size == 0`; Shiny tests the string's own size word
+  at `engine + 0x1b4` — so it never re-arms this way.
+- `FUN_00423130`, the run reset, which also clears `+ 0x560` and `+ 0x214` and
+  reads the `AutoMode` INI key. Its one caller is `FUN_00427780`, the host
+  vtable slot at `0x004d29f4`, and that function *is* a run: reset,
+  `FUN_00423a70` to load the script named by `+ 0x188`, then the tick loop
+  `FUN_00427300`. **Neither writes `+ 0x188`**, which only `FUN_004239e0`
+  (host `vt[0x128]`) does, from outside. So the name member survives a run
+  boundary: whatever the last run left in it is still there when the next
+  begins.
+
+`FUN_00427300` dispatches on `engine + 0x220`: 1 is playback (`FUN_004253f0`,
+where `FUN_00424020` runs), 2 is a 1000 ms fade-out that then drops to 0, 4 is
+the `+ 0x224` state machine (`FUN_00425bf0`) that holds case 7. Case 7's empty
+branch — `FUN_004253c0` in HQ — sets `+ 0x224 = 0` and `+ 0x220 = 2`, ending
+the run with the member empty and the latch still clear. HQ's `FUN_00425bf0`
+makes no `vt[0x1c]` call anywhere, so in HQ case 7 never marks; Shiny's does.
+
+**It is not a script that ends without asking the route module.** That would
+leave the member empty with `ROUTE` never set to -1 and neither latch armed,
+which is exactly the shape needed — but every shipped script carries a
+`[Next]`: 1,857 of 1,857 in School Days HQ and 2,587 of 2,587 in Shiny Days,
+counted over the extracted `.ORS`. **DaysEngine does not write the blank entry**: the name is the route
 module's end-of-route sentinel rather than a script, nothing reads it back
 (`_GetReadScriptCount@4` counts script names), and a store that already has one
 keeps it, because the engine only ever adds.

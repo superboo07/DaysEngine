@@ -446,7 +446,10 @@ impl Progress {
     /// [`mark_read`] takes an empty name as nothing to record. The shipped
     /// call is unconditional — neither `0x0041c633` nor `0x0041cf5e` checks
     /// the string first — so the original does write it whenever the name is
-    /// empty at an end of script.
+    /// empty at an end of script. Every mark site marks *before* it replaces
+    /// the member, so the blank is written by a tick that arrives with the
+    /// member already empty, never by the pass that empties it; which tick
+    /// that is remains unrecovered. See `docs/FORMATS.md`.
     ///
     /// The empty name is the **route module's own end-of-route sentinel**, not
     /// an uninitialised buffer. `FUN_10005a50` is the emitter each route
