@@ -14,3 +14,7 @@
 
 # Cargo.lock is intentionally NOT ignored. It is the pin that makes the
 # dependency policy in docs/DEPENDENCIES.md real. Do not add it here.
+
+# Release archives and the vendored SDL3/ffmpeg builds land under /target, which
+# is already ignored above. The submodule *sources* in third_party/ are tracked
+# by git as submodules and must not be listed here.

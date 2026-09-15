@@ -297,10 +297,10 @@ impl Pads {
     /// accepted.
     ///
     /// SDL answers this through a property, and reading a property means
-    /// `SDL_GetGamepadProperties` — which the safe binding only offers behind
-    /// `unsafe`, and `src/media` is the only module in this engine allowed
-    /// that. `SDL_RumbleGamepad` reports the same refusal through its return
-    /// value, so this asks it that way.
+    /// `SDL_GetGamepadProperties`, which the safe binding does not wrap — so it
+    /// would be another raw FFI call, and this file is `forbid(unsafe_code)`.
+    /// `SDL_RumbleGamepad` reports the same refusal through its return value,
+    /// so this asks it that way.
     fn takes_a_level(&mut self, at: usize) -> bool {
         self.open
             .get_mut(at)

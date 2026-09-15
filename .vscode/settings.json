@@ -1,0 +1,20 @@
+{
+  "// Lint on save with clippy": "The commit gate is `clippy -D warnings`, so seeing anything less than that in the editor just defers the failure.",
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--locked", "--all-targets", "--", "-D", "warnings"],
+
+  "// third_party is not ours": "The ffmpeg and SDL3 submodules are vendored upstream sources, built by tools/build-*.sh for release archives only. Nothing in them is edited here.",
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/third_party/**": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/third_party": true
+  },
+
+  "[rust]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  }
+}

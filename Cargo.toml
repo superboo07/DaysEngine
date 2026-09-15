@@ -29,6 +29,16 @@ clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
+[features]
+# Link SDL3 into the executable rather than against a shared libSDL3.
+#
+# Off by default, because a developer build links whatever SDL3 the machine has
+# and no distribution ships a static one. tools/dist.sh turns it on: an archive
+# is a drag-and-drop, and SDL3's zlib licence attaches no condition to linking
+# it in. ffmpeg deliberately does NOT get the same treatment -- see the
+# licensing note at the top of tools/build-ffmpeg.sh.
+static-sdl = ["sdl3/static-link"]
+
 [[bin]]
 name = "daysengine"
 path = "src/main.rs"

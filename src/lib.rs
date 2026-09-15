@@ -9,10 +9,13 @@
 //! own game directory, [`media`] decodes it, [`playback`] schedules a script
 //! over it, and [`ui`] is the game's menus.
 
-// Every other module is held to the same rule the workspace always had. The
-// exception is `media`, whose every `unsafe` is a call into the system libav —
-// Rust requires the keyword on all FFI, so it cannot be avoided there, and the
-// allow is deliberately narrow and greppable.
+// The rule is that `unsafe` here only ever means "FFI Rust requires the keyword
+// on, with no safe binding to call instead", and that every such call is narrow
+// and greppable. Two places qualify: `media`, whose every `unsafe` is a call
+// into the system libav, and `install::clock::local_offset`, which reads the
+// machine's UTC offset out of SDL because the safe `sdl3` crate wraps no part of
+// `SDL_time.h`. `clock` carries its own allow on that one function rather than
+// on the module.
 #![deny(unsafe_code)]
 
 pub mod install;

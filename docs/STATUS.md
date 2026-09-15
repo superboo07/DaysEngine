@@ -9,6 +9,20 @@ doc comment beside the code.
 Early. School Days HQ is the title the engine was brought up on and the one the
 rows below describe; Shiny Days is being brought up on the same code.
 
+## Platforms
+
+| | State |
+|---|---|
+| Linux x86_64 | **Works.** The platform the engine is developed and verified on. A developer build links the system SDL3 and ffmpeg |
+| Windows x86_64 | **Builds.** Cross-compiled from Linux for `x86_64-pc-windows-gnu` against vendored SDL3 and ffmpeg; `just dist-windows` packages the `.exe` files with their DLLs. **Not yet run against a real install on Windows** — the build is verified, the game is not |
+| macOS | Not worked on, and not planned |
+| Android | Not started |
+
+The only place the engine ever needed a platform branch was the local UTC
+offset for a save slot's timestamp line, and it does not need one now either:
+`install::clock` asks SDL, which asks the platform. Everything else is portable
+Rust over SDL3 and libav. `docs/WINDOWS.md` has the cross-build.
+
 **The file formats transfer for free.** Both titles are FILMEngine, so the
 archives, the scripts, the glyph store, the hit maps, the atlases and the save
 container are the same readers with no branch in them at all:

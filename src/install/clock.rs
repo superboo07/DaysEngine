@@ -5,16 +5,14 @@
 //! which the standard library does not provide — it offers a UTC instant and
 //! nothing else.
 //!
-//! So this is the two pieces that turns one into the other: the civil date
-//! from a UNIX timestamp, and the machine's offset from UTC. The offset comes
-//! from the system zone file (`/etc/localtime`, in the TZif format every Unix
-//! ships), read far enough to find the offset in force right now. A platform
-//! with no such file — Windows — falls back to UTC and says so, which makes
-//! the timestamp wrong by the zone offset rather than absent.
-//!
-//! Around 150 lines rather than a date crate, which is the trade this project
-//! makes for a need this small.
+//! So this is the two pieces that turn one into the other: the civil date from
+//! a UNIX timestamp, and the machine's offset from UTC. The date arithmetic is
+//! ours, because the standard library has none. The offset is SDL's: it already
+//! asks each platform's own clock the question, and asking SDL is what this
+//! engine does wherever SDL has the answer — so there is no zone-file reader
+//! here and no second code path for Windows.
 
+use sdl3::sys::time::{SDL_DateTime, SDL_TimeToDateTime};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A civil date and time, with the fields `GetLocalTime` fills in.
@@ -76,71 +74,34 @@ pub fn civil_from_unix(secs: i64) -> Civil {
 
 /// The machine's offset from UTC in seconds, at `secs`.
 ///
-/// Zero when there is no zone file to read, which is honest rather than silent:
-/// a timestamp an hour out is better than no save line, and the log says why.
+/// `SDL_TimeToDateTime` is the platform's own local-time conversion — the zone
+/// database on Unix, `SystemTimeToTzSpecificLocalTime` on Windows — and it
+/// reports what it applied in `utc_offset`, seconds east of UTC. Only that
+/// field is used: the civil fields are recomputed by [`civil_from_unix`], whose
+/// weekday counts from Sunday the way `SYSTEMTIME.wDayOfWeek` does.
+///
+/// It needs no initialised subsystem, so the headless `days` tools get the same
+/// answer the game does.
+///
+/// Zero when SDL declines to convert, which is honest rather than silent: a
+/// timestamp an hour out is better than no save line, and the log says why.
+#[allow(unsafe_code)]
 fn local_offset(secs: i64) -> i64 {
-    match std::fs::read("/etc/localtime") {
-        Ok(bytes) => tzif_offset(&bytes, secs).unwrap_or_else(|| {
-            log::warn!("/etc/localtime is not a zone file this understands; timestamps are UTC");
-            0
-        }),
-        Err(_) => {
-            log::debug!("no /etc/localtime; save timestamps are UTC");
-            0
-        }
+    let mut dt = SDL_DateTime::default();
+    // SDL counts nanoseconds from the same epoch. The saturating multiply is
+    // for a clock so far out that nanoseconds overflow; the offset it then
+    // reports is for a different century, which is the least of that machine's
+    // problems.
+    let ticks = secs.saturating_mul(1_000_000_000);
+    // SAFETY: an FFI call with no safe binding in the `sdl3` crate. `dt` is a
+    // live, initialised `SDL_DateTime` this frame owns, and SDL only writes
+    // through the pointer for the duration of the call.
+    let converted = unsafe { SDL_TimeToDateTime(ticks, &mut dt, true) };
+    if !converted {
+        log::debug!("SDL would not convert to local time; save timestamps are UTC");
+        return 0;
     }
-}
-
-/// The UTC offset a TZif file gives for `at`.
-///
-/// Only the version-1 block is read: it is present in every TZif file whatever
-/// the version, its 32-bit transition times cover every date this will ever be
-/// asked about, and reading it needs no 64-bit second block.
-///
-/// ```text
-/// "TZif"  magic       4 bytes
-/// version             1 byte
-/// reserved            15 bytes
-/// six counts          6 x u32 big-endian: isutcnt isstdcnt leapcnt
-///                                        timecnt typecnt charcnt
-/// timecnt x i32       transition times, ascending
-/// timecnt x u8        the type index in force after each
-/// typecnt x (i32,u8,u8)   offset, is_dst, abbreviation index
-/// ```
-fn tzif_offset(b: &[u8], at: i64) -> Option<i64> {
-    if b.get(..4)? != b"TZif" {
-        return None;
-    }
-    let u32be =
-        |o: usize| -> Option<u32> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
-    let timecnt = u32be(0x20)? as usize;
-    let typecnt = u32be(0x24)? as usize;
-    if typecnt == 0 {
-        return None;
-    }
-
-    let times = 0x2c;
-    let indices = times + timecnt * 4;
-    let types = indices + timecnt;
-    let offset_of = |kind: usize| -> Option<i64> {
-        let at = types + kind * 6;
-        Some(i32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?) as i64)
-    };
-
-    // The last transition at or before `at` names the type in force. Before
-    // the first transition the file's first type applies.
-    let mut kind = 0usize;
-    for i in 0..timecnt {
-        let when = i32::from_be_bytes(b.get(times + i * 4..times + i * 4 + 4)?.try_into().ok()?);
-        if i64::from(when) > at {
-            break;
-        }
-        kind = *b.get(indices + i)? as usize;
-    }
-    if kind >= typecnt {
-        return None;
-    }
-    offset_of(kind)
+    i64::from(dt.utc_offset)
 }
 
 #[cfg(test)]
@@ -182,29 +143,5 @@ mod tests {
         let c = civil_from_unix(-1);
         assert_eq!((c.year, c.month, c.day), (1969, 12, 31));
         assert_eq!((c.hour, c.minute, c.second), (23, 59, 59));
-    }
-
-    #[test]
-    fn a_file_that_is_not_a_zone_file_yields_no_offset() {
-        assert_eq!(tzif_offset(b"not a zone file at all", 0), None);
-    }
-
-    /// A minimal TZif with one transition: UTC before it, +1h after.
-    #[test]
-    fn reads_the_offset_in_force_at_a_moment() {
-        let mut b = Vec::new();
-        b.extend_from_slice(b"TZif2");
-        b.extend_from_slice(&[0u8; 15]);
-        for count in [0u32, 0, 0, 1, 2, 0] {
-            b.extend_from_slice(&count.to_be_bytes());
-        }
-        b.extend_from_slice(&1_000_000i32.to_be_bytes()); // the transition
-        b.push(1); // into type 1
-        b.extend_from_slice(&0i32.to_be_bytes());
-        b.extend_from_slice(&[0, 0]);
-        b.extend_from_slice(&3600i32.to_be_bytes());
-        b.extend_from_slice(&[1, 0]);
-        assert_eq!(tzif_offset(&b, 999_999), Some(0));
-        assert_eq!(tzif_offset(&b, 1_000_001), Some(3600));
     }
 }

@@ -9,3 +9,16 @@ git-fetch-with-cli = true
 
 [registries.crates-io]
 protocol = "sparse"
+
+# Windows builds are cross-compiled from Linux against the MinGW-w64 toolchain:
+# there is no Windows machine in this project's loop, and `x86_64-pc-windows-gnu`
+# is the target that a GCC cross-compiler can actually link. The MSVC target
+# would need link.exe and a Windows SDK.
+#
+# This only names the linker. Everything else the cross-build needs — where the
+# Windows SDL3 and ffmpeg import libraries live, and which sysroot bindgen parses
+# ffmpeg's headers against — is per-invocation environment, so it lives in the
+# `just windows-*` recipes rather than here. See docs/WINDOWS.md.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

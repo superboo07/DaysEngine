@@ -64,10 +64,11 @@ deliberately small and deliberately boring.
 
 ## Third-party native libraries
 
-`libSDL3` and `libav*` are linked from the system, not vendored. This is a
-deliberate trade: it means we inherit the distribution's security updates for
-two large C codebases that parse untrusted media, rather than freezing a copy
-that goes stale. It also means the build depends on the host having them:
+`libSDL3` and `libav*` are linked from the system for a **developer build**, not
+vendored. This is a deliberate trade: it means we inherit the distribution's
+security updates for two large C codebases that parse untrusted media, rather
+than freezing a copy that goes stale. It also means the build depends on the
+host having them:
 
 ```bash
 # Arch
@@ -85,6 +86,41 @@ more than the 41ms a 24 fps frame gets. See `media::video::new_scaler`.
 Note that ffmpeg will be parsing media out of the user's own game install, which
 is not attacker-controlled in the normal case. Keep it that way: never point the
 decoder at a file the user did not supply themselves.
+
+### Release archives vendor both
+
+A **distribution build** cannot make the assumption above. The player who
+unpacks an archive may have no libSDL3 at all, and on Windows there is no
+distribution shipping libav security updates to inherit from in the first place.
+So an archive carries its own copies, built from the pinned submodules in
+`third_party/` by `tools/build-sdl.sh` and `tools/build-ffmpeg.sh`:
+
+| | |
+|---|---|
+| `third_party/ffmpeg` | FFmpeg `n9.0.1`, LGPL v2.1 |
+| `third_party/sdl` | SDL `release-3.4.16`, zlib |
+
+They are linked differently, and the licence is the whole reason. **SDL3 is
+zlib, so it is built static and goes inside the executables** (the `static-sdl`
+feature, which `tools/dist.sh` turns on and a developer build leaves off); no
+libSDL3 ships at all. **ffmpeg is LGPL v2.1, so it stays shared**: static
+linking is permitted only against an obligation to let the player relink, and
+shipping it shared satisfies section 6 without one — which is also the
+arrangement this project wants, since a player who needs a patched libav can
+drop the library in. The ffmpeg build is `--disable-gpl
+--disable-nonfree --disable-version3 --disable-autodetect`, so neither a
+GPL-only component nor a library that merely happened to be installed on the
+build machine can end up in a shipped binary. Every archive carries
+`FFMPEG-SOURCE.txt` (upstream commit and the full configure line) and
+`COPYING.LGPLv2.1` beside the libraries; that pair is the compliance artifact
+and an archive must not be published without it.
+
+These submodules are **not** in the developer path. `cargo build`, the tests and
+the `days` inspection commands never touch them, and the pins bump the same way
+a dependency does: deliberately, with the diff reviewed.
+
+`docs/WINDOWS.md` has the cross-build, the toolchain it needs, and the component
+list the ffmpeg build is trimmed to.
 
 ## Verifying a checkout
 

@@ -309,8 +309,10 @@ Design decisions already made and not up for re-litigation:
   the GPU and cannot be inspected from a test.
 - **Menu modes stay the game's own integers** (`Mode(2)` is the title) because
   they cross the engine/menu boundary in the original.
-- `src/media` is the only module allowed `unsafe`, and only because Rust
-  requires the keyword on FFI calls into system libav.
+- **`unsafe` only ever means FFI with no safe binding to call instead**, and
+  every such call is narrow and greppable. Today that is `src/media` (system
+  libav) and `install::clock::local_offset` (`SDL_TimeToDateTime`, which the
+  `sdl3` crate does not wrap). Anything else is a design error.
 - **All pack and CMAP lookups are case-insensitive.** INIs say
   `System/Title/TitleBase.png`; packs store `TITLE/TITLEBASE.PNG`.
 

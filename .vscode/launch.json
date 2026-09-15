@@ -1,0 +1,105 @@
+{
+  "version": "0.2.0",
+  "// Debugger": "These use CodeLLDB (vadimcn.vscode-lldb). The `cargo` key needs rust-analyzer's companion support; if your setup lacks it, run the matching task first and point `program` at target/debug/<binary>.",
+  "configurations": [
+    {
+      "name": "daysengine (the game)",
+      "// Opens a window": "This is the one thing the headless tools cannot verify, and the one thing that takes over the desktop. Prefer a `days` configuration below unless you are debugging the window, the GPU path or input.",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" }
+    },
+    {
+      "name": "daysengine (release, the game)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--release", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "info" }
+    },
+    {
+      "name": "days (inspection tools)",
+      "// The verification path": "Headless: composites a screen, parses a script, reads the save, and prints what it found. Everything here can be checked from a test or a diff.",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--bin=days"],
+        "filter": { "name": "days", "kind": "bin" }
+      },
+      "args": ["--game", "${input:gameDir}", "${input:daysCmd}"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" }
+    },
+    {
+      "name": "days menu (one screen)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--bin=days"],
+        "filter": { "name": "days", "kind": "bin" }
+      },
+      "args": [
+        "--game",
+        "${input:gameDir}",
+        "menu",
+        "${input:menuMode}",
+        "--out",
+        "${workspaceFolder}/target/menu.png"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" }
+    },
+    {
+      "name": "debug unit tests (daysengine)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--locked", "--no-run", "--lib", "--package=daysengine"],
+        "filter": { "name": "daysengine", "kind": "lib" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "gameDir",
+      "type": "promptString",
+      "description": "Game directory (the one holding Packs and the game executable)",
+      "default": "${env:DAYS_GAME_DIR}"
+    },
+    {
+      "id": "daysCmd",
+      "type": "pickString",
+      "description": "Subcommand",
+      "options": ["key", "ui", "save", "assets", "scripts", "list", "verify"],
+      "default": "ui"
+    },
+    {
+      "id": "menuMode",
+      "type": "pickString",
+      "description": "Menu mode",
+      "options": [
+        { "label": "2 - title", "value": "2" },
+        { "label": "3 - save/load", "value": "3" },
+        { "label": "4 - option", "value": "4" },
+        { "label": "5 - replay", "value": "5" },
+        { "label": "6 - route map", "value": "6" },
+        { "label": "7 - SOMCON", "value": "7" },
+        { "label": "9 - dress select", "value": "9" }
+      ],
+      "default": "2"
+    }
+  ]
+}

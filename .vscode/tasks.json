@@ -1,0 +1,157 @@
+{
+  "version": "2.0.0",
+  "// Everything passes --locked": "A build must never silently rewrite Cargo.lock; see the justfile.",
+  "tasks": [
+    {
+      "label": "check",
+      "detail": "fmt --check, clippy -D warnings, and the test suite. The pre-commit gate.",
+      "type": "shell",
+      "command": "cargo fmt --all -- --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "build",
+      "detail": "Debug build against the system SDL3 and ffmpeg.",
+      "type": "shell",
+      "command": "cargo build --locked --workspace",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build (release)",
+      "detail": "What the player runs. Asset decode is unusably slow in a debug build.",
+      "type": "shell",
+      "command": "cargo build --locked --release --workspace",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "cargo test --locked --workspace",
+      "group": "test",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "clippy",
+      "type": "shell",
+      "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "fmt",
+      "type": "shell",
+      "command": "cargo fmt --all",
+      "problemMatcher": []
+    },
+    {
+      "label": "audit",
+      "detail": "Supply-chain gate: advisories, licences, banned crates, source registries.",
+      "type": "shell",
+      "command": "cargo deny --locked check",
+      "problemMatcher": []
+    },
+
+    {
+      "label": "dist: windows",
+      "detail": "Cross-compile daysengine.exe and days.exe and package them. Builds the vendored SDL3 and ffmpeg first if needed.",
+      "type": "shell",
+      "command": "./tools/build-sdl.sh windows && ./tools/build-ffmpeg.sh windows && ./tools/dist.sh windows",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
+      "label": "windows: deps",
+      "detail": "Build the vendored SDL3 and ffmpeg for MinGW-w64. Slow; once per checkout.",
+      "type": "shell",
+      "command": "./tools/build-sdl.sh windows && ./tools/build-ffmpeg.sh windows",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
+      "label": "dist: linux",
+      "detail": "Release archive with the vendored SDL3 and LGPL ffmpeg beside the binaries.",
+      "type": "shell",
+      "command": "./tools/build-sdl.sh linux && ./tools/build-ffmpeg.sh linux && ./tools/dist.sh linux",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
+      "label": "dist: windows (binaries already built)",
+      "detail": "Package only. Fails if the vendored libraries or the .exe files are missing.",
+      "type": "shell",
+      "command": "./tools/dist.sh windows",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+
+    {
+      "// The `days` inspection tools": "These are the verification path. They run headless against a real install and print what they found; the game itself is not a test harness.",
+      "label": "days: menu",
+      "detail": "Compose a menu screen headlessly and report the widgets it chose.",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" menu ${input:menuMode}",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "days: ui",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" ui",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "days: save",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" save",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "days: scripts",
+      "detail": "Parse every .ORS and report anything the parser cannot handle.",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" scripts --stats",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "days: assets",
+      "detail": "Check that every asset path referenced by every script resolves.",
+      "type": "shell",
+      "command": "cargo run --locked --release --bin days -- --game \"${input:gameDir}\" assets",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "gameDir",
+      "type": "promptString",
+      "description": "Game directory (the one holding Packs and the game executable)",
+      "default": "${env:DAYS_GAME_DIR}"
+    },
+    {
+      "id": "menuMode",
+      "// The game's own integers": "Menu modes stay the original's numbers because they cross the engine/menu boundary that way. See ui::menu::Mode.",
+      "type": "pickString",
+      "description": "Menu mode",
+      "options": [
+        { "label": "2 - title", "value": "2" },
+        { "label": "3 - save/load", "value": "3" },
+        { "label": "4 - option", "value": "4" },
+        { "label": "5 - replay", "value": "5" },
+        { "label": "6 - route map", "value": "6" },
+        { "label": "7 - SOMCON", "value": "7" },
+        { "label": "9 - dress select", "value": "9" }
+      ],
+      "default": "2"
+    }
+  ]
+}
