@@ -2879,11 +2879,74 @@ card follows whichever of a pair plays — and the clip is opened from the
 result, `Ex01/System/EndRoll/03-K2-F01-END`. The clip is a `FILMOBJ::ImageChar`
 (`operator new(0x2d4)` then `FUN_00434270`), the class `[CreateBG]` uses: its
 top-left is `(0, 0)` through `vt[0x58]` and its z is 7000 through `vt[0x70]`,
-above the end roll's own `1000 + n` and below the 7500 a fade layer takes. The
-one call `[CreateBG]` does not make is `vt[0x50]` (`FUN_00438130`), which
-copies the film object's `+0xc`, `+0x10` and `+0x14` onto the clip; **what
-those three are is not recovered**, and nothing about them shows in the shipped
-card.
+above the end roll's own `1000 + n` and below the 7500 a fade layer takes. Like
+every other clip the dispatcher builds, it then takes the film object's `+0xc`,
+`+0x10` and `+0x14` through `vt[0x50]` (`FUN_00438130`) — the stage transform,
+below.
+
+### The stage transform, and why every clip is handed it
+
+`FILMOBJ::BaseLayer`'s `+0xc`, `+0x10` and `+0x14` are three floats: an x
+offset, a y offset and a uniform scale, in destination pixels. `FUN_00437fd0`
+is the only reader, and it maps the layer's four source corners — `+0x58`/`+0x5c`
+top-left, `+0x60`/`+0x64`, `+0x68`/`+0x6c`, `+0x70`/`+0x74` — into the
+destination quad at `+0x78`..`+0x94`:
+
+```text
+dst.x = src.x * [+0x14] + [+0xc]
+dst.y = src.y * [+0x14] + [+0x10]
+```
+
+adding 1.0 to the right column and the bottom row, which turns the
+right/bottom-exclusive rect into an inclusive one. `FUN_00434ea0`, slot `0x14`
+of `FILMOBJ::ImageChar`, calls it on the way into the sprite draw, so the
+transform is applied to every layer on every frame it is drawn.
+
+`vt[0x50]` (`FUN_00438130`) is the plain three-float setter. The film object
+overrides it with `FUN_00427c90`, which stores the triple on itself *and*
+walks the layer registry at film `+0x390` (`FUN_004266b0`), calling each
+registered layer's own `vt[0x50]` — so one call re-transforms the whole stage.
+
+The value comes from `FUN_00421b60`:
+
+```text
++0xc  = -0.5
++0x10 = -0.5                       when FUN_00408e20() == 1
+      = FUN_00408ef0() - 0.5       otherwise
++0x14 = FUN_00408f30()
+```
+
+`FUN_00408e20` reads the current entry of the display-mode table
+(`DAT_004b2030[DAT_004b2074]`); `FUN_00408ef0` is
+`(DAT_004b20c8 - DAT_004b2094) * 0.5`, half the difference of two heights, i.e.
+the letterbox top margin; and `FUN_00408f30` is 1.0 unless `DAT_004b208c` and
+the mode are both 1, when it is a width ratio (`DAT_004b20b8` or `DAT_004b2044`
+over `DAT_004b2050`). The `-0.5` in both offsets is the Direct3D 9 half-texel
+rule, not a layout decision.
+
+`FUN_00421b60` is called from three places: `FUN_00422520`, once, immediately
+after it constructs the film object — neither `FUN_0042fa20` nor the base
+constructors `FUN_004386b0`/`FUN_00437e60` write the triple, so this is its
+initialisation — and `FUN_00416790` and `FUN_00417970`, the handlers behind the
+`_GetWideFlag@0` and `_GetFullFlag@0` latches. So the stage is re-fitted when
+the player toggles widescreen or fullscreen, and at no other time.
+
+Because the triple is never zero-initialised, every clip has to be handed it at
+creation, and every clip is: `FUN_0042b770` registers clips at exactly two
+places (`FUN_00427800` at `0x0042d575` under the script's own name, and at
+`0x0042c49b` under `L"END"` for the episode title card), and each is preceded
+by the `vt[0x50]` call. `FUN_0042a450` does the same for the clip it builds.
+
+**Shiny Days only.** `SCHOOLDAYS HQ.exe` has no such transform: no function
+reads `+0xc`/`+0x10`/`+0x14` as floats off one register, and a raw scan of
+`.text` for the setter's encoding (`d9 59 0c` … `d9 59 10` … `d9 59 14`) finds
+one site in `SHINYDAYS.exe` and none in HQ. Both executables do carry
+`_GetWideFlag@0` and `_GetFullFlag@0`.
+
+DaysEngine has no equivalent member. It composes the stage at 800x450 and
+letterboxes that whole box into the window (`letterbox` in `src/main.rs`),
+which is where the original's per-layer offset and scale land; the `-0.5` is a
+Direct3D 9 sampling correction with no counterpart on this renderer.
 
 Its window runs from the `[EndRoll]`'s own start, for a length chosen by host
 slot `+0x134` — `FUN_0041dac0`, the float at the engine's `+0x594`: `0x2d0`

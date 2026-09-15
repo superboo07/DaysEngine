@@ -287,10 +287,18 @@ pub struct Stage {
 /// uses, `operator new(0x2d4)` then `FUN_00434270` — at the `[EndRoll]`'s own
 /// start, with its top-left at `(0, 0)` (`vt[0x58]`) and z 7000 (`vt[0x70]`),
 /// which is above the end roll's own `BGS` counter + 1000 and below the 7500
-/// the fade layer takes. The one call `[CreateBG]` does not make is
-/// `vt[0x50]` (`FUN_00438130`), which copies the film object's `+0xc`,
-/// `+0x10` and `+0x14` onto the clip; **what those three are is not
-/// recovered**, and nothing about them is visible in the shipped card.
+/// the fade layer takes. Like every clip the dispatcher builds, it is then
+/// handed the film object's `+0xc`, `+0x10` and `+0x14` through `vt[0x50]`
+/// (`FUN_00438130`): the stage transform — an x offset, a y offset and a
+/// uniform scale that `FUN_00437fd0` applies to a layer's four corners as
+/// `dst = src * scale + offset` on every frame it draws. `FUN_00421b60` sets
+/// it to `(-0.5, -0.5, 1.0)` unless the display mode is the widescreen one,
+/// and re-broadcasts it to every registered layer (`FUN_00427c90`) when the
+/// player toggles widescreen or fullscreen. The `-0.5` is the Direct3D 9
+/// half-texel rule. This engine has no counterpart member: it composes at
+/// 800x450 and letterboxes that box into the window, which is where the
+/// original's per-layer offset and scale land. Shiny Days only — `SCHOOLDAYS
+/// HQ.exe` has no such transform. See `docs/FORMATS.md`.
 struct Card {
     still: Still,
     start: Frame,
