@@ -154,6 +154,13 @@ pub enum Next {
     /// More than one name means the DLL rotates between them.
     Named { names: Vec<String>, scene: u16 },
     /// `ROUTE` becomes -1 and the name is empty: the route is over.
+    ///
+    /// The helper behind it is `FUN_10005a50`, which sets `ROUTE` to
+    /// `0xffffffff` through host slot `+0xc` and then
+    /// `wcscpy_s(buf, len, L"")`. The empty name is deliberate, and the
+    /// executable carries it all the way to the read record — see
+    /// `Progress::mark_read`. Some handler arms call the emitter and still
+    /// return 1, so an answer of "success" can still be this.
     Stop,
     /// The handler returned without naming anything.
     Nothing,

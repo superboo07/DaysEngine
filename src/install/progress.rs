@@ -441,15 +441,36 @@ impl Progress {
     /// thread in `FUN_00427780`) and the engine tearing down (`FUN_00422e10`)
     /// — all three through `FUN_0042b5f0`, the writer for the `FlagFileName`
     /// the film INI names. See [`Progress::save_to`].
-    /// **The blank entry is not recovered.** Both players' stores carry one
-    /// entry whose name is the empty string, set `true`, and this engine does
-    /// not write it: [`mark_read`] takes an empty name as nothing to record.
-    /// The shipped call is unconditional — neither `0x0041c633` nor
-    /// `0x0041cf5e` checks the string first — so the original does write it
-    /// whenever the name is empty at an end of script, but **what leaves it
-    /// empty there has not been followed**. Two branches of `FUN_00424020`
-    /// blank `engine + 0x188`, and both set the moving and stop flags beside
-    /// it, which should keep the block from running again.
+    /// **The blank entry.** Both players' stores carry one entry whose name is
+    /// the empty string, set `true`, and this engine does not write it:
+    /// [`mark_read`] takes an empty name as nothing to record. The shipped
+    /// call is unconditional — neither `0x0041c633` nor `0x0041cf5e` checks
+    /// the string first — so the original does write it whenever the name is
+    /// empty at an end of script.
+    ///
+    /// The empty name is the **route module's own end-of-route sentinel**, not
+    /// an uninitialised buffer. `FUN_10005a50` is the emitter each route
+    /// handler's `default:` arm calls: it sets `ROUTE` to `-1` through host
+    /// slot `+0xc` and then `wcscpy_s(buf, len, L"")`. `days_route` reaches
+    /// the same function from the other side without reading it — that is
+    /// `Helper::Stop`, and the `Next::Stop` that [`Progress::advance`] already
+    /// turns into `ROUTE = -1`. Some arms call
+    /// the emitter and still return 1, so even a *successful*
+    /// `_GetNextScriptFile@12` can hand back an empty name.
+    ///
+    /// Three paths carry it into the member the mark reads: `FUN_00425bf0`
+    /// case 7 assigns an empty string outright, `FUN_00430f60`'s load retry
+    /// hands one to `vt[0x128]`, and `FUN_0043d4c0`'s `[Next]` arm leaves the
+    /// script object's `+0x114` (`+0x11c` in Shiny) as constructed — or copies
+    /// the emitted `L""` — for the end-of-script block to copy up. It is
+    /// **not** `[Exit]`, which parks an empty name too but appears in none of
+    /// School Days HQ's 1,857 or Shiny Days' 2,587 scripts.
+    ///
+    /// **Which tick marks it is still not recovered.** The block's only latch
+    /// on that branch is set either by the `ROUTE == -1` test below the mark
+    /// or at the end of the load-the-next-script branch that the emptiness
+    /// guard skips, and both should latch on the pass that empties the member.
+    /// See `docs/FORMATS.md`.
     fn mark_read(&mut self) {
         let (script, twin) = (self.script.clone(), self.twin.clone());
         mark_read(&mut self.stores.global, &script, &twin);

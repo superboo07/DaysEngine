@@ -3843,14 +3843,64 @@ FUN_00422e10    the engine tearing down
 DaysEngine writes at the first two: `Progress::save_to` and, when playback is
 left, `Progress::flush_flags`.
 
-**One thing here is not recovered.** Both players' stores carry a single entry
-whose name is the **empty string**, set true. The shipped call is
-unconditional — neither `0x0041c633` nor `0x0041cf5e` looks at the string
-first — so the original writes it whenever the name is empty at an end of
-script. What leaves it empty there has not been followed: two branches of
-`FUN_00424020` blank `engine + 0x188`, and both raise the moving and stop flags
-beside it, which should stop the block running again. This engine does not
-write the blank entry.
+### The blank entry, and where the empty name comes from
+
+Both players' stores carry a single entry whose name is the **empty string**,
+set true. The shipped call is unconditional — neither `0x0041c633` nor
+`0x0041cf5e` looks at the string first — so the original writes it whenever
+the name is empty at an end of script.
+
+The empty name is not an uninitialised buffer. It is **the route module's own
+"this route is over" sentinel**, written on purpose. `FUN_10005a50` is the
+emitter each route handler's `default:` arm calls:
+
+```text
+FUN_10005a50(host, buf, len, flag):
+    if flag: host vt[0x1c](L"FLAG_LOGO", 0)
+    host vt[0x2c]()
+    host vt[0xc](L"ROUTE", 0xffffffff)      ROUTE becomes -1
+    wcscpy_s(buf, len, L"")                 and the name becomes empty
+```
+
+`days-route` reaches the same function from the other side without reading it:
+`Helper::Stop` is classified by the `ROUTE <- imm` argument alone, and
+`Next::Stop` is what `days route --edges` reports as a route with nothing after
+it. Some arms call the emitter and still `return 1`, so a **successful**
+`_GetNextScriptFile@12` can hand back an empty name.
+
+Three paths carry that empty name into the member the mark reads:
+
+- **`FUN_00425bf0` case 7**, the timeline-move state. It calls the export
+  itself and assigns `engine + 0x188` an explicitly empty `std::wstring` on a
+  zero answer, or the buffer — which may be the emitted `L""` — on a non-zero
+  one.
+- **`FUN_00430f60`**, the script-load retry behind `"ScriptLoad Error"`. It
+  builds an empty `std::wstring`, fills it only if `_GetNextScriptFile@12` or
+  `_GetBackScriptFile@12` answered, and hands it to host `vt[0x128]`
+  (`FUN_004239e0`, which writes `host + 0x15c` = `engine + 0x188`) either way.
+- **`FUN_0043d4c0`'s `[Next]` arm**, which parks the next name at the script
+  object's `+0x114` (`+0x11c` in Shiny, `FUN_0042ea70`). School Days HQ parks
+  only on a non-zero answer and `FUN_004388c0` default-constructs the member,
+  so it stays empty; Shiny Days copies the buffer unconditionally, so it takes
+  the emitted `L""`. `FUN_00424020` / `FUN_0041c440` copy that member into
+  `engine + 0x188` / `+ 0x1a0` immediately after marking.
+
+**It is not `[Exit]`.** `FUN_0043d4c0` does park an empty name for `[Exit]`,
+which made it the obvious candidate, but no script ships one: zero of School
+Days HQ's 1,857 and zero of Shiny Days' 2,587.
+
+**What is still not recovered** is which tick actually marks the empty name.
+The end-of-script block reads the member *first* and replaces it *second*, and
+on the branch that matters its only latch — `engine + 0x210` (`+ 0x244` in
+Shiny) — is set either by the `ROUTE == -1` test a few lines below the mark or
+at the end of the "load the next script" branch, which the emptiness guard
+(`FUN_004201c0`, a plain `size == 0`; Shiny tests `engine + 0x1b4` directly)
+skips. Both of those should latch on the same pass that empties the member, so
+the exact sequence that gets one — and only one — blank mark written is not
+settled. **DaysEngine does not write the blank entry**: the name is the route
+module's end-of-route sentinel rather than a script, nothing reads it back
+(`_GetReadScriptCount@4` counts script names), and a store that already has one
+keeps it, because the engine only ever adds.
 
 ### What the title screen reads
 
