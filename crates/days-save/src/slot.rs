@@ -14,7 +14,9 @@
 //! records, until a 0 tag:
 //!     varint tag
 //!     tag 1   wstring script     where the player is
-//!             f32     version    checked against _GetVersionToRoute@4
+//!             version            checked against _GetVersionToRoute@4;
+//!                                an f32 in School Days HQ, a wstring in
+//!                                Shiny Days -- see [`Version`]
 //!             FlgH    store      the save's variable store at that moment
 //!     tag 3   wstring script     a story point reached
 //!             wstring story      the SP*** flag its marker set
@@ -57,7 +59,66 @@
 //! last wrote it — both appear in the player's own saves.
 //!
 //! Read from the shipped reader and writer, `FUN_004336c0` and `FUN_00433340`
-//! in `SCHOOLDAYS HQ.exe`.
+//! in `SCHOOLDAYS HQ.exe`, and `FUN_004250e0` and `FUN_00423370` in
+//! `SHINYDAYS.exe`.
+//!
+//! # The version field is the only thing the two titles spell differently
+//!
+//! Tags 3 and 4 are the same records in the same order in both. Tag 1's second
+//! field is not: `SCHOOLDAYS HQ.exe` reads four raw bytes and compares them as
+//! a float, and `SHINYDAYS.exe`'s `FUN_004250e0` reads a length-prefixed wide
+//! string and compares it with `wcscmp`.
+//!
+//! That is the route module's doing, not the save's. Both titles' tag 1 is
+//! checked against `_GetVersionToRoute@4`, an export of the player's own route
+//! module, and the two exports return different *types* while choosing between
+//! the same two values:
+//!
+//! ```text
+//! RouteProcSDHQ.dll  _GetVersionToRoute@4 @ 0x10006840
+//!     call [edx+0x34]; test eax,eax
+//!     non-zero -> FLD dword ptr [0x100554f0]   = 0.01
+//!     zero     -> FLD1                         = 1.0
+//!
+//! RouteProcSD.dll    _GetVersionToRoute@4 @ 0x10005b30
+//!     call [edx+0x34]; test eax,eax
+//!     non-zero -> MOV EAX, 0x1006468c          = L"0.01"
+//!     zero     -> MOV EAX, 0x10064698          = L"1.0"
+//! ```
+//!
+//! So the same rule, twice, in two representations. Every slot in either
+//! install holds the zero branch -- `1.0` as a float, `"1.0"` as text.
+//!
+//! # How this reader tells them apart
+//!
+//! The shipped engines never have to: each executable ships exactly one of the
+//! two readers, so the title decides. One engine reads both, so it decides per
+//! file, on the `FlgH` magic that the store after the version field must begin
+//! with. That is this engine's rule and not the original's, and it is
+//! decidable rather than a guess: four raw bytes followed by `FlgH` is the
+//! float form, and anything else is the string form, whose own length prefix
+//! then has to land the store's magic in the same place.
+//!
+//! Both titles carry **two** slot readers, and which one runs is the same rule
+//! in both: the following-record flag the replay play-data list raises, host
+//! `+0x98` in School Days HQ and `+0xa4` in Shiny Days, picks a plain load
+//! against one that follows the slot's own recorded answers. School Days HQ
+//! spends it in `FUN_00423a70` on `FUN_0042b250`/`FUN_00428ab0`, which hand the
+//! stream to `FUN_004336c0` or `FUN_00434020`; Shiny Days spends it in
+//! `FUN_0041eb10` on `FUN_00419420`/`FUN_00419240`, which hand it to
+//! `FUN_004250e0` or `FUN_00425830`. In Shiny Days the flag is member `+0x1e8`,
+//! read by the getter `FUN_0041da10` and written by the setter `FUN_0041da20`.
+//!
+//! School Days HQ's two readers agree about tag 1: both take the version as
+//! four raw bytes, `FUN_00434020` through `FUN_00434fe0`. Shiny Days' two do
+//! **not** — `FUN_004250e0` takes the wide string described above and
+//! `FUN_00425830` takes four raw bytes. **What that means for a Shiny Days slot
+//! loaded with its answers followed is not established here**: it has not been
+//! checked against the retail game, and this engine does not reach that path.
+//! It is written down as what the disassembly says and no more.
+//!
+//! Every slot in the player's install is the string form, so that is the form
+//! this engine reads and writes.
 
 use crate::{Error, FlagStore, Reader, Writer};
 use std::collections::BTreeMap;
@@ -94,6 +155,38 @@ pub struct Mark {
     pub store: FlagStore,
 }
 
+/// The script version a slot records, in the form its title's reader expects.
+///
+/// The two are the same rule in two representations, and which one a file
+/// carries follows the title's route module: `_GetVersionToRoute@4` returns a
+/// float from `RouteProcSDHQ.dll` and a wide string from `RouteProcSD.dll`.
+/// Both choose between the same two values, `1.0` and `0.01`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Version {
+    /// School Days HQ: four raw bytes, compared as a float. `FUN_004336c0`.
+    Number(f32),
+    /// Shiny Days: a length-prefixed wide string, compared with `wcscmp`.
+    /// `FUN_004250e0`.
+    Text(String),
+}
+
+impl Default for Version {
+    /// The form School Days HQ writes, and the value every slot in either
+    /// install holds.
+    fn default() -> Self {
+        Version::Number(1.0)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Version::Number(v) => write!(f, "{v}"),
+            Version::Text(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 /// The decoded contents of a save slot.
 #[derive(Debug, Clone, Default)]
 pub struct Slot {
@@ -101,7 +194,7 @@ pub struct Slot {
     pub script: String,
     /// The script engine's version. The game refuses a slot whose version is
     /// not the one `_GetVersionToRoute@4` reports, with a message box.
-    pub version: f32,
+    pub version: Version,
     /// The save's variable store: `ROUTE`, `SCENE`, the feeling counters, the
     /// numbered gate flags and the `BS****` back-bookmarks.
     pub store: FlagStore,
@@ -132,9 +225,7 @@ impl Slot {
                 0 => break,
                 1 => {
                     slot.script = r.string(0)?;
-                    let raw = r.take(4, "the script version")?;
-                    slot.version =
-                        f32::from_le_bytes(raw.try_into().expect("take(4) returns 4 bytes"));
+                    slot.version = r.version()?;
                     slot.store = r.store()?;
                     positioned = true;
                 }
@@ -183,7 +274,10 @@ impl Slot {
 
         w.varint(1);
         w.string(&self.script);
-        w.raw(&self.version.to_le_bytes());
+        match &self.version {
+            Version::Number(v) => w.raw(&v.to_le_bytes()),
+            Version::Text(v) => w.string(v),
+        }
         self.store.write_into(&mut w);
 
         for mark in self.marks.values() {
@@ -211,6 +305,21 @@ impl Slot {
 }
 
 impl Reader<'_> {
+    /// Tag 1's version field, in whichever of the two forms the file carries.
+    ///
+    /// Told apart by the store magic that has to follow it. The shipped
+    /// engines never do this -- each executable ships one reader and the title
+    /// decides -- but one engine reads both titles' saves, so it decides per
+    /// file. See the module docs.
+    fn version(&mut self) -> Result<Version, Error> {
+        if self.rest().get(4..8) == Some(&crate::MAGIC) {
+            let raw = self.take(4, "the script version")?;
+            let raw: [u8; 4] = raw.try_into().expect("take(4) returns 4 bytes");
+            return Ok(Version::Number(f32::from_le_bytes(raw)));
+        }
+        Ok(Version::Text(self.string(0)?))
+    }
+
     /// A whole `FlgH` store embedded in a record.
     fn store(&mut self) -> Result<FlagStore, Error> {
         let (store, read) = FlagStore::parse_embedded(self.rest())?;
@@ -227,7 +336,7 @@ mod tests {
     fn slot() -> Slot {
         let mut s = Slot {
             script: "05/05-A2-Z00".into(),
-            version: 1.0,
+            version: Version::Number(1.0),
             store: FlagStore::from_entries([
                 ("001".to_owned(), Value::Int(69)),
                 ("002".to_owned(), Value::Int(62)),
@@ -265,13 +374,46 @@ mod tests {
         let bytes = slot().to_bytes();
         let back = Slot::parse(&bytes).expect("parses");
         assert_eq!(back.script, "05/05-A2-Z00");
-        assert_eq!(back.version, 1.0);
+        assert_eq!(back.version, Version::Number(1.0));
         assert_eq!(back.store.get("001"), Some(&Value::Int(69)));
         assert_eq!(back.store.get("946"), Some(&Value::Bool(true)));
         assert_eq!(back.marks.len(), 2);
         assert_eq!(back.marks["SP101"].script, "00/00-00-A03");
         assert_eq!(back.choices["01/01-00-J01"], -1);
         assert_eq!(back.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn either_title_s_version_field_survives_the_store_magic_that_follows_it() {
+        // The two forms are told apart by the `FlgH` the store must begin
+        // with, so the case that matters is the one where the string form's
+        // own bytes could be mistaken for four raw bytes and back.
+        let mut hq = slot();
+        hq.version = Version::Number(1.0);
+        let mut sd = slot();
+        sd.version = Version::Text("1.0".into());
+
+        let hq_bytes = hq.to_bytes();
+        let sd_bytes = sd.to_bytes();
+        assert_ne!(hq_bytes, sd_bytes);
+        assert_eq!(
+            Slot::parse(&hq_bytes).unwrap().version,
+            Version::Number(1.0)
+        );
+        assert_eq!(
+            Slot::parse(&sd_bytes).unwrap().version,
+            Version::Text("1.0".into())
+        );
+        // And the other value the route module can report, whose text form is
+        // four characters and so eight bytes rather than four.
+        let mut other = slot();
+        other.version = Version::Text("0.01".into());
+        let bytes = other.to_bytes();
+        assert_eq!(
+            Slot::parse(&bytes).unwrap().version,
+            Version::Text("0.01".into())
+        );
+        assert_eq!(Slot::parse(&bytes).unwrap().to_bytes(), bytes);
     }
 
     #[test]

@@ -3370,7 +3370,8 @@ that into the engine rather than restoring a memory image.
 records, until a 0 tag:
     varint tag
     tag 1   wstring script     where the player is
-            f32     version    checked against _GetVersionToRoute@4
+            version            checked against _GetVersionToRoute@4; an f32
+                               in School Days HQ, a wstring in Shiny Days
             FlgH    store      the save's store at that moment
     tag 3   wstring script     a story point reached
             wstring story      the SP*** flag its marker set
@@ -3402,12 +3403,15 @@ Where each record comes from:
   settles (`FUN_00428a50`) and reads it back instead of asking the player while
   the engine is replaying (`FUN_00428a80`).
 
-**The version is checked.** `_GetVersionToRoute@4` reports a float and a slot
-whose tag-1 version differs is refused with a message box — "Script version
-does not match." / the Japanese equivalent, chosen by host `+0x5c`. Every slot
-in a retail install carries `1.0`; what the export computes is **not
-recovered**, so DaysEngine writes back whatever a slot was read with, and `1.0`
-for a slot written from nothing.
+**The version is checked.** A slot whose tag-1 version differs from what
+`_GetVersionToRoute@4` reports is refused with a message box — "Script version
+does not match." / the Japanese equivalent, chosen by host `+0x5c`. The export
+reports a float in School Days HQ and a wide string in Shiny Days, choosing in
+both between the same two values; every slot in either retail install carries
+the `1.0` branch. **What makes the export take its other branch, `0.01`, is not
+recovered** — it is the answer of the object at `[edx+0x34]`, which has not been
+followed. DaysEngine writes back whatever a slot was read with, and for a slot
+written from nothing the value and the form its own route module reports.
 
 ### One store, not two
 
@@ -3449,6 +3453,71 @@ That is the standard the writer is held to: a save DaysEngine writes is a save
 the original game reads. `days save --roundtrip` is that check.
 
 ---
+
+### The version field is the only thing the two titles spell differently
+
+Tags 3 and 4 are the same records in the same order in both titles. Tag 1's
+second field is not. `SCHOOLDAYS HQ.exe`'s reader takes four raw bytes and
+compares them as a float; `SHINYDAYS.exe`'s `FUN_004250e0` reads a
+length-prefixed wide string with the same `FUN_004230c0` the other strings use
+(cap `0x80`) and compares it with `wcscmp`.
+
+That difference belongs to the route module, not to the save. Both readers
+check the field against `_GetVersionToRoute@4`, an export of the player's own
+route module, and the two exports are the same shape returning different types
+while choosing between the same two values:
+
+```text
+RouteProcSDHQ.dll  _GetVersionToRoute@4 @ 0x10006840
+    call [edx+0x34]; test eax,eax
+    non-zero -> FLD dword ptr [0x100554f0]   = 0.01
+    zero     -> FLD1                         = 1.0
+
+RouteProcSD.dll    _GetVersionToRoute@4 @ 0x10005b30
+    call [edx+0x34]; test eax,eax
+    non-zero -> MOV EAX, 0x1006468c          = L"0.01"
+    zero     -> MOV EAX, 0x10064698          = L"1.0"
+```
+
+Every slot in either install holds the zero branch. What makes the export take
+the other one is **not recovered**: it is the answer of the object at
+`[edx+0x34]`, which has not been followed. `days-route`'s `Image::route_version`
+recovers the form and the retail value from the export's own prologue, so no
+address is written down in the engine.
+
+Shiny Days' writer is `FUN_00423370`: it writes the magic, then walks its record
+vector letting each record serialize itself through its own vtable slot `+4`,
+then the choice map, then the end tag.
+
+**Both titles carry two slot readers**, and which one runs is the same rule in
+both: the following-record flag the replay play-data list raises picks a plain
+load against one that follows the slot's own recorded answers. That is host
+`+0x98` in School Days HQ, spent in `FUN_00423a70` on
+`FUN_0042b250`/`FUN_00428ab0`, and host `+0xa4` in Shiny Days — the same slot
+under this title's `0xc` shift — spent in `FUN_0041eb10` on
+`FUN_00419420`/`FUN_00419240`. Shiny Days' pair hand the stream to
+`FUN_004250e0` and `FUN_00425830` exactly as School Days HQ's hand it to
+`FUN_004336c0` and `FUN_00434020`, both through the backlog object at
+`engine+0xac`, and the answers-followed one additionally copies `EndClear` and
+`NewRadish` out of the slot's store into the global one. In Shiny Days the flag
+is member `+0x1e8`, read by the getter `FUN_0041da10` at slot `+0xa4` and
+written by the setter `FUN_0041da20` at `+0xa0`.
+
+School Days HQ's two readers agree about tag 1: both take the version as four
+raw bytes, `FUN_00434020` through `FUN_00434fe0`, which is what its float field
+is. Shiny Days' two do **not** — `FUN_004250e0` takes the wide string above and
+`FUN_00425830` takes four raw bytes. **What that means for a Shiny Days slot
+loaded with its answers followed is not established here.** It has not been
+checked against the retail game and this engine does not reach that path, so it
+is recorded as what the disassembly says and no more; calling it a shipped bug
+would need the evidence the house rules ask of that claim.
+
+Every slot in the player's install is the string form, so that is the form this
+engine reads and writes. One engine reads both titles, so `Slot::parse` decides
+per file rather than per title: the version field is followed by the store,
+which must begin with `FlgH`, and four raw bytes followed by that magic is the
+float form. That rule is this engine's, not the original's — each shipped
+executable ships exactly one of the two readers and never has to choose.
 
 ## The save/load screen — mode 3, `System/SaveLoad`
 

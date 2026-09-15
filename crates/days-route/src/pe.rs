@@ -167,3 +167,77 @@ impl<'a> Image<'a> {
         }
     }
 }
+
+/// What `_GetVersionToRoute@4` hands back, in the form the module returns it.
+///
+/// Both titles' export is the same shape — ask the object at `[edx+0x34]`, then
+/// pick one of two constants — and both pick between the same two values. They
+/// differ in type, which is what decides how a save slot spells its tag-1
+/// version field:
+///
+/// ```text
+/// RouteProcSDHQ.dll @ 0x10006840    non-zero -> FLD [0.01]   zero -> FLD1
+/// RouteProcSD.dll   @ 0x10005b30    non-zero -> L"0.01"      zero -> L"1.0"
+/// ```
+///
+/// Recovered from the export's own prologue, so no address is written down
+/// here. `None` for a module whose export does not have this shape, which is
+/// a module this has not been recovered against rather than a broken one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteVersion {
+    /// Returned in `ST(0)`. The zero branch is `FLD1`, so `1.0`.
+    Float(f32),
+    /// Returned in `EAX` as a pointer to a wide string.
+    Text(String),
+}
+
+impl Image<'_> {
+    /// The version the route module reports for the retail path.
+    ///
+    /// The export tests the result of `call [edx+0x34]` and takes one of two
+    /// constants. Every slot in either install holds the **zero** branch, so
+    /// that is the one recovered here: `FLD1` for the float form, and the
+    /// second string pointer for the text form.
+    pub fn route_version(&self) -> Option<RouteVersion> {
+        let at = *self.exports.get("_GetVersionToRoute@4")?;
+        // The common prologue, up to the branch: push ebp; mov ebp,esp;
+        // mov eax,[ebp+8]; mov edx,[eax]; mov ecx,[ebp+8]; mov eax,[edx+0x34];
+        // call eax; test eax,eax; jz short.
+        const HEAD: [u8; 18] = [
+            0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x8b, 0x10, 0x8b, 0x4d, 0x08, 0x8b, 0x42, 0x34,
+            0xff, 0xd0, 0x85, 0xc0,
+        ];
+        let start = self.at(at)?;
+        if self.bytes.get(start..start + HEAD.len())? != HEAD {
+            return None;
+        }
+        // `74 xx` is the jump taken when the call answered zero.
+        let after = start + HEAD.len();
+        if *self.bytes.get(after)? != 0x74 {
+            return None;
+        }
+        let body = after + 2;
+        match *self.bytes.get(body)? {
+            // d9 05 <imm32> = FLD dword ptr [imm32]; the zero branch that
+            // follows it is d9 e8 = FLD1.
+            0xd9 => {
+                let rest = body + 6;
+                (self.bytes.get(rest..rest + 4)? == [0xeb, 0x02, 0xd9, 0xe8])
+                    .then_some(RouteVersion::Float(1.0))
+            }
+            // b8 <imm32> = mov eax,imm32; the zero branch is the second one.
+            0xb8 => {
+                let rest = body + 5;
+                if self.bytes.get(rest..rest + 2)? != [0xeb, 0x05] {
+                    return None;
+                }
+                if *self.bytes.get(rest + 2)? != 0xb8 {
+                    return None;
+                }
+                let va = u32le(self.bytes, rest + 3)?;
+                Some(RouteVersion::Text(self.wide_ascii(va)?))
+            }
+            _ => None,
+        }
+    }
+}

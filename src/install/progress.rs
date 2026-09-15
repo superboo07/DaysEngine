@@ -33,7 +33,7 @@ use crate::install::ini::Ini;
 use crate::install::save::{self, Mark, Slot};
 use crate::install::vfs::Vfs;
 use days_route::{Act, Context, Machine, Next, Routes};
-use days_save::{FlagStore, Value};
+use days_save::{FlagStore, Value, Version};
 use std::path::Path;
 
 /// The names the position is kept under in the save's store. The route DLL
@@ -44,10 +44,32 @@ const SCENE: &str = "SCENE";
 /// The version a retail slot carries, and the one the shipped executable
 /// compares against.
 ///
-/// Every slot in the player's install holds `1.0`. What
-/// `_GetVersionToRoute@4` computes is **not recovered**, so a slot written
-/// from nothing carries this and a slot rewritten carries whatever it had.
-const RETAIL_VERSION: f32 = 1.0;
+/// Every slot in the player's install holds `1.0`, and both titles' route
+/// module returns it from the branch the retail path takes. A slot rewritten
+/// carries whatever it had; a slot written from nothing carries what the
+/// player's own route module reports, which is also what says whether this
+/// title spells the field as a float or as text.
+///
+/// What makes the export take its *other* branch — `0.01` in both titles — is
+/// **not recovered**; it asks the object at `[edx+0x34]` a question this engine
+/// has not followed.
+fn retail_version(route_dll: &[u8]) -> Version {
+    let form = days_route::pe::Image::parse(route_dll)
+        .ok()
+        .and_then(|img| img.route_version());
+    match form {
+        Some(days_route::pe::RouteVersion::Text(v)) => Version::Text(v),
+        Some(days_route::pe::RouteVersion::Float(v)) => Version::Number(v),
+        None => {
+            log::warn!(
+                "the route module's _GetVersionToRoute@4 is not a shape this \
+                 engine has recovered; a slot written from nothing will carry \
+                 the School Days HQ form"
+            );
+            Version::default()
+        }
+    }
+}
 
 /// The stores the route DLL questions, and the tables it questions them
 /// against.
@@ -100,10 +122,11 @@ pub struct Progress {
     marks: std::collections::BTreeMap<String, Mark>,
     /// The choice made at each script, likewise.
     choices: std::collections::BTreeMap<String, i32>,
-    /// The engine version a slot must match, from `_GetVersionToRoute@4`. Not
-    /// recovered, so slots are written with what they were read with, or with
-    /// the retail 1.0 for a slot written from nothing.
-    version: f32,
+    /// The engine version a slot must match, from `_GetVersionToRoute@4`, in
+    /// whichever form this title's route module reports it. Slots are written
+    /// with what they were read with, or with what that module reports for a
+    /// slot written from nothing.
+    version: Version,
     /// Whether the affection gauge should be showing, which the DLL raises
     /// through host slot `+0x30` after a delta that moved `001` or `002`.
     gauge_raised: bool,
@@ -144,7 +167,7 @@ impl Progress {
             },
             marks: Default::default(),
             choices: Default::default(),
-            version: RETAIL_VERSION,
+            version: retail_version(route_dll),
             gauge_raised: false,
         })
     }
@@ -293,7 +316,7 @@ impl Progress {
                 .script(route.max(0) as usize, scene.max(0) as usize)
                 .unwrap_or_default()
                 .to_owned(),
-            version: self.version,
+            version: self.version.clone(),
             store: self.stores.save.clone(),
             marks: self.marks.clone(),
             choices: self.choices.clone(),

@@ -72,7 +72,7 @@
 
 pub mod slot;
 
-pub use slot::{Mark, Slot};
+pub use slot::{Mark, Slot, Version};
 
 use std::collections::BTreeMap;
 
