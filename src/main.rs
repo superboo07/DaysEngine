@@ -12,7 +12,6 @@
 use anyhow::{bail, Context, Result};
 use days_font::Font;
 use days_script::{Frame, Script, FPS};
-use daysengine::install::binaries::Binaries;
 use daysengine::install::binding::{Action as Control, Bindings, Sign, Trigger};
 use daysengine::install::config::{Channel, Config, Flag, Sound};
 use daysengine::install::engine::Settings;
@@ -773,7 +772,8 @@ fn main() -> Result<()> {
     let vfs = Vfs::mount(&game)?;
     // Which files the three shipped binaries are, found by what they export
     // rather than by name: the titles on this engine spell them differently.
-    let binaries = Binaries::find(&game, vfs.executable());
+    // Mounting the packs already had to classify them, so take that answer.
+    let binaries = vfs.binaries().clone();
     log::info!("ffmpeg {}", daysengine::media::ffmpeg_version());
 
     let start = Ini::parse_bytes(&vfs.read_path("Ini/STARTSCRIPT.INI")?);

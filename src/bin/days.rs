@@ -534,26 +534,38 @@ fn main() -> Result<()> {
             println!("key recovered ({} packs readable)", packs(&game)?.len());
         }
         Cmd::List { pack, filter } => {
-            let packs = select_packs(&game, pack.as_deref())?;
-            let mut total = 0usize;
-            for p in packs {
-                let ar = Archive::open(&p, &key)?;
-                let name = pack_name(&p);
-                for e in ar.entries() {
-                    if !matches(&e.name, filter.as_deref()) {
-                        continue;
-                    }
-                    total += 1;
-                    println!(
-                        "{:<12} {:>12} {:>12}  {}",
-                        name,
-                        e.size,
-                        e.decoded_len(),
-                        e.name
-                    );
-                }
+            // Through the VFS rather than straight off the pack files, so what
+            // this lists is what the game can see: one row per logical path,
+            // from whichever patch overlay won it.
+            let vfs = daysengine::install::vfs::Vfs::mount(&game)?;
+            let prefix = pack.map(|p| format!("{}/", p.to_ascii_lowercase()));
+            let mut rows: Vec<_> = vfs
+                .entries()
+                .filter(|&(logical, h)| {
+                    prefix.as_deref().is_none_or(|p| logical.starts_with(p))
+                        && matches(&vfs.entry(h).name, filter.as_deref())
+                })
+                .collect();
+            rows.sort_unstable_by_key(|&(logical, _)| logical);
+            for (_, h) in &rows {
+                let e = vfs.entry(*h);
+                let layer = vfs.layer_of(*h);
+                let from = match layer
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gpk"))
+                {
+                    true => String::new(),
+                    false => format!("  <- {}", pack_name(layer)),
+                };
+                println!(
+                    "{:<12} {:>12} {:>12}  {}{from}",
+                    vfs.pack_of(*h),
+                    e.size,
+                    e.decoded_len(),
+                    e.name,
+                );
             }
-            eprintln!("{total} entries");
+            eprintln!("{} entries", rows.len());
         }
         Cmd::Extract { pack, out, filter } => {
             let p = resolve_pack(&game, &pack)?;
@@ -2112,10 +2124,17 @@ fn matches(name: &str, filter: Option<&str>) -> bool {
     }
 }
 
+/// A pack file's name without the `[FileExtend]`: `System`, `System.000`.
 fn pack_name(p: &Path) -> String {
-    p.file_stem().unwrap_or_default().to_string_lossy().into()
+    daysengine::install::vfs::pack_display_name(p)
 }
 
+/// Every pack file in `Packs`: the base packs and their patch overlays.
+///
+/// The overlays are `System.GPK.000` .. `System.GPK.009`, so they are not
+/// `.GPK` files by extension and have to be recognised by shape. They are pack
+/// files all the same, which is why `verify` reads them and `extract` can name
+/// one — `days extract System.000`.
 fn packs(dir: &Path) -> Result<Vec<PathBuf>> {
     let packs_dir = dir.join("Packs");
     let mut out = Vec::new();
@@ -2123,15 +2142,27 @@ fn packs(dir: &Path) -> Result<Vec<PathBuf>> {
         std::fs::read_dir(&packs_dir).with_context(|| format!("reading {}", packs_dir.display()))?
     {
         let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gpk"))
-        {
+        if is_pack_file(&path) {
             out.push(path);
         }
     }
     out.sort();
     Ok(out)
+}
+
+fn is_pack_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    match name.rsplit_once('.') {
+        Some((_, "gpk")) => true,
+        Some((head, tail)) => {
+            head.ends_with(".gpk") && tail.len() == 3 && tail.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 fn resolve_pack(dir: &Path, name: &str) -> Result<PathBuf> {

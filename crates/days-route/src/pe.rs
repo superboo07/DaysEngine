@@ -243,6 +243,41 @@ impl Image<'_> {
 }
 
 impl Image<'_> {
+    /// How many patch overlays the route module says one pack may carry.
+    ///
+    /// A pack is not one file. `FUN_004413c0` opens `<Directory><Pack><FileExtend>`
+    /// and then layers `_GetPatchMax@0()` overlays over it, each named by
+    /// `_SetPackName@16` — `swprintf_s(buf, len, L"%s.%03d", name, i)` — where
+    /// `name` already carries the extension, so the files are
+    /// `System.GPK.000` .. `System.GPK.009`. `docs/FORMATS.md` has the whole
+    /// mount sequence and the lookup order the overlays are searched in.
+    ///
+    /// The export is a constant return in both titles, so it is read out of
+    /// its own code rather than written down:
+    ///
+    /// ```text
+    /// 55 8b ec                push ebp; mov ebp,esp
+    /// b8 0a 00 00 00          mov eax, 10
+    /// 5d c3                   pop ebp; ret
+    /// ```
+    ///
+    /// `None` for a module that does not export it, or whose export is not
+    /// that shape — a module this has not been recovered against rather than
+    /// a broken one.
+    pub fn patch_max(&self) -> Option<u32> {
+        let at = *self.exports.get("_GetPatchMax@0")?;
+        let start = self.at(at)?;
+        if self.bytes.get(start..start + 4)? != [0x55, 0x8b, 0xec, 0xb8] {
+            return None;
+        }
+        if self.bytes.get(start + 8..start + 10)? != [0x5d, 0xc3] {
+            return None;
+        }
+        u32le(self.bytes, start + 4)
+    }
+}
+
+impl Image<'_> {
     /// The scenes that have a second, "Radish uniform" recording, out of
     /// `_CheckUniformBlock@4`.
     ///

@@ -18,6 +18,31 @@
 //!   [`Vfs::resolve_as`] to pin it.
 //! * **Case is inconsistent.** Pack indices are mostly uppercase while the
 //!   `.INI` files use mixed case. Every lookup here is case-insensitive.
+//!
+//! # A pack is not one file
+//!
+//! `FUN_0043eee0` walks the route module's pack table and hands each name to
+//! `FUN_0043ecf0`, which appends the engine INI's `[FileExtend]` (`".GPK"`)
+//! and calls `FUN_004413c0`. That opens `[Directory]` + the name — `Packs\` —
+//! and then layers `_GetPatchMax@0()` = 10 **patch overlays** over it, named by
+//! `_SetPackName@16`'s `L"%s.%03d"` off the name that already carries the
+//! extension:
+//!
+//! ```text
+//! Packs/System.GPK        the base pack
+//! Packs/System.GPK.000    overlay 0
+//! ...
+//! Packs/System.GPK.009    overlay 9
+//! ```
+//!
+//! `FUN_00440940` searches them **highest first**: overlay 9 down to overlay 0,
+//! and only then the base pack. So a later overlay shadows an earlier one and
+//! any overlay shadows the base, which is what makes a patch a patch. The index
+//! here is built in the opposite order — base, then 0 upward — so that the last
+//! writer wins and the resulting map is the same.
+//!
+//! Neither retail install ships an overlay, so nothing in either one changes;
+//! a patched or translated install is what this is for.
 
 use days_gpk::{Archive, Entry, Key};
 use std::collections::HashMap;
@@ -66,8 +91,11 @@ pub struct Bgm {
 /// All of a game installation's packs, mounted as one namespace.
 pub struct Vfs {
     root: PathBuf,
-    executable: PathBuf,
+    binaries: super::binaries::Binaries,
     archives: Vec<Archive>,
+    /// The logical pack each archive is a layer of, e.g. `"System"` for both
+    /// `System.GPK` and `System.GPK.003`.
+    packs: Vec<String>,
     /// Lowercased `"pack/inner/path.ext"` -> handle.
     index: HashMap<String, Handle>,
 }
@@ -80,47 +108,72 @@ impl Vfs {
         let root = root.as_ref().to_path_buf();
         let executable = super::binaries::find_executable(&root)?;
         let key = Key::from_executable(&executable)?;
+        let binaries = super::binaries::Binaries::find(&root, &executable);
+        let patches = patch_max(&binaries);
 
-        let mut paths = pack_paths(&root)?;
-        paths.sort();
+        let mut bases = pack_paths(&root)?;
+        bases.sort();
 
-        let mut archives = Vec::with_capacity(paths.len());
+        let mut archives = Vec::with_capacity(bases.len());
+        let mut packs = Vec::with_capacity(bases.len());
         let mut index = HashMap::new();
-        for path in &paths {
-            let pack = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let archive = Archive::open(path, &key)?;
-            let a = archives.len();
-            for (e, entry) in archive.entries().iter().enumerate() {
-                let logical = format!("{pack}/{}", entry.name.to_ascii_lowercase());
-                // Packs do not overlap in practice; if one ever does, first wins
-                // and we say so rather than silently shadowing.
-                if let Some(prev) = index.insert(
-                    logical.clone(),
-                    Handle {
-                        archive: a,
-                        entry: e,
-                    },
-                ) {
-                    log::warn!("{logical} appears in more than one pack; shadowing {prev:?}");
+        let mut overlaid = 0usize;
+        for base in &bases {
+            let name = pack_display_name(base);
+            let pack = name.to_ascii_lowercase();
+            // Base first, then overlay 0 upward, so the highest-numbered
+            // overlay holding a path is the one left in the index.
+            for layer in std::iter::once(base.clone()).chain(overlay_paths(base, patches)) {
+                let archive = match Archive::open(&layer, &key) {
+                    Ok(archive) => archive,
+                    // A base pack that will not open is the install being
+                    // broken; an overlay that will not open costs only itself.
+                    Err(err) if layer != *base => {
+                        log::warn!("{}: {err}; not layered over {name}", layer.display());
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let a = archives.len();
+                for (e, entry) in archive.entries().iter().enumerate() {
+                    let logical = format!("{pack}/{}", entry.name.to_ascii_lowercase());
+                    if index
+                        .insert(
+                            logical,
+                            Handle {
+                                archive: a,
+                                entry: e,
+                            },
+                        )
+                        .is_some()
+                    {
+                        overlaid += 1;
+                    }
                 }
+                if layer != *base {
+                    log::info!(
+                        "{} layers {} entries over {name}",
+                        layer.display(),
+                        archive.entries().len()
+                    );
+                }
+                archives.push(archive);
+                packs.push(name.clone());
             }
-            archives.push(archive);
         }
 
         log::info!(
-            "mounted {} packs, {} entries from {}",
+            "mounted {} packs in {} files, {} entries from {} ({overlaid} replaced by an overlay)",
+            bases.len(),
             archives.len(),
             index.len(),
             root.display()
         );
         Ok(Vfs {
             root,
-            executable,
+            binaries,
             archives,
+            packs,
             index,
         })
     }
@@ -131,7 +184,16 @@ impl Vfs {
 
     /// The game executable the archive key was recovered from.
     pub fn executable(&self) -> &Path {
-        &self.executable
+        &self.binaries.executable
+    }
+
+    /// The three shipped binaries, classified while the key was being found.
+    ///
+    /// Mounting already has to read every `.dll` in the root to learn how many
+    /// patch overlays a pack carries, so callers that want the menu or route
+    /// module take that answer rather than classifying them a second time.
+    pub fn binaries(&self) -> &super::binaries::Binaries {
+        &self.binaries
     }
 
     pub fn len(&self) -> usize {
@@ -200,13 +262,17 @@ impl Vfs {
         &self.archives[handle.archive].entries()[handle.entry]
     }
 
-    /// The pack a handle lives in, e.g. `"movie00"`.
+    /// The pack a handle lives in, e.g. `"Movie00"`.
+    ///
+    /// The logical pack, not the file: a handle into `Movie00.GPK.002` is in
+    /// `Movie00`. [`Vfs::layer_of`] is the file.
     pub fn pack_of(&self, handle: Handle) -> &str {
-        self.archives[handle.archive]
-            .path()
-            .file_stem()
-            .map(|s| s.to_str().unwrap_or_default())
-            .unwrap_or_default()
+        &self.packs[handle.archive]
+    }
+
+    /// The pack file a handle was read out of — a base pack or one overlay.
+    pub fn layer_of(&self, handle: Handle) -> &Path {
+        self.archives[handle.archive].path()
     }
 
     /// Resolves a `[PlayBgm]` path into its intro and loop halves.
@@ -240,6 +306,14 @@ impl Vfs {
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.index.keys().map(String::as_str)
     }
+
+    /// Every logical path with the handle it resolves to, unordered.
+    ///
+    /// The layered view: one entry per path the game can see, pointing at
+    /// whichever layer won. For tooling and diagnostics.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, Handle)> {
+        self.index.iter().map(|(k, &h)| (k.as_str(), h))
+    }
 }
 
 fn normalise(logical: &str) -> String {
@@ -258,6 +332,58 @@ fn has_extension(path: &str) -> bool {
     path.rsplit('/')
         .next()
         .is_some_and(|last| last.contains('.'))
+}
+
+/// How many overlays a pack may carry, out of the player's own route module.
+///
+/// Not written down here: `_GetPatchMax@0` is a constant return, and reading
+/// it is what keeps this right on a build whose answer is not ten. A route
+/// module that cannot be found or read costs the overlays and nothing else,
+/// which is no loss on an install that ships none.
+fn patch_max(binaries: &super::binaries::Binaries) -> u32 {
+    let bytes = binaries.route_bytes();
+    let found = days_route::pe::Image::parse(&bytes)
+        .ok()
+        .and_then(|image| image.patch_max());
+    match found {
+        Some(max) => max,
+        None => {
+            log::warn!("no _GetPatchMax@0 in the route module; pack overlays will be skipped");
+            0
+        }
+    }
+}
+
+/// The overlay files layered over `base`, lowest first, that actually exist.
+///
+/// The original probes all ten names and tolerates every miss — School Days
+/// HQ's pack table names a `Commentary` pack the retail install does not ship,
+/// and the game runs — so a name with no file behind it is simply not a layer.
+fn overlay_paths(base: &Path, patches: u32) -> impl Iterator<Item = PathBuf> {
+    let base = base.to_path_buf();
+    (0..patches)
+        .map(move |i| overlay_path(&base, i))
+        .filter(|p| p.is_file())
+}
+
+/// Where overlay `i` of `base` would live, whether or not it is there.
+///
+/// `_SetPackName@16` formats `L"%s.%03d"` off a name that already carries the
+/// `[FileExtend]`, so this is `Packs/System.GPK.000` and not
+/// `Packs/System.000`.
+fn overlay_path(base: &Path, i: u32) -> PathBuf {
+    let mut name = base.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{i:03}"));
+    base.with_file_name(name)
+}
+
+/// A pack file's name without the `[FileExtend]`: `System`, `System.000`.
+pub fn pack_display_name(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    match name.to_ascii_lowercase().find(".gpk") {
+        Some(at) => format!("{}{}", &name[..at], &name[at + 4..]),
+        None => name.into_owned(),
+    }
 }
 
 fn pack_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
@@ -304,6 +430,23 @@ mod tests {
             "system/title/titlebase.png"
         );
         assert_eq!(normalise("/BGM/SD_BGM/sdbgm07"), "bgm/sd_bgm/sdbgm07");
+    }
+
+    /// `_SetPackName@16` numbers the name the base pack was opened under,
+    /// which already carries the `[FileExtend]`.
+    #[test]
+    fn an_overlay_is_numbered_after_the_extension_not_before_it() {
+        let base = Path::new("/game/Packs/System.GPK");
+        assert_eq!(
+            overlay_path(base, 0),
+            Path::new("/game/Packs/System.GPK.000")
+        );
+        assert_eq!(
+            overlay_path(base, 9),
+            Path::new("/game/Packs/System.GPK.009")
+        );
+        assert_eq!(pack_display_name(&overlay_path(base, 3)), "System.003");
+        assert_eq!(pack_display_name(base), "System");
     }
 
     /// Asset directories contain dots, so only the final component counts.

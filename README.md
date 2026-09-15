@@ -69,7 +69,7 @@ What works today:
 
 | Area | State |
 |---|---|
-| `.GPK` archive reading | **Done** — all 69,936 entries across 29 packs decode and verify, and all 89,273 across Shiny Days' 27 |
+| `.GPK` archive reading | **Done** — all 69,936 entries across 29 packs decode and verify, and all 89,273 across Shiny Days' 27. A pack is not one file: the engine layers up to `_GetPatchMax@0()` patch overlays — `System.GPK.000` through `System.GPK.009` — over each one, highest first, and so does this. Neither retail install ships one; a patched or translated install is what they are for. Split volumes (`System.GPK1`..`F`) are recovered in `docs/FORMATS.md` and not implemented — no install ships one to verify a reader against |
 | Archive key recovery | **Done** — read from the user's own executable, not embedded |
 | `.ORS` script format | **Decoded** — 14 commands, and the fifteenth Shiny Days adds, documented in `docs/FORMATS.md` |
 | `.CMAP` UI hit maps | **Decoded** |

@@ -1140,10 +1140,98 @@ points worth repeating:
 - Archives begin with a leading stub before the first entry's data (5,120 bytes
   in `Ini.GPK`); never assume data starts at 0.
 
-### Packs
+### Packs — which ones, and where they are
 
-`Ini`, `Script`, `System`, `SysSe`, `BGM`, and then six chapters each of
-`Event0N` (PNG stills), `Movie0N` (WMV), `Se0N` and `Voice0N` (OGG).
+The pack list is not a directory scan: `FUN_0043eee0` asks the route module for
+it, `for i in 0 .. _GetPackMax@0()` calling `_GetPackFile@4(i)`. That export is
+a table lookup with a formatted tail — `mov eax, [i*4 + table]` below a bound,
+`swprintf(L"Ex%02d", i - bound)` at or above it — so the names are:
+
+```text
+RouteProcSDHQ.dll   _GetPackMax@0 = 40    bound 30
+  0..29   Ini System Script SysSe BGM
+          Event00..Event05  Movie00..Movie05  Se00..Se05  Voice00..Voice05
+          Commentary
+  30..39  Ex01 .. Ex10        (i - 29)
+
+RouteProcSD.dll     _GetPackMax@0 = 36    bound 26
+  0..25   Ini System Script SysSe GenSe BGM
+          Event01..Event04  EventZ1..EventZ4
+          Movie01..Movie04  MovieZ1..MovieZ4
+          Voice01..Voice04
+  26..35  Ex01 .. Ex10        (i - 25)
+```
+
+Both tables were read out of the module's `.data` from the file, and both come
+to exactly `_GetPackMax@0` when the `Ex` range is added — 30 + 10 and 26 + 10 —
+which is the second check on the bound. **School Days HQ names a `Commentary`
+pack that the retail install does not ship**, and Shiny Days ships only `Ex01`
+of its ten, so a name with no file behind it is ordinary and must not be fatal.
+
+DaysEngine scans `Packs/` rather than reading the table. The two agree on every
+install the original would load: a logical path names its own pack, so packs
+never shadow each other and mounting one the table does not name only adds a
+pack nothing references. The table is recorded here because it is what
+establishes the `Ex%02d` numbering and the overlay naming below.
+
+Where the files are comes from the engine INI the executable carries, read by
+`FUN_0043ef20`. Both titles ship the same values:
+
+```text
+[FileExtend]=".GPK"
+[Directory]="Packs\"
+[CDDirectory]="Overflow\SHINYDAYS\Packs\"      School Days HQ: "Overflow\SCHOOLDAYS HQ\Packs\"
+[UseLocalFileFirst]="0"
+```
+
+`FUN_004424e0` tries `[Directory]` first and falls back to `[CDDirectory]`,
+recording which one answered in a bit per volume — `+0x1c` for the first,
+`+0x1e` for the second. **DaysEngine reads `Packs/` only.** The CD prefix hangs
+off a different base than the plain one (`FUN_0044b3a0` rather than
+`FUN_0044b380`) and which directory that is has not been recovered, so there is
+nothing to implement it against. What `[UseLocalFileFirst]` gates is likewise
+not recovered; it is `"0"` in both titles.
+
+### A pack is not one file
+
+Two things are layered onto every pack name, and neither is in either retail
+install, so both are latent until someone patches one.
+
+**Patch overlays.** `FUN_0043ecf0` appends `[FileExtend]` to the table name and
+hands the result to `FUN_004413c0`, which opens it and then layers
+`_GetPatchMax@0()` = 10 overlays over it. `_SetPackName@16` is
+`swprintf_s(buf, len, L"%s.%03d", name, i)` and the `name` it is given **already
+carries the extension**, so the files are:
+
+```text
+Packs/System.GPK        the base pack
+Packs/System.GPK.000    overlay 0
+...
+Packs/System.GPK.009    overlay 9
+```
+
+`FUN_00440940` is the lookup, and it walks the overlay vector **backwards**: the
+cursor starts at `end` (`this+0x54`), each step subtracts one `0x44`-byte
+element, and only when it reaches `begin` (`this+0x50`) does it fall through to
+the base pack at `this` itself. An entry missing from a layer throws out of
+`FUN_00441bc0` and is caught back into the step, so the search order is
+
+```text
+overlay 9, 8, ... 1, 0, then the base pack — first hit wins
+```
+
+DaysEngine builds its index in the opposite order — base, then overlay 0 upward,
+each insert overwriting — which leaves the same winner in the map. The cap is
+read from the player's own `_GetPatchMax@0` rather than written down here; see
+`Image::patch_max` in `crates/days-route/src/pe.rs`.
+
+**Split volumes.** `FUN_00442060` then probes volumes 1 through 15 of each file,
+named by `FUN_00441a90` as the path with one uppercase hex digit appended —
+`Packs/System.GPK1` .. `Packs/System.GPKF` — and records which exist in the same
+two masks. Each index entry carries its volume at `+0x28`, and `FUN_00441bc0`
+rebuilds the volume's path from the mask before reading. Neither install ships a
+volume above 0 and **DaysEngine does not implement this**: there is no shipped
+input to verify a reader against.
 
 ---
 
