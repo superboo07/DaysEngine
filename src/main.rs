@@ -1573,7 +1573,18 @@ fn run_menu(
 
         for action in actions {
             match action {
-                Action::Play => return Ok(Outcome::Play),
+                Action::Play => {
+                    // The dress-select screen is the only thing that puts a
+                    // dress on the session, and its confirm is what ends the
+                    // menus. The original tells the host the moment the dress
+                    // is committed — host `+0x48`, `FUN_0041dc50` — and the
+                    // value only matters once the run starts, which is here.
+                    if let (Some(p), Some(dress)) = (progress.as_deref_mut(), menu.session().dress)
+                    {
+                        p.set_dress(dress);
+                    }
+                    return Ok(Outcome::Play);
+                }
                 Action::PlayReplay(script) => return Ok(Outcome::Replay(script)),
                 Action::PlayRecorded(slot) => {
                     return Ok(Outcome::LoadSlot {

@@ -626,9 +626,16 @@ non-zero and `B` when it is zero, so **widget 0 is the `A` uniform** and exactly
 two scenes in the shipped route branch on it. That `RouteProcSD` holds this same
 interface is confirmed by its use of the neighbouring slots: `+0x8(wstr)`,
 `+0xc(wstr, int)`, `+0x10(wstr) -> int` and `+0x1c(wstr, int)` match the
-signatures at `0x0048e50c` exactly. `_CheckUniformBlock@4` is a different
-question and does not read this value: it takes a block name and answers whether
-it is one of 288 listed at `PTR_u_01_00_A01_100890f8`.
+signatures at `0x0048e50c` exactly.
+
+`+0x7fc` is also where the whole engine's uniform swap starts. `FUN_0041eb10`
+writes it into the save's store as `NewRadish` when a film run begins, and
+`FUN_0041b830` reads that flag for every script name the route module produces
+— so the same choice that suffixes those two scenes `A`/`B` selects the 288
+second recordings. `_CheckUniformBlock@4` does not read this value itself: it
+takes a name and answers whether it is one of the 288 listed at
+`PTR_u_01_00_A01_100890f8`. See *Shiny Days swaps in the Radish-uniform
+recording*.
 
 **How mode 9 is entered is not recovered.** `getNextMode` never returns 9, so
 the host raises it. `FUN_00413250` in `SHINYDAYS.exe` handles mode 9 specially —
@@ -2645,23 +2652,36 @@ exceptions on either side:
                nothing can select it. 04/04-I0-D07 is ROUTE 68 SCENE 21
 ```
 
-#### What first sets `NewRadish` is not recovered
+#### `NewRadish` is the dress the player picked
 
 The flag is a name in the save's own store, not the global one — host
-`+0x10`/`+0x14`, and the player's `GlobalFlag.DAT` does not carry it. The
-engine keeps a copy at `engine + 0x7fc`: `FUN_0041eb10` reads the flag into it
-when a slot or a story point is put back, and writes it out again after
-anything empties the store — the start of a film run in the same function, and
-the rewind in `FUN_0041c440`. So `NewRadish` outlives `_ZeroReset@4` where
-nothing else in the save's store does.
+`+0x10`/`+0x14`, and the player's `GlobalFlag.DAT` does not carry it. It gets
+there from `engine + 0x7fc`, which is where the **dress-select screen**'s
+answer lands: `FUN_1000ded0` commits through host slot `+0x48`, which is
+`FUN_0041dc50`, and that stores the argument at the subobject's `+0x7d0` — the
+object's `+0x7fc` — and raises `+0x7d4` beside it. The module passes 1 for
+widget 0 and 0 for widget 1, so the flag is set for the **left dress**. See
+*The dress-select screen* above, and `src/ui/dress.rs`.
 
-Nothing raises it. `engine + 0x7fc` is zeroed by the constructor
-(`FUN_0041d660`) and the only other write to it is the read above, so within
-the three shipped binaries the flag can only arrive in a slot that already
-carries it. Checked by scanning `.text` for every reference to the literal and
-for every access at `+0x7fc`, and by searching `SysMenuSD.dll` and
-`RouteProcSD.dll` for the name, which neither holds. A name built at run time,
-or a patch this has not read, would not show up either way.
+`FUN_0041eb10` moves it the rest of the way. At the start of a film run it
+writes `engine + 0x7fc` into the store as `NewRadish` with host `+0x14` —
+**after** `_ZeroReset@4` has emptied the store, so the choice outlives the
+reset where nothing else in the save's store does — and clears `+0x800`, the
+"a dress has been chosen" flag beside it. `FUN_0041c440` writes the flag again
+after a rewind. The same function reads it back out with `+0x10` into
+`+0x7fc` whenever a slot or a story point is put back, so a loaded save decides
+which dress the run is wearing.
+
+So the 288 second recordings are the left dress, and the two scenes
+`RouteProcSD.dll` suffixes `A`/`B` through host slot `+0x44` branch on the same
+choice. `_CheckUniformBlock` is named for exactly what it does: it says whether
+this scene has a second uniform to block in.
+
+The offset is the thing to watch. `FUN_0041dc50` spells the member `+0x7d0`
+because the host interface is a secondary base subobject at `[object + 0x2c]`,
+so a scan of `.text` for accesses at `+0x7fc` finds the reads and misses the
+write that matters. That scan was run, and it is what nearly produced the
+conclusion "nothing raises it".
 
 ### A film run starts from nothing
 

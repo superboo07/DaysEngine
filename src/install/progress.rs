@@ -145,22 +145,22 @@ pub struct Progress {
     /// The scenes that have a second recording, out of `_CheckUniformBlock@4`.
     /// Empty for a title whose route module does not export it.
     uniform: Vec<String>,
-    /// The engine's own copy of the `NewRadish` flag, `engine + 0x7fc`.
+    /// The dress the player chose, `engine + 0x7fc`.
     ///
-    /// It is read out of the store with host slot `+0x10` whenever a slot or a
-    /// story point is put back (`FUN_0041eb10`), and written back with
-    /// `+0x14` after anything empties the store — the start of a film run in
-    /// the same function, and the rewind in `FUN_0041c440`. So the flag
-    /// outlives `_ZeroReset@4` where nothing else in the save's store does.
+    /// This is what `NewRadish` is: the dress-select screen commits through
+    /// host slot `+0x48`, which is `FUN_0041dc50` — it stores the argument at
+    /// the subobject's `+0x7d0`, the object's `+0x7fc`, and raises `+0x7d4`
+    /// beside it. `FUN_1000ded0` passes 1 for widget 0 and 0 for widget 1, so
+    /// the flag is set for the left dress. See [`crate::ui::dress`].
     ///
-    /// **What first sets it is not recovered.** `engine + 0x7fc` is zeroed by
-    /// the constructor (`FUN_0041d660`) and the only thing that ever raises it
-    /// is the read above, so within the three shipped binaries the flag can
-    /// only come from a slot that already carries it. Checked by scanning
-    /// `.text` for every reference to the literal and for every write to
-    /// `+0x7fc`, and by searching `SysMenuSD.dll` and `RouteProcSD.dll` for
-    /// the name, which neither holds. A name built at run time, or a patch
-    /// this has not read, would not show up either way.
+    /// The engine then moves it between that member and the save's store.
+    /// `FUN_0041eb10` writes it into the store as `NewRadish` with host
+    /// `+0x14` at the start of a film run — after `_ZeroReset@4` has emptied
+    /// the store, so the choice outlives the reset where nothing else in the
+    /// store does — and `FUN_0041c440` writes it again after a rewind. The
+    /// same function reads the flag back out with `+0x10` into `+0x7fc`
+    /// whenever a slot or a story point is put back, so a loaded save decides
+    /// which dress the run is wearing.
     new_radish: bool,
 }
 
@@ -209,6 +209,16 @@ impl Progress {
         })
     }
 
+    /// The dress the player committed to, as host slot `+0x48` is told it.
+    ///
+    /// `FUN_0041dc50` stores it at `engine + 0x7fc`; [`Progress::film_start`]
+    /// is what puts it into the save's store. Non-zero is the left dress,
+    /// which is the one the `Z` recordings are of — see
+    /// [`Progress::uniform_block`] and [`crate::ui::dress::host_value`].
+    pub fn set_dress(&mut self, dress: u32) {
+        self.new_radish = dress != 0;
+    }
+
     /// Swaps a script for its Radish-uniform recording, the way
     /// `FUN_0041b830` does.
     ///
@@ -241,6 +251,11 @@ impl Progress {
     /// `School Days HQ` never swaps: its route module exports no
     /// `_CheckUniformBlock@4`, so the table is empty, and its packs hold no
     /// `Z` scripts to swap to.
+    ///
+    /// `NewRadish` is the dress-select screen's answer — see
+    /// [`Progress::new_radish`] — so the 288 second recordings are the left
+    /// dress, and the two scenes `RouteProcSD.dll` suffixes `A`/`B` through
+    /// host `+0x44` branch on the same choice.
     fn uniform_block(&self, name: &str) -> String {
         uniform_block(&self.uniform, self.stores.save.flag(NEW_RADISH), name)
     }
@@ -422,10 +437,11 @@ impl Progress {
         feeling::zero_reset(&mut self.stores.save, self.deltas.names());
         self.stores.save.set_int(ROUTE, 0);
         self.stores.save.set_int(SCENE, 0);
-        // The one thing a New Game carries over: see `Progress::new_radish`.
-        // Only where the title has the mechanism at all — the write-back is
-        // `SHINYDAYS.exe`'s, and `SCHOOLDAYS HQ.exe` holds the name nowhere,
-        // so an HQ slot written from nothing must not grow it.
+        // The dress the player picked goes in after the reset, not before:
+        // it is the one thing a run carries across `_ZeroReset@4`. See
+        // `Progress::new_radish`. Only where the title has the mechanism at
+        // all — the write-back is `SHINYDAYS.exe`'s, and `SCHOOLDAYS HQ.exe`
+        // holds the name nowhere, so an HQ slot must not grow it.
         if !self.uniform.is_empty() {
             self.stores.save.set_flag(NEW_RADISH, self.new_radish);
         }
