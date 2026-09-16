@@ -490,9 +490,10 @@ pub struct MenuArgs {
     /// Open this menu mode directly instead of starting at the title.
     ///
     /// An inspection entry, not a route the game has: it says nothing about
-    /// how the original reaches the mode. It is the only way in to
-    /// `--mode 9`, the dress-select screen, because what raises that mode in
-    /// `SHINYDAYS.exe` is not recovered — see [`daysengine::ui::dress`].
+    /// how the original reaches the mode. `--mode 9`, the dress-select screen,
+    /// is reachable the way the original reaches it — the title screen's
+    /// `START` — so this is a shortcut to it rather than the only way in; see
+    /// [`daysengine::ui::dress`].
     #[arg(long, value_name = "N", conflicts_with = "from_bar")]
     mode: Option<i32>,
     /// Stand in a playthrough loaded from this slot, so the screens that ask
@@ -3176,6 +3177,12 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         );
         match action {
             Action::Play => {
+                // The dress-select screen is the only thing that puts one on
+                // the session, so this line appears only on a run that came
+                // through the title's START on a module that has mode 9.
+                if let Some(dress) = menu.session().dress {
+                    println!("  (committed dress {dress}, which is what NewRadish takes)");
+                }
                 println!("  (would start the script)");
                 break;
             }

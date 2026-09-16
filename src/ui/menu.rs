@@ -100,8 +100,8 @@ impl Mode {
     /// [`Paths::stem`] finds no screen for it and the mode is unavailable.
     ///
     /// Its confirm popup is a second hit map inside this mode rather than a
-    /// mode of its own, and what raises the mode at all is not recovered. See
-    /// [`crate::ui::dress`] for both.
+    /// mode of its own. The title screen's `START` is what raises the mode —
+    /// see [`title_action`] for that arm and [`crate::ui::dress`] for the rest.
     pub const DRESS_SELECT: Mode = Mode(9);
 
     /// The variant a module opens with the first time it is entered.
@@ -1104,6 +1104,48 @@ impl ReplayPage {
             _ => &self.chip,
         }
     }
+}
+
+/// The title screen's dispatch: the mode each of its widgets asks for.
+///
+/// `FUN_100207a0` in `SysMenuSDHQ.dll` and `FUN_1002fc60` in `SysMenuSD.dll`
+/// are the same function over the same widget numbering. Each arm tests the
+/// widget is live, calls one host slot, and writes the module's own next-mode
+/// member — School Days HQ's `+0xb8`, Shiny Days' `+0xe0`. That member is the
+/// whole of `_getNextMode@8` case 2: both modules answer it with a plain load
+/// and no clamp (`FUN_10001930` and `FUN_100019b0`), so whatever an arm writes
+/// is the mode the executable goes to next.
+///
+/// The one arm that differs between the modules is **widget 0, `START`**:
+/// School Days HQ writes mode 1, playback, and Shiny Days writes **mode 9**,
+/// the dress-select screen — which is how that screen is reached. Its own
+/// `getNextMode` case then answers mode 1 once the player has confirmed a
+/// uniform, so the two titles arrive at playback the same way with one screen
+/// in between. Everything either side of that write matches, including the
+/// host call the arm makes first: `+0xe0(0)` on School Days HQ and `+0xfc(0)`
+/// on Shiny Days, which are the same setter at the two modules' own slot
+/// numbers, for the member `docs/FORMATS.md` records as dead weight in the
+/// retail build.
+///
+/// `has_dress_select` is the module's own answer rather than a title name, and
+/// it agrees with the module's own bounds check: `getNextMode` compares against
+/// 9 in `SysMenuSD.dll` and against 8 in `SysMenuSDHQ.dll`, whose `SystemInit`
+/// has no case 9 either.
+///
+/// Widget 5 is School Days HQ's sixth, mouse-only entry, painted into the
+/// all-clear title — `FUN_100207a0` case 5 writes mode 1, as case 0 does, and
+/// differs only in passing 1 to that host slot instead of 0. Shiny Days has no
+/// such widget; its dispatch bounds-checks at 4.
+fn title_action(widget: usize, has_dress_select: bool) -> Option<Mode> {
+    Some(match widget {
+        0 if has_dress_select => Mode::DRESS_SELECT,
+        0 | 5 => Mode::PLAY,
+        1 => Mode::SAVELOAD,
+        2 => Mode::REPLAY,
+        3 => Mode::OPTION,
+        4 => Mode::CONFIRM,
+        _ => return None,
+    })
 }
 
 /// Which widget of the title screen is `REPLAY`, and whether its caption is a
@@ -2442,13 +2484,9 @@ impl Menu {
         }
         match self.mode() {
             Some(Mode::TITLE) => {
-                let next = match widget {
-                    0 | 5 => Mode::PLAY,
-                    1 => Mode::SAVELOAD,
-                    2 => Mode::REPLAY,
-                    3 => Mode::OPTION,
-                    4 => Mode::CONFIRM,
-                    _ => return Ok(Action::Stay),
+                let has_dress = self.paths.has_screen(Mode::DRESS_SELECT.0);
+                let Some(next) = title_action(widget, has_dress) else {
+                    return Ok(Action::Stay);
                 };
                 self.advance(vfs, dll, next)
             }
@@ -3457,6 +3495,33 @@ mod tests {
                 backing_out(entry, Showing::Mode(Mode::CONFIRM), Mode::REPLAY),
                 Leaving::To(Mode::REPLAY)
             );
+        }
+    }
+
+    /// The title's `START` is what reaches the dress-select screen, and only on
+    /// a module that has one.
+    ///
+    /// `FUN_1002fc60` case 0 writes 9 where `FUN_100207a0` case 0 writes 1, and
+    /// that constant is the only difference between the two dispatches.
+    #[test]
+    fn the_title_start_widget_asks_for_the_dress_screen_only_where_there_is_one() {
+        assert_eq!(title_action(0, true), Some(Mode::DRESS_SELECT));
+        assert_eq!(title_action(0, false), Some(Mode::PLAY));
+    }
+
+    /// Every other arm writes the same mode on both modules.
+    ///
+    /// Widget 5 is School Days HQ's sixth, mouse-only entry; its case 5 writes
+    /// mode 1 like case 0 does, so it stays playback whichever module is asked.
+    #[test]
+    fn the_rest_of_the_title_dispatch_is_the_same_on_both_modules() {
+        for has_dress in [true, false] {
+            assert_eq!(title_action(1, has_dress), Some(Mode::SAVELOAD));
+            assert_eq!(title_action(2, has_dress), Some(Mode::REPLAY));
+            assert_eq!(title_action(3, has_dress), Some(Mode::OPTION));
+            assert_eq!(title_action(4, has_dress), Some(Mode::CONFIRM));
+            assert_eq!(title_action(5, has_dress), Some(Mode::PLAY));
+            assert_eq!(title_action(6, has_dress), None);
         }
     }
 

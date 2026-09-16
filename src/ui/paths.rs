@@ -205,6 +205,18 @@ impl Paths {
         Some(stem.replace("%02d", episode).replace("%s", variant))
     }
 
+    /// Whether this module has a screen for `mode` at all.
+    ///
+    /// The two modules do not hold the same set. Asking this rather than which
+    /// title an install is keeps the answer where every other screen path's
+    /// comes from — the module's own literals — and it agrees with the module's
+    /// own dispatch: `_SystemInit@8` bounds-checks the mode against 9 in
+    /// `SysMenuSD.dll` and against 8 in `SysMenuSDHQ.dll`, which is mode 9,
+    /// the dress-select screen, being one module's and not the other's.
+    pub fn has_screen(&self, mode: i32) -> bool {
+        self.literal(mode).is_some()
+    }
+
     /// The variant to build the title's stem from, which is not always the
     /// variant its art is chosen by.
     ///

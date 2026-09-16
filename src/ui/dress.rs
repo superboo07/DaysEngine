@@ -98,15 +98,30 @@
 //! `+0x8(wstr)`, `+0xc(wstr, int)`, `+0x10(wstr) -> int` and `+0x1c(wstr, int)`
 //! match the signatures at `0x0048e50c` exactly.
 //!
-//! **How the screen is entered is not recovered.** `getNextMode` never returns
-//! 9, so the host raises it: `FUN_00413250` in `SHINYDAYS.exe` handles mode 9
-//! specially — it is one of the two modes, with the confirm popup, that skip
-//! the call silencing what is already playing — but nothing found so far writes
-//! 9 into the pump state it switches on. That state, `+0x2d8`, is written only
-//! from the return values of `FUN_00412330`, `FUN_00412c10`, `FUN_00412f60`,
-//! `FUN_004129d0` and `FUN_00413250`, and a decompile of each plus a scan of
-//! the exe for the literal 9 in that region found no producer. The blind spot
-//! is a data-driven one: a script opcode or a table would not spell 9 in code.
+//! # How the screen is entered
+//!
+//! The title screen's `START` widget asks for it. `FUN_1002fc60` case 0 — the
+//! title module's dispatch — writes **9** into its next-mode member `+0xe0`,
+//! and `_getNextMode@8` case 2 returns that member verbatim through
+//! `FUN_100019b0`, a plain load with no clamp. `SysMenuSDHQ.dll`'s matching
+//! arm, `FUN_100207a0` case 0, writes 1 instead, which is the whole of the
+//! difference between the two titles here; see [`crate::ui::menu::Mode`].
+//!
+//! The executable takes it from there without ever naming the number.
+//! `FUN_004158c0` is the mode pump: it loads `+0x2d8`, adds one, and jumps
+//! through a four-entry table for modes -1 through 2 — every other mode,
+//! 9 among them, falls to the **default arm**, which is
+//! `FUN_00413250(mode)` with the mode passed as a parameter and its return
+//! stored back into `+0x2d8`. That handler switches on its own phase counter
+//! `+0x2dc` and, in phase 1, tests the mode twice: `mode == -1` and
+//! `mode == 9` both skip `FUN_0041aa10`, the call that silences what is
+//! already playing, and `mode == 9` additionally takes the arm described under
+//! [`BACKGROUND_KEY`] before handing the mode to `_SystemInit@8` through
+//! `FUN_004167e0`.
+//!
+//! So nothing writes a literal 9 in the executable at all: it arrives as a
+//! parameter from the module, which is why a scan of the exe for the constant
+//! finds nothing.
 
 use days_ui::atlas::{Atlas, Widget};
 
@@ -147,15 +162,23 @@ pub enum Act {
 /// `STARTSCRIPT.INI`'s key for what plays behind the transparent plate.
 ///
 /// The shipped file sets it to `System/DressSelect/sentakuBG_03.wmv`, and the
-/// install ships `sentakuBG_03.png` beside it. Nothing decompiled so far reads
-/// the still, so which of the two the original falls back to is **not
-/// recovered**.
+/// install ships `sentakuBG_03.png` beside it. **The key chooses between them
+/// by its own extension**, in `FUN_00413250`'s mode-9 arm: it hands the value
+/// and the literal `L".png"` at `0x0048df38` to `wcsstr` — the import at IAT
+/// slot `0x0048c228`, `MSVCR90.dll!wcsstr`, reached through the thunk at
+/// `0x0048330a` — and a hit takes the still arm, `FUN_00420df0` on the object
+/// at `this + 0x74` with `+0x304` cleared, while a miss takes the movie arm,
+/// `FUN_004212a0` then `FUN_00421110` on a different object at `this + 0x178`
+/// with `+0x304` set. Either way `FUN_00408da0` starts it. So the retail value,
+/// ending `.wmv`, takes the movie arm, and pointing the key at the `.png` beside
+/// it would take the still one.
+///
+/// `FUN_004212a0`'s second argument is `1` here; **what that argument selects
+/// is not recovered**, so nothing is claimed about whether the movie loops.
 ///
 /// **This engine does not play it yet.** The screen composites over whatever
-/// backdrop it is handed, and there is nowhere to start the movie from while
-/// what raises mode 9 is itself unrecovered — see this module's header. The key
-/// is recorded here because it is the recovered answer to "what is behind the
-/// transparent plate", not because anything reads it.
+/// backdrop it is handed. What the arm does is written down because it is
+/// recovered, not because anything here reads it.
 pub const BACKGROUND_KEY: &str = "DressBG";
 
 /// How many frames the commit slide runs for: `_DAT_1004a750`, a double.

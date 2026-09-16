@@ -639,17 +639,57 @@ takes a name and answers whether it is one of the 288 listed at
 `PTR_u_01_00_A01_100890f8`. See *Shiny Days swaps in the Radish-uniform
 recording*.
 
-**How mode 9 is entered is not recovered.** `getNextMode` never returns 9, so
-the host raises it. `FUN_00413250` in `SHINYDAYS.exe` handles mode 9 specially —
-it is one of the two modes, with the confirm popup, that skip the call silencing
-what is already playing — but nothing found so far *writes* 9 into the pump
-state `FUN_004158c0` switches on. That state, `+0x2d8`, is written only from the
-return values of `FUN_00412330`, `FUN_00412c10`, `FUN_00412f60`, `FUN_004129d0`
-and `FUN_00413250`; a decompile of each, plus a scan of that region for the
-literal 9, found no producer. The blind spot is that a data-driven raise — a
-script opcode or a table — would not spell 9 in code. Until it is recovered the
-screen is reachable only through `daysengine menu --mode 9`, which is an inspection
-entry and not a claim about the original.
+**Mode 9 is what the title screen's `START` asks for.** `FUN_1002fc60` is the
+title module's dispatch, five arms over widgets 0 to 4, and each one writes the
+module's next-mode member `+0xe0`:
+
+```text
+widget 0  START    host +0xfc(0), then +0xe0 = 9    the dress-select screen
+widget 1  LOAD                    +0xe0 = 3
+widget 2  REPLAY                  +0xe0 = 5
+widget 3  OPTION                  +0xe0 = 4
+widget 4  EXIT                    +0xe0 = -1
+```
+
+`_getNextMode@8` case 2 returns that member verbatim — `FUN_100019b0` is a
+plain load of `+0xe0` with no clamp — so whatever an arm writes is the next
+mode. `SysMenuSDHQ.dll` is the same function over the same numbering,
+`FUN_100207a0`, writing its own `+0xb8` through `FUN_10001930`; its widget 0
+writes **1** where Shiny Days writes **9**, and that single constant is the
+whole of the difference. School Days HQ has a sixth, mouse-only widget in the
+all-clear title whose case 5 also writes 1, differing only in passing 1 rather
+than 0 to the host slot; Shiny Days' dispatch bounds-checks at 4 and has none.
+
+Nothing in `SHINYDAYS.exe` writes a literal 9, which is why scanning it for one
+found nothing: the mode arrives as a **parameter**. `FUN_004158c0` loads
+`+0x2d8`, adds one and jumps through a four-entry table covering modes -1
+through 2; every other mode falls to the default arm, `FUN_00413250(mode)`,
+whose return goes back into `+0x2d8`. That handler switches on its own phase
+counter `+0x2dc`, and its phase 1 tests the parameter twice: `mode == -1` and
+`mode == 9` both skip `FUN_0041aa10`, the call that silences what is already
+playing, and `mode == 9` additionally runs the `[DressBG]` arm below before
+handing the mode to `_SystemInit@8` through `FUN_004167e0`.
+
+A whole-module disassembly of `SysMenuSD.dll` finds **eight** writes to a
+`+0xe0` displacement and no more: the five arms above, two that park the member
+on 2 when the screen is built and when it is activated, and `FUN_10030043`,
+which computes -1 or 2 from its argument. Only one of the eight writes 9. The
+anchor is confirmed from both sides — `_SystemInit@8` case 2 hands out the same
+object `0x1005b7b0` whose `+0xe0` `getNextMode` case 2 reads — and the whole
+chain was read with `objdump` rather than the decompiler, so it is a second
+method against Ghidra's own index rather than the same one twice.
+
+**`[DressBG]` picks a movie or a still by its own extension.** `FUN_00413250`'s
+mode-9 arm hands the key's value and the literal `L".png"` at `0x0048df38` to
+`wcsstr` — `MSVCR90.dll!wcsstr`, IAT slot `0x0048c228`, thunk `0x0048330a`. A
+hit takes the still arm, `FUN_00420df0` on the object at `this + 0x74` with
+`+0x304` cleared; a miss takes the movie arm, `FUN_004212a0` then
+`FUN_00421110` on a different object at `this + 0x178` with `+0x304` set. Either
+way `FUN_00408da0` starts it. The retail value ends `.wmv` and so takes the
+movie arm, and the install ships `sentakuBG_03.png` beside it for the other one.
+`FUN_004212a0`'s second argument is 1 here and **what that argument selects is
+not recovered**, so nothing is claimed about looping. This engine composites the
+screen over whatever backdrop it is handed and does not play either yet.
 
 **`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
 `[FeedTime]`, `[Select1]` and `[Select2]`. `STARTSCRIPT.INI` adds `[SystemBGM2]`
