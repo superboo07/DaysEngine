@@ -17,26 +17,66 @@ This project ships no game data. The archive key comes from your
 container with nothing mounted can build the engine and cannot verify one line
 of it.
 
-Copy `.devcontainer/.env.example` to `.devcontainer/.env` and fill in the paths:
+Copy `.env.example` to `.env` — at the **top of the repository**, not inside
+`.devcontainer/` — and fill in the paths:
 
 ```bash
-cp .devcontainer/.env.example .devcontainer/.env
+cp .env.example .env
 ```
 
-| Variable | What it is | Where it lands |
-| --- | --- | --- |
-| `DAYS_GAME_DIR` | the School Days HQ install | `/game/schooldays` |
-| `DAYS_SHINYDAYS_DIR` | the Shiny Days install, if you have one | `/game/shinydays` |
-| `DAYS_MOUNT_MODE` | `rw` (default) or `ro` | both mounts |
+| Variable | What it is |
+| --- | --- |
+| `DAYS_GAME_DIR` | the School Days HQ install |
+| `DAYS_SHINYDAYS_DIR` | the Shiny Days install, if you have one |
+| `DAYS_MOUNT_MODE` | `rw` (default) or `ro`, for both mounts |
 
-`.env` is read by `docker-compose.yml` and is gitignored — it holds paths from
-your own machine. A variable left unset falls back to an empty directory, so the
-container still comes up and `daysengine` reports no install rather than the
-runtime creating an empty directory where the game was meant to be.
+**Each install is mounted at its own path.** `/home/you/Games/School Days HQ` on
+your machine is that same path inside the container, rather than something like
+`/game/schooldays` that only means anything in here. So one value in `.env` is
+correct on both sides and nothing has to be translated between them —
+`tools/in-container.sh` mounts the source tree the same way, and for the same
+reason.
 
-`DAYS_GAME_DIR` is also set *inside* the container, to `/game/schooldays`, and
-`daysengine --game` reads it (`src/inspect.rs`) — so the inspection subcommands
-and the tasks in `.vscode/tasks.json` need no path typed in.
+That is what lets three different things read one file:
+
+| Reader | What it takes from it |
+| --- | --- |
+| `.devcontainer/docker-compose.yml` | what to mount, and the two variables to set inside the container |
+| `.vscode/launch.json` | what to pass `--game` for each title |
+| you, in a shell | `set -a; . ./.env; set +a` |
+
+`.env` is gitignored — it holds paths from your own machine. A variable left
+unset falls back to an empty directory, so the container still comes up and
+`daysengine` reports no install rather than the runtime creating an empty
+directory where the game was meant to be.
+
+Compose looks for `.env` beside the compose file, so `devcontainer.json`'s
+`initializeCommand` links the real one into `.devcontainer/` on the host before
+the container is built. There is still exactly one `.env`, and both paths are
+gitignored.
+
+`DAYS_GAME_DIR` and `DAYS_SHINYDAYS_DIR` are also set *inside* the container, by
+`docker-compose.yml` out of that same `.env`. `daysengine --game` reads the first
+of them (`src/inspect.rs`), so the inspection subcommands and the tasks in
+`.vscode/tasks.json` need no path typed in.
+
+### Playing either title from the debugger
+
+`.vscode/launch.json` has a configuration per title per profile — **Play: School
+Days HQ**, **Play: Shiny Days**, and a `(release)` each. They read `.env`, so
+they work in here with nothing else set.
+
+On a bare host they need the two variables in VS Code's own environment, because
+that is what resolves `${env:...}` in a launch configuration — `envFile` reaches
+the debugged process but not the configuration that spawns it. Start VS Code
+with them exported:
+
+```bash
+set -a; . ./.env; set +a; code .
+```
+
+Without that, `--game` arrives empty and `daysengine` says it found no install,
+which is a clear failure rather than a wrong one.
 
 Playing writes saves into the install, which is why `rw` is the default. To
 verify against something that cannot be touched, point `DAYS_GAME_DIR` at a copy
@@ -104,8 +144,8 @@ executable is slow. If you already have a project on the host, set
 Importing, once, from inside the container:
 
 ```bash
-"$HEADLESS" "$GHIDRA_PROJ" SDHQ -import "/game/schooldays/SCHOOLDAYS HQ.exe"
-"$HEADLESS" "$GHIDRA_PROJ" SDHQ -import "/game/schooldays/SysMenuSDHQ.dll"
+"$HEADLESS" "$GHIDRA_PROJ" SDHQ -import "$DAYS_GAME_DIR/SCHOOLDAYS HQ.exe"
+"$HEADLESS" "$GHIDRA_PROJ" SDHQ -import "$DAYS_GAME_DIR/SysMenuSDHQ.dll"
 ```
 
 Then run scripts against it with `-noanalysis`, as CLAUDE.md describes. Nothing

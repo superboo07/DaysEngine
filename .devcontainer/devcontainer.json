@@ -25,11 +25,10 @@
     "WAYLAND_DISPLAY": "wayland-0",
     "DISPLAY": "${localEnv:DISPLAY}",
 
-    // Where the installs land inside the container. `daysengine` reads
-    // DAYS_GAME_DIR for its --game argument (src/inspect.rs), so the inspection
-    // subcommands and the tasks in .vscode/tasks.json need no path typed in.
-    "DAYS_GAME_DIR": "/game/schooldays",
-    "DAYS_SHINYDAYS_DIR": "/game/shinydays",
+    // DAYS_GAME_DIR and DAYS_SHINYDAYS_DIR are NOT here. They come from .env,
+    // and compose is what reads that file, so docker-compose.yml sets them --
+    // see its `environment:` block. Written here they would be a second,
+    // hardcoded answer that .env could not correct.
 
     // git's global config lives on a volume (docker-compose.yml), not in the
     // container's filesystem and not copied from the host. This is what points
@@ -67,6 +66,17 @@
       }
     }
   },
+
+  // **Runs on the host, before the container exists.** Compose looks for .env
+  // beside the compose file; this project keeps it at the top of the tree, where
+  // .vscode/launch.json and a plain shell can read the same one. The link is
+  // made rather than the file copied, so there is still exactly one .env and it
+  // cannot drift -- and it is only made when there is something to link to, so a
+  // fresh clone with no .env yet gets no dangling symlink (compose then falls
+  // back to /var/empty, which is the designed answer for "no install").
+  //
+  // Both paths are gitignored by the `*.env` rule, so neither is ever committed.
+  "initializeCommand": "bash -c '[ -f .env ] && ln -sfn ../.env .devcontainer/.env || true'",
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   "waitFor": "postCreateCommand"

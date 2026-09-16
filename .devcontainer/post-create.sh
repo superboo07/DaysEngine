@@ -71,17 +71,33 @@ MSG
 fi
 
 echo
-if [ -e "/game/schooldays/Packs" ] || [ -e "/game/schooldays/SCHOOLDAYS HQ.exe" ]; then
-    echo "School Days install mounted at /game/schooldays."
-else
+# Each install is mounted at its own path, so DAYS_GAME_DIR and
+# DAYS_SHINYDAYS_DIR mean the same thing in here as they do on the host --
+# docker-compose.yml sets both from the same .env it mounted them from.
+for title in "School Days HQ:${DAYS_GAME_DIR:-}" "Shiny Days:${DAYS_SHINYDAYS_DIR:-}"; do
+    name=${title%%:*}
+    dir=${title#*:}
+    [ -n "$dir" ] || continue
+    if [ -d "$dir/Packs" ]; then
+        echo "$name mounted at $dir."
+    else
+        echo "$name: nothing at $dir -- check the path in .env."
+    fi
+done
+
+if [ -z "${DAYS_GAME_DIR:-}" ] && [ -z "${DAYS_SHINYDAYS_DIR:-}" ]; then
     cat <<'MSG'
   ------------------------------------------------------------------
-  /game/schooldays holds no install.
+  No install is mounted.
 
-  Copy .devcontainer/.env.example to .devcontainer/.env, point
-  DAYS_GAME_DIR at your own School Days HQ directory, and rebuild the
-  container. Without it the engine builds and nothing can be verified:
-  the archive key and the UI widget tables both come from your install.
+  Copy .env.example to .env -- at the top of the repository, not in
+  .devcontainer/ -- point DAYS_GAME_DIR at your own School Days HQ
+  directory, and rebuild the container. Without it the engine builds
+  and nothing can be verified: the archive key and the UI widget
+  tables both come from your install.
+
+  The same file is what .vscode/launch.json reads, so filling it in
+  once is also what makes the "Play:" configurations work.
   ------------------------------------------------------------------
 MSG
 fi

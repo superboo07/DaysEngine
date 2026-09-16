@@ -1,9 +1,11 @@
 {
   "version": "0.2.0",
   "// Debugger": "These use CodeLLDB (vadimcn.vscode-lldb). The `cargo` key needs rust-analyzer's companion support; if your setup lacks it, run the matching task first and point `program` at target/debug/<binary>.",
+  "// Where the installs are": "From .env at the top of the repository, the same file docker-compose.yml reads. `envFile` puts both paths in the debugged process's environment; `${env:...}` in `args` is resolved by VS Code from its OWN environment, which inside the devcontainer is what docker-compose.yml's `environment:` block sets. On a bare host, export them before starting VS Code: `set -a; . ./.env; set +a; code .` -- otherwise --game arrives empty and daysengine says it found no install.",
+  "// Why both titles": "Shiny Days is a second title on the same engine, not a variant. Every screen is its own recovery, so a change is not verified until it has been seen on the one it was recovered from.",
   "configurations": [
     {
-      "name": "daysengine (the game)",
+      "name": "Play: School Days HQ",
       "// Opens a window": "One binary does both: with no subcommand it plays, and takes over the desktop. Prefer an inspection configuration below unless you are debugging the window, the GPU path or input.",
       "type": "lldb",
       "request": "launch",
@@ -11,19 +13,47 @@
         "args": ["build", "--locked", "--bin=daysengine"],
         "filter": { "name": "daysengine", "kind": "bin" }
       },
-      "args": [],
+      "args": ["--game", "${env:DAYS_GAME_DIR}"],
+      "envFile": "${workspaceFolder}/.env",
       "cwd": "${workspaceFolder}",
       "env": { "RUST_LOG": "debug" }
     },
     {
-      "name": "daysengine (release, the game)",
+      "name": "Play: Shiny Days",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
+      },
+      "args": ["--game", "${env:DAYS_SHINYDAYS_DIR}"],
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" }
+    },
+    {
+      "name": "Play: School Days HQ (release)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
         "args": ["build", "--locked", "--release", "--bin=daysengine"],
         "filter": { "name": "daysengine", "kind": "bin" }
       },
-      "args": [],
+      "args": ["--game", "${env:DAYS_GAME_DIR}"],
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "info" }
+    },
+    {
+      "name": "Play: Shiny Days (release)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--release", "--bin=daysengine"],
+        "filter": { "name": "daysengine", "kind": "bin" }
+      },
+      "args": ["--game", "${env:DAYS_SHINYDAYS_DIR}"],
+      "envFile": "${workspaceFolder}/.env",
       "cwd": "${workspaceFolder}",
       "env": { "RUST_LOG": "info" }
     },
@@ -37,6 +67,7 @@
         "filter": { "name": "daysengine", "kind": "bin" }
       },
       "args": ["--game", "${input:gameDir}", "${input:daysCmd}"],
+      "envFile": "${workspaceFolder}/.env",
       "cwd": "${workspaceFolder}",
       "env": { "RUST_LOG": "debug" }
     },
@@ -57,6 +88,7 @@
         "--out",
         "${workspaceFolder}/target/menu.png"
       ],
+      "envFile": "${workspaceFolder}/.env",
       "cwd": "${workspaceFolder}",
       "env": { "RUST_LOG": "debug" }
     },
@@ -76,6 +108,7 @@
   "inputs": [
     {
       "id": "gameDir",
+      "// Either title": "Prefilled with DAYS_GAME_DIR; paste DAYS_SHINYDAYS_DIR's value to inspect the other install. Both are in .env, and both are the same path inside the devcontainer as outside it.",
       "type": "promptString",
       "description": "Game directory (the one holding Packs and the game executable)",
       "default": "${env:DAYS_GAME_DIR}"

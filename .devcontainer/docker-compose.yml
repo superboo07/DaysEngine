@@ -1,6 +1,9 @@
 # The devcontainer, and the reason it is compose rather than a plain image: the
 # game installs are mounted from paths that differ on every machine, and compose
-# is what reads .env (beside this file) for them. See .env.example.
+# is what reads .env for them. That file is at the **top of the repository**, not
+# beside this one, because launch.json and a plain shell read it too; compose
+# looks for .env next to the compose file, so devcontainer.json's
+# initializeCommand links it here before any of this runs. See .env.example.
 #
 # A variable that is not set falls back to a path that exists and holds nothing,
 # so the container still comes up; `daysengine` then reports no install rather
@@ -13,6 +16,15 @@ services:
     command: sleep infinity
     init: true
 
+    # **The same two values, inside the container.** `daysengine`'s inspection
+    # subcommands read DAYS_GAME_DIR for their --game default (src/inspect.rs),
+    # and VS Code resolves ${env:...} in .vscode/launch.json out of this. They
+    # are set here rather than in devcontainer.json's containerEnv because the
+    # values come from .env, and compose is what reads that.
+    environment:
+      DAYS_GAME_DIR: ${DAYS_GAME_DIR:-}
+      DAYS_SHINYDAYS_DIR: ${DAYS_SHINYDAYS_DIR:-}
+
     volumes:
       - ..:/workspaces/DaysEngine:cached
 
@@ -21,8 +33,16 @@ services:
       # their SysMenuSDHQ.dll, so the container is useless without the real
       # thing mounted. Read-write by default because playing writes saves; set
       # DAYS_MOUNT_MODE=ro in .env to work against an install nothing can touch.
-      - ${DAYS_GAME_DIR:-/var/empty}:/game/schooldays:${DAYS_MOUNT_MODE:-rw}
-      - ${DAYS_SHINYDAYS_DIR:-/var/empty}:/game/shinydays:${DAYS_MOUNT_MODE:-rw}
+      #
+      # **Each install is mounted at its own path**, not at a path of the
+      # container's choosing. One value in .env is then correct on the host and
+      # in here alike, so launch.json, a shell and docker-compose can all read
+      # the same file and none of them has to translate between two spellings of
+      # the same directory. tools/in-container.sh mounts the source tree the same
+      # way, and for a related reason: a path that means one thing outside and
+      # another inside is a path that ends up baked into something.
+      - ${DAYS_GAME_DIR:-/var/empty}:${DAYS_GAME_DIR:-/var/empty}:${DAYS_MOUNT_MODE:-rw}
+      - ${DAYS_SHINYDAYS_DIR:-/var/empty}:${DAYS_SHINYDAYS_DIR:-/var/empty}:${DAYS_MOUNT_MODE:-rw}
 
       # The desktop session, so the game can be run from in here rather than
       # only built. SDL3 picks its video driver from what it can reach: Wayland
