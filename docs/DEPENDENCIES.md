@@ -75,7 +75,8 @@ host having them:
 sudo pacman -S sdl3 ffmpeg clang
 # Debian / Ubuntu
 sudo apt install libsdl3-dev libavcodec-dev libavformat-dev libavutil-dev \
-                 libswscale-dev libswresample-dev clang pkg-config
+                 libswscale-dev libswresample-dev libavfilter-dev \
+                 libavdevice-dev clang pkg-config
 ```
 
 **libswscale must be new enough for `sws_scale_frame`** (ffmpeg 5.0, 2022).

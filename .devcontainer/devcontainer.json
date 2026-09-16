@@ -1,0 +1,73 @@
+{
+  "name": "DaysEngine",
+
+  // Compose rather than a bare image, because the game installs are mounted
+  // from paths that differ on every machine and .env (beside this file) is how
+  // those are said once. Copy .env.example to .env and fill it in.
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspaces/DaysEngine",
+  "shutdownAction": "stopCompose",
+
+  // Root, deliberately. Podman inside this container (see the comment in
+  // tools/Dockerfile.build) can write a multi-range uid map as root and cannot
+  // as an unprivileged user, which is what lets a release archive be built in
+  // here without --privileged. The Wayland and PipeWire binds go to
+  // /run/user/0 to match.
+  "remoteUser": "root",
+  "containerUser": "root",
+
+  "containerEnv": {
+    // Where docker-compose.yml put the sockets, and which display to reach.
+    // The name is fixed rather than copied from the host because the bind
+    // renames whatever the host calls its socket to wayland-0.
+    "XDG_RUNTIME_DIR": "/run/user/0",
+    "WAYLAND_DISPLAY": "wayland-0",
+    "DISPLAY": "${localEnv:DISPLAY}",
+
+    // Where the installs land inside the container. `daysengine` reads
+    // DAYS_GAME_DIR for its --game argument (src/inspect.rs), so the inspection
+    // subcommands and the tasks in .vscode/tasks.json need no path typed in.
+    "DAYS_GAME_DIR": "/game/schooldays",
+    "DAYS_SHINYDAYS_DIR": "/game/shinydays",
+
+    // git's global config lives on a volume (docker-compose.yml), not in the
+    // container's filesystem and not copied from the host. This is what points
+    // git at it -- and it is also what makes the Dev Containers extension's own
+    // copy of the host ~/.gitconfig irrelevant, which matters because that copy
+    // names a signing key at a host path that does not exist in here and every
+    // commit then dies with "Couldn't load public key".
+    //
+    // Your identity and your key are yours to put in, once, from inside the
+    // container. They persist across rebuilds because the volume does.
+    "GIT_CONFIG_GLOBAL": "/root/.config/git/config",
+
+    // Everything Claude Code keeps -- credentials, settings.json, .claude.json
+    // (the account, the per-project trust and history), projects/, sessions/ --
+    // in one directory, which is the volume above. Without this, .claude.json
+    // sits at /root/.claude.json instead, outside the volume: the credentials
+    // persist and the login does not, so every rebuild asks again.
+    "CLAUDE_CONFIG_DIR": "/root/.claude"
+  },
+
+  "customizations": {
+    "vscode": {
+      // The same list as .vscode/extensions.json recommends, installed rather
+      // than suggested: a devcontainer that comes up without rust-analyzer is a
+      // devcontainer someone has to set up twice.
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.extraArgs": ["--locked", "--all-targets", "--", "-D", "warnings"]
+      }
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "waitFor": "postCreateCommand"
+}

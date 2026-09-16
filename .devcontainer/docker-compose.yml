@@ -1,0 +1,125 @@
+# The devcontainer, and the reason it is compose rather than a plain image: the
+# game installs are mounted from paths that differ on every machine, and compose
+# is what reads .env (beside this file) for them. See .env.example.
+#
+# A variable that is not set falls back to a path that exists and holds nothing,
+# so the container still comes up; `daysengine` then reports no install rather
+# than the runtime creating an empty directory where the game was meant to be.
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sleep infinity
+    init: true
+
+    volumes:
+      - ..:/workspaces/DaysEngine:cached
+
+      # **The player's install.** Nothing in this project ships game data: the
+      # archive key comes from their SCHOOLDAYS HQ.exe and the widget tables from
+      # their SysMenuSDHQ.dll, so the container is useless without the real
+      # thing mounted. Read-write by default because playing writes saves; set
+      # DAYS_MOUNT_MODE=ro in .env to work against an install nothing can touch.
+      - ${DAYS_GAME_DIR:-/var/empty}:/game/schooldays:${DAYS_MOUNT_MODE:-rw}
+      - ${DAYS_SHINYDAYS_DIR:-/var/empty}:/game/shinydays:${DAYS_MOUNT_MODE:-rw}
+
+      # The desktop session, so the game can be run from in here rather than
+      # only built. SDL3 picks its video driver from what it can reach: Wayland
+      # if the socket below resolves, X11 otherwise. The bind renames whatever
+      # the host calls its socket to wayland-0, which is what containerEnv then
+      # points WAYLAND_DISPLAY at.
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-0}:/run/user/0/wayland-0
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pipewire-0:/run/user/0/pipewire-0
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native:/run/user/0/pulse/native
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+      # **Gamepads.** A pad reaches SDL through evdev, and evdev is not the
+      # Wayland socket -- which is why a keyboard works in a container and a
+      # controller never does without this. The directory is bound rather than
+      # the nodes so one plugged in later appears, and /run/udev with it so SDL
+      # can use udev instead of falling back to watching the directory.
+      - /dev/input:/dev/input
+      - /run/udev:/run/udev:ro
+
+      # **The Ghidra project**, which holds the user's own game binaries and so
+      # can never be in this repository. A plain name here is a named volume, a
+      # path is a bind -- so the default keeps imports across rebuilds, and
+      # setting DAYS_GHIDRA_PROJECT_DIR in .env uses a project you already have
+      # instead. Analysing SCHOOLDAYS HQ.exe takes long enough that re-importing
+      # it per rebuild is not an option.
+      - ${DAYS_GHIDRA_PROJECT_DIR:-daysengine-ghidra}:/root/ghidra_projects
+
+      # Podman's image store, on a volume: the build image it holds is not free
+      # to make again, and vfs (see tools/Dockerfile.build) copies every layer.
+      - daysengine-containers:/var/lib/containers
+      # Shell history, and the crates the build downloads, across rebuilds.
+      - daysengine-bashhistory:/commandhistory
+      - daysengine-cargo:/usr/local/cargo/registry
+      # The compiler rust-toolchain.toml pins. The image installs rustup and no
+      # toolchain (see .devcontainer/Dockerfile), so this is what keeps a
+      # rebuild from downloading it again.
+      - daysengine-rustup:/usr/local/rustup
+
+      # **No credential is bound in from the host.** No ~/.ssh, no ~/.gitconfig,
+      # no Claude login: each of those is a volume the container owns and you
+      # fill in once, from inside. A key generated or pasted in here stays here
+      # and survives a rebuild, and a host key is never exposed to anything
+      # running in the container. The one exception is your skills directory,
+      # below, which is read-only and holds no secret.
+      #
+      # git's global config is a volume too, and containerEnv points
+      # GIT_CONFIG_GLOBAL into it -- which is also what makes the copy of the
+      # host's ~/.gitconfig that the Dev Containers extension drops in inert.
+      # Set your identity once, in here:
+      #     git config --global user.name  "..."
+      #     git config --global user.email "..."
+      - daysengine-ssh:/root/.ssh
+      - daysengine-gitconfig:/root/.config/git
+      # Claude Code's credentials, settings and per-project history, so a
+      # rebuild does not ask you to log in again.
+      - daysengine-claude:/root/.claude
+      # Your own skills, read-only, over the volume above -- the one thing that
+      # does come from the host, because a skill is something you wrote and want
+      # in here, not a credential. Read-only so nothing in the container can
+      # edit them, and a bind rather than a copy so editing them on the host
+      # takes effect without a rebuild. Docker mounts the shorter path first, so
+      # this lands inside the volume rather than being hidden by it.
+      - ${HOME}/.claude/skills:/root/.claude/skills:ro
+
+    # The GPU. The container renders on the host's card through /dev/dri; with
+    # no card passed through, Mesa falls back to lavapipe and the game still
+    # draws, slowly.
+    devices:
+      - /dev/dri:/dev/dri
+    # Docker denies every character device it was not explicitly given, so
+    # without this rule /dev/input/event* is visible and every open is EPERM --
+    # which SDL reports as no gamepads rather than as an error. 13 is the input
+    # major, covering evdev and the joystick nodes together.
+    device_cgroup_rules:
+      - "c 13:* rmw"
+
+    # gdb/lldb need SYS_PTRACE to attach; the unconfined seccomp profile is what
+    # lets podman inside this container start one of its own.
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+      - label=disable
+      # **What podman inside this container needs from outside it.** Docker
+      # masks a dozen paths under /proc, and the kernel will not mount a fresh
+      # /proc for a nested container's PID namespace while those overmounts are
+      # there -- podman fails with "mount `proc` to `proc`: Operation not
+      # permitted". Unmasking them is what makes a release build in here work;
+      # tools/in-container.sh carries the other half.
+      - systempaths=unconfined
+
+volumes:
+  daysengine-containers:
+  daysengine-bashhistory:
+  daysengine-cargo:
+  daysengine-rustup:
+  daysengine-ssh:
+  daysengine-gitconfig:
+  daysengine-claude:
+  daysengine-ghidra:

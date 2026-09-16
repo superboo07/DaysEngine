@@ -21,6 +21,12 @@
 # shipping it shared is how section 6 is satisfied without one.
 set -euo pipefail
 
+# Builds what ships, so it builds in the image that decides what that links --
+# on a bare host, in the devcontainer, or already inside it, this is the line
+# that works out which and re-execs there when it has to.
+# shellcheck source=tools/in-container.sh
+. "$(dirname "${BASH_SOURCE[0]}")/in-container.sh"
+
 target=${1:-}
 case "$target" in
 linux | windows) ;;

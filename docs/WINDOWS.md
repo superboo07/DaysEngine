@@ -158,7 +158,8 @@ break configs that already work against a system ffmpeg.
 
 `just dist-linux` produces the same flat layout with `.so` files instead of
 DLLs, and an `$ORIGIN` rpath so the archive's own libraries win over anything
-installed. It needs `patchelf`.
+installed. The rpath is a link argument on the release build itself, so nothing
+rewrites the finished binary and no extra tool is needed.
 
 A developer build still uses the system libraries and a shared SDL3. Vendoring
 and static SDL3 are for archives.

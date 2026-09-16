@@ -18,3 +18,7 @@
 # Release archives and the vendored SDL3/ffmpeg builds land under /target, which
 # is already ignored above. The submodule *sources* in third_party/ are tracked
 # by git as submodules and must not be listed here.
+
+# The devcontainer's mount configuration: paths to the user's own installs.
+# .devcontainer/.env.example is the tracked half.
+*.env

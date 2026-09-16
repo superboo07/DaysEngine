@@ -40,6 +40,12 @@
 # required to run it.
 set -euo pipefail
 
+# Builds what ships, so it builds in the image that decides what that links --
+# on a bare host, in the devcontainer, or already inside it, this is the line
+# that works out which and re-execs there when it has to.
+# shellcheck source=tools/in-container.sh
+. "$(dirname "${BASH_SOURCE[0]}")/in-container.sh"
+
 target=${1:-}
 case "$target" in
 linux | windows) ;;
@@ -89,7 +95,16 @@ if [ "$target" = windows ]; then
     built=$root/target/x86_64-pc-windows-gnu/release
     binaries=(daysengine.exe)
 else
-    cargo build --locked --release --features static-sdl --bin daysengine
+    # $ORIGIN, not $ORIGIN/lib: the archive is flat, and the libraries beside the
+    # binary must win over anything installed. Single quotes keep $ORIGIN for the
+    # dynamic loader to expand at run time rather than the shell at build time.
+    #
+    # Set at link time rather than written into the finished ELF afterwards: the
+    # linker is already deciding what this binary says about where its libraries
+    # are, and a second tool rewriting that decision is one more thing to install
+    # and one more place the answer lives.
+    RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN' \
+        cargo build --locked --release --features static-sdl --bin daysengine
     built=$root/target/release
     binaries=(daysengine)
 fi
@@ -125,12 +140,6 @@ for binary in "${binaries[@]}"; do
         done
     done < <(needed "$out/$binary")
 done
-
-if [ "$target" = linux ]; then
-    # $ORIGIN, not $ORIGIN/lib: the archive is flat, and the libraries beside
-    # the binary must win over anything installed.
-    patchelf --set-rpath '$ORIGIN' "${binaries[@]/#/$out/}"
-fi
 
 # The compliance artifact. FFMPEG-SOURCE.txt records ffmpeg's upstream commit
 # and full configure line, which together with COPYING.LGPLv2.1 is what LGPL
