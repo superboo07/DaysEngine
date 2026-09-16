@@ -65,6 +65,23 @@
       "presentation": { "panel": "dedicated" }
     },
     {
+      "// Playing it": "A task is a shell, so it reads .env itself -- no variable has to be exported first and nothing has to be generated. This is the difference from .vscode/launch.json, where VS Code resolves ${env:...} out of its own environment before any shell exists.",
+      "label": "run: School Days HQ",
+      "detail": "Play School Days HQ. Opens a window and takes over the desktop.",
+      "type": "shell",
+      "command": "set -a; . ./.env; set +a; : \"${DAYS_GAME_DIR:?not set -- put it in .env, and quote the path if it has spaces}\"; cargo run --locked --bin daysengine -- --game \"$DAYS_GAME_DIR\"",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "run: Shiny Days",
+      "detail": "Play Shiny Days. Opens a window and takes over the desktop.",
+      "type": "shell",
+      "command": "set -a; . ./.env; set +a; : \"${DAYS_SHINYDAYS_DIR:?not set -- put it in .env, and quote the path if it has spaces}\"; cargo run --locked --bin daysengine -- --game \"$DAYS_SHINYDAYS_DIR\"",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "deps",
       "detail": "Build the vendored SDL3 and ffmpeg every build links. Slow; once per checkout. Nothing compiles until this has run.",
       "type": "shell",

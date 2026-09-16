@@ -3803,8 +3803,22 @@ fn find_script(vfs: &Vfs, wanted: &str, english: bool) -> Result<(String, String
     Ok((wanted.to_uppercase(), path))
 }
 
-/// Finds the game by looking where this binary lives, then the working directory.
+/// Finds the game: `DAYS_GAME_DIR`, then where this binary lives, then the
+/// working directory.
+///
+/// The environment variable comes first because it is the one someone set on
+/// purpose, and it is taken as given rather than tested for `Packs/` — exactly
+/// as `--game` is, so that a wrong value reports what is wrong with *that*
+/// directory instead of falling through to some other install.
+///
+/// **The inspection subcommands have always read it** (`env = "DAYS_GAME_DIR"`
+/// in [`inspect::Cli`]), so without this `daysengine ui` and `daysengine` found
+/// the install two different ways, and only one of them honoured the `.env`
+/// this repository keeps the path in.
 fn discover_game_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("DAYS_GAME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     let candidates = [
         std::env::current_exe()
             .ok()
@@ -3816,7 +3830,10 @@ fn discover_game_dir() -> Result<PathBuf> {
             return Ok(dir);
         }
     }
-    bail!("no School Days HQ install found; put this next to the game or pass --game <dir>")
+    bail!(
+        "no install found; put this next to the game, pass --game <dir>, \
+         or set DAYS_GAME_DIR"
+    )
 }
 
 #[cfg(test)]

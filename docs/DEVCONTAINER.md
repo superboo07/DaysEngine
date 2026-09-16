@@ -60,16 +60,19 @@ gitignored.
 of them (`src/inspect.rs`), so the inspection subcommands and the tasks in
 `.vscode/tasks.json` need no path typed in.
 
-### Playing either title from the debugger
+### Playing either title
 
-`.vscode/launch.json` has a configuration per title per profile — **Play: School
-Days HQ**, **Play: Shiny Days**, and a `(release)` each. They read `.env`, so
-they work in here with nothing else set.
+**Tasks — `run: School Days HQ` and `run: Shiny Days`** — work everywhere with
+nothing set up, in here or on a bare host. A task is a shell, so it sources
+`.env` itself.
 
-On a bare host they need the two variables in VS Code's own environment, because
-that is what resolves `${env:...}` in a launch configuration — `envFile` reaches
-the debugged process but not the configuration that spawns it. Start VS Code
-with them exported:
+**Launch configurations** — `Play: School Days HQ`, `Play: Shiny Days`, and a
+`(release)` each — are the same thing under the debugger, and they are automatic
+only in the container. VS Code resolves `${env:...}` in a launch configuration
+from its **own** environment, before any shell exists; `envFile` reaches the
+debugged process but not the configuration that spawns it. In here, compose put
+both variables in the container's environment, so they resolve. On a bare host,
+export them first:
 
 ```bash
 set -a; . ./.env; set +a; code .
@@ -77,6 +80,10 @@ set -a; . ./.env; set +a; code .
 
 Without that, `--game` arrives empty and `daysengine` says it found no install,
 which is a clear failure rather than a wrong one.
+
+`daysengine` with no `--game` also reads `DAYS_GAME_DIR` now, the way the
+inspection subcommands always have, so a shell that has sourced `.env` can just
+run it.
 
 Playing writes saves into the install, which is why `rw` is the default. To
 verify against something that cannot be touched, point `DAYS_GAME_DIR` at a copy
