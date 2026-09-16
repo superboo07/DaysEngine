@@ -13,7 +13,7 @@ Video filtering! The stock filters are meant to cover up the poor WMV compressio
 Cross platform! Both Windows, and Linux are supported. I do not have a mac so apple support will not be worked on, I do apologize however. Android support coming at the end of the project. 
 
 # Requirements
-This project physically does **not** work without either an up to date english copy of School Days HQ, or Shiny Days. Cross Days support will be later. Right now you need a Linux computer, windows support soon. 
+This project physically does **not** work without either an up to date english copy of School Days HQ, or Shiny Days. Cross Days support will be later.
 
 # Support
 Jast USA School Days HQ 1.02 HQ should fully function but testing is underway, JastUSA Shiny Days 1.01e support is underway.
