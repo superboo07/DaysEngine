@@ -85,6 +85,16 @@ set: `GHIDRA_INSTALL_DIR`, `HEADLESS`, `GHIDRA_PROJ`. It is pinned by version
 and by the SHA-256 the release publishes, so a substituted download fails the
 image build.
 
+`analyzeHeadless` on `PATH` is a small wrapper, not Ghidra's own script, and the
+difference is the whole point: **Ghidra 12 runs a `.py` script only through
+PyGhidra**, and `/opt/ghidra/support/analyzeHeadless` starts a JVM with no
+interpreter in it, so a `-postScript` there fails with "Ghidra was not started
+with PyGhidra. Python is not available". The wrapper launches the same
+`AnalyzeHeadless` class with the same arguments and the same heap and thread
+caps, through a virtual environment at `/opt/ghidra-venv` that the image
+installs PyGhidra into from the wheels Ghidra itself ships — `--no-index`, so
+nothing is fetched and the JPype is the one that release was tested against.
+
 The **project** is not in the image and never in the repository: it holds your
 `SCHOOLDAYS HQ.exe` and `SysMenuSDHQ.dll`. `/root/ghidra_projects` is a volume,
 so an import survives a rebuild — which matters, because analysing the
@@ -105,9 +115,9 @@ build`, the tests and the `daysengine` subcommands all work without a project.
 ## Building a release archive
 
 Not in the devcontainer. That image carries Mesa, the Vulkan loader, a debugger,
-podman and Claude Code, and it links the system SDL3 and ffmpeg Debian packages;
-an archive built there is linked against whatever a developer happened to have
-installed, and its glibc floor is an accident rather than a decision.
+podman and Claude Code; an archive built there would take its glibc floor from
+whatever that image happened to be based on, which is an accident rather than a
+decision.
 
 **Nothing new has to be run to get that right.** The three scripts that build
 what ships -- `tools/build-sdl.sh`, `tools/build-ffmpeg.sh` and `tools/dist.sh`
@@ -117,7 +127,7 @@ before the script does anything:
 | where it is | what happens |
 | --- | --- |
 | already in the build image | runs, no nesting |
-| in the devcontainer | podman, with `--network=host --pid=host`, re-execs the script in the build image |
+| in the devcontainer | podman, with `--network=host --cgroups=disabled`, re-execs the script in the build image |
 | on a bare host | podman or docker, whichever is installed, same re-exec |
 
 So `./tools/dist.sh linux` means the same thing in all three places, the tasks in
@@ -132,9 +142,11 @@ Dockerfile or the toolchain pin changes, because the label it carries is a hash
 of both -- "an image by that name exists" is the wrong question, and answering it
 costs a whole build when the Dockerfile has moved underneath you.
 
-A developer build is untouched by any of this: `cargo build` and `just check`
-link the system libraries of wherever they run, which is what
-`docs/DEPENDENCIES.md` asks for.
+A developer build goes through the same image for the same libraries: `just deps`
+builds the pinned SDL3 and ffmpeg into `target/`, once per checkout, and
+`.cargo/config.toml` points cargo at them, so a plain `cargo build` links what a
+release links. `docs/DEPENDENCIES.md` has the reasoning, including why this is
+no longer the distribution's ffmpeg.
 
 Podman inside the devcontainer runs without `--privileged`. Three things make
 that work, and each was measured in this image rather than copied from

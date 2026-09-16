@@ -161,8 +161,11 @@ DLLs, and an `$ORIGIN` rpath so the archive's own libraries win over anything
 installed. The rpath is a link argument on the release build itself, so nothing
 rewrites the finished binary and no extra tool is needed.
 
-A developer build still uses the system libraries and a shared SDL3. Vendoring
-and static SDL3 are for archives.
+A developer build links the same vendored libraries and the same static SDL3 --
+`just deps` builds them and `.cargo/config.toml` points cargo at them. What an
+archive adds is the packaging and the `$ORIGIN` rpath; a developer build carries
+an rpath into `target/ffmpeg/linux/lib` instead, so a binary run straight out of
+`target/` finds its libav*.
 
 ## Known gaps
 

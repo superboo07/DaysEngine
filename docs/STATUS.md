@@ -13,7 +13,7 @@ rows below describe; Shiny Days is being brought up on the same code.
 
 | | State |
 |---|---|
-| Linux x86_64 | **Works.** The platform the engine is developed and verified on. A developer build links the system SDL3 and ffmpeg |
+| Linux x86_64 | **Works.** The platform the engine is developed and verified on. Every build links the pinned SDL3 and ffmpeg from `third_party/`, static and shared respectively |
 | Windows x86_64 | **Builds.** Cross-compiled from Linux for `x86_64-pc-windows-gnu` against vendored SDL3 and ffmpeg; `just dist-windows` packages the `.exe` files with their DLLs. **Not yet run against a real install on Windows** — the build is verified, the game is not |
 | macOS | Not worked on, and not planned |
 | Android | Not started |

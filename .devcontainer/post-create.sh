@@ -8,13 +8,29 @@ cd "$(dirname "$0")/.."
 # user running it.
 git config --global --add safe.directory "$PWD" || true
 
-# third_party/ffmpeg and third_party/sdl are the pinned sources a *release*
-# archive is built from (tools/build-sdl.sh, tools/build-ffmpeg.sh). A developer
-# build does not need them -- it links the system SDL3 and ffmpeg the image
-# carries -- so a fetch that fails is reported and not fatal.
+# third_party/ffmpeg and third_party/sdl are the pinned sources EVERY build
+# links, a developer's as much as a release archive's (tools/build-sdl.sh,
+# tools/build-ffmpeg.sh, and the note at the top of the justfile). Without them
+# there is nothing to build against at all, so say so loudly -- but do not fail
+# the container, which is still worth having for everything that is not a build.
 git submodule update --init --depth 1 || {
-    echo "submodule fetch failed; 'just dist-*' will need it, 'just check' will not." >&2
+    echo "submodule fetch failed; nothing will build until it succeeds." >&2
 }
+
+# The libraries every build links, built once, in the image that owns SDL3's and
+# ffmpeg's build dependencies (tools/in-container.sh re-execs there by itself).
+# Slow the first time and a no-op afterwards -- the prefixes are under target/,
+# which is in the bind mount, so a container rebuild does not repeat it.
+#
+# Not fatal. A container that came up without these is still worth having for
+# everything that is not a build, and the failure `cargo build` then gives names
+# the missing prefix outright.
+if [ ! -d target/sdl/linux/lib/pkgconfig ] || [ ! -d target/ffmpeg/linux/lib/pkgconfig ]; then
+    echo "Building the vendored SDL3 and ffmpeg. This is the slow part, and it happens once."
+    ./tools/build-sdl.sh linux && ./tools/build-ffmpeg.sh linux || {
+        echo "vendored library build failed; run 'just deps' once it is fixed." >&2
+    }
+fi
 
 # Install the compiler rust-toolchain.toml pins, and the two components the
 # commit gate needs. The image ships rustup with no toolchain so the pin stays

@@ -46,13 +46,14 @@ deliberately small and deliberately boring.
 | `serde` + `serde_json` | 1.0.229 / 1.0.151 | Route graph and config (de)serialization | Proc macro in `derive`. Note `serde_derive` historically shipped a precompiled binary; that was reverted and the current release builds from source — re-check this on every bump. |
 | `clap` | 4.6.6 | CLI parsing for the offline tools | Binary crates only. |
 | `sdl3` | 0.20.0 | Window, input, GPU present, audio output | Thin bindings over the **system** libSDL3; has a `build.rs` that locates and links it. Reviewed: it probes pkg-config and does not download anything. Younger crate than the rest of this list — the riskiest entry here, revisit on each bump. |
-| `rusty_ffmpeg` | 0.17.0 | WMV3/VC-1 video and Vorbis audio decode | Generates bindgen bindings against the **system** ffmpeg at build time, so it tracks whatever libav* the host ships rather than lagging releases like `ffmpeg-next`. Has a `build.rs` running bindgen. Chosen deliberately: we link the distro's ffmpeg, which the distro already patches for CVEs, instead of vendoring a frozen copy. |
+| `rusty_ffmpeg` | 0.17.0 | WMV3/VC-1 video and Vorbis audio decode | Generates bindgen bindings at build time against whichever ffmpeg it is pointed at, rather than carrying pre-written ones for a release it lags behind, as `ffmpeg-next` does. Has a `build.rs` running bindgen. `FFMPEG_PKG_CONFIG_PATH` is how it is aimed at the vendored prefix; see *Third-party native libraries*. |
 | `png` | 0.18.1 | PNG decode for backgrounds and UI art | image-rs owned, pure Rust. Used instead of routing PNGs through ffmpeg so the image path has no C in it. |
 
 ## Deliberately *not* depended on
 
-- **`ffmpeg-next`** — lags upstream ffmpeg releases; would have blocked us on
-  libavcodec 63 (ffmpeg 8.1), which is what this machine ships.
+- **`ffmpeg-next`** — lags upstream ffmpeg releases, and the vendored ffmpeg is
+  pinned at `n9.0.1` (libavcodec 63, libavutil 61, libswscale 10), ahead of what
+  it binds.
 - **`cpal`** — SDL3 already gives us an audio device and stream mixer. One
   fewer dependency and one fewer platform backend matrix.
 - **`lewton` / `symphonia`** — ffmpeg already decodes the Vorbis the game ships.
@@ -64,25 +65,68 @@ deliberately small and deliberately boring.
 
 ## Third-party native libraries
 
-`libSDL3` and `libav*` are linked from the system for a **developer build**, not
-vendored. This is a deliberate trade: it means we inherit the distribution's
-security updates for two large C codebases that parse untrusted media, rather
-than freezing a copy that goes stale. It also means the build depends on the
-host having them:
+`libSDL3` and `libav*` are **vendored**, pinned as git submodules in
+`third_party/`, and built by `just deps` into `target/sdl/linux` and
+`target/ffmpeg/linux`. A developer build links those, and so does a release
+archive. `.cargo/config.toml` is where cargo is told, so a plain `cargo build`
+finds them without the task runner.
+
+So the build depends on a container runtime, not on the host's libraries:
 
 ```bash
 # Arch
-sudo pacman -S sdl3 ffmpeg clang
+sudo pacman -S clang pkgconf podman
 # Debian / Ubuntu
-sudo apt install libsdl3-dev libavcodec-dev libavformat-dev libavutil-dev \
-                 libswscale-dev libswresample-dev libavfilter-dev \
-                 libavdevice-dev clang pkg-config
+sudo apt install clang pkg-config podman
 ```
 
-**libswscale must be new enough for `sws_scale_frame`** (ffmpeg 5.0, 2022).
-That entry point, not the older `sws_scale`, is the one that honours the
-`threads` option, and a movie frame scaled to a 4K window on one thread costs
-more than the 41ms a 24 fps frame gets. See `media::video::new_scaler`.
+Then, once per checkout:
+
+```bash
+just deps        # or: ./tools/build-sdl.sh linux && ./tools/build-ffmpeg.sh linux
+```
+
+Both build inside `tools/dist/`'s image, which is the only place carrying SDL3's
+and ffmpeg's own build dependencies and is what decides a release archive's
+glibc floor — `tools/in-container.sh` is that argument in full, and the scripts
+re-exec there by themselves.
+
+### Why this stopped being the system's copies
+
+Linking the distribution's was the earlier decision, and it had a real argument
+behind it: a distribution ships security updates for two large C codebases that
+parse media, and freezing a copy gives that up. It was taken while this project
+was developed on a host whose ffmpeg happened to be current.
+
+It does not survive a host whose is not. **`media::image` calls
+`sws_scale_frame` on an allocated-but-uninitialised context** — the dynamic
+swscale API, which ffmpeg's own header documents as usable "without setting up
+any frame properties or calling `sws_init_context()`", and which first ships in
+**n8.0** (`git tag --contains 2a091d4f2e`, the commit "swscale: introduce new,
+dynamic scaling API"). Debian 13 ships ffmpeg 7.1. There, that call reaches
+`av_frame_ref` through `sws_frame_start` with frames the context was never
+configured for, and segfaults.
+
+The older `sws_scale` is not an alternative: `sws_scale_frame` is the entry
+point that honours the `threads` option, and a movie frame scaled to a 4K window
+on one thread costs more than the 41ms a 24 fps frame gets. See
+`media::video::new_scaler`.
+
+A player who wants their distribution's ffmpeg still gets it — it stays shared
+precisely so it can be replaced, and `FFMPEG-SOURCE.txt` in the archive says so.
+
+**SDL3 is linked statically and ffmpeg is not.** SDL3 is zlib, which attaches no
+condition to linking it in, so it goes inside the executable; that is the
+`static-sdl` feature, and it is **on by default**. ffmpeg is LGPL v2.1, which
+permits static linking only against an obligation to let the player relink, so
+it stays shared and is found through an rpath. Only an LGPL library is dynamic
+here.
+
+`--no-default-features` asks for a *shared* SDL3 instead. That alone is not
+enough to get the distribution's: `PKG_CONFIG_LIBDIR` in `.cargo/config.toml`
+names only the vendored prefix, which is static-only, so the link fails until
+that variable is pointed back at the system's own pkgconfig directory. Both
+halves are needed, and they are two separate decisions.
 
 Note that ffmpeg will be parsing media out of the user's own game install, which
 is not attacker-controlled in the normal case. Keep it that way: never point the

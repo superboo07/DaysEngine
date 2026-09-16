@@ -14,18 +14,20 @@
 # the scripts exactly as they always did and end up in the right container
 # without knowing it.
 #
-# **Why a container at all, rather than building where you are.** The
-# devcontainer carries Mesa, the Vulkan loader, a debugger, podman and Claude
-# Code, and it links Debian's SDL3 and ffmpeg packages. An archive built there
-# is linked against whatever a developer happened to have installed, and its
-# glibc floor is an accident rather than a decision. tools/dist/Dockerfile is
-# the decision: a toolchain, the MinGW cross-compiler, the assembler, nothing
-# else, and the pinned SDL3 and ffmpeg sources from third_party/ built inside
-# it.
+# **Why a container at all, rather than building where you are.** Two reasons,
+# and they are not the same reason. An archive's glibc floor is a property of
+# the image it was linked in, and the devcontainer -- Mesa, the Vulkan loader, a
+# debugger, podman, Claude Code -- is not a decision about that, it is an
+# accident. And SDL3 and ffmpeg have build dependencies of their own, dozens of
+# -dev packages between them, which live in exactly one place rather than being
+# installed twice. tools/dist/Dockerfile is both: a toolchain, the MinGW
+# cross-compiler, the assembler, those build dependencies, and nothing else.
 #
-# A developer build is untouched by any of this: `cargo build` and `just check`
-# link the system libraries of wherever they run, which is what
-# docs/DEPENDENCIES.md asks for.
+# A developer build is NOT untouched by this, and has not been since the
+# libraries stopped being the host's: `just deps` builds the same pinned SDL3 and
+# ffmpeg through these same scripts, into the same prefixes, in this same image.
+# What differs between a developer build and an archive is the packaging, not
+# what gets linked. See docs/DEPENDENCIES.md.
 
 # Set by tools/dist/Dockerfile. Inside the build image there is nothing to do.
 if [ -n "${DAYS_IN_CONTAINER:-}" ]; then
@@ -133,21 +135,30 @@ if [ ! -f "$days_root/third_party/sdl/CMakeLists.txt" ] ||
     days_die "third_party is empty. Run: git submodule update --init --depth 1"
 fi
 
-# The tree is mounted at /src and everything lands under target/ in it, exactly
-# as a build outside the container leaves it. The crates go on a volume because
-# the container is --rm, and without one every build refetches the whole graph.
+# **The tree is mounted at its own path, not at /src.** Everything lands under
+# target/ in it, exactly as a build outside the container leaves it -- and that
+# is the point: what these builds install into target/sdl and target/ffmpeg
+# includes pkg-config and CMake files, and those record the prefix they were
+# configured with as an absolute path. Mounted at /src, ffmpeg's libavcodec.pc
+# says `prefix=/src/target/ffmpeg/linux` and SDL3's says the same, so the
+# libraries are unusable anywhere but inside this container -- which is exactly
+# what a developer build then needs them to be. Mounting at the real path costs
+# nothing and makes the artifacts mean the same thing on both sides.
+#
+# The crates go on a volume because the container is --rm, and without one every
+# build refetches the whole graph.
 days_run=(--rm)
 [ -t 0 ] && [ -t 1 ] && days_run+=(-it)
 days_run+=(
-    -v "$days_root:/src"
-    -w /src
+    -v "$days_root:$days_root"
+    -w "$days_root"
     -e CARGO_TERM_COLOR=always
     # tools/dist.sh names the archive after the commit, so git runs in there --
     # and git refuses a tree owned by another uid unless the mount is declared
     # safe.
     -e GIT_CONFIG_COUNT=1
     -e GIT_CONFIG_KEY_0=safe.directory
-    -e GIT_CONFIG_VALUE_0=/src
+    -e GIT_CONFIG_VALUE_0="$days_root"
 )
 
 # **Who the build runs as, and why the answer is not always the same.** What
@@ -175,8 +186,8 @@ if [ "$days_rootless" = 0 ] && [ "$(id -u)" -ne 0 ]; then
     mkdir -p "$days_root/target/dist/.home" "$days_root/target/dist/.cargo"
     days_run+=(
         --user "$(id -u):$(id -g)"
-        -e HOME=/src/target/dist/.home
-        -e CARGO_HOME=/src/target/dist/.cargo
+        -e HOME="$days_root/target/dist/.home"
+        -e CARGO_HOME="$days_root/target/dist/.cargo"
     )
 else
     days_run+=(-v "${DAYS_CARGO_VOLUME:-daysengine-dist-cargo}:/usr/local/cargo/registry")

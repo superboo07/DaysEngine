@@ -2,15 +2,56 @@
 # If a recipe fails with "the lock file needs to be updated", that is the point.
 # Update it deliberately with `just add` / `just update`, then review the diff.
 
+# ---------------------------------------------------------------------------
+# What a build links
+#
+# The pinned SDL3 and ffmpeg in third_party/, built by tools/build-sdl.sh and
+# tools/build-ffmpeg.sh -- **not** the distribution's packages, and the same
+# libraries for a developer build as for a release archive.
+#
+# That reverses an earlier decision, and why is worth keeping: inheriting a
+# distribution's CVE patches on two large C media parsers is a real benefit, but
+# it was chosen while this project was developed on a host whose ffmpeg happened
+# to be current. In general it is not. Debian 13 ships ffmpeg 7.1, and
+# `media::image` calls `sws_scale_frame` on an allocated-but-uninitialised
+# context -- the dynamic swscale API, which ffmpeg's own header documents as
+# usable "without setting up any frame properties or calling sws_init_context()"
+# and which first ships in **n8.0** (`git tag --contains 2a091d4f2e`). On 7.1
+# that call reaches `av_frame_ref` through `sws_frame_start` with frames the
+# context was never configured for, and segfaults. A build that depends on the
+# host being new enough is a build that breaks on whichever host is not.
+#
+# **Both builds happen in the same image**, tools/dist/, which is the only place
+# that carries SDL3's and ffmpeg's own build dependencies -- and which is what
+# decides an archive's glibc floor. tools/in-container.sh is that argument in
+# full; build-sdl.sh and build-ffmpeg.sh re-exec there on their own. So there is
+# one prefix, one set of libraries, and nothing for a developer build to leave
+# behind that a release would then ship.
+#
+# Where cargo is *told* all this is .cargo/config.toml, not here, because
+# `cargo build` is what gets typed far more often than `just`.
+# ---------------------------------------------------------------------------
+sdl := justfile_directory() / "target/sdl/linux"
+ffmpeg := justfile_directory() / "target/ffmpeg/linux"
+
 default: check
 
-build:
+# Build the vendored SDL3 and ffmpeg. Slow, and once per checkout: every recipe
+# below needs them, and this does nothing when they are already there. Delete
+# the prefixes to force a rebuild.
+deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -d "{{ sdl }}/lib/pkgconfig" ] || ./tools/build-sdl.sh linux
+    [ -d "{{ ffmpeg }}/lib/pkgconfig" ] || ./tools/build-ffmpeg.sh linux
+
+build: deps
     cargo build --locked --workspace
 
-release:
+release: deps
     cargo build --locked --release --workspace
 
-check:
+check: deps
     cargo fmt --all -- --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
     cargo test --locked --workspace
@@ -31,14 +72,10 @@ verify-lock: build
 # ---------------------------------------------------------------------------
 # Distribution builds
 #
-# A developer build links the system SDL3 and ffmpeg, which is what
-# docs/DEPENDENCIES.md asks for: a distribution ships its own CVE patches on two
-# large C media parsers and we want to inherit them rather than freeze a copy.
-#
-# A *release archive* cannot rely on that. The player who unpacks it may have no
-# libSDL3 at all, and on Windows there is no distribution to inherit from in the
-# first place. So the archives carry their own, built from the pinned submodules
-# in third_party/ by tools/build-sdl.sh and tools/build-ffmpeg.sh.
+# A release archive links exactly what a developer build links -- see the note
+# at the top of this file -- so what is left below is only the packaging, and
+# the Windows cross-build, which needs a prefix of its own because it is a
+# different target rather than a different promise.
 #
 # SDL3 is zlib and is linked in statically, so no libSDL3 ships. ffmpeg is LGPL
 # v2.1 and stays shared, because static linking it would oblige us to let the
@@ -47,12 +84,7 @@ verify-lock: build
 # line beside the libraries, and is otherwise flat: a drag-and-drop.
 # ---------------------------------------------------------------------------
 
-# Build the vendored SDL3 and ffmpeg for the host. Slow; once per checkout.
-deps-linux:
-    ./tools/build-sdl.sh linux
-    ./tools/build-ffmpeg.sh linux
-
-# The same, cross-compiled for Windows with MinGW-w64.
+# The Windows half of `deps`, cross-compiled with MinGW-w64.
 windows-deps:
     ./tools/build-sdl.sh windows
     ./tools/build-ffmpeg.sh windows
@@ -76,7 +108,7 @@ windows-release:
 
 # Release archives. tools/dist.sh is where the layout actually lives, so that
 # .vscode/tasks.json can call the same thing and `just` stays optional.
-dist-linux: deps-linux
+dist-linux: deps
     ./tools/dist.sh linux
 
 dist-windows: windows-deps

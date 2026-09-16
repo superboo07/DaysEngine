@@ -2,16 +2,26 @@
 # the desktop libraries that let the game actually run in here, and podman for
 # the release build (which happens in a container of its own -- tools/dist/).
 #
-# Debian 13 (trixie) is the base because it is the oldest release carrying both
-# of the libraries a developer build links as packages: libsdl3-dev, and an
-# ffmpeg new enough for rusty_ffmpeg. docs/DEPENDENCIES.md's apt line is this
-# list; if the two disagree, that file is the one to fix.
+# Debian 13 (trixie) is the base. It no longer has to carry the libraries a
+# build links: those are the pinned SDL3 and ffmpeg in third_party/, built in
+# tools/dist/'s image by `just deps` and found through .cargo/config.toml. What
+# trixie is still asked for is the libraries SDL3 *dlopen()s* at run time, so
+# that the game can be played in here and not only built.
+#
+# That is why an apt ffmpeg is no longer in this list. Trixie's is 7.1, and
+# `media::image` needs the dynamic swscale API that first ships in n8.0 -- see
+# the note at the top of the justfile. Linking it segfaulted; pinning a newer
+# one in from testing would have been a second ffmpeg to reason about.
 FROM debian:trixie-slim
 
-# Everything docs/DEPENDENCIES.md asks a developer to install, plus what the
-# vendored SDL3/ffmpeg builds in tools/build-*.sh need (cmake, ninja, nasm) and
-# what the Windows cross-build needs (mingw-w64). docs/WINDOWS.md is the same
-# list said another way; if these disagree, that file is the one to fix.
+# Everything docs/DEPENDENCIES.md asks a developer to install, and what the
+# Windows cross-build needs (mingw-w64). docs/WINDOWS.md is the same list said
+# another way; if these disagree, that file is the one to fix.
+#
+# cmake, ninja and nasm are NOT here for the vendored SDL3 and ffmpeg -- those
+# build in tools/dist/'s image, which carries their build dependencies, and this
+# one only starts them. They stay because a C dependency that appears later
+# should not need an image rebuild to try.
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 	&& apt-get install -y --no-install-recommends \
 		build-essential \
@@ -29,30 +39,22 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 		xz-utils \
 		zip \
 		unzip \
-		# The developer build's system libraries.
+		# **Not what the build links** -- that is the vendored SDL3 in
+		# target/sdl/linux. This is here for the libraries SDL3 opens at
+		# run time (X11, Wayland, XKB and the rest), which arrive as this
+		# package's own dependencies and which a statically linked SDL3
+		# still needs in order to open a window.
 		libsdl3-dev \
-		libavcodec-dev \
-		libavformat-dev \
-		libavutil-dev \
-		libswscale-dev \
-		libswresample-dev \
-		# rusty_ffmpeg puts libavdevice and libavfilter on the link line
-		# whatever the code calls, so a build fails at pkg-config without
-		# them -- which is how they were found to be missing from
-		# docs/DEPENDENCIES.md's apt line as well.
-		libavdevice-dev \
-		libavfilter-dev \
 		# The Windows cross-toolchain. .cargo/config.toml names
 		# x86_64-w64-mingw32-gcc as the linker for x86_64-pc-windows-gnu.
 		mingw-w64 \
 	&& apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Fail the image build, not the first cargo build inside it. A base that stopped
-# shipping either library is the one failure mode this image has, and it should
-# say so here rather than as a pkg-config error forty minutes into someone's
-# first build.
-RUN pkg-config --exists sdl3 && pkg-config --exists libavcodec \
-	|| { echo "base image no longer carries libsdl3-dev / libavcodec-dev" >&2; exit 1; }
+# Fail the image build, not the first run inside it. A base that stopped
+# shipping SDL3's runtime dependencies is the one failure mode this image has,
+# and it should say so here rather than as a window that never opens.
+RUN pkg-config --exists sdl3 \
+	|| { echo "base image no longer carries libsdl3-dev" >&2; exit 1; }
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
@@ -146,14 +148,63 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 	&& echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum -c - \
 	&& unzip -q /tmp/ghidra.zip -d /opt \
 	&& mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
-	&& rm /tmp/ghidra.zip \
-	&& ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless
+	&& rm /tmp/ghidra.zip
+
+# **The Python that runs Ghidra's scripts**, without which the decompiler above
+# can be driven only by hand.
+#
+# Ghidra 12 runs a .py script through PyGhidra and nothing else -- Jython is
+# gone -- and the stock support/analyzeHeadless starts a JVM with no interpreter
+# in it, so `-postScript whatever.py` fails there with "Ghidra was not started
+# with PyGhidra. Python is not available". That is a decompiler you cannot
+# script, which for this project is most of the value of having one.
+#
+# Installed from the wheels Ghidra already ships, with --no-index: nothing is
+# fetched, and the jpype that results is the exact build this Ghidra release was
+# tested against rather than whatever is current. A virtual environment because
+# Debian's interpreter is externally managed and refuses to be installed into,
+# and at a fixed path of its own rather than the one PyGhidra would pick for
+# itself -- that one is under /root, where a named volume would shadow it and
+# the first session after a rebuild would find it empty.
+RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
+	&& apt-get install -y --no-install-recommends python3-venv python3-pip \
+	&& apt-get clean && rm -rf /var/lib/apt/lists/* \
+	&& python3 -m venv /opt/ghidra-venv \
+	&& /opt/ghidra-venv/bin/python3 -m pip install --quiet --no-index \
+		-f /opt/ghidra/Ghidra/Features/PyGhidra/pypkg/dist pyghidra \
+	&& /opt/ghidra-venv/bin/python3 -c "import pyghidra, jpype"
+
+# `analyzeHeadless` on PATH is the PyGhidra launcher, so that the command
+# CLAUDE.md documents runs both halves of the job: -import, and the -postScript
+# that asks the imported program a question.
+#
+# It launches the same ghidra.app.util.headless.AnalyzeHeadless with the same
+# arguments and the same heap and thread caps the stock script applies, so
+# -import behaves identically. -X.../-D... are pulled back out by
+# pyghidra.ghidra_launch and handed to the JVM; everything after them reaches
+# AnalyzeHeadless untouched. Ghidra's own support/analyzeHeadless is left where
+# it is and is still the Java-only launcher.
+RUN printf '%s\n' \
+		'#!/usr/bin/env bash' \
+		'set -euo pipefail' \
+		'GHIDRA_HEADLESS_MAXMEM=${GHIDRA_HEADLESS_MAXMEM:-${GHIDRA_MAXMEM:-2G}}' \
+		'exec /opt/ghidra-venv/bin/python3 \' \
+		'	/opt/ghidra/Ghidra/Features/PyGhidra/support/pyghidra_launcher.py \' \
+		'	/opt/ghidra --headless \' \
+		'	"-Xmx${GHIDRA_HEADLESS_MAXMEM}" \' \
+		'	-XX:ParallelGCThreads=2 -XX:CICompilerCount=2 \' \
+		'	-Djava.awt.headless=true \' \
+		'	"$@"' \
+		> /usr/local/bin/analyzeHeadless \
+	&& chmod +x /usr/local/bin/analyzeHeadless
 
 # The two names CLAUDE.md's Ghidra section exports by hand, so a session in here
 # does not have to. GHIDRA_PROJ is the mount point docker-compose.yml puts the
 # project volume (or your own project directory) on.
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
-ENV HEADLESS=/opt/ghidra/support/analyzeHeadless
+# The wrapper above, not /opt/ghidra/support/analyzeHeadless: that one cannot
+# run a Python script.
+ENV HEADLESS=/usr/local/bin/analyzeHeadless
 ENV GHIDRA_PROJ=/root/ghidra_projects
 
 # **Podman inside the devcontainer, and no --privileged.**

@@ -2,6 +2,66 @@
 # Surface warnings as errors locally the same way CI does.
 # (Opt out for a scratch build with `RUSTFLAGS= cargo build`.)
 
+# ---------------------------------------------------------------------------
+# What a build links
+#
+# The pinned SDL3 and ffmpeg in third_party/, built into target/ by
+# `just deps` -- not the distribution's packages. SDL3 is zlib and goes inside
+# the executable (the default `static-sdl` feature); ffmpeg is LGPL v2.1 and
+# stays shared. Only an LGPL library is dynamic here.
+#
+# **Here rather than in the justfile** because `cargo build` is what people and
+# agents actually type -- CLAUDE.md says outright that `just` is not on PATH and
+# to run the cargo commands from the justfile directly -- and a setting only the
+# task runner applies is a setting most builds would miss. That is not
+# hypothetical: it is how a Debian 13 devcontainer linked libswscale 8 against
+# code written for the dynamic swscale API that first ships in ffmpeg n8.0, and
+# segfaulted inside av_frame_ref.
+#
+# `[env]` does not override a variable already set in the environment, so
+# tools/dist.sh and the `windows-*` recipes, which export these themselves for
+# their own prefixes, still win.
+[env]
+# LIBDIR *replaces* pkg-config's default search path rather than adding to it,
+# so a prefix that has not been built fails the link with a clear pkg-config
+# error instead of silently resolving against whatever the machine has. PATH is
+# searched as well, which is how both prefixes are named when only one variable
+# can carry a relative path.
+PKG_CONFIG_LIBDIR = { value = "target/sdl/linux/lib/pkgconfig", relative = true }
+PKG_CONFIG_PATH = { value = "target/ffmpeg/linux/lib/pkgconfig", relative = true }
+FFMPEG_PKG_CONFIG_PATH = { value = "target/ffmpeg/linux/lib/pkgconfig", relative = true }
+
+# ffmpeg is shared, so a binary has to be told where its libav* are. Three
+# entries, and one linker flag that is not optional:
+#
+# `$ORIGIN`                      beside the binary -- the flat release archive.
+# `$ORIGIN/../ffmpeg/...`        target/debug/daysengine, one level below target/.
+# `$ORIGIN/../../ffmpeg/...`     target/debug/deps/<test>, and examples/, two.
+#
+# A path that does not exist is skipped, so one set serves a developer build, a
+# test binary and an unpacked archive, and nothing has to relink per situation.
+# $ORIGIN is expanded by the dynamic loader at run time rather than the shell at
+# build time, which is why it survives being written into the ELF.
+#
+# **`--disable-new-dtags` is what makes it work at all.** Modern ld emits
+# DT_RUNPATH, and a RUNPATH is used only for that object's own direct
+# dependencies -- it is not inherited. `libswresample` is not referenced
+# directly here; it arrives as a dependency of libavfilter, and the loader
+# resolves *that* against libavfilter's own RUNPATH, which ffmpeg builds without.
+# So the test binary linked, ran, and died on "libswresample.so.7: cannot open
+# shared object file". --disable-new-dtags emits DT_RPATH instead, which *is*
+# inherited by dependencies, and the transitive ones resolve.
+#
+# Per-target, so the Windows cross-build -- where an rpath means nothing -- does
+# not get one. An explicit RUSTFLAGS in the environment replaces this outright.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,--disable-new-dtags",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../ffmpeg/linux/lib",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../ffmpeg/linux/lib",
+]
+
 [net]
 # Never let a build reach for a git dependency; deny.toml enforces this too, but
 # failing at fetch time gives a clearer error.

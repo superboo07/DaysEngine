@@ -240,8 +240,14 @@ style as whatever is already there.
 
 ### Hazards, all of which have cost a cycle
 
-- Scripts run under **Jython 2.7: ASCII only.** One em dash in a docstring is
-  a `SyntaxError`.
+- Scripts run under **CPython 3 through PyGhidra**, which is the only script
+  runtime Ghidra 12 has — Jython is gone. The devcontainer's `analyzeHeadless`
+  is a wrapper that launches it; Ghidra's own `support/analyzeHeadless` starts a
+  JVM with no interpreter and fails a `.py` postScript with "Ghidra was not
+  started with PyGhidra". On a machine that is not the devcontainer, install
+  PyGhidra from the wheels Ghidra ships in
+  `Ghidra/Features/PyGhidra/pypkg/dist` and run
+  `Ghidra/Features/PyGhidra/support/pyghidra_launcher.py <install> --headless`.
 - `mem.getBytes()` returns **zeros for `.data`** in `SysMenuSDHQ.dll`, and
   vtable scans of the exe image come back empty. Code xrefs and the decompiler
   are fine; raw memory reads are not. Map RVA to file offset and read the file
@@ -267,7 +273,7 @@ methods that agree is the standard the rules above ask for.
 
 ```text
 src/install/      the player's install: vfs, ini, config, save
-src/media/        audio + video decode through system ffmpeg
+src/media/        audio + video decode through ffmpeg (vendored; see below)
 src/playback/     stage, mixer, lipsync, text, compose
 src/ui/           menu, screen, options, replay, ending
 src/main.rs       `daysengine` — the game (SDL3), and the dispatch that
@@ -307,8 +313,19 @@ logic underneath them.
 
 Design decisions already made and not up for re-litigation:
 
-- Rust + SDL3 + **system** ffmpeg, linked not vendored, so we inherit the
-  distro's CVE patches on two large C media parsers.
+- Rust + SDL3 + ffmpeg, both **pinned in `third_party/` and vendored**, built in
+  `tools/dist/`'s image by `just deps` and found through `.cargo/config.toml` --
+  for a developer build as much as for a release archive. Linking the
+  distribution's copies instead was the earlier decision, taken to inherit its
+  CVE patches on two large C media parsers; it was made while this project was
+  developed on a host whose ffmpeg happened to be current, and it does not
+  survive a host whose is not. Debian 13's ffmpeg 7.1 predates the dynamic
+  swscale API `media::image` uses and segfaults inside `av_frame_ref`.
+- **SDL3 is linked statically and ffmpeg is not.** SDL3 is zlib, which attaches
+  no condition to linking it in; ffmpeg is LGPL v2.1, which permits static
+  linking only against an obligation to let the player relink, so it stays
+  shared. Only an LGPL library is dynamic here — that is the whole rule, and it
+  is the same on both sides of the developer/release line.
 - The runtime is a **scheduler, not an interpreter**. `.ORS` files are
   timelines; every statement owns a `[start, end)` window in frames at 24 fps.
 - **A missing asset logs and continues**, never fatal. A screen that cannot be

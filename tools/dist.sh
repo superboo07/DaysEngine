@@ -67,12 +67,6 @@ for prefix in "$sdl" "$ffmpeg"; do
     fi
 done
 
-# Only the vendored prefixes are on the search path. A library that failed to
-# build then fails the link, rather than silently resolving against the build
-# machine's own copy -- which on a cross-build produces an .exe nobody can run,
-# and on a native build produces an archive that works here and nowhere else.
-export PKG_CONFIG_LIBDIR="$sdl/lib/pkgconfig:$ffmpeg/lib/pkgconfig"
-export FFMPEG_PKG_CONFIG_PATH="$ffmpeg/lib/pkgconfig"
 
 # The build this archive is, named so two of them cannot be confused. `-dirty`
 # means the working tree had changes git did not have, so the SOURCE.zip beside
@@ -86,25 +80,26 @@ out=$root/target/dist/daysengine-$target-x86_64-$version
 rm -rf "$out"
 mkdir -p "$out"
 
+# **The build is an ordinary `cargo build --release`.** Where the libraries are,
+# which of them is static, and the `$ORIGIN` rpath that makes a flat archive
+# resolve are all in .cargo/config.toml, because they are true of every build
+# and not of this script -- a developer build links the same SDL3 statically and
+# the same ffmpeg shared, and finds it the same way. What is left here is the
+# distribution: the layout, the licences, the source note, the archive.
+#
+# The cross-build is the exception, and only because its environment cannot be
+# expressed per-target in .cargo/config.toml.
 if [ "$target" = windows ]; then
+    export PKG_CONFIG_LIBDIR="$sdl/lib/pkgconfig:$ffmpeg/lib/pkgconfig"
+    export FFMPEG_PKG_CONFIG_PATH="$ffmpeg/lib/pkgconfig"
     export PKG_CONFIG_ALLOW_CROSS=1
     # bindgen parses ffmpeg's headers with clang, which otherwise reads glibc's.
     export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-w64-mingw32 -I/usr/x86_64-w64-mingw32/include"
-    cargo build --locked --release --features static-sdl \
-        --bin daysengine --target x86_64-pc-windows-gnu
+    cargo build --locked --release --bin daysengine --target x86_64-pc-windows-gnu
     built=$root/target/x86_64-pc-windows-gnu/release
     binaries=(daysengine.exe)
 else
-    # $ORIGIN, not $ORIGIN/lib: the archive is flat, and the libraries beside the
-    # binary must win over anything installed. Single quotes keep $ORIGIN for the
-    # dynamic loader to expand at run time rather than the shell at build time.
-    #
-    # Set at link time rather than written into the finished ELF afterwards: the
-    # linker is already deciding what this binary says about where its libraries
-    # are, and a second tool rewriting that decision is one more thing to install
-    # and one more place the answer lives.
-    RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN' \
-        cargo build --locked --release --features static-sdl --bin daysengine
+    cargo build --locked --release --bin daysengine
     built=$root/target/release
     binaries=(daysengine)
 fi

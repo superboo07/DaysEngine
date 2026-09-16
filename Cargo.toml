@@ -30,13 +30,22 @@ log.workspace = true
 env_logger.workspace = true
 
 [features]
-# Link SDL3 into the executable rather than against a shared libSDL3.
+# **On by default**, because every build here links the pinned SDL3 in
+# third_party/, built by tools/build-sdl.sh into target/sdl/linux -- a developer
+# build as much as a release archive. SDL3's zlib licence attaches no condition
+# to linking it in, so it goes inside the executable and no libSDL3 ships or has
+# to be found at run time.
 #
-# Off by default, because a developer build links whatever SDL3 the machine has
-# and no distribution ships a static one. tools/dist.sh turns it on: an archive
-# is a drag-and-drop, and SDL3's zlib licence attaches no condition to linking
-# it in. ffmpeg deliberately does NOT get the same treatment -- see the
-# licensing note at the top of tools/build-ffmpeg.sh.
+# ffmpeg deliberately does NOT get the same treatment. It is LGPL v2.1, which
+# permits static linking only against an obligation to let the player relink, so
+# it stays shared -- see the licensing note at the top of tools/build-ffmpeg.sh.
+# Only an LGPL library is dynamic here; that is the whole rule.
+#
+# `--no-default-features` links a *shared* SDL3 instead. On its own that still
+# resolves against the vendored prefix, which is static-only and will not
+# satisfy it; reaching the distribution's copy means pointing PKG_CONFIG_LIBDIR
+# back at the system's own pkgconfig directory, over .cargo/config.toml.
+default = ["static-sdl"]
 static-sdl = ["sdl3/static-link"]
 
 # One binary. The inspection tools used to be a second one, `days`; they are

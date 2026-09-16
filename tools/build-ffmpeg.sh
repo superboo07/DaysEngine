@@ -5,11 +5,12 @@
 #   tools/build-ffmpeg.sh linux     -> target/ffmpeg/linux
 #   tools/build-ffmpeg.sh windows   -> target/ffmpeg/windows   (MinGW-w64 cross)
 #
-# This is NOT the developer build path. `cargo build` and `just check` link the
-# system ffmpeg, which is what docs/DEPENDENCIES.md asks for: a distribution
-# inherits its own CVE patches on a large C media parser and we do not want to
-# get in the way of that. What this script produces is the copy that goes in a
-# release archive, for the people who have no distribution to inherit from.
+# This IS the developer build path as well as the release one. `just deps` calls
+# it, .cargo/config.toml points cargo at what it produces, and `cargo build`
+# links that -- because Debian 13's ffmpeg 7.1 predates the dynamic swscale API
+# media::image uses and segfaults on it. docs/DEPENDENCIES.md has the reasoning
+# and the evidence. The same libraries then go into a release archive, for the
+# people who have no distribution to inherit from.
 #
 # ---------------------------------------------------------------------------
 # Licensing

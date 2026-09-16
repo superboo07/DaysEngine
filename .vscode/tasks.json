@@ -65,6 +65,14 @@
       "presentation": { "panel": "dedicated" }
     },
     {
+      "label": "deps",
+      "detail": "Build the vendored SDL3 and ffmpeg every build links. Slow; once per checkout. Nothing compiles until this has run.",
+      "type": "shell",
+      "command": "./tools/build-sdl.sh linux && ./tools/build-ffmpeg.sh linux",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
       "label": "windows: deps",
       "detail": "Build the vendored SDL3 and ffmpeg for MinGW-w64. Slow; once per checkout.",
       "type": "shell",

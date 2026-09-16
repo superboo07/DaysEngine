@@ -90,7 +90,11 @@ RUN test -n "$RUST_CHANNEL" \
 	&& rustup target add x86_64-pc-windows-gnu \
 	&& chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
-WORKDIR /src
+# A default only. tools/in-container.sh mounts the tree at its own absolute path
+# and passes -w to match, because the pkg-config and CMake files that SDL3 and
+# ffmpeg install record their prefix absolutely -- a tree mounted somewhere else
+# produces libraries that only resolve in here.
+WORKDIR /
 
 # What tools/in-container.sh looks for: a build already inside this image runs
 # rather than starting another container.
