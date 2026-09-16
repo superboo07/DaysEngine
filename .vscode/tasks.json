@@ -13,7 +13,7 @@
     },
     {
       "label": "build",
-      "detail": "Debug build against the system SDL3 and ffmpeg.",
+      "detail": "Debug build",
       "type": "shell",
       "command": "cargo build --locked --workspace",
       "group": { "kind": "build", "isDefault": true },
