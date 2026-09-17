@@ -243,7 +243,7 @@ impl VideoDecoder {
             guard.packet = packet;
             guard.frame = frame;
 
-            let scaler = new_scaler(VideoScaler::default())?;
+            let scaler = new_scaler(VideoScaler::default(), ScaleBackend::Legacy)?;
             let scaled = new_rgba_frame((width, height))?;
 
             guard.disarm();
@@ -387,7 +387,7 @@ impl VideoDecoder {
         }
         // SAFETY: the new context is built before the old one is freed, so a
         // failure leaves the decoder with the filter it already had.
-        let scaler = unsafe { new_scaler(filter)? };
+        let scaler = unsafe { new_scaler(filter, ScaleBackend::Legacy)? };
         unsafe { ffi::sws_freeContext(self.scaler) };
         self.scaler = scaler;
         self.filter = filter;
@@ -634,6 +634,108 @@ impl VideoDecoder {
     }
 }
 
+/// Which of libswscale's implementations a context may scale through.
+///
+/// libswscale 9 has two. The *legacy* backend is the one that has always been
+/// there: it scales in an internal planar YUV representation, so a packed-RGB
+/// source is converted to YUV on the way in and back to RGB on the way out. The
+/// *ops* backend, new in 9, compiles a list of per-pixel operations and runs
+/// them through SIMD kernels in whatever format the pixels are already in, so
+/// an RGBA source is filtered as RGBA.
+///
+/// For a movie frame that costs nothing either way — the source is YUV420P
+/// already, so the legacy backend's internal format *is* the source format and
+/// the YUV-to-RGB step is the colour conversion the frame needs regardless.
+/// For a still it is most of the cost of the scale. 800x452 to 1920x1080,
+/// bicubic, eight slice threads, this machine:
+///
+/// ```text
+///                           -> 1920x1080   -> 3840x2160
+///   still  RGBA    legacy       30.4 ms       131.3 ms
+///   still  RGBA    ops           9.5 ms        24.4 ms
+///   movie  YUV420P legacy         7.3 ms        16.3 ms
+///   movie  YUV420P ops            6.7 ms        19.3 ms
+/// ```
+///
+/// The middle two rows are the same destination, the same filter and the same
+/// slice threads; only the source pixel format differs. That is what says the
+/// cost is the RGB round trip and not the kernel — and it is also why nearest
+/// neighbour used to be no cheaper than bicubic here, since both paid it.
+///
+/// Two further things the legacy backend does to an RGB source, both from
+/// `sws_init_context` in `libswscale/utils.c`: it forces `SWS_FULL_CHR_H_INT`
+/// ("Forcing full internal H chroma due to input having non subsampled
+/// chroma"), which puts the whole output through the full-chroma writer, and
+/// there is no way for a caller to turn that back off. `SWS_FAST_BILINEAR` is
+/// the single exception the condition carves out, which is why that one filter
+/// was always the fast one.
+///
+/// [`Ops`](Self::Ops) is set through `SWS_UNSTABLE`, which upstream documents
+/// as experimental. Two things make that a supportable thing to ship here: the
+/// ffmpeg this links is vendored and pinned to an exact commit in
+/// `third_party/`, so "semantics subject to change at any point in time" is a
+/// change this project makes deliberately and re-tests; and the flag only
+/// *adds* the ops backend to the set `graph.c:add_convert_pass` may choose
+/// from, so anything it cannot compile an operation list for still falls back
+/// to legacy rather than failing.
+///
+/// The output was checked against the legacy backend on three real backgrounds
+/// from the game, at 1920x1080, 3840x2160, 1366x768 and 1367x771 — the last for
+/// an odd width, which is its own path in `sws_init_context`. Bicubic, bilinear,
+/// lanczos and area all differ by at most 7 of 255 in any channel, with a mean
+/// absolute difference of 0.13 to 0.24: rounding. It is the same filter either
+/// way, and swscale's own log names it — `SWS_OP_FILTER_H : 800 -> 1920 bicubic
+/// (4 taps)` — so a still and a movie still go up through the filter the player
+/// chose, which is the point of [`crate::media::image`].
+///
+/// Two divergences are real rather than rounding, and both are written down
+/// here because a divergence nobody recorded is indistinguishable from one
+/// nobody found:
+///
+/// - **`SWS_FAST_BILINEAR` has no ops-backend filter at all.** `format.c`'s
+///   `get_scaler_fallback` maps the legacy flag bits onto the `SwsScaler` enum,
+///   and that bit is not in the list, so it falls through to `SWS_SCALE_AUTO`,
+///   which `filters.c` resolves to *bicubic*. A still would have been filtered
+///   bicubic while the movie beside it kept legacy fast bilinear — exactly the
+///   seam this engine puts stills through swscale to avoid. It measured as a
+///   mean absolute difference of 3 to 6 of 255 against legacy, two orders of
+///   magnitude above every other filter's. So [`Self::for_still`] keeps that
+///   one filter on the legacy backend, where it is already the fast path.
+/// - **Nearest neighbour picks a different source pixel at some output
+///   columns.** Bit-identical between the two backends at 1920x1080 and
+///   3840x2160, but at 1366x768 and 1367x771 between 0.1% and 0.5% of pixels
+///   take the neighbouring source pixel instead. That is a half-pixel
+///   difference in where the sample origin rounds, not a different filter;
+///   both answers are nearest neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScaleBackend {
+    /// The legacy backend only. What a movie frame wants.
+    Legacy,
+    /// Prefer the ops backend, falling back to legacy. What a still wants.
+    Ops,
+}
+
+impl ScaleBackend {
+    /// The backend a still should be scaled through with `filter`.
+    ///
+    /// Everything but [`VideoScaler::FastBilinear`], which the ops backend
+    /// would quietly turn into bicubic; see the note above.
+    pub(super) fn for_still(filter: VideoScaler) -> ScaleBackend {
+        match filter {
+            VideoScaler::FastBilinear => ScaleBackend::Legacy,
+            _ => ScaleBackend::Ops,
+        }
+    }
+
+    /// The `sws_flags` bits this adds.
+    fn flag(self) -> i64 {
+        match self {
+            ScaleBackend::Legacy => 0,
+            ScaleBackend::Ops => i64::from(ffi::SWS_UNSTABLE),
+        }
+    }
+}
+
 /// Builds the colour-conversion and scaling context.
 ///
 /// Nothing about a size is set here. Modern libswscale reads what to do from
@@ -648,18 +750,25 @@ impl VideoDecoder {
 /// otherwise. At 1:1 it costs nothing either way: swscale takes its unscaled
 /// path whatever the flag says.
 ///
-/// And **slice threads**, which is why this goes the long way round through
+/// **Slice threads**, which is why this goes the long way round through
 /// `sws_alloc_context` rather than `sws_getContext`: the convenience
 /// constructor has nowhere to put an option, the default is one thread, and one
 /// thread scaling a frame to 4K costs more than the whole 41ms a frame gets.
-/// The threads are also why [`VideoDecoder::convert_frame`] calls
-/// `sws_scale_frame` and not `sws_scale` — the older entry point ignores them.
+/// Measured on eight cores, 800x452 to 3840x2160 with bicubic: 389ms on one
+/// thread against 131ms on eight. The threads are also why
+/// [`VideoDecoder::convert_frame`] calls `sws_scale_frame` and not `sws_scale`
+/// — the older entry point ignores them.
+///
+/// And the **backend**, for which see [`ScaleBackend`].
 ///
 /// # Safety
 ///
 /// The returned context is owned by the caller and must be freed with
 /// `sws_freeContext`.
-pub(super) unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsContext, Error> {
+pub(super) unsafe fn new_scaler(
+    filter: VideoScaler,
+    backend: ScaleBackend,
+) -> Result<*mut ffi::SwsContext, Error> {
     // SAFETY: the context is freed on the one path that does not return it,
     // and both options below are ones swscale defines on its own context.
     unsafe {
@@ -670,7 +779,7 @@ pub(super) unsafe fn new_scaler(filter: VideoScaler) -> Result<*mut ffi::SwsCont
         let opt = scaler.cast();
         let set =
             |name: &std::ffi::CStr, value: i64| ffi::av_opt_set_int(opt, name.as_ptr(), value, 0);
-        let flags = set(c"sws_flags", filter.flag());
+        let flags = set(c"sws_flags", filter.flag() | backend.flag());
         // One slice per core. A machine that will not say how many it has gets
         // one, which is swscale's own default.
         let threads = std::thread::available_parallelism()

@@ -26,7 +26,7 @@ pub mod image;
 pub mod video;
 
 pub use audio::{decode_audio, AudioBuffer};
-pub use image::ImageScaler;
+pub use image::{ImageScaler, Scaled};
 pub use video::{VideoDecoder, VideoFrame, VideoScaler};
 
 /// Mixer sample rate, from `Ini/DX8SOUND.INI` (`SamplePerSec`).

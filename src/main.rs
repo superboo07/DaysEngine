@@ -3673,12 +3673,14 @@ fn run_script(
                 let scaled = scaler
                     .scale(base, src, at)
                     .context("scaling the background")?;
-                let (w, h, rgba) = match &scaled {
-                    Some(pixels) => (at.0, at.1, pixels.as_slice()),
-                    None => (still.width, still.height, base),
+                let (w, h, rgba, pitch) = match &scaled {
+                    // The scaler's rows carry its own padding, so the pitch
+                    // comes with the pixels rather than being width times four.
+                    Some(out) => (at.0, at.1, out.rgba, out.pitch),
+                    None => (still.width, still.height, base, still.width as usize * 4),
                 };
                 let mut texture = new_texture(creator, w, h, art)?;
-                texture.update(None, rgba, w as usize * 4)?;
+                texture.update(None, rgba, pitch)?;
                 stills.keep(key.clone(), texture);
             }
             if let Some(texture) = stills.find(&key) {
@@ -3710,13 +3712,18 @@ fn run_script(
                 let scaled = scaler
                     .scale(&card.rgba, src, at)
                     .context("scaling the ending card")?;
-                let (w, h, rgba) = match &scaled {
-                    Some(pixels) => (at.0, at.1, pixels.as_slice()),
-                    None => (card.width, card.height, card.rgba.as_slice()),
+                let (w, h, rgba, pitch) = match &scaled {
+                    Some(out) => (at.0, at.1, out.rgba, out.pitch),
+                    None => (
+                        card.width,
+                        card.height,
+                        card.rgba.as_slice(),
+                        card.width as usize * 4,
+                    ),
                 };
                 let mut texture = new_texture(creator, w, h, art)?;
                 texture.set_blend_mode(BlendMode::Blend);
-                texture.update(None, rgba, w as usize * 4)?;
+                texture.update(None, rgba, pitch)?;
                 card_texture.keep(key.clone(), texture);
             }
             if let Some(texture) = card_texture.find(&key) {

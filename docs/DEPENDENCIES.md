@@ -112,6 +112,15 @@ point that honours the `threads` option, and a movie frame scaled to a 4K window
 on one thread costs more than the 41ms a 24 fps frame gets. See
 `media::video::new_scaler`.
 
+A still asks that context for one thing more. libswscale 9 has a second scaling
+backend that filters packed RGBA as RGBA rather than round-tripping it through
+an internal planar YUV, and a still is the only thing here that hands swscale
+RGBA; `media::video::ScaleBackend` has the measurements and the reasoning. It is
+requested with the `SWS_UNSTABLE` bit in `sws_flags`, which is not a version
+gate: `sws_flags` is an `AV_OPT_TYPE_FLAGS` option with `.max = UINT_MAX`, so an
+ffmpeg that has never heard of that bit accepts it and ignores it, and the still
+is scaled the way it was before. Slower, not broken.
+
 A player who wants their distribution's ffmpeg still gets it — it stays shared
 precisely so it can be replaced, and `FFMPEG-SOURCE.txt` in the archive says so.
 
