@@ -686,10 +686,14 @@ pub struct Menu {
     /// the module that does, and on any other screen.
     option_page: Option<OptionPage>,
     replay_page: Option<ReplayPage>,
-    /// Which of the dress-select screen's two hit maps is loaded:
+    /// Whether the dress-select screen's confirm popup is up:
     /// `MENU::DressSelect` `+0x140`. Meaningless on every other screen, and
     /// kept across a display-mode change because `FUN_1000ef80` keeps it.
     dress_phase: dress::Phase,
+    /// That screen's commit slide, which is what carries the two dresses to
+    /// the middle and back. Idle on every other screen; [`Menu::tick`] is what
+    /// runs it.
+    dress_slide: dress::Slide,
     /// That screen's art that is not the loaded map's own: the caption plate
     /// and, while the popup is up, the sheet the two dresses under it are cut
     /// from. Absent on every other screen.
@@ -852,6 +856,7 @@ impl Menu {
             option_page: None,
             replay_page: None,
             dress_phase: dress::Phase::default(),
+            dress_slide: dress::Slide::default(),
             dress: None,
             font: load_font(vfs),
             rows: None,
@@ -874,13 +879,15 @@ impl Menu {
         showing: Showing,
         return_to: Mode,
     ) -> Result<(), Error> {
-        // Arriving at the dress-select screen starts it on its own hit map,
-        // which is the module's `+0x140` coming up zero from the constructor.
+        // Arriving at the dress-select screen starts it on its own hit map
+        // with nothing moving: `FUN_1000d980`, the screen's init, clears
+        // `+0x140` and the slide's `+0x13c`, `+0x12c` and `+0x154` together.
         // Reloading the screen that is already showing — which is what a
-        // display-mode change is — keeps whichever map is loaded, the way
-        // `FUN_1000ef80` re-lays the popup out rather than dismissing it.
+        // display-mode change is — keeps both, the way `FUN_1000ef80` re-lays
+        // the popup and the slide out rather than dismissing them.
         if self.showing != showing {
             self.dress_phase = dress::Phase::default();
+            self.dress_slide = dress::Slide::default();
         }
         let variant = variant_for(
             &self.session,
@@ -1669,21 +1676,35 @@ impl Menu {
         });
         let mut layers = self.screen.layers(&Composite {
             backdrop: self.dress_art.as_ref().or(backdrop),
-            base: true,
+            base: self.base_art(),
             page,
             states: &self.states,
             sprites: &sprites,
             ..Default::default()
         });
+        // The two dresses while they are moving. They are cuts and not widget
+        // sprites because a thirtieth of 194.5 pixels leaves them on a
+        // fraction, and they come from whichever sheet holds the six records —
+        // which, during the slide back apart, is the one kept beside the
+        // popup's. See `dress::Slide`.
+        if self.showing.is(Mode::DRESS_SELECT)
+            && self.dress_slide.drawn(self.dress_phase) == dress::Drawn::Sliding
+        {
+            let from = self.dress_records();
+            for cut in &self.dress_slide.cuts(from.atlas()) {
+                layers.push(self.screen.cut_layer(from.chip(), cut));
+            }
+        }
         // The caption is the other way round from the dresses: `FUN_1000c740`
-        // draws it after them and their highlight, and only while the main map
-        // is loaded, so the popup covers it rather than sitting under it.
+        // draws it after them and their highlight, and only while they are
+        // resting — it goes the moment the slide starts, and the popup covers
+        // it rather than sitting under it.
         //
         // It is placed at the display map's letterbox rather than the output's,
         // which is what the code this replaced did; the two are the same except
         // in 4:3, where this screen has no caption to draw.
-        if let (dress::Phase::Choosing, Some(caption)) = (
-            self.dress_phase,
+        if let (dress::Drawn::Dresses, Some(caption)) = (
+            self.dress_slide.drawn(self.dress_phase),
             self.dress.as_ref().and_then(|d| d.scaled.as_ref()),
         ) {
             layers.push(Layer {
@@ -1758,17 +1779,37 @@ impl Menu {
         }
     }
 
-    /// What the dress-select popup is composited over: the two dresses, slid
-    /// together, cut from the sheet the previous hit map came with.
+    /// Whether the loaded screen's own base art is drawn under everything.
+    ///
+    /// It always is, but for one moment on one screen: the dress-select slide
+    /// back apart is still catching clicks through the popup's hit map, so the
+    /// popup's screen is the one this engine has loaded, and `FUN_1000c740`
+    /// draws that art only while `+0x140` is up. What the main map would have
+    /// under the dresses is `System/Screen/Transparence.png` — 800x450 of alpha
+    /// zero — so drawing no base at all is the same picture the module gets.
+    fn base_art(&self) -> bool {
+        !(self.showing.is(Mode::DRESS_SELECT)
+            && self.dress_slide.drawn(self.dress_phase) == dress::Drawn::Sliding
+            && self
+                .dress
+                .as_ref()
+                .is_some_and(|dress| dress.under.is_some()))
+    }
+
+    /// What the dress-select popup is composited over: the two dresses where
+    /// the slide left them, cut from the sheet the previous hit map came with.
     ///
     /// `None` on every other screen and while the main map is loaded, where the
-    /// dresses are the loaded screen's own widgets instead.
+    /// dresses are the loaded screen's own widgets instead. The slide back
+    /// apart is not this: `+0x140` is already down by then, so the popup has
+    /// nothing to be composited over and the moving dresses are a layer of
+    /// their own — see [`Menu::layers`].
     fn dress_under(&self, backdrop: Option<&days_ui::Image>) -> Option<days_ui::Image> {
-        let dress::Phase::Confirming { chosen } = self.dress_phase else {
+        let dress::Phase::Confirming { .. } = self.dress_phase else {
             return None;
         };
         let under = self.dress.as_ref()?.under.as_ref()?;
-        let cuts = dress::committed(under.atlas(), chosen);
+        let cuts = self.dress_slide.cuts(under.atlas());
         let (width, height) = self.screen.size();
         let mut out = days_ui::Image::empty(width, height);
         if let Some(back) = backdrop {
@@ -1911,8 +1952,12 @@ impl Menu {
         // A page module draws one of these and only one: the tab's own header,
         // which `FUN_100083b0` takes from the frame table at record `tab + 4`.
         // Everything else on its screen belongs to the page.
-        // The dress under the pointer, drawn over the two resting ones.
-        if self.showing.is(Mode::DRESS_SELECT) && self.dress_phase == dress::Phase::Choosing {
+        // The dress under the pointer, drawn over the two resting ones — and
+        // only while they are resting, because `FUN_1000c740` gates it on the
+        // slide as well as on the popup.
+        if self.showing.is(Mode::DRESS_SELECT)
+            && self.dress_slide.drawn(self.dress_phase) == dress::Drawn::Dresses
+        {
             if let Some(lit) = self
                 .selection
                 .and_then(|widget| dress::lit(self.screen.atlas(), widget))
@@ -2216,8 +2261,20 @@ impl Menu {
         // other screen's are — they are sprites `FUN_1000c740` draws every
         // frame, before it looks at the selection at all. The lit record goes
         // over the one under the pointer; see `Menu::sprites`.
-        if self.showing.is(Mode::DRESS_SELECT) && self.dress_phase == dress::Phase::Choosing {
-            self.states = vec![WidgetState::Active; self.states.len()];
+        //
+        // While the slide runs neither map's widgets are drawn: the two
+        // dresses are the slide's own sprites, which are cuts, and the popup's
+        // two buttons wait for `+0x140`. See `dress::Drawn`.
+        if self.showing.is(Mode::DRESS_SELECT) {
+            match self.dress_slide.drawn(self.dress_phase) {
+                dress::Drawn::Dresses => {
+                    self.states = vec![WidgetState::Active; self.states.len()];
+                }
+                dress::Drawn::Sliding => {
+                    self.states = vec![WidgetState::Resting; self.states.len()];
+                }
+                dress::Drawn::Popup => {}
+            }
         }
         self.dirty = true;
     }
@@ -2555,7 +2612,7 @@ impl Menu {
             Some(Mode::SAVELOAD) if self.pending_save.is_some() => Ok(Action::Stay),
             Some(Mode::SAVELOAD) => self.confirm_saveload(vfs, dll, widget),
             Some(Mode::ROUTEMAP) => self.confirm_routemap(vfs, dll, widget),
-            Some(Mode::DRESS_SELECT) => self.confirm_dress(vfs, dll, widget),
+            Some(Mode::DRESS_SELECT) => self.confirm_dress(widget),
             // The popup's two widgets are YES then NO, from its own dispatch:
             // widget 0 records the affirmative answer, widget 1 records the
             // negative one and sends the player back to the mode the popup
@@ -2575,24 +2632,93 @@ impl Menu {
     /// The dress-select screen's dispatch, from `FUN_1000ded0`.
     ///
     /// Committing to a dress tells the host at once — host `+0x48`, which
-    /// [`Session::dress`] is this engine's side of — and then swaps the hit map
-    /// for the popup's, which is what `FUN_1000e440` phase 1 does once the
-    /// slide has run. Answering the popup yes sets the module's `+0xfc`, and
-    /// `getNextMode` case 9 reads that as mode 1: leave the menus and play.
-    /// Answering it no puts the first map back.
-    fn confirm_dress(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
+    /// [`Session::dress`] is this engine's side of — and then starts the slide
+    /// that carries the two dresses together. The popup is not raised here:
+    /// `FUN_1000e440` arm 1 takes its art and hit map thirty ticks later, and
+    /// [`Menu::tick`] is what gets there. Answering the popup yes sets the
+    /// module's `+0xfc`, and `getNextMode` case 9 reads that as mode 1: leave
+    /// the menus and play. Answering it no runs the slide backwards.
+    fn confirm_dress(&mut self, widget: usize) -> Result<Action, Error> {
         match dress::action(self.dress_phase, widget) {
             dress::Act::None => Ok(Action::Stay),
             dress::Act::Commit(chosen) => {
                 self.session.dress = Some(dress::host_value(chosen));
-                self.set_dress_phase(vfs, dll, dress::Phase::Confirming { chosen })
+                // The records are the loaded map's: the main one's while the
+                // dresses are at rest, and — for a click during the slide back
+                // apart, which the popup's map is still catching — the sheet
+                // kept beside it. Both are the same six records.
+                let mut slide = std::mem::take(&mut self.dress_slide);
+                slide.commit(self.dress_records().atlas(), chosen);
+                self.dress_slide = slide;
+                self.refresh();
+                Ok(Action::Sound(SystemSe::Click))
             }
             // `FUN_1000ded0` returns 0 here, which the update pump reads as
             // "this screen is finished"; the mode it leaves for is
             // `getNextMode`'s, and for mode 1 that is playback.
             dress::Act::Accept => Ok(Action::Play),
-            dress::Act::Cancel => self.set_dress_phase(vfs, dll, dress::Phase::Choosing),
+            // `+0x140` drops at the click and the popup goes with it, but the
+            // hit map it came with stays loaded until arm 3 has run — so the
+            // screen this engine keeps is the popup's too, with nothing of it
+            // drawn. See [`Menu::tick`].
+            dress::Act::Cancel => {
+                self.dress_phase = dress::Phase::Choosing;
+                self.dress_slide.cancel();
+                self.refresh();
+                Ok(Action::Sound(SystemSe::Click))
+            }
         }
+    }
+
+    /// One host tick of whatever the screen that is up animates itself.
+    ///
+    /// Today that is the dress-select screen's slide and nothing else: it is
+    /// the only screen in either module whose update moves anything. A caller
+    /// that draws every frame calls this every frame, which is what the
+    /// original does — see [`dress::SLIDE_FRAMES`] for why a tick is one
+    /// presented frame.
+    pub fn tick(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<(), Error> {
+        if !self.showing.is(Mode::DRESS_SELECT) {
+            return Ok(());
+        }
+        self.dirty |= self.dress_slide.moving();
+        match self.dress_slide.tick() {
+            None => Ok(()),
+            // Arm 1: the popup's art and hit map, and `+0x140` raised.
+            Some(dress::Slid::Popup) => {
+                let chosen = self.dress_slide.chosen();
+                self.set_dress_phase(vfs, dll, dress::Phase::Confirming { chosen })?;
+                Ok(())
+            }
+            // The tail of arm 3: `FUN_1000d7f0`, the main hit map again. The
+            // phase went back to [`dress::Phase::Choosing`] at the click.
+            Some(dress::Slid::Dresses) => {
+                self.set_dress_phase(vfs, dll, dress::Phase::Choosing)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether the screen that is up has something still to move.
+    ///
+    /// For a caller that is not a frame loop: an inspection tool clicks and
+    /// then pumps [`Menu::tick`] until this is false, where the player's
+    /// machine would have drawn thirty frames.
+    pub fn moving(&self) -> bool {
+        self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving()
+    }
+
+    /// The screen the two dresses' records and sheet come from.
+    ///
+    /// The screen's own while its map is loaded, and the copy kept beside the
+    /// popup's while that is — `FUN_1000c740` keeps drawing them from
+    /// `DressSelect_Chip.png` whichever map the module is answering clicks
+    /// through. See [`Menu::load_dress_main`].
+    fn dress_records(&self) -> &Screen {
+        self.dress
+            .as_ref()
+            .and_then(|dress| dress.under.as_ref())
+            .unwrap_or(&self.screen)
     }
 
     /// Swaps the dress-select screen's hit map, keeping the mode.

@@ -751,6 +751,17 @@ impl Screen {
         }
     }
 
+    /// A [`Cut`] from a sheet that is not this screen's own, as a layer in this
+    /// screen's layout space.
+    ///
+    /// For art that belongs to a screen other than the loaded one: the
+    /// dress-select screen keeps drawing its two dresses from
+    /// `DressSelect_Chip.png` while the popup's map and sheet are the ones
+    /// loaded. See [`crate::ui::dress::Slide`].
+    pub fn cut_layer<'a>(&self, sheet: &'a Image, cut: &Cut) -> Layer<'a> {
+        self.cut(sheet, cut)
+    }
+
     /// A [`Cut`] as a layer, placed by its own layout-space rectangle.
     fn cut<'a>(&self, sheet: &'a Image, cut: &Cut) -> Layer<'a> {
         let dst = self.place_layout(cut.dst);
@@ -865,8 +876,8 @@ impl Screen {
     /// another screen's art: the dress-select popup covers the two dresses,
     /// which `FUN_1000c740` keeps drawing from `DressSelect_Chip.png` while the
     /// popup's own map and sheet are the ones loaded. They are [`Cut`]s rather
-    /// than widgets because the slide leaves them on a half pixel — see
-    /// [`crate::ui::dress::committed`].
+    /// than widgets because the slide leaves them on a fraction of a pixel —
+    /// see [`crate::ui::dress::Slide`].
     pub fn draw_cuts_from(&self, out: &mut Image, sheet: &Image, cuts: &[Cut]) {
         for cut in cuts {
             self.draw(out, &self.cut(sheet, cut));

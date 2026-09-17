@@ -465,7 +465,10 @@ pub struct MenuArgs {
     /// Events to replay, comma separated: `down`, `up`, `left`, `right`,
     /// `enter`, `esc`, `at:X:Y` to point at a pixel, and `click:X:Y` to point
     /// and confirm. A slider is dragged with `press:X:Y`, then `drag:X:Y` for
-    /// each step, then `release`.
+    /// each step, then `release`. `tick` draws one frame and `tick:N` draws N,
+    /// which is how the dress-select slide is stopped part-way; until one is
+    /// used, every event lets whatever is moving finish first, the way the
+    /// frames between two clicks do on the player's machine.
     #[arg(long, short = 'e', default_value = "")]
     events: String,
     /// Resolution: standard, wide, note or full.
@@ -3054,7 +3057,15 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 if let Some((x, y)) = menu.screen().widget_point(0) {
                     menu.point_at(x, y);
                 }
-                let acted = menu.confirm(&vfs, &dll);
+                let acted = menu.confirm(&vfs, &dll).and_then(|action| {
+                    // Committing starts the slide; the popup's map arrives
+                    // thirty ticks later. `daysengine` gets those ticks from
+                    // its frame loop, so here they are pumped by hand.
+                    while menu.moving() {
+                        menu.tick(&vfs, &dll)?;
+                    }
+                    Ok(action)
+                });
                 println!(
                     "  mode  9  dress popup   {:<34} {}",
                     paths.dress_select_popup().unwrap_or_default(),
@@ -3165,12 +3176,29 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         println!("backdrop {} ({:?})", chosen.path, chosen.reason);
     }
 
+    let mut stepping = false;
     for event in args
         .events
         .split(',')
         .map(str::trim)
         .filter(|e| !e.is_empty())
     {
+        // The player's machine draws between one click and the next, and the
+        // dress-select slide moves on those frames. So an event that follows a
+        // click arrives after the slide has run, the way the player's would.
+        // A `tick` takes that over: once frames are being counted by hand,
+        // nothing is settled behind the caller's back, which is how a click
+        // part-way through the slide is reached.
+        let tick_event = event.starts_with("tick");
+        if menu.moving() && !stepping && !tick_event {
+            let mut ticks = 0;
+            while menu.moving() {
+                menu.tick(&vfs, &dll)?;
+                ticks += 1;
+            }
+            println!("  {:<12} -> {ticks} frames of the slide", "(settling)");
+        }
+        stepping |= tick_event;
         let (action, label) = match event {
             "down" => (menu.navigate(&vfs, &dll, Dir::Down)?, "down".to_string()),
             "up" => (menu.navigate(&vfs, &dll, Dir::Up)?, "up".to_string()),
@@ -3180,6 +3208,22 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             "esc" => (menu.cancel(&vfs, &dll)?, "esc".to_string()),
             "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),
             "release" => (menu.release(), "release".to_string()),
+            // One frame of whatever the screen animates itself, for looking at
+            // the dress-select slide part-way through: `tick` is one, `tick:N`
+            // is N. See `daysengine::ui::dress::SLIDE_FRAMES`.
+            "tick" => {
+                menu.tick(&vfs, &dll)?;
+                (Action::Stay, "tick".to_string())
+            }
+            other if other.starts_with("tick:") => {
+                let count: usize = other["tick:".len()..]
+                    .parse()
+                    .with_context(|| format!("{other:?} needs a frame count, as tick:N"))?;
+                for _ in 0..count {
+                    menu.tick(&vfs, &dll)?;
+                }
+                (Action::Stay, format!("tick {count}"))
+            }
             other => {
                 // Points are written `at:X:Y` rather than `at:X,Y` so the comma
                 // stays free as the separator between events.
@@ -3189,8 +3233,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                     .with_context(|| {
                         format!(
                             "unknown menu event {other:?}; expected down, up, enter, \
-                             esc, yes, left, right, release, at:X:Y, click:X:Y, \
-                             press:X:Y or drag:X:Y"
+                             esc, yes, left, right, release, tick, tick:N, \
+                             at:X:Y, click:X:Y, press:X:Y or drag:X:Y"
                         )
                     })?;
                 let (x, y) = point

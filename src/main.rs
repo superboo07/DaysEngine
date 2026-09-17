@@ -2093,6 +2093,12 @@ fn run_menu(
             menu.finish_save(slot, line.unwrap_or_default());
         }
 
+        // One tick of whatever the screen animates itself, which is the
+        // dress-select slide and nothing else. This is the module update the
+        // exe's message loop makes once per presented frame, and this loop is
+        // paced the same way — see `daysengine::ui::dress::SLIDE_FRAMES`.
+        menu.tick(player.vfs, &player.dll)?;
+
         // Where the screen lands, and then the screen composited at exactly
         // that size — one pass from the 800x450 art to the pixels the player
         // sees, rather than one into the hit map's size and another onto the

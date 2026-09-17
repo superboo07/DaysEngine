@@ -13,8 +13,16 @@
 //! and swaps it: `FUN_1000d7f0` loads `System/DressSelect/DressSelect*.cmap` and
 //! `FUN_1000d8c0` loads `System/DressSelect/Popup/Popup_Select*.cmap` into the
 //! same member, each picking its widescreen variant from host `+0xcc`, `+0xd0`
-//! and `+0xe4` the way every other screen does. [`Phase`] is which of the two is
-//! loaded, and it is the module's `+0x140`.
+//! and `+0xe4` the way every other screen does. [`Phase`] is the module's
+//! `+0x140`, which says whether the popup is up.
+//!
+//! # A click does not land on the popup, it slides there
+//!
+//! Committing does not raise the popup: it starts [`Slide`], and the two
+//! dresses travel to the middle of the screen over [`SLIDE_FRAMES`] frames
+//! before `FUN_1000e440` arm 1 takes the popup's art and hit map. Answering it
+//! no runs the same travel backwards. [`Slide::drawn`] is what the screen shows
+//! at each point of that, and [`Slide::tick`] is the arm that moves it.
 //!
 //! # The records, from `FUN_1000d980`, `FUN_1000ded0` and `FUN_1000ef80`
 //!
@@ -52,23 +60,24 @@
 //! playing behind the plate; see [`background`].
 //!
 //! `DressSelect_Text.png` is a caption over that, loaded by `FUN_1000cce0` as a
-//! full-screen plate and drawn by `FUN_1000c740` only while [`Phase::Choosing`]
-//! — the popup covers it rather than sitting under it.
+//! full-screen plate and drawn by `FUN_1000c740` only while the dresses are at
+//! rest — it goes the moment they start moving, and the popup covers it rather
+//! than sitting under it. See [`Drawn`].
 //!
 //! # The dispatch, from `FUN_1000ded0`
 //!
 //! `FUN_1000dea0` is the availability test and is `0 <= widget <= 1`: neither
-//! dress is ever locked, on either hit map. What a click does depends on which
-//! map is loaded, which is the whole of [`action`]:
+//! dress is ever locked, on either hit map. What a click does depends on
+//! `+0x140` rather than on which map it came through, which is the whole of
+//! [`action`]:
 //!
 //! * While choosing, either widget commits. The module tells the host the
 //!   choice at once — host `+0x48(1)` for widget 0 and `+0x48(0)` for widget 1
-//!   — slides the two dresses together over [`SLIDE_FRAMES`] frames, then
-//!   `FUN_1000e440` phase 1 loads the popup's art and hit map and raises
-//!   `+0x140`.
+//!   — and starts the slide; `FUN_1000e440` arm 1 loads the popup's art and hit
+//!   map and raises `+0x140` once it has run.
 //! * While confirming, widget 0 sets `+0xfc` and widget 1 clears `+0x140` and
-//!   asks `FUN_1000e440` phase 3 to slide the dresses back apart and reload the
-//!   main hit map.
+//!   sets `+0x154` to 3, which is `FUN_1000e440`'s arm that slides the dresses
+//!   back apart and reloads the main hit map.
 //!
 //! `+0xfc` is what `getNextMode` case 9 reads through `FUN_10001a10`, and it
 //! answers mode 1 — leave the menus and play. `+0x88` answers mode -1, the
@@ -128,17 +137,21 @@ use days_ui::atlas::{Atlas, Widget};
 use crate::install::ini::Ini;
 use crate::ui::screen::Cut;
 
-/// Which of the screen's two hit maps is loaded: `MENU::DressSelect` `+0x140`.
+/// Whether the confirm popup is up: `MENU::DressSelect` `+0x140`.
 ///
-/// The module raises this once the commit slide has finished and
-/// `FUN_1000e440` phase 1 has swapped the map, which is why choosing and
-/// confirming cannot be told apart by the widget count — both maps carry two.
+/// `FUN_1000e440` arm 1 raises it in the same breath as it takes the popup's
+/// art and hit map, once the commit slide has run; `FUN_1000ded0` drops it the
+/// moment the popup is answered no, thirty frames before arm 3 puts the main
+/// hit map back. So it is the screen's own state and not a name for which map
+/// is loaded — for the length of the slide back apart, the popup's map is
+/// still the loaded one. Neither map can be told from the other by its widget
+/// count: both carry two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
     /// The main hit map: the two dresses.
     #[default]
     Choosing,
-    /// The popup's hit map, over the dress the player committed to.
+    /// The popup, over the dress the player committed to.
     Confirming {
         /// The widget that was clicked, which is also the index the two
         /// dresses are drawn in — not the value the host was told. See
@@ -249,18 +262,51 @@ pub fn background(start: &Ini) -> Option<Background> {
 /// loops for as long as the screen is up**.
 pub const BACKGROUND_FPS: f64 = 24.0;
 
-/// How many frames the commit slide runs for: `_DAT_1004a750`, a double.
+/// How many ticks the slide runs for: `_DAT_1004a750`, a double.
 ///
-/// `FUN_1000e440` adds `_DAT_100497b0` — 1.0, also a double — to `+0x12c` each
-/// tick and finishes when it reaches this, moving each dress a thirtieth of its
-/// travel per frame.
+/// `FUN_1000e440` adds `_DAT_100497b0` — 1.0, also a double — to `+0x12c` on
+/// each tick of the arm and finishes when it reaches this, moving each dress a
+/// thirtieth of its travel per tick.
+///
+/// # The tick is a presented frame
+///
+/// Nothing paces the module's update but the picture: `FUN_004011e0`'s message
+/// loop calls `FUN_004158c0` once round, whose default arm runs
+/// `FUN_00413250`, whose case 3 calls the module's update and then
+/// `FUN_00409690` — which ends in `IDirect3DDevice9::Present`, device vtable
+/// `+0x44`. The device is created by `FUN_00408cd0` from parameters
+/// `FUN_00408ac0` builds, and that `memset`s the 0x38-byte structure and never
+/// writes `+0x34`, so `PresentationInterval` is `D3DPRESENT_INTERVAL_DEFAULT`:
+/// one vertical retrace. So the slide is thirty refreshes of the player's
+/// display, and this engine gives it thirty passes round its own loop, which
+/// vsync paces the same way. See [`crate::ui::menu::Menu::tick`].
 pub const SLIDE_FRAMES: f32 = 30.0;
 
 /// Where the left dress ends up once the slide finishes: `_DAT_1004a740`.
+///
+/// The two are ten pixels apart and both sprites are 273 wide, so the dresses
+/// finish stacked in the middle of the 800-wide layout with the chosen one on
+/// top — this is the "moving to the centre" the screen does, not two dresses
+/// side by side.
 pub const SLID_LEFT_X: f32 = 258.5;
 
 /// Where the right dress ends up: `_DAT_1004a748`.
 pub const SLID_RIGHT_X: f32 = 268.5;
+
+/// Where one of the two dresses lands, whichever of them was chosen.
+///
+/// `FUN_1000ded0` sets each sprite's travel to the difference between its
+/// resting `x` and the constant for the side it came from, not the side it was
+/// clicked on: the left dress always ends at [`SLID_LEFT_X`] and the right at
+/// [`SLID_RIGHT_X`]. Only which of them is lit, and so which is drawn on top,
+/// changes.
+fn slid_x(widget: usize) -> f32 {
+    if widget == 0 {
+        SLID_LEFT_X
+    } else {
+        SLID_RIGHT_X
+    }
+}
 
 /// How many widgets each of the screen's two hit maps carries.
 pub const WIDGETS: usize = 2;
@@ -319,44 +365,219 @@ pub fn resting(atlas: &Atlas) -> Vec<Widget> {
     atlas.widgets.iter().take(WIDGETS).copied().collect()
 }
 
-/// Where the two dresses sit once the popup is up.
+/// What the screen draws this frame, from `FUN_1000c740`'s two gates.
 ///
-/// `FUN_1000ded0` sets each sprite's travel to the difference between its
-/// resting `x` and the constant for the side it lands on, and `FUN_1000ef80`
-/// re-derives the same two positions when the display mode changes mid-commit.
-/// The left dress always ends at [`SLID_LEFT_X`] and the right at
-/// [`SLID_RIGHT_X`] whichever one was chosen; only which of them is lit
-/// changes.
-pub fn committed(atlas: &Atlas, chosen: usize) -> Vec<Cut> {
-    // `FUN_1000c740` draws `+0xc8` and then `+0xcc`, and `FUN_1000ded0` loads
-    // the *unchosen* dress's resting record into the first and the chosen
-    // dress's lit record into the second — so the chosen one is always the one
-    // on top, whichever side it is.
-    let order = if chosen == 0 { [1, 0] } else { [0, 1] };
-    order
-        .into_iter()
-        .filter_map(|widget| {
-            let source = if widget == chosen {
-                lit(atlas, widget)?
-            } else {
-                atlas.widgets.get(widget).copied()?
-            };
-            let x = if widget == 0 {
-                SLID_LEFT_X
-            } else {
-                SLID_RIGHT_X
-            };
-            Some(cut_at(source, x))
-        })
-        .collect()
+/// Everything after the two dresses is drawn under one of two conditions:
+/// `+0x13c == 0 && +0x140 == 0` for the dress under the pointer and the
+/// caption, and `+0x13c != 0 && +0x140 != 0` for the popup and its own hovered
+/// widget. The two flags disagree for exactly as long as a slide is running,
+/// and then neither block draws — which is why the caption goes as soon as the
+/// dresses start moving rather than when the popup arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drawn {
+    /// Both dresses at rest, the one under the pointer lit, and the caption.
+    Dresses,
+    /// The two dresses wherever the slide has them, and nothing else.
+    Sliding,
+    /// The popup over the two dresses, which stay where the slide left them.
+    Popup,
 }
 
-/// One record as a sprite, moved to a new `x` and left where it is in `y`.
-fn cut_at(widget: Widget, x: f32) -> Cut {
-    let (w, h) = (widget.dst.width as f32, widget.dst.height as f32);
-    Cut {
-        src: (widget.src_x as f32, widget.src_y as f32, w, h),
-        dst: (x, widget.dst.y as f32, w, h),
+/// Which arm of `FUN_1000e440` the slide is in: `MENU::DressSelect` `+0x154`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Step {
+    /// Arm 0, the dresses moving together.
+    #[default]
+    Together,
+    /// Arm 1, which takes the popup's art and hit map and raises `+0x140`. It
+    /// is a tick of its own: arm 0 only sets `+0x154` to 1 when it reaches the
+    /// end, so the popup comes up the frame after the dresses have met.
+    Raise,
+    /// Arm 2, which the module has no code for: the popup is up and the slide
+    /// sits where it left off.
+    Held,
+    /// Arm 3, the dresses moving back apart, which `FUN_1000ded0` selects when
+    /// the popup is answered no.
+    Apart,
+}
+
+/// The slide the two dresses make on the way to the popup and back.
+///
+/// The fields are the module's own members, and the arithmetic is
+/// `FUN_1000e440`'s: each of the two sprites carries how far it has to travel
+/// and how far it has gone, and a tick adds a thirtieth of the first to the
+/// second. Both sprites are indexed in **draw order** — `FUN_1000c740` draws
+/// `+0xc8` and then `+0xcc`, and `FUN_1000ded0` puts the unchosen dress's
+/// resting record in the first and the chosen dress's lit record in the second,
+/// so the chosen one is always on top.
+#[derive(Debug, Clone, Default)]
+pub struct Slide {
+    /// `+0x158`: the widget that was clicked, which is the one drawn lit.
+    chosen: usize,
+    /// `+0x144` and `+0x148`: how far each sprite travels, signed.
+    travel: [f32; 2],
+    /// `+0x14c` and `+0x150`: how far each has gone.
+    offset: [f32; 2],
+    /// `+0x12c`: how many ticks the running arm has had.
+    frame: f32,
+    /// `+0x154`.
+    step: Step,
+    /// `+0x13c`: whether the screen is showing the slide's two sprites rather
+    /// than the loaded hit map's widgets. `FUN_1000d980` clears it on the way
+    /// into the screen along with `+0x140`, `+0x12c` and `+0x154`.
+    running: bool,
+}
+
+/// What a tick of the slide asks the screen to do once an arm finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slid {
+    /// The dresses have met: take the popup's art and hit map and raise
+    /// [`Phase::Confirming`]. `FUN_1000e440` arm 1.
+    Popup,
+    /// They are back where they started: load the main hit map again. The tail
+    /// of arm 3, which re-lays both sprites from records 0 and 1 and calls
+    /// `FUN_1000d7f0`.
+    Dresses,
+}
+
+impl Slide {
+    /// Which widget each of the two sprites carries, in draw order.
+    fn slots(&self) -> [usize; WIDGETS] {
+        if self.chosen == 0 {
+            [1, 0]
+        } else {
+            [0, 1]
+        }
+    }
+
+    /// `FUN_1000ded0`'s commit arm: the travel for a dress that has just been
+    /// clicked, from the records the screen's own table holds.
+    ///
+    /// It writes every member but `+0x154`, which is why a click during the
+    /// slide back apart keeps that arm and carries the new dress's travel into
+    /// it. A module whose table has no record for a widget leaves that sprite
+    /// with nowhere to go, and it stays where it is rather than the screen
+    /// refusing to commit.
+    pub fn commit(&mut self, atlas: &Atlas, chosen: usize) {
+        self.chosen = chosen;
+        for (slot, widget) in self.slots().into_iter().enumerate() {
+            let from = atlas
+                .widgets
+                .get(widget)
+                .map_or(slid_x(widget), |w| w.dst.x as f32);
+            self.travel[slot] = slid_x(widget) - from;
+            self.offset[slot] = 0.0;
+        }
+        self.frame = 0.0;
+        self.running = true;
+    }
+
+    /// The popup's no: `FUN_1000ded0` sets `+0x154` to 3 and leaves the rest of
+    /// the members alone, so the slide runs back from wherever it stopped.
+    pub fn cancel(&mut self) {
+        self.step = Step::Apart;
+    }
+
+    /// One host tick of `FUN_1000e440`'s slide, before it looks at the pointer.
+    pub fn tick(&mut self) -> Option<Slid> {
+        if !self.running {
+            return None;
+        }
+        match self.step {
+            Step::Together => {
+                self.advance(1.0);
+                if self.frame >= SLIDE_FRAMES {
+                    // The arm snaps each sprite onto its travel rather than
+                    // leaving it on the thirtieth accumulation, and the tick
+                    // that does so is still drawn.
+                    self.offset = self.travel;
+                    self.frame = 0.0;
+                    self.step = Step::Raise;
+                }
+                None
+            }
+            Step::Raise => {
+                self.step = Step::Held;
+                Some(Slid::Popup)
+            }
+            Step::Held => None,
+            Step::Apart => {
+                self.advance(-1.0);
+                if self.frame >= SLIDE_FRAMES {
+                    // The arm re-lays both sprites from records 0 and 1 with
+                    // no offset at all rather than from where thirty
+                    // subtractions left them, which is a clear here — thirty
+                    // thirtieths of 194.5 come back a fraction short.
+                    self.offset = [0.0; WIDGETS];
+                    self.frame = 0.0;
+                    self.step = Step::Together;
+                    self.running = false;
+                    return Some(Slid::Dresses);
+                }
+                None
+            }
+        }
+    }
+
+    /// One tick of travel on both sprites, in the direction the arm runs.
+    fn advance(&mut self, direction: f32) {
+        for slot in 0..WIDGETS {
+            self.offset[slot] += direction * self.travel[slot] / SLIDE_FRAMES;
+        }
+        self.frame += 1.0;
+    }
+
+    /// What the screen draws while this slide is where it is: `+0x13c` against
+    /// `+0x140`. See [`Drawn`].
+    pub fn drawn(&self, phase: Phase) -> Drawn {
+        match (self.running, phase) {
+            (true, Phase::Confirming { .. }) => Drawn::Popup,
+            (false, Phase::Choosing) => Drawn::Dresses,
+            _ => Drawn::Sliding,
+        }
+    }
+
+    /// Whether the next tick moves something, which is every part of the slide
+    /// but the wait while the popup is up.
+    pub fn moving(&self) -> bool {
+        self.running && self.step != Step::Held
+    }
+
+    /// The widget the slide is carrying to the middle.
+    pub fn chosen(&self) -> usize {
+        self.chosen
+    }
+
+    /// The two dresses as the screen draws them, in draw order.
+    ///
+    /// `FUN_1000ef80` re-derives exactly these when the display mode changes
+    /// mid-commit, from the same records and the same offsets, so a resolution
+    /// change during the slide does not move them.
+    pub fn cuts(&self, atlas: &Atlas) -> Vec<Cut> {
+        self.slots()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, widget)| {
+                let source = if widget == self.chosen {
+                    // A table without the lit records draws the chosen dress
+                    // resting rather than not at all, the same answer [`lit`]
+                    // gives the highlight.
+                    lit(atlas, widget).or_else(|| atlas.widgets.get(widget).copied())?
+                } else {
+                    atlas.widgets.get(widget).copied()?
+                };
+                let (w, h) = (source.dst.width as f32, source.dst.height as f32);
+                Some(Cut {
+                    src: (source.src_x as f32, source.src_y as f32, w, h),
+                    dst: (
+                        source.dst.x as f32 + self.offset[slot],
+                        source.dst.y as f32,
+                        w,
+                        h,
+                    ),
+                })
+            })
+            .collect()
     }
 }
 
@@ -470,18 +691,80 @@ mod tests {
         }
     }
 
+    /// A committed slide, run until it has asked for the popup.
+    fn slid(atlas: &Atlas, chosen: usize) -> Slide {
+        let mut slide = Slide::default();
+        slide.commit(atlas, chosen);
+        while slide.tick() != Some(Slid::Popup) {}
+        slide
+    }
+
     /// Both dresses land on the same two `x` positions whichever was chosen,
     /// and the chosen one is drawn last so it is on top.
     #[test]
     fn committing_slides_both_dresses_together() {
         let atlas = atlas();
         for chosen in 0..WIDGETS {
-            let cuts = committed(&atlas, chosen);
+            let cuts = slid(&atlas, chosen).cuts(&atlas);
             assert_eq!(cuts.len(), 2);
             let xs: Vec<f32> = cuts.iter().map(|cut| cut.dst.0).collect();
             assert!(xs.contains(&SLID_LEFT_X) && xs.contains(&SLID_RIGHT_X));
             assert_eq!(cuts.last().expect("the top sprite").src.1, 452.0);
         }
+    }
+
+    /// The slide takes [`SLIDE_FRAMES`] ticks and the popup comes up on the one
+    /// after, which is `FUN_1000e440` arm 0 handing over to arm 1.
+    #[test]
+    fn the_popup_is_one_tick_behind_the_end_of_the_slide() {
+        let atlas = atlas();
+        let mut slide = Slide::default();
+        slide.commit(&atlas, 0);
+        for tick in 1..SLIDE_FRAMES as usize {
+            assert_eq!(slide.tick(), None, "tick {tick}");
+            // Moving, and not yet arrived: a thirtieth of the way per tick.
+            let x = slide.cuts(&atlas)[1].dst.0;
+            assert!(x > 64.0 && x < SLID_LEFT_X, "tick {tick} put it at {x}");
+        }
+        // The thirtieth tick lands them, and is drawn there.
+        assert_eq!(slide.tick(), None);
+        assert_eq!(slide.cuts(&atlas)[1].dst.0, SLID_LEFT_X);
+        assert_eq!(slide.tick(), Some(Slid::Popup));
+        assert_eq!(slide.tick(), None);
+    }
+
+    /// Nothing but the two dresses is drawn while they are moving, and the
+    /// popup only once `+0x140` is up: `FUN_1000c740`'s two gates.
+    #[test]
+    fn the_caption_and_the_highlight_go_the_moment_the_dresses_move() {
+        let atlas = atlas();
+        let mut slide = Slide::default();
+        assert_eq!(slide.drawn(Phase::Choosing), Drawn::Dresses);
+        slide.commit(&atlas, 0);
+        assert_eq!(slide.drawn(Phase::Choosing), Drawn::Sliding);
+        assert!(slide.moving());
+        while slide.tick() != Some(Slid::Popup) {}
+        assert_eq!(slide.drawn(Phase::Confirming { chosen: 0 }), Drawn::Popup);
+        assert!(!slide.moving(), "nothing moves while the popup is up");
+    }
+
+    /// The popup's no runs the same travel backwards and ends where it began:
+    /// `FUN_1000ded0` sets arm 3 and touches nothing else.
+    #[test]
+    fn cancelling_slides_them_back_to_their_records() {
+        let atlas = atlas();
+        let mut slide = slid(&atlas, 1);
+        slide.cancel();
+        assert_eq!(slide.drawn(Phase::Choosing), Drawn::Sliding);
+        let mut ticks = 0;
+        while slide.tick() != Some(Slid::Dresses) {
+            ticks += 1;
+            assert!(ticks < 100, "the slide back never finished");
+        }
+        assert_eq!(slide.drawn(Phase::Choosing), Drawn::Dresses);
+        let cuts = slide.cuts(&atlas);
+        assert_eq!(cuts[0].dst.0, 64.0);
+        assert_eq!(cuts[1].dst.0, 463.0);
     }
 
     /// A module whose table stops at the two the map covers still draws: the
@@ -492,6 +775,8 @@ mod tests {
         atlas.extras.clear();
         assert_eq!(lit(&atlas, 0), None);
         assert_eq!(resting(&atlas).len(), WIDGETS);
-        assert_eq!(committed(&atlas, 0).len(), 1);
+        let cuts = slid(&atlas, 0).cuts(&atlas);
+        assert_eq!(cuts.len(), WIDGETS, "both dresses, the chosen one unlit");
+        assert_eq!(cuts[1].src.1, 1.0);
     }
 }

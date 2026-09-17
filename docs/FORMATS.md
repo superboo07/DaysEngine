@@ -595,8 +595,11 @@ loads `System/DressSelect/DressSelect*.cmap` and `FUN_1000d8c0` loads
 `System/DressSelect/Popup/Popup_Select*.cmap` into the same member, each
 picking its widescreen variant from host `+0xcc`, `+0xd0` and `+0xe4`. So the
 popup has no `SystemInit` code and is not a mode — it is the module's `+0x140`,
-raised once `FUN_1000e440` phase 1 has swapped the map. `src/ui/dress.rs` is
-that screen.
+raised by `FUN_1000e440` arm 1 in the same breath as it takes the popup's art
+and map. `+0x140` is the screen's own state and not a name for which map is
+loaded: `FUN_1000ded0` drops it the moment the popup is answered no, thirty
+frames before arm 3 puts the main map back, so for the length of that slide the
+popup's map is the one catching clicks. `src/ui/dress.rs` is that screen.
 
 Its background is not art of its own: `FUN_1000d980` hands `FUN_10010620`
 `System/Screen/Transparence.png` paired with
@@ -632,11 +635,37 @@ it identically. The player's sheets confirm the shape independently:
 shipped `Popup_Select.cmap`, whose two regions this engine matches to records 4
 and 5 at DLL offset `0x53180`, which is where `DAT_10054980` lands in the file.
 
-Committing slides both dresses together over 30 frames (`_DAT_1004a750`), the
-left to x 258.5 (`_DAT_1004a740`) and the right to 268.5 (`_DAT_1004a748`)
-whichever was chosen; the chosen one is drawn last, from its lit record, so it
-ends on top. `FUN_1000dea0` is the availability test and is `0 <= widget <= 1`
-on both maps — neither dress is ever locked.
+**Committing does not raise the popup, it slides there.** `FUN_1000ded0` gives
+each of the two sprites a distance to travel — the difference between its
+resting `x` and the constant for the side it came from — and raises `+0x13c`;
+`FUN_1000e440` arm 0 then adds a thirtieth of that distance to each sprite's
+offset per tick and counts `+0x12c` up to 30 (`_DAT_1004a750`). The left dress
+lands at x 258.5 (`_DAT_1004a740`) and the right at 268.5 (`_DAT_1004a748`)
+whichever was chosen, and both sprites are 273 wide, so they finish **stacked in
+the middle of the 800-wide layout**, the chosen one drawn last from its lit
+record and so on top. Arm 1, which is the tick after, takes the popup's art and
+map; the popup's no sets `+0x154` to 3 and arm 3 runs the same travel backwards
+and reloads the main map at the end of it. `FUN_1000dea0` is the availability
+test and is `0 <= widget <= 1` on both maps — neither dress is ever locked, and
+that includes a click that lands while the slide is running, which re-aims it.
+
+A tick is one presented frame: `FUN_004011e0`'s message loop runs
+`FUN_004158c0` once round, its default arm reaches `FUN_00413250` case 3, and
+that calls the module's update and then `FUN_00409690`, which ends in
+`IDirect3DDevice9::Present`. Nothing else paces the loop, and the device's
+`PresentationInterval` is `D3DPRESENT_INTERVAL_DEFAULT` — `FUN_00408ac0`
+`memset`s the present parameters and never writes `+0x34` — so the slide is 30
+refreshes of the player's display, and this engine gives it 30 passes round its
+own vsynced loop.
+
+**What is drawn follows `+0x13c` and `+0x140` together.** `FUN_1000c740` draws
+the two dresses unconditionally, the dress under the pointer and the caption
+only while `+0x13c == 0 && +0x140 == 0`, and the popup and its own hovered
+widget only while both are set. The two disagree for exactly as long as a slide
+is running, so the caption goes the moment the dresses start moving rather than
+when the popup arrives, and the popup goes the moment its no is clicked rather
+than when the dresses are back. `daysengine menu --mode 9 -e click:200:200,tick:15`
+stops the slide half way and draws it.
 
 **What the screen selects reaches `RouteProcSD.dll`.** `FUN_1000ded0` reports
 the choice the moment it is committed, through host `+0x48(1)` for widget 0 and
