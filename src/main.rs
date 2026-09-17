@@ -44,7 +44,7 @@ use daysengine::ui::options::{self, Dir, Display, Som};
 use daysengine::ui::paths::Paths;
 use daysengine::ui::replay::{self, Scenes};
 use daysengine::ui::saveload::{self, Slots};
-use daysengine::ui::screen::Resolution;
+use daysengine::ui::screen::{self, Layer, Resolution};
 use daysengine::ui::select::{self, Choice, Input, Select};
 use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
@@ -54,7 +54,8 @@ use sdl3::joystick::JoystickId;
 use sdl3::keyboard::Keycode;
 use sdl3::mouse::MouseButton;
 use sdl3::pixels::{Color, PixelFormat};
-use sdl3::render::{BlendMode, Canvas, FRect, ScaleMode, Texture, TextureCreator};
+use sdl3::rect::Rect;
+use sdl3::render::{BlendMode, Canvas, ClippingRect, FRect, ScaleMode, Texture, TextureCreator};
 use sdl3::video::{Window, WindowContext};
 use sdl3::EventPump;
 use sdl3::GamepadSubsystem;
@@ -1614,7 +1615,9 @@ fn run_menu(
         play_menu_bgm(player, start.get("TitleBGM"));
     }
 
-    let mut texture: Option<Texture> = None;
+    // The textures the menu's layers are drawn from, kept across frames and
+    // across screens; see `Layers`.
+    let mut textures = Layers::new(creator, player.whole_pixels());
     // The slot the player picked on the save screen, waiting for the
     // comment dialog to confirm or abandon it.
     let mut naming: Option<u32> = None;
@@ -1757,7 +1760,6 @@ fn run_menu(
                 // engine picks the new volumes up.
                 Action::SettingsChanged => {
                     apply_settings(menu.session(), player.mixer);
-                    texture = None;
                 }
                 // The Option screen's close button. `FUN_10007ef0` widget 3
                 // flushes the config object and then leaves the menus with
@@ -1773,9 +1775,8 @@ fn run_menu(
                         }
                         menu.session_mut().config = config;
                     }
-                    match menu.leave(player.vfs, &player.dll)? {
-                        Action::Play => return Ok(Outcome::Play),
-                        _ => texture = None,
+                    if let Action::Play = menu.leave(player.vfs, &player.dll)? {
+                        return Ok(Outcome::Play);
                     }
                 }
                 // The Def tab does not change the display itself: it raises a
@@ -1802,7 +1803,6 @@ fn run_menu(
                     // Full screen can land the window on a panel that refreshes
                     // at another rate.
                     cadence = Cadence::new(canvas);
-                    texture = None;
                 }
                 // The SOMCON tab asked something of the device, and the
                 // engine is the half that knows what is really there.
@@ -1851,7 +1851,6 @@ fn run_menu(
                     }
                     menu.set_som(player.vfs, &player.dll, som)?;
                     apply_settings(menu.session(), player.mixer);
-                    texture = None;
                 }
                 Action::Sound(se) => {
                     player
@@ -1877,7 +1876,6 @@ fn run_menu(
                         &mut player.sounds,
                         player.mixer,
                     );
-                    texture = None;
                 }
                 Action::Stay => {}
             }
@@ -1901,11 +1899,18 @@ fn run_menu(
                     .unwrap_or_default();
                 // Cancelling calls nothing, so nothing is taken and no save
                 // happens — `FUN_0042e4a0` simply never reaches `_CommentSet@4`.
-                run_comment(player, canvas, creator, events, &mut menu, &existing)?
+                run_comment(
+                    player,
+                    canvas,
+                    creator,
+                    events,
+                    &mut menu,
+                    &mut textures,
+                    &existing,
+                )?
             } else {
                 Some(String::new())
             };
-            texture = None;
             if let Some(comment) = taken {
                 menu.begin_save(slot, comment);
             }
@@ -1943,7 +1948,6 @@ fn run_menu(
                 }
             };
             menu.finish_save(slot, line.unwrap_or_default());
-            texture = None;
         }
 
         // Where the screen lands, and then the screen composited at exactly
@@ -1972,28 +1976,20 @@ fn run_menu(
             menu.set_output_size(at.0, at.1);
             // The backdrop is scaled into the screen's space, so it follows.
             under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
-            texture = None;
         }
-        if menu.dirty() || texture.is_none() {
-            // The backdrop is only the title's; every other screen draws its own
-            // background or sits over black.
-            let image = menu.compose(
-                (menu.showing().is(Mode::TITLE))
-                    .then_some(under.as_ref())
-                    .flatten(),
-            );
-            let mut new = new_texture(creator, image.width, image.height, art_sampling(whole))?;
-            new.update(None, &image.rgba, image.width as usize * 4)?;
-            texture = Some(new);
-        }
+        // The backdrop is only the title's; every other screen draws its own
+        // background or sits over black.
+        let under = (menu.showing().is(Mode::TITLE))
+            .then_some(under.as_ref())
+            .flatten();
+        // Rasterises whatever the menu draws for itself, and only when
+        // something moved it; the layers below are then the same list as the
+        // last frame's, and the textures behind them are still good.
+        menu.prepare(under);
 
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
-        if let Some(texture) = &texture {
-            canvas
-                .copy(texture, None, dst)
-                .map_err(|e| anyhow::anyhow!("drawing the menu: {e}"))?;
-        }
+        textures.draw(canvas, &menu.layers(under), dst, at, whole)?;
         canvas.present();
         cadence.wait(now);
     }
@@ -2014,6 +2010,7 @@ fn run_comment(
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     menu: &mut Menu,
+    textures: &mut Layers<'_>,
     existing: &str,
 ) -> Result<Option<String>> {
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
@@ -2034,17 +2031,28 @@ fn run_comment(
     let base = comment::base_units(english);
 
     player.text_input.start(canvas.window());
-    let result = comment_loop(player, canvas, creator, events, menu, &mut dialog, base);
+    let result = comment_loop(
+        player,
+        canvas,
+        creator,
+        events,
+        menu,
+        textures,
+        &mut dialog,
+        base,
+    );
     player.text_input.stop(canvas.window());
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn comment_loop(
     player: &mut Player,
     canvas: &mut Canvas<Window>,
     creator: &TextureCreator<WindowContext>,
     events: &mut EventPump,
     menu: &mut Menu,
+    textures: &mut Layers<'_>,
     dialog: &mut comment::Comment,
     base: (i32, i32),
 ) -> Result<Option<String>> {
@@ -2138,8 +2146,12 @@ fn comment_loop(
             }
         }
 
+        // The menu under the dialog is the menu: its own layers, drawn from
+        // the same textures the screen behind this loop was drawn from, so
+        // typing a character costs the dialog and nothing else. Before this it
+        // recomposited and re-uploaded the whole screen per keystroke.
+        size = menu.screen().size();
         if dirty || texture.is_none() {
-            let mut image = menu.compose(None);
             // The menu under it is composited straight at the size the window
             // will show — see `Screen::fit_to` — so the dialog is magnified by
             // the same factor. Drawn at its own pixel size it would keep
@@ -2153,29 +2165,45 @@ fn comment_loop(
             // does too.
             let (w, h) = (over.width, over.height);
             let at = (
-                (image.width as i64 - w as i64) / 2,
-                (image.height as i64 - h as i64) / 2,
+                (size.0 as i64 - w as i64) / 2,
+                (size.1 as i64 - h as i64) / 2,
             );
-            image.blit_scaled(&over, (0, 0, w, h), (at.0, at.1, w, h));
-            // Written where it was drawn, so `to_dialog` cannot disagree with
-            // the blit above about where the dialog is.
+            // Written where it is drawn, so `to_dialog` cannot disagree with
+            // the copy below about where the dialog is.
             placed = Some(Placed {
                 at,
                 size: (w, h),
                 scale,
             });
-            size = (image.width, image.height);
-            let mut new = new_texture(creator, image.width, image.height, art_sampling(whole))?;
-            new.update(None, &image.rgba, image.width as usize * 4)?;
+            let mut new = new_texture(creator, w, h, art_sampling(whole))?;
+            new.set_blend_mode(BlendMode::Blend);
+            new.update(None, &over.rgba, w as usize * 4)?;
             texture = Some(new);
             dirty = false;
         }
 
+        let dst = letterbox(canvas, size.0, size.1, whole);
+        let k = if size.0 == 0 {
+            1.0
+        } else {
+            dst.w / size.0 as f32
+        };
+        menu.prepare(None);
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
-        if let Some(texture) = &texture {
+        textures.draw(canvas, &menu.layers(None), dst, size, whole)?;
+        if let (Some(texture), Some(at)) = (&texture, placed) {
             canvas
-                .copy(texture, None, letterbox(canvas, size.0, size.1, whole))
+                .copy(
+                    texture,
+                    None,
+                    FRect::new(
+                        dst.x + at.at.0 as f32 * k,
+                        dst.y + at.at.1 as f32 * k,
+                        at.size.0 as f32 * k,
+                        at.size.1 as f32 * k,
+                    ),
+                )
                 .map_err(|e| anyhow::anyhow!("drawing the comment dialog: {e}"))?;
         }
         canvas.present();
@@ -2485,6 +2513,138 @@ fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
 /// leaving it to SDL's default is the difference between a recovered choice and
 /// an inherited one — and it is what lets whole-number scaling say otherwise;
 /// see [`art_sampling`].
+/// The textures a menu frame's layers are drawn from, kept between frames.
+///
+/// The menus are drawn the way the original draws them: one textured quad per
+/// layer, with nothing composited on the CPU and nothing uploaded that has not
+/// changed. `FUN_1000c740` and the rest hand Direct3D a quad per sprite and
+/// never touch a pixel themselves, and this is the same picture through the
+/// same kind of pipe.
+///
+/// What is held is keyed on [`screen::Key`], which carries the source image's
+/// version (see `days_ui::Image::version`) — so a texture is reused only while
+/// the pixels behind it are the ones it was uploaded from, and a change
+/// anywhere is a miss rather than a stale sprite. See
+/// `daysengine::ui::screen::Layer`.
+struct Layers<'r> {
+    creator: &'r TextureCreator<WindowContext>,
+    held: HashMap<screen::Key, Held<'r>>,
+    /// Which sampling the textures were made with. The whole-number scaling
+    /// setting picks it, and changing that setting mid-run throws them away.
+    whole: bool,
+    frame: u64,
+}
+
+struct Held<'r> {
+    texture: Texture<'r>,
+    /// The frame this was last drawn on; see [`Layers::sweep`].
+    last: u64,
+}
+
+/// How many frames a texture nothing has drawn is kept before it is dropped.
+///
+/// Long enough that moving the pointer off a widget and back does not re-upload
+/// its sprite, short enough that a screen the player has left does not hold its
+/// base art on the GPU.
+const KEEP_FRAMES: u64 = 240;
+
+impl<'r> Layers<'r> {
+    fn new(creator: &'r TextureCreator<WindowContext>, whole: bool) -> Layers<'r> {
+        Layers {
+            creator,
+            held: HashMap::new(),
+            whole,
+            frame: 0,
+        }
+    }
+
+    /// Draws one frame's layers into `dst`, uploading only what is new.
+    ///
+    /// `out` is the space the layers are placed in — the size the menu
+    /// composites at — and `dst` is where that rectangle lands in the window.
+    /// The two are the same size in every case but whole-number scaling, where
+    /// `dst` is an integer multiple and the sampling above is nearest, so a
+    /// layer's pixels are multiplied into blocks exactly as the one composited
+    /// image used to be.
+    fn draw(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        layers: &[Layer],
+        dst: FRect,
+        out: (u32, u32),
+        whole: bool,
+    ) -> Result<()> {
+        if whole != self.whole {
+            self.held.clear();
+            self.whole = whole;
+        }
+        self.frame += 1;
+        let k = if out.0 == 0 {
+            1.0
+        } else {
+            dst.w / out.0 as f32
+        };
+        // A composite clipped what it drew to its own bounds, and a widget
+        // record is free to hang off the edge -- the save/load rows' own
+        // sprites do. A quad has no such edge, so the renderer is given one,
+        // or a sprite that used to be cut off would run out over the
+        // letterbox bars.
+        canvas.set_clip_rect(Rect::new(
+            dst.x.floor() as i32,
+            dst.y.floor() as i32,
+            dst.w.ceil().max(0.0) as u32,
+            dst.h.ceil().max(0.0) as u32,
+        ));
+        for layer in layers {
+            let (x, y, w, h) = layer.rect();
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let held = match self.held.entry(layer.key()) {
+                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let art = layer.realize();
+                    let mut texture =
+                        new_texture(self.creator, art.width, art.height, art_sampling(whole))?;
+                    texture.set_blend_mode(BlendMode::Blend);
+                    texture.update(None, &art.rgba, art.width as usize * 4)?;
+                    slot.insert(Held { texture, last: 0 })
+                }
+            };
+            held.last = self.frame;
+            canvas
+                .copy(
+                    &held.texture,
+                    None,
+                    FRect::new(
+                        dst.x + x as f32 * k,
+                        dst.y + y as f32 * k,
+                        w as f32 * k,
+                        h as f32 * k,
+                    ),
+                )
+                .map_err(|e| anyhow::anyhow!("drawing a menu layer: {e}"))?;
+        }
+        canvas.set_clip_rect(ClippingRect::None);
+        self.sweep();
+        Ok(())
+    }
+
+    /// Drops what nothing has drawn for [`KEEP_FRAMES`].
+    ///
+    /// Swept on a fraction of frames rather than every one: the map holds a
+    /// screen's worth of entries, and walking it is only worth doing at all
+    /// because the base art in it is megabytes.
+    fn sweep(&mut self) {
+        if !self.frame.is_multiple_of(60) {
+            return;
+        }
+        let frame = self.frame;
+        self.held
+            .retain(|_, held| frame.saturating_sub(held.last) < KEEP_FRAMES);
+    }
+}
+
 fn new_texture<'a>(
     creator: &'a TextureCreator<WindowContext>,
     width: u32,
