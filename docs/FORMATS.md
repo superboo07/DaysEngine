@@ -164,6 +164,24 @@ Tab 1, from `FUN_10006a20` and `FUN_10009430`: widgets 4, 5 are `MenVoice`
 (`+0xd4`) on and off, widgets 6, 7 are `Mute` (`+0x184`) on and off. Widget 6
 also calls host `+0x90` with the new value.
 
+#### The Sound tab's male-voice caption contradicts its own buttons
+
+Widget 4 — the left button of the pair, record 0 at x 78, drawn from the chip
+sheet's first cell, which reads `ON` — sets `MenVoice` to 1, and a `MenVoice`
+of 1 is what **plays** male lines: `FUN_0043b110` refuses a line whose flag is
+set only when `_GetMenVoice@0` returns zero. The art over that row says
+`Male Voice Setting` / *Turn off male voices.*, and every other caption on the
+page states what its `ON` does — *Allow fast-forward on unread blocks*,
+*Display subtitles*, *Mute all sounds*. Read the same way, this one is
+backwards.
+
+The buttons are what the engine goes by, in both titles, and School Days HQ's
+version of the row is the unambiguous one: its art is `Male Voices` with `ON`
+and `OFF` and no caption, over the same code. So the caption is a line of art
+text that disagrees with the screen it sits on, not a behaviour: nothing here
+is inverted for Shiny Days, and inverting it would also flip the setting for
+the retail game, which reads the same `Config.DAT`.
+
 Tab 2, from `FUN_100070f0` and `FUN_100095c0`: widgets 4, 5 are `UseSOM`
 (`+0x224`) on and off — widget 4 runs the port scan and widget 5 clears both
 `+0x224` and `+0x218` — and widgets 6, 7 start and stop a test pulse
@@ -3758,8 +3776,21 @@ engine INI with a banner line:
 
 The `Config` class in the executable writes every scalar with `%d` or `%f`
 (`FUN_0046cd30` and its neighbours, reached from `FUN_0046c520`, the one
-function that references the banner). The values it is handed are Windows
-`VARIANT`s, so **a true bool is written as `-1`**.
+function that references the banner; `FUN_0044bfe0` and the format string
+`[%s]="%d"` are the same writer in `SHINYDAYS.exe`). What it is handed is the
+menu's own member, and **a true bool reaches it spelled two different ways**:
+
+- **`1`** when the player has just pressed the button. `FUN_10008260` stores
+  the literal `1` in `+0xa8` and `FUN_10009430` stores it in `+0xd4`, and the
+  key is written from that member in the same breath.
+- **`-1`** when the value came back from the file. The getter returns the
+  `VARIANT_BOOL` the conversion produced — `-1` for true — and the member holds
+  that until something presses the button again.
+
+So a retail install's file migrates: the first run writes the defaults as `1`,
+and every run after that loads them, gets `-1`, and writes `-1` back. Both are
+the retail writer's own spelling of true, and both read as true. This engine
+writes `1`, because every write it makes is a press.
 
 The getters are the class's vtable at `0x004d73d0`:
 

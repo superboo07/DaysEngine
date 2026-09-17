@@ -23,11 +23,17 @@
 //! [TextView]="-1"
 //! ```
 //!
-//! # Why a bool is `-1`, and how one is read back
+//! # Why a true bool is written `1` here and `-1` in a played install
 //!
 //! `Config`'s writer formats every scalar with `%d` (`FUN_0046cd30` and its
-//! neighbours) and the values it is handed are Windows `VARIANT`s, so a true
-//! bool arrives as `VARIANT_TRUE` and prints as `-1`.
+//! neighbours; `FUN_0044bfe0` and `[%s]="%d"` in `SHINYDAYS.exe`), and what it
+//! is handed is the menu's own member. That member holds a true bool spelled
+//! two ways. A button press stores the literal `1` — `FUN_10008260` into
+//! `+0xa8`, `FUN_10009430` into `+0xd4` — and writes the key from it. A value
+//! that came back from the file is the `VARIANT_BOOL` the getter converted,
+//! which is `-1`. So a retail file's first run carries `1` and every run after
+//! it carries `-1`, both meaning true. Every write this engine makes is a
+//! press, so [`Config::set_flag`] writes `1`.
 //!
 //! The getters are the other half, and they are the class's vtable at
 //! `0x004d73d0`: slot `+0xc` a string, `+0x10` a bool, `+0x14` an int, `+0x18`
@@ -495,9 +501,17 @@ impl Config {
         }
     }
 
-    /// Sets a bool, writing it the way the shipped writer does.
+    /// Sets a bool, writing it the way a pressed button writes it.
+    ///
+    /// The shipped writer prints `%d` of the menu's member, and a press stores
+    /// the literal `1` there (`FUN_10009430` for `MenVoice` and `Mute`,
+    /// `FUN_10008260` on the other module). A file that has been loaded and
+    /// saved again carries `-1` instead, because the member is then the
+    /// `VARIANT_BOOL` the getter returned; both read as true, here and in the
+    /// retail reader. Every write this engine makes is a press, so this writes
+    /// what a press writes.
     pub fn set_flag(&mut self, flag: Flag, value: bool) {
-        self.set(flag.key(), if value { "-1" } else { "0" });
+        self.set(flag.key(), if value { "1" } else { "0" });
     }
 
     /// A volume, clamped into the range the DLL enforces.
