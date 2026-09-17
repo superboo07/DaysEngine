@@ -649,6 +649,18 @@ and reloads the main map at the end of it. `FUN_1000dea0` is the availability
 test and is `0 <= widget <= 1` on both maps — neither dress is ever locked, and
 that includes a click that lands while the slide is running, which re-aims it.
 
+**This engine loads both maps as the screen comes up.** The original reads the
+popup's art and hit map inside arm 1 and the dresses' back inside arm 3 — both
+of them frames of the slide, and a tick is a presented frame (below). Decoding
+a screen's art and resampling it to the window is tens of milliseconds, so each
+end of the slide stalled on the frame that swapped the maps. Here
+`Menu::load_dress` loads the other map beside the loaded one when the screen is
+entered and the swap is a move; the maps still change hands on the same frames,
+and only when the files are read differs. The two dresses are brought to the
+size they are drawn at on the same schedule, a sprite a frame while the screen
+is at rest, because the click that starts the slide has no time for them
+either — `Menu::warm_layers`.
+
 A tick is one presented frame: `FUN_004011e0`'s message loop runs
 `FUN_004158c0` once round, its default arm reaches `FUN_00413250` case 3, and
 that calls the module's update and then `FUN_00409690`, which ends in

@@ -356,6 +356,29 @@ pub fn lit(atlas: &Atlas, widget: usize) -> Option<Widget> {
     atlas.extras.get(widget).copied()
 }
 
+/// Every sprite the commit slide can draw, in their resting rectangles.
+///
+/// The two dresses and the two lit records behind them: which pair a slide
+/// uses depends on which dress is clicked, and all four are the same four
+/// however it goes. They are here so that a caller can bring them to the size
+/// they are drawn at before the click that starts the slide — what identifies
+/// a realized cut is its source and its size, and neither moves while the
+/// slide runs; only where it lands does. See [`Slide::cuts`] and
+/// [`crate::ui::menu::Menu::warm_layers`].
+pub fn slide_cuts(atlas: &Atlas) -> Vec<Cut> {
+    (0..WIDGETS)
+        .flat_map(|widget| [atlas.widgets.get(widget).copied(), lit(atlas, widget)])
+        .flatten()
+        .map(|source| {
+            let (w, h) = (source.dst.width as f32, source.dst.height as f32);
+            Cut {
+                src: (source.src_x as f32, source.src_y as f32, w, h),
+                dst: (source.dst.x as f32, source.dst.y as f32, w, h),
+            }
+        })
+        .collect()
+}
+
 /// The two dresses' resting sprites, which this screen draws itself.
 ///
 /// `FUN_1000c740` walks `+0xc8` and `+0xcc` before anything else and draws both
@@ -765,6 +788,36 @@ mod tests {
         let cuts = slide.cuts(&atlas);
         assert_eq!(cuts[0].dst.0, 64.0);
         assert_eq!(cuts[1].dst.0, 463.0);
+    }
+
+    /// What a slide can draw is the four records, whichever dress is clicked,
+    /// and each of them at the source and size a realized cut is keyed by —
+    /// which is what makes warming them before the click work.
+    #[test]
+    fn the_cuts_to_warm_are_every_sprite_a_slide_can_draw() {
+        let atlas = atlas();
+        let warm = slide_cuts(&atlas);
+        assert_eq!(warm.len(), 4);
+        for chosen in 0..WIDGETS {
+            let mut slide = Slide::default();
+            slide.commit(&atlas, chosen);
+            for cut in slide.cuts(&atlas) {
+                assert!(
+                    warm.iter()
+                        .any(|w| w.src == cut.src && w.dst.2 == cut.dst.2 && w.dst.3 == cut.dst.3),
+                    "the slide draws a sprite nothing warmed: {cut:?}"
+                );
+            }
+        }
+    }
+
+    /// A table without the lit records has nothing to warm for them either,
+    /// and warms what it does have rather than refusing.
+    #[test]
+    fn the_cuts_to_warm_follow_the_table() {
+        let mut atlas = atlas();
+        atlas.extras.clear();
+        assert_eq!(slide_cuts(&atlas).len(), WIDGETS);
     }
 
     /// A module whose table stops at the two the map covers still draws: the

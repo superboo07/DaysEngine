@@ -359,7 +359,9 @@ pub struct Screen {
     /// `RefCell` because compositing takes `&self`: it is a memo of a pure
     /// function, not state. Nothing re-enters it — realizing a cut does not
     /// draw anything.
-    realized: std::cell::RefCell<std::collections::HashMap<Key, Image>>,
+    /// Shared, so that two screens that draw the same sprites realize them
+    /// once between them: see [`Screen::share_realized`].
+    realized: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Key, Image>>>,
 }
 
 /// How many realized cuts a screen keeps before it starts again.
@@ -1017,6 +1019,58 @@ impl Screen {
         out
     }
 
+    /// Realizes what this screen draws into the same memo as another screen's.
+    ///
+    /// The dress-select screen keeps both of its hit maps loaded and draws the
+    /// two dresses through whichever of them is up — see
+    /// [`crate::ui::menu::Menu::load_dress`]. The sprites are the same sprites
+    /// at the same size, and what identifies a realized cut says nothing about
+    /// which screen asked for it, so the two share one answer rather than each
+    /// paying for it.
+    pub fn share_realized(&mut self, other: &Screen) {
+        self.realized = std::rc::Rc::clone(&other.realized);
+    }
+
+    /// A layer's realized pixels, when this screen has them already.
+    ///
+    /// `None` rather than realizing them, so that a caller that turns them
+    /// into something of its own — the player's textures — follows the pace
+    /// [`Screen::warm`] sets rather than paying for a sprite the screen has
+    /// not brought to size yet. A copy, because the memo outlives the answer
+    /// and copying a sprite costs a fraction of realizing one.
+    pub fn realized(&self, layer: &Layer) -> Option<Image> {
+        self.realized.borrow().get(&layer.key()).cloned()
+    }
+
+    /// Whether [`Screen::realized`] would answer, without the copy.
+    pub fn is_realized(&self, layer: &Layer) -> bool {
+        self.realized.borrow().contains_key(&layer.key())
+    }
+
+    /// Brings a layer's pixels to the size they are drawn at and keeps them,
+    /// without drawing anything.
+    ///
+    /// For a layer that is about to be wanted on a frame that will not have
+    /// time to prepare it — see [`crate::ui::menu::Menu::warm_layers`]. True
+    /// when this call is what realized it, so that a caller warming a list can
+    /// spread the work over as many frames as the list is long. An
+    /// [`Art::Whole`] has nothing to prepare and is ignored.
+    pub fn warm(&self, layer: &Layer) -> bool {
+        if matches!(layer.art, Art::Whole(_)) {
+            return false;
+        }
+        let mut realized = self.realized.borrow_mut();
+        if realized.len() >= REALIZED_MAX {
+            realized.clear();
+        }
+        let key = layer.key();
+        if realized.contains_key(&key) {
+            return false;
+        }
+        realized.insert(key, layer.realize().into_owned());
+        true
+    }
+
     /// Draws one layer onto an image, which is always a 1:1 alpha blit of its
     /// realized pixels.
     ///
@@ -1129,44 +1183,112 @@ fn sampled(src: &Image, rect: (f32, f32, f32, f32), size: (u32, u32)) -> Image {
     let (sx, sy, sw, sh) = rect;
     let (dw, dh) = size;
     let mut out = Image::empty(dw, dh);
-    if dw == 0 || dh == 0 {
+    if dw == 0 || dh == 0 || src.width == 0 || src.height == 0 {
         return out;
     }
+    // Which two source columns each destination pixel mixes, and in what
+    // proportion, worked out once for the whole image: the map is the same on
+    // every row, and inline it cost a division and two clamps per pixel. This
+    // is the saving `Image::blit_scaled` takes, for the same reason.
+    let cols: Vec<(usize, usize, f32)> = (0..dw)
+        .map(|col| {
+            let u = sx + (col as f32 + 0.5) * sw / dw as f32 - 0.5;
+            texels(u, src.width)
+        })
+        .collect();
+    // The window of the sheet those columns read, so that a row of it is
+    // premultiplied into the width it is sampled through rather than the
+    // sheet's own.
+    let from = cols.iter().map(|(x0, _, _)| *x0).min().unwrap_or(0);
+    let to = cols.iter().map(|(_, x1, _)| *x1 + 1).max().unwrap_or(0);
+    let mut top = Row::default();
+    let mut bottom = Row::default();
     for (row, line) in out.rgba.chunks_exact_mut(dw as usize * 4).enumerate() {
         let v = sy + (row as f32 + 0.5) * sh / dh as f32 - 0.5;
-        for (col, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let u = sx + (col as f32 + 0.5) * sw / dw as f32 - 0.5;
-            *px = bilinear(src, u, v);
+        let (y0, y1, fy) = texels(v, src.height);
+        // Both rows are premultiplied once and read by every destination pixel
+        // on the line, and the row a line ends on is usually the row the next
+        // one starts on: at 1080p the dresses are drawn 2.4x their own size, so
+        // each source row is read by five lines. Converting it per sample cost
+        // four divisions a pixel.
+        if bottom.at == Some(y0) {
+            std::mem::swap(&mut top, &mut bottom);
+        }
+        top.fill(src, y0, from, to);
+        if y1 != y0 {
+            bottom.fill(src, y1, from, to);
+        }
+        let below = if y1 == y0 { &top } else { &bottom };
+        for (px, (x0, x1, fx)) in line.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+            let (x0, x1) = (x0 - from, x1 - from);
+            *px = mix(
+                [top.px[x0], top.px[x1], below.px[x0], below.px[x1]],
+                *fx,
+                fy,
+            );
         }
     }
     out
 }
 
-/// One bilinear sample of `src` at `(u, v)` in texel space, edges clamped.
-fn bilinear(src: &Image, u: f32, v: f32) -> [u8; 4] {
-    let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max.saturating_sub(1));
-    let (x0, y0) = (clamp(u.floor(), src.width), clamp(v.floor(), src.height));
-    let (x1, y1) = (
-        clamp(u.floor() + 1.0, src.width),
-        clamp(v.floor() + 1.0, src.height),
-    );
-    let fx = (u - u.floor()).clamp(0.0, 1.0);
-    let fy = (v - v.floor()).clamp(0.0, 1.0);
+/// One row of a sheet, premultiplied, over the columns a [`sampled`] cut reads.
+///
+/// Premultiplied for the reason [`resampled`] is: the sheet's transparent
+/// pixels carry arbitrary colour, and blending them unpremultiplied would drag
+/// it into the edge of the cut. The fourth channel is the alpha itself, which
+/// is what the blend carries through.
+#[derive(Default)]
+struct Row {
+    /// Which row of the sheet this holds, so that a row already converted is
+    /// not converted again.
+    at: Option<usize>,
+    px: Vec<[f32; 4]>,
+}
+
+impl Row {
+    fn fill(&mut self, src: &Image, row: usize, from: usize, to: usize) {
+        if self.at == Some(row) {
+            return;
+        }
+        let stride = src.width as usize * 4;
+        let line = &src.rgba[row * stride + from * 4..row * stride + to * 4];
+        self.px.clear();
+        self.px.extend(line.as_chunks::<4>().0.iter().map(|p| {
+            let a = f32::from(p[3]) / 255.0;
+            [
+                f32::from(p[0]) * a,
+                f32::from(p[1]) * a,
+                f32::from(p[2]) * a,
+                f32::from(p[3]),
+            ]
+        }));
+        self.at = Some(row);
+    }
+}
+
+/// The two texels a coordinate falls between and how far it is between them,
+/// with the edges clamped as `D3DSAMP_ADDRESSU`/`V` clamp them.
+fn texels(t: f32, extent: u32) -> (usize, usize, f32) {
+    let clamp = |v: f32| (v.max(0.0) as u32).min(extent - 1) as usize;
+    let floor = t.floor();
+    (
+        clamp(floor),
+        clamp(floor + 1.0),
+        (t - floor).clamp(0.0, 1.0),
+    )
+}
+
+/// The bilinear blend of four premultiplied texels, in the order top left, top
+/// right, bottom left, bottom right.
+fn mix(texels: [[f32; 4]; 4], fx: f32, fy: f32) -> [u8; 4] {
     let mut acc = [0.0f32; 4];
-    for (x, y, w) in [
-        (x0, y0, (1.0 - fx) * (1.0 - fy)),
-        (x1, y0, fx * (1.0 - fy)),
-        (x0, y1, (1.0 - fx) * fy),
-        (x1, y1, fx * fy),
-    ] {
-        let Some(p) = src.pixel(x, y) else { continue };
-        let a = f32::from(p[3]) / 255.0;
-        for (slot, c) in acc.iter_mut().zip([
-            f32::from(p[0]) * a,
-            f32::from(p[1]) * a,
-            f32::from(p[2]) * a,
-            f32::from(p[3]),
-        ]) {
+    for (p, w) in texels.into_iter().zip([
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ]) {
+        for (slot, c) in acc.iter_mut().zip(p) {
             *slot += c * w;
         }
     }
@@ -1211,6 +1333,52 @@ mod tests {
             Resolution::Note,
             "1024x576 with it"
         );
+    }
+
+    /// A cut is sampled at the texel its destination pixel's centre falls on,
+    /// with the edges clamped the way `D3DSAMP_ADDRESSU`/`V` clamp them: a
+    /// source rectangle that runs off the sheet repeats its edge texel rather
+    /// than wrapping or dropping out.
+    #[test]
+    fn a_cut_samples_between_texels_and_clamps_at_the_edges() {
+        let mut src = Image::black(2, 1);
+        src.rgba
+            .copy_from_slice(&[0, 0, 0, 255, 255, 255, 255, 255]);
+        let ramp = sampled(&src, (0.0, 0.0, 2.0, 1.0), (8, 1));
+        let greys: Vec<u8> = ramp.rgba.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        assert!(
+            greys.windows(2).all(|w| w[0] <= w[1]),
+            "the ramp must not reverse: {greys:?}"
+        );
+        assert!(
+            greys.iter().any(|v| (8..248).contains(v)),
+            "point sampling would give only 0 and 255: {greys:?}"
+        );
+        let off = sampled(&src, (-4.0, -4.0, 2.0, 1.0), (4, 1));
+        assert!(
+            off.rgba.as_chunks::<4>().0.iter().all(|p| p[0] == 0),
+            "off the top left, every sample is the corner texel"
+        );
+    }
+
+    /// A transparent texel's colour is arbitrary — the sheets carry black
+    /// under the alpha — so the blend weights colour by alpha and takes it
+    /// back out, or the edge of every cut would be dragged towards it.
+    #[test]
+    fn a_cut_blends_colour_through_alpha() {
+        let mut src = Image::black(2, 1);
+        src.rgba.copy_from_slice(&[0, 0, 0, 0, 200, 100, 50, 255]);
+        let out = sampled(&src, (0.0, 0.0, 2.0, 1.0), (4, 1));
+        for px in out.rgba.as_chunks::<4>().0 {
+            if px[3] == 0 {
+                continue;
+            }
+            assert_eq!(
+                [px[0], px[1], px[2]],
+                [200, 100, 50],
+                "a half-covered pixel keeps the covered texel's colour"
+            );
+        }
     }
 
     /// Art scaled up to a display size is filtered, not point-sampled: the

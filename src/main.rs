@@ -45,7 +45,7 @@ use daysengine::ui::options::{self, Dir, Display, Som};
 use daysengine::ui::paths::Paths;
 use daysengine::ui::replay::{self, Scenes};
 use daysengine::ui::saveload::{self, Slots};
-use daysengine::ui::screen::{self, Layer, Resolution};
+use daysengine::ui::screen::{self, Layer, Resolution, Screen};
 use daysengine::ui::select::{self, Choice, Input, Select};
 use daysengine::{install::ini::Ini, playback::text, Mixer, Stage};
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream};
@@ -2138,6 +2138,11 @@ fn run_menu(
         // something moved it; the layers below are then the same list as the
         // last frame's, and the textures behind them are still good.
         menu.prepare(under);
+        // What the next moving frame will draw, brought to the GPU while
+        // nothing is moving: the dress-select slide's two dresses are the only
+        // ones, and the click that starts them has no time for them. See
+        // `Menu::warm_layers`.
+        textures.warm(menu.screen(), &menu.warm_layers(), whole)?;
         // The dress-select screen is the one screen with something moving
         // behind it. It is opened when that screen comes up and dropped when
         // the player leaves, which is also what the original does: the mode
@@ -2158,7 +2163,7 @@ fn run_menu(
         if let Some(Some(back)) = &dress_back {
             back.draw(canvas, dst);
         }
-        textures.draw(canvas, &menu.layers(under), dst, at, whole)?;
+        textures.draw(canvas, menu.screen(), &menu.layers(under), dst, at, whole)?;
         canvas.present();
         cadence.wait(now);
     }
@@ -2360,7 +2365,7 @@ fn comment_loop(
         menu.prepare(None);
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
-        textures.draw(canvas, &menu.layers(None), dst, size, whole)?;
+        textures.draw(canvas, menu.screen(), &menu.layers(None), dst, size, whole)?;
         if let (Some(texture), Some(at)) = (&texture, placed) {
             canvas
                 .copy(
@@ -2743,6 +2748,7 @@ impl<'r> Layers<'r> {
     fn draw(
         &mut self,
         canvas: &mut Canvas<Window>,
+        screen: &Screen,
         layers: &[Layer],
         dst: FRect,
         out: (u32, u32),
@@ -2774,18 +2780,7 @@ impl<'r> Layers<'r> {
             if w == 0 || h == 0 {
                 continue;
             }
-            let held = match self.held.entry(layer.key()) {
-                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let art = layer.realize();
-                    let mut texture =
-                        new_texture(self.creator, art.width, art.height, art_sampling(whole))?;
-                    texture.set_blend_mode(BlendMode::Blend);
-                    texture.update(None, &art.rgba, art.width as usize * 4)?;
-                    slot.insert(Held { texture, last: 0 })
-                }
-            };
-            held.last = self.frame;
+            let held = self.hold(screen, layer, whole)?;
             canvas
                 .copy(
                     &held.texture,
@@ -2801,6 +2796,48 @@ impl<'r> Layers<'r> {
         }
         canvas.set_clip_rect(ClippingRect::None);
         self.sweep();
+        Ok(())
+    }
+
+    /// The texture for one layer, uploaded if this is the first time it has
+    /// been asked for, and kept from the next sweep either way.
+    fn hold(&mut self, screen: &Screen, layer: &Layer, whole: bool) -> Result<&mut Held<'r>> {
+        let held = match self.held.entry(layer.key()) {
+            std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // From what the screen has already brought to size where it
+                // has: a cut the CPU side of this frame realized is a copy
+                // here rather than the same work again.
+                let art = match screen.realized(layer) {
+                    Some(art) => std::borrow::Cow::Owned(art),
+                    None => layer.realize(),
+                };
+                let mut texture =
+                    new_texture(self.creator, art.width, art.height, art_sampling(whole))?;
+                texture.set_blend_mode(BlendMode::Blend);
+                texture.update(None, &art.rgba, art.width as usize * 4)?;
+                slot.insert(Held { texture, last: 0 })
+            }
+        };
+        held.last = self.frame;
+        Ok(held)
+    }
+
+    /// Uploads layers that are not drawn yet, for the frame that will draw
+    /// them: see [`Menu::warm_layers`], which is where the list comes from.
+    ///
+    /// Only the ones the screen has already brought to size, so that this
+    /// follows that pace rather than realizing a sprite itself — a dress at
+    /// 1080p costs more than a frame, and the point of warming is that no
+    /// frame pays for one. The frame counter is not advanced here, because a
+    /// warm layer is one nothing has drawn, but holding it marks it as used so
+    /// the sweep leaves it alone for as long as the screen keeps asking.
+    fn warm(&mut self, screen: &Screen, layers: &[Layer], whole: bool) -> Result<()> {
+        for layer in layers {
+            if screen.is_realized(layer) {
+                self.hold(screen, layer, whole)?;
+            }
+        }
         Ok(())
     }
 

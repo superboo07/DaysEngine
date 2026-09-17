@@ -694,6 +694,11 @@ pub struct Menu {
     /// the middle and back. Idle on every other screen; [`Menu::tick`] is what
     /// runs it.
     dress_slide: dress::Slide,
+    /// Which of the screen's two hit maps is the loaded one, which is not the
+    /// same question as [`Menu::dress_phase`]: `FUN_1000ded0` drops `+0x140`
+    /// the moment the popup is answered no, and the popup's map stays loaded
+    /// for the thirty frames it takes arm 3 to slide the dresses back apart.
+    dress_map: dress::Phase,
     /// That screen's art that is not the loaded map's own: the caption plate
     /// and, while the popup is up, the sheet the two dresses under it are cut
     /// from. Absent on every other screen.
@@ -857,6 +862,7 @@ impl Menu {
             replay_page: None,
             dress_phase: dress::Phase::default(),
             dress_slide: dress::Slide::default(),
+            dress_map: dress::Phase::default(),
             dress: None,
             font: load_font(vfs),
             rows: None,
@@ -927,13 +933,29 @@ impl Menu {
 
     /// Loads the dress-select screen's art that is not the loaded map's own.
     ///
-    /// Two things: the caption `FUN_1000cce0` builds as a full-screen plate, and
-    /// — while the popup's map is loaded — `DressSelect_Chip.png`, because
-    /// `FUN_1000c740` keeps drawing the two dresses from it under the popup.
-    /// Either missing leaves the rest of the screen drawn, which is the rule
-    /// for every asset in this engine.
+    /// Two things: the caption `FUN_1000cce0` builds as a full-screen plate,
+    /// and the screen's *other* hit map with the sheet that comes with it —
+    /// the popup's while the dresses' map is loaded, and the dresses' while
+    /// the popup's is. `FUN_1000c740` needs the second of those either way,
+    /// because it keeps drawing the two dresses from `DressSelect_Chip.png`
+    /// under the popup. Either missing leaves the rest of the screen drawn,
+    /// which is the rule for every asset in this engine.
+    ///
+    /// # This engine loads the other map early
+    ///
+    /// The original takes the popup's art and hit map in `FUN_1000e440` arm 1,
+    /// on the frame the two dresses meet, and the dresses' back in arm 3 on
+    /// the frame they are apart again. Here both are loaded as the screen
+    /// comes up and the swap at each end of the slide is a move. Decoding a
+    /// screen's art and resampling it to the window costs about seventy
+    /// milliseconds on the machine this was measured on, which the original
+    /// spends inside a frame of the slide; a frame is what paces the slide, so
+    /// that is a visible stall at each end of it. Nothing about the screen's
+    /// behaviour changes — the maps swap on the same frames — only when the
+    /// files are read.
     fn load_dress(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.dress = None;
+        self.dress_map = self.dress_phase;
         if !self.showing.is(Mode::DRESS_SELECT) {
             return;
         }
@@ -952,34 +974,41 @@ impl Menu {
                 }
             }
         });
-        // The dresses are only a layer of their own while the popup's map is
-        // the loaded one; on the main map they are that screen's own widgets.
-        // Loading the main screen again is what gets at both the records and
-        // the sheet, since the popup's atlas describes the popup.
-        let under = match self.dress_phase {
-            dress::Phase::Choosing => None,
-            dress::Phase::Confirming { .. } => {
-                match self.load_dress_main(vfs, dll) {
-                    Ok(screen) => Some(screen),
-                    Err(err) => {
-                        // The popup still draws; what is lost is the two
-                        // dresses showing through it.
-                        log::warn!("dress select: cannot draw the dresses under the popup: {err}");
-                        None
-                    }
-                }
+        // The map that is not the loaded one. While the popup's is loaded this
+        // is the screen's own, which is what gets at both the records and the
+        // sheet the dresses under the popup are cut from — the popup's atlas
+        // describes the popup.
+        let other = match self.load_dress_other(vfs, dll) {
+            Ok(screen) => Some(screen),
+            Err(err) => {
+                // Everything that is loaded still draws; what is lost is the
+                // two dresses showing through the popup, and the swap at the
+                // end of the slide goes back to loading the map it needs.
+                log::warn!("dress select: cannot load the screen's other hit map: {err}");
+                None
             }
         };
         self.dress = Some(DressScreen {
             caption,
             scaled: None,
             at: (0, 0),
-            under,
+            other,
         });
     }
 
-    /// The dress-select screen's own map and sheet, loaded beside the popup's.
-    fn load_dress_main(&self, vfs: &Vfs, dll: &[u8]) -> Result<Screen, Error> {
+    /// The dress-select screen's other hit map and the sheet it comes with.
+    ///
+    /// The popup's while the screen's own is loaded and the screen's own while
+    /// the popup's is, which is what [`Menu::load_dress`] holds it for. The
+    /// chosen dress is the slide's, because that is the widget the popup would
+    /// come up over; nothing about the art depends on it.
+    fn load_dress_other(&self, vfs: &Vfs, dll: &[u8]) -> Result<Screen, Error> {
+        let other = match self.dress_phase {
+            dress::Phase::Choosing => dress::Phase::Confirming {
+                chosen: self.dress_slide.chosen(),
+            },
+            dress::Phase::Confirming { .. } => dress::Phase::Choosing,
+        };
         let mut screen = load_screen(
             vfs,
             dll,
@@ -990,12 +1019,23 @@ impl Menu {
             self.tab,
             self.kind,
             &self.session,
-            dress::Phase::Choosing,
+            other,
             self.resolution,
         )?;
         screen.fit_to(self.screen.size().0, self.screen.size().1);
+        // Both maps draw the two dresses, at the same size, from the same
+        // sheet, so what one of them has realized serves the other.
+        screen.share_realized(&self.screen);
         Ok(screen)
     }
+}
+
+/// Puts one screen at the menu's output scale, which is what [`Menu::refit`]
+/// does to every screen it holds.
+fn fit(screen: &mut Screen, out_scale: f64) {
+    let (map_w, map_h) = screen.map_size();
+    let at = |v: u32| (f64::from(v) * out_scale).round().max(1.0) as u32;
+    screen.fit_to(at(map_w), at(map_h));
 }
 
 /// The dress-select screen's art that is not the loaded hit map's own.
@@ -1012,9 +1052,11 @@ struct DressScreen {
     /// the base art's own resample costs.
     scaled: Option<days_ui::Image>,
     at: (u32, u32),
-    /// The screen's own map and sheet, loaded beside the popup's while the
-    /// popup is up so the two dresses can still be drawn under it.
-    under: Option<Screen>,
+    /// Whichever of the screen's two hit maps is not the loaded one, with the
+    /// sheet it comes with. Kept loaded so that swapping them costs no frame,
+    /// and because the dresses under the popup are cut from the screen's own
+    /// sheet. See [`Menu::load_dress`].
+    other: Option<Screen>,
 }
 
 /// The Option screen's page for one tab: the records it draws from, read once
@@ -1585,6 +1627,14 @@ impl Menu {
         }
         let was = self.screen.size();
         self.screen.fit_to(width, height);
+        // The dress-select screen's other map follows the loaded one, so that
+        // the swap at each end of the slide has nothing left to resample. Both
+        // of that screen's maps are the same size, so the factor puts them at
+        // the same size too. See [`Menu::load_dress`].
+        let scale = self.out_scale;
+        if let Some(other) = self.dress.as_mut().and_then(|dress| dress.other.as_mut()) {
+            fit(other, scale);
+        }
         self.dirty |= self.screen.size() != was;
     }
 
@@ -1597,9 +1647,15 @@ impl Menu {
         if self.out_scale == 1.0 {
             return;
         }
-        let (map_w, map_h) = self.screen.map_size();
-        let at = |v: u32| (f64::from(v) * self.out_scale).round().max(1.0) as u32;
-        self.screen.fit_to(at(map_w), at(map_h));
+        let scale = self.out_scale;
+        fit(&mut self.screen, scale);
+        // The dress-select screen's other map is fitted with it rather than
+        // when it is swapped in: resampling a screen's base art is the
+        // expensive half of loading one, and the swap happens on the frame the
+        // slide ends. See [`Menu::set_dress_phase`].
+        if let Some(other) = self.dress.as_mut().and_then(|dress| dress.other.as_mut()) {
+            fit(other, scale);
+        }
     }
 
     pub fn screen(&self) -> &Screen {
@@ -1639,6 +1695,7 @@ impl Menu {
     /// them only on the frames they moved.
     pub fn prepare(&mut self, backdrop: Option<&days_ui::Image>) {
         self.refit_page();
+        self.warm_one();
         if !self.dirty {
             return;
         }
@@ -1662,6 +1719,57 @@ impl Menu {
             }
             (false, _) => None,
         };
+    }
+
+    /// The layers this screen will draw the moment something moves, so that
+    /// the frame it moves on has nothing left to prepare.
+    ///
+    /// Only the dress-select screen has any. Its two dresses are drawn as cuts
+    /// while they slide, and bringing one to the 655x1080 a 1080p window asks
+    /// for costs about thirty-five milliseconds — more time than the frame the
+    /// click lands on has, and the stall was plain as the slide started. Both
+    /// draw paths key what they keep by the same [`crate::ui::screen::Key`],
+    /// and a cut's key does not move with it — only where it lands does — so
+    /// realizing them while the screen is still at rest is the whole of the
+    /// fix. The caller that draws through the GPU warms its textures from this
+    /// list; [`Menu::warm_one`] warms the pixels behind them.
+    pub fn warm_layers(&self) -> Vec<Layer<'_>> {
+        self.warm_for(&self.screen)
+    }
+
+    /// The same list, placed by whichever of the screens will draw it.
+    fn warm_for<'a>(&'a self, screen: &'a Screen) -> Vec<Layer<'a>> {
+        if !self.showing.is(Mode::DRESS_SELECT) {
+            return Vec::new();
+        }
+        let from = self.dress_records();
+        dress::slide_cuts(from.atlas())
+            .iter()
+            .map(|cut| screen.cut_layer(from.chip(), cut))
+            .collect()
+    }
+
+    /// Brings one of [`Menu::warm_layers`] to the size it is drawn at, and
+    /// stops there for this frame.
+    ///
+    /// One a frame, because realizing a cut costs more than a frame does and
+    /// doing all of them at once would only move the stall to whichever frame
+    /// took them. The screen sits still for many frames before the click that
+    /// starts the slide, and each of these is realized once and kept.
+    ///
+    /// Each of the screen's two maps keeps what it has realized, and the
+    /// dresses are drawn through both: through the loaded one while they
+    /// slide, either way round, and through the one holding their own sheet
+    /// while the popup is over them.
+    fn warm_one(&self) {
+        let other = self.dress.as_ref().and_then(|dress| dress.other.as_ref());
+        for screen in std::iter::once(&self.screen).chain(other) {
+            for layer in self.warm_for(screen) {
+                if screen.warm(&layer) {
+                    return;
+                }
+            }
+        }
     }
 
     /// Everything this frame draws, in the order it is drawn.
@@ -1790,10 +1898,7 @@ impl Menu {
     fn base_art(&self) -> bool {
         !(self.showing.is(Mode::DRESS_SELECT)
             && self.dress_slide.drawn(self.dress_phase) == dress::Drawn::Sliding
-            && self
-                .dress
-                .as_ref()
-                .is_some_and(|dress| dress.under.is_some()))
+            && matches!(self.dress_map, dress::Phase::Confirming { .. }))
     }
 
     /// What the dress-select popup is composited over: the two dresses where
@@ -1808,7 +1913,7 @@ impl Menu {
         let dress::Phase::Confirming { .. } = self.dress_phase else {
             return None;
         };
-        let under = self.dress.as_ref()?.under.as_ref()?;
+        let under = self.dress.as_ref()?.other.as_ref()?;
         let cuts = self.dress_slide.cuts(under.atlas());
         let (width, height) = self.screen.size();
         let mut out = days_ui::Image::empty(width, height);
@@ -2710,20 +2815,30 @@ impl Menu {
 
     /// The screen the two dresses' records and sheet come from.
     ///
-    /// The screen's own while its map is loaded, and the copy kept beside the
-    /// popup's while that is — `FUN_1000c740` keeps drawing them from
+    /// The loaded one while its own map is up, and the one held beside it
+    /// while the popup's is — `FUN_1000c740` keeps drawing them from
     /// `DressSelect_Chip.png` whichever map the module is answering clicks
-    /// through. See [`Menu::load_dress_main`].
+    /// through. It follows the loaded map rather than [`Menu::dress_phase`],
+    /// because the two disagree for the length of the slide back apart. See
+    /// [`Menu::load_dress`].
     fn dress_records(&self) -> &Screen {
-        self.dress
-            .as_ref()
-            .and_then(|dress| dress.under.as_ref())
-            .unwrap_or(&self.screen)
+        match self.dress_map {
+            dress::Phase::Choosing => &self.screen,
+            dress::Phase::Confirming { .. } => self
+                .dress
+                .as_ref()
+                .and_then(|dress| dress.other.as_ref())
+                .unwrap_or(&self.screen),
+        }
     }
 
     /// Swaps the dress-select screen's hit map, keeping the mode.
     ///
-    /// A map that will not load leaves the one that is up, the same answer
+    /// Both maps are loaded while this screen is up — see [`Menu::load_dress`]
+    /// — so the swap is a move between the loaded screen and the one held
+    /// beside it, on the frame the slide ends. A module that could only load
+    /// one of the two falls back to loading the other here, and a map that
+    /// will not load at all leaves the one that is up, the same answer
     /// [`Action::Unavailable`] gives for a whole screen.
     fn set_dress_phase(
         &mut self,
@@ -2733,6 +2848,17 @@ impl Menu {
     ) -> Result<Action, Error> {
         let was = self.dress_phase;
         self.dress_phase = phase;
+        if let Some(other) = self.dress.as_mut().and_then(|dress| dress.other.take()) {
+            let loaded = std::mem::replace(&mut self.screen, other);
+            if let Some(dress) = &mut self.dress {
+                dress.other = Some(loaded);
+            }
+            self.dress_map = phase;
+            self.states = vec![WidgetState::Resting; self.screen.widget_count()];
+            self.selection = None;
+            self.refresh();
+            return Ok(Action::Sound(SystemSe::Click));
+        }
         let (showing, back) = (self.showing, self.return_to);
         if let Err(err) = self.enter(vfs, dll, showing, back) {
             log::warn!("dress select: cannot load the other hit map: {err}");
