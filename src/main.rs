@@ -619,12 +619,76 @@ struct MovieFrame<'r> {
 /// image means a new background. Everything else about a still changes rarely —
 /// a background lasts seconds — and a mouth flaps eight times a second, which
 /// is still far short of once a pass.
-struct StillFrame<'r> {
+/// Which scaled background a held texture is.
+#[derive(PartialEq, Eq, Clone)]
+struct StillKey {
     path: String,
+    /// The size it was scaled to, which is the window's unless whole-number
+    /// scaling is on.
     size: (u32, u32),
     /// Each patch rectangle and which of the three images it is showing.
     mouths: Vec<(usize, usize, usize, usize, usize)>,
-    texture: Texture<'r>,
+}
+
+/// The scaled backgrounds this stage is drawing from.
+///
+/// One would do if a background never changed, but a lip-synced line moves the
+/// mouth at 8 Hz — `FUN_00444cf0` steps a phase counter on every third frame —
+/// and the mouths are patched into the surface *before* it is scaled, so every
+/// step used to mean scaling the whole background again and uploading it. At
+/// 1920x1080 that is 26 ms and seven megabytes, at 3840x2160 90 ms and
+/// thirty-one, eight times a second for as long as anyone is speaking.
+///
+/// That counter is modulo three. A line cycles `.A`, `.B`, `.C`, `.A` and never
+/// produces a fourth picture, so keeping three is keeping all of them: the
+/// first cycle pays for the scales and every step after it draws from a texture
+/// that is already there. Nothing about the picture changes — these are the
+/// same scaled surfaces, kept rather than rebuilt.
+///
+/// Two characters speaking at once have nine combinations between them and will
+/// miss more often than one. That is the case this degrades in, and it degrades
+/// to what it did before.
+struct Stills<T> {
+    /// Most recently built last.
+    held: Vec<(StillKey, T)>,
+}
+
+/// How many scaled backgrounds are kept: the three a lip-synced line cycles.
+const STILL_VARIANTS: usize = 3;
+
+impl<T> Stills<T> {
+    fn new() -> Stills<T> {
+        Stills { held: Vec::new() }
+    }
+
+    fn find(&self, key: &StillKey) -> Option<&T> {
+        self.held
+            .iter()
+            .find(|(held, _)| held == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Keeps one, dropping the oldest once there are more than
+    /// [`STILL_VARIANTS`].
+    ///
+    /// A background or a window size that has moved on makes every held one
+    /// useless at once, so those go together rather than ageing out —
+    /// otherwise a scene change would keep the previous stage on the GPU until
+    /// three of the new one had been built.
+    fn keep(&mut self, key: StillKey, value: T) {
+        self.held
+            .retain(|(held, _)| held.path == key.path && held.size == key.size);
+        if self.held.len() >= STILL_VARIANTS {
+            self.held.remove(0);
+        }
+        self.held.push((key, value));
+    }
+
+    /// Drops the lot. For a renderer that is no longer the one they were made
+    /// on.
+    fn clear(&mut self) {
+        self.held.clear();
+    }
 }
 
 /// Everything the two loops both need.
@@ -2758,10 +2822,10 @@ fn run_script(
     // The background as it will be shown: mouth patches already in it, scaled
     // to the window. Keyed by everything that decides those pixels, so a pass
     // that changes none of them reuses the texture.
-    let mut still_texture: Option<StillFrame<'_>> = None;
+    let mut stills: Stills<Texture<'_>> = Stills::new();
     let mut movie_texture: Option<MovieFrame<'_>> = None;
     // The ending card, which is one picture for its whole window.
-    let mut card_texture: Option<StillFrame<'_>> = None;
+    let mut card_texture: Stills<Texture<'_>> = Stills::new();
     // Stills go through libswscale, the same scaler and the same filter a movie
     // frame goes through — they are two ways of filling the same 800x452 stage,
     // and a still that went through a different filter did not match the clip
@@ -3361,7 +3425,7 @@ fn run_script(
                             movie_texture = None;
                             choice_labels = None;
                             bar_texture = None;
-                            still_texture = None;
+                            stills.clear();
                             text_texture = None;
                             // Saving no longer ends the menus: the screen
                             // writes the slot itself and stays up, which is
@@ -3585,15 +3649,16 @@ fn run_script(
             } else {
                 window_px
             };
-            let mouths: Vec<_> = visual
-                .mouths
-                .iter()
-                .map(|(m, index)| (m.x, m.y, m.width, m.height, *index))
-                .collect();
-            let stale = still_texture.as_ref().is_none_or(|held| {
-                held.path != still.path || held.size != at || held.mouths != mouths
-            });
-            if stale {
+            let key = StillKey {
+                path: still.path.clone(),
+                size: at,
+                mouths: visual
+                    .mouths
+                    .iter()
+                    .map(|(m, index)| (m.x, m.y, m.width, m.height, *index))
+                    .collect(),
+            };
+            if stills.find(&key).is_none() {
                 // The mouths go into the background's own surface first, at the
                 // background's own size. That is what the original does — a
                 // straight `memcpy` into the surface in `FUN_00444b80`, before
@@ -3614,16 +3679,11 @@ fn run_script(
                 };
                 let mut texture = new_texture(creator, w, h, art)?;
                 texture.update(None, rgba, w as usize * 4)?;
-                still_texture = Some(StillFrame {
-                    path: still.path.clone(),
-                    size: at,
-                    mouths,
-                    texture,
-                });
+                stills.keep(key.clone(), texture);
             }
-            if let Some(held) = &still_texture {
+            if let Some(texture) = stills.find(&key) {
                 canvas
-                    .copy(&held.texture, None, dst)
+                    .copy(texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing background: {e}"))?;
             }
         }
@@ -3637,10 +3697,15 @@ fn run_script(
             } else {
                 window_px
             };
-            let stale = card_texture
-                .as_ref()
-                .is_none_or(|held| held.path != card.path || held.size != at);
-            if stale {
+            // The card has no mouths on it and only ever one picture, so its
+            // key is the path and the size; it is held the same way the
+            // backgrounds are rather than by a second set of rules.
+            let key = StillKey {
+                path: card.path.clone(),
+                size: at,
+                mouths: Vec::new(),
+            };
+            if card_texture.find(&key).is_none() {
                 let src = (card.width, card.height);
                 let scaled = scaler
                     .scale(&card.rgba, src, at)
@@ -3652,16 +3717,11 @@ fn run_script(
                 let mut texture = new_texture(creator, w, h, art)?;
                 texture.set_blend_mode(BlendMode::Blend);
                 texture.update(None, rgba, w as usize * 4)?;
-                card_texture = Some(StillFrame {
-                    path: card.path.clone(),
-                    size: at,
-                    mouths: Vec::new(),
-                    texture,
-                });
+                card_texture.keep(key.clone(), texture);
             }
-            if let Some(held) = &card_texture {
+            if let Some(texture) = card_texture.find(&key) {
                 canvas
-                    .copy(&held.texture, None, dst)
+                    .copy(texture, None, dst)
                     .map_err(|e| anyhow::anyhow!("drawing the ending card: {e}"))?;
             }
         }
@@ -4005,6 +4065,82 @@ mod tests {
     /// 1920x1200 panel that is exactly twice — not the 2.4 that fitting the
     /// window would give, and it is the 0.4 that cannot be drawn without
     /// inventing pixels.
+    fn still(path: &str, size: (u32, u32), mouth: usize) -> StillKey {
+        StillKey {
+            path: path.to_string(),
+            size,
+            mouths: vec![(392, 160, 48, 43, mouth)],
+        }
+    }
+
+    /// The three pictures a lip-synced line cycles are all held at once, so
+    /// after the first cycle the mouth moves without scaling anything. This is
+    /// the whole point of keeping more than one.
+    #[test]
+    fn a_lip_synced_line_stops_missing_after_one_cycle() {
+        let mut stills: Stills<usize> = Stills::new();
+        let at = (1920, 1080);
+        let mut built = 0;
+        // Four cycles of `.A`, `.B`, `.C`, which is half a second of speech.
+        for step in 0..12 {
+            let key = still("Stage/A", at, step % 3);
+            if stills.find(&key).is_none() {
+                built += 1;
+                stills.keep(key, built);
+            }
+        }
+        assert_eq!(built, 3, "only the first cycle should build anything");
+    }
+
+    /// A background that has changed makes every held one useless at once, so
+    /// they go together rather than ageing out one at a time.
+    #[test]
+    fn a_new_background_drops_the_previous_stage() {
+        let mut stills: Stills<usize> = Stills::new();
+        let at = (1920, 1080);
+        for mouth in 0..3 {
+            stills.keep(still("Stage/A", at, mouth), mouth);
+        }
+        stills.keep(still("Stage/B", at, 0), 9);
+        assert!(stills.find(&still("Stage/A", at, 0)).is_none());
+        assert_eq!(stills.find(&still("Stage/B", at, 0)), Some(&9));
+    }
+
+    /// And so does a window that has been resized: what is held was scaled to
+    /// the old size and no part of it is worth keeping.
+    #[test]
+    fn a_resize_drops_what_was_scaled_for_the_old_size() {
+        let mut stills: Stills<usize> = Stills::new();
+        for mouth in 0..3 {
+            stills.keep(still("Stage/A", (1920, 1080), mouth), mouth);
+        }
+        stills.keep(still("Stage/A", (2560, 1440), 0), 9);
+        assert!(stills.find(&still("Stage/A", (1920, 1080), 0)).is_none());
+        assert_eq!(stills.find(&still("Stage/A", (2560, 1440), 0)), Some(&9));
+    }
+
+    /// A fourth picture of the same stage — a second character speaking, or the
+    /// gap between lines where there is no mouth at all — drops the oldest and
+    /// keeps going rather than growing.
+    #[test]
+    fn a_fourth_picture_of_one_stage_drops_the_oldest() {
+        let mut stills: Stills<usize> = Stills::new();
+        let at = (1920, 1080);
+        for mouth in 0..3 {
+            stills.keep(still("Stage/A", at, mouth), mouth);
+        }
+        let none = StillKey {
+            path: "Stage/A".to_string(),
+            size: at,
+            mouths: Vec::new(),
+        };
+        stills.keep(none.clone(), 9);
+        assert_eq!(stills.held.len(), STILL_VARIANTS);
+        assert!(stills.find(&still("Stage/A", at, 0)).is_none());
+        assert_eq!(stills.find(&still("Stage/A", at, 2)), Some(&2));
+        assert_eq!(stills.find(&none), Some(&9));
+    }
+
     #[test]
     fn whole_number_scaling_multiplies_by_an_integer() {
         let content = (800, 450);
