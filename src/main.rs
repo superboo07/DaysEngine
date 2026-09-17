@@ -3550,6 +3550,16 @@ fn run_script(
                                 player.mixer.pause_script();
                             }
                             paused = !paused;
+                            // The glyph turns over on the frame of the press,
+                            // not the one after it. Both modules re-place
+                            // widget 1's sprites at the *end* of the update
+                            // that dispatched the press — `FUN_10024100` and
+                            // `FUN_100335f0` close with
+                            // `if (host->+0x114() == 1) this->+0x2c()`, Shiny
+                            // Days' slot being `+0x130` — so the answer they
+                            // re-read is the one this press just changed. See
+                            // [`bar::Layout::hover_while_paused`].
+                            bar_state.paused = paused;
                         }
                         // Host `+0x8c` is `FUN_00424f90`, and it does three
                         // things in this order: it stops the clock, sets the

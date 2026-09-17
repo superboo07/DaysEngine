@@ -224,24 +224,40 @@ pub struct Layout {
     /// widget's own record is used. HQ `FUN_10024100`'s special case for index
     /// 0, Shiny Days `FUN_100335f0`'s.
     pub auto_hover_on: usize,
-    /// Widget 1's hover art, which both dispatches pick the same way: the
-    /// widget's own record while playback is paused, an alternate while it is
-    /// running.
+    /// Widget 1's hover art, which the vtable `+0x2c` re-place picks — HQ
+    /// `FUN_100258f0`, Shiny Days `FUN_10034c50` — off the same "is playback
+    /// paused" answer that picks [`Layout::resting_while_playing`], and out of
+    /// the same column of the sheet, so the resting glyph and the glyph the
+    /// pointer lights are always the same one.
     ///
-    /// **On Shiny Days that alternate carries the wrong glyph.** Its sheet puts
-    /// the pause glyph at `x` 1 and the play glyph at `x` 108 in both the hover
-    /// row and the resting row, and record 16 — what `FUN_100335f0` reaches
-    /// while playback is *running* — is the one at 108. So hovering the button
-    /// mid-playback turns it from "pause" into "play" while it still pauses.
-    /// School Days HQ's record 26 is the pause glyph and does not.
+    /// **The re-place is the last thing the update does**, which is what makes
+    /// it the recovered rule rather than the dispatch's own assignment.
+    /// `FUN_10024100` and `FUN_100335f0` both end with
+    /// `if (host->+0x114() == 1) this->+0x2c()` — Shiny Days' slot is `+0x130`
+    /// — after the hit test, after the press dispatch, and after their own
+    /// assignment of the hovered widget's record, which they make only on the
+    /// frame the hovered widget *changes*. The re-place then runs every frame
+    /// and re-states both sprites, so it is what the draw pass sees.
     ///
-    /// The module disagrees with itself about it: `FUN_10034c50`, the vtable
-    /// `+0x2c` re-place, picks record 1 where `FUN_100335f0` picks 16 and so
-    /// leaves the button consistent. It runs only while host `+0x130` answers
-    /// 1 and the pointer is already on widget 1, and **what writes the member
-    /// `+0x130` returns — `SHINYDAYS.exe`'s `+0x228` — is not recovered**, so
-    /// when the original shows the other glyph is not recovered either. The
-    /// steady state is `FUN_100335f0`'s, and that is what is reproduced.
+    /// That slot is the engine's state word. `SHINYDAYS.exe`'s `FUN_0041da70`
+    /// returns the host subobject's `+0x228` and nothing else, and the
+    /// subobject is installed at engine `+0x2c` — `mov [esi+0x2c],
+    /// 0x0048e50c`, the only two occurrences of that immediate in `.text` —
+    /// so the member is engine `+0x254`. 1 is the state a film plays in:
+    /// `FUN_00418360`, the window message pump, gates every one of the bar's
+    /// keyboard shortcuts on `engine+0x254 == 1` and asks the same question
+    /// through `+0x130` a few lines further down, which ties the slot to the
+    /// member a second way.
+    ///
+    /// The two halves of the module agree on School Days HQ and **disagree on
+    /// Shiny Days**, and the sheet says which one to believe. Widget 1's four
+    /// records all draw to `(10, 21, 106, 24)` and differ only in their source:
+    /// resting is `x` 1 (record 20, playing) or `x` 108 (record 21, paused) on
+    /// row `y` 81, and the hover row at `y` 1 holds the same two columns,
+    /// record 1 at `x` 1 and record 16 at `x` 108. `FUN_10034c50` pairs column
+    /// with column; `FUN_100335f0` crosses them, taking record 16 while
+    /// playback runs. Its assignment is overwritten inside the same call before
+    /// anything draws, so the crossed pair never reaches the screen.
     pub hover_while_paused: usize,
     pub hover_while_playing: usize,
     /// First of the twelve caption strips [`caption`] indexes.
@@ -383,8 +399,8 @@ impl Layout {
         replay_mode: ReplayMode::OnStrip { live: 38, dead: 39 },
         knob: Knob::Drag { record: 40 },
         auto_hover_on: 15,
-        hover_while_paused: 1,
-        hover_while_playing: 16,
+        hover_while_paused: 16,
+        hover_while_playing: 1,
         caption_first: 24,
     };
 
@@ -1867,6 +1883,33 @@ mod tests {
         state.set_speed(SPEEDS.len());
         assert_eq!(state.speed, 0);
         assert_eq!(state.rate, 1.0);
+    }
+
+    /// Widget 1 lights the glyph it is already showing. The vtable `+0x2c`
+    /// re-place takes the resting sprite and the hover sprite out of the same
+    /// column of the sheet — HQ `FUN_100258f0`, Shiny Days `FUN_10034c50` — and
+    /// it is the last thing either update does, so its pairing is the one that
+    /// draws. The record numbers are per module; the pairing is not. See
+    /// [`Layout::hover_while_paused`].
+    #[test]
+    fn widget_1_lights_the_glyph_it_is_already_showing() {
+        for (layout, playing, paused) in [
+            (&Layout::SCHOOL_DAYS_HQ, (44, 26), (45, 1)),
+            (&Layout::SHINY_DAYS, (20, 1), (21, 16)),
+        ] {
+            assert_eq!(
+                (layout.resting_while_playing, layout.hover_while_playing),
+                playing,
+                "{} pairs the wrong records while playback runs",
+                layout.module
+            );
+            assert_eq!(
+                (layout.resting_while_paused, layout.hover_while_paused),
+                paused,
+                "{} pairs the wrong records while playback is paused",
+                layout.module
+            );
+        }
     }
     use super::*;
 

@@ -1469,13 +1469,17 @@ statements across 2,232 of the 2,587 scripts. `FUN_0042b770` in `SHINYDAYS.exe` 
 - it opens **looping**: `FUN_00431170(obj, path, NULL, 1)`, against the `0` a
   four-argument `PlaySe` passes.
 
-It is also **gated**, and that gate is **not recovered**. The arm runs only when
-host vtable slot `+0x130` returns 1 or the film object's `+0x320` is 1. Slot
-`+0x130` of the concrete host vtable at `0x0048e50c` is `FUN_0041da70`, which
-returns the member at `+0x228` of the host subobject and nothing more; which of
-the several writes to that offset is the one that matters has not been traced,
-so what the gate asks is unknown. Until it is, the command's meaning is
-incomplete and the engine does not act on it.
+It is also **gated**. The arm runs only when host vtable slot `+0x130` returns 1
+or the film object's `+0x320` is 1. Slot `+0x130` of the concrete host vtable at
+`0x0048e50c` is `FUN_0041da70`, which returns the member at `+0x228` of the host
+subobject and nothing more — engine `+0x254`, the engine's state word, since the
+subobject sits at engine `+0x2c` — and 1 is the state a film plays in; see *The
+Shiny Days bar* for how that member is tied to the slot twice over. **Whether
+that state is 1 at the moment a script is parsed is not recovered**: the parser
+runs from the script open, the state is written in `FUN_0041cb60`,
+`FUN_0041eb10` and `FUN_004166f0` among others, and which of those has run by
+then has not been traced. Until it is, the command's meaning is incomplete and
+the engine does not act on it.
 
 (The host vtable anchor: `0x0048e50c` is stored into `[reg+0x2c]` by
 `FUN_0041d6c0`, is preceded in `.rdata` by an RTTI pointer, and runs 93 code
@@ -2547,7 +2551,7 @@ sprites' destinations come from `FUN_10031030` and their sources from
 | 40 | `this+0x78`, the transparency knob | `+0xa4` |
 | 41 / 42 | `this+0x74`, the knob's bed live / dead | always |
 | 43 | `this+0x68`, the gauge's bed | with the fill |
-| 1 / 16 | `this+0x48`, widget 1 hovered, paused / playing | hovered |
+| 16 / 1 | `this+0x48`, widget 1 hovered, paused / playing | hovered |
 | 0 / 15 | `this+0x48`, widget 0 hovered, auto off / on | hovered |
 
 Four things are genuinely different from School Days HQ's, and each is a reading
@@ -2613,17 +2617,46 @@ serves both. Its twelfth strip is unreachable in the retail build: it belongs to
 widget `0xf`, and the caption is drawn only for a widget the enabled test
 answers true for.
 
-**One shipped bug, reproduced.** `FUN_100335f0` picks record 16 for widget 1's
-hover art while playback is *running*, and record 16 is the play glyph — the
-sheet puts the pause glyph at `x` 1 and the play glyph at `x` 108 in both the
-hover row and the resting row. So hovering the button mid-playback turns it from
-"pause" into "play" while it still pauses. The module disagrees with itself:
-`FUN_10034c50` picks record 1 there and leaves the button consistent, but it
-runs only while host `+0x130` answers 1 and the pointer is already on widget 1,
-and **what writes the member it returns, `SHINYDAYS.exe`'s `+0x228`, is not
-recovered** — so when the original shows the other glyph is not recovered
-either. School Days HQ's `FUN_10024100` has the same two-record switch and its
-record 26 is the pause glyph, so HQ does not have the bug.
+**Widget 1's hover art is the `+0x2c` re-place's, not the dispatch's.** The two
+halves of the module disagree about it — `FUN_100335f0` assigns record 16 while
+playback is *running* and record 1 while it is paused, `FUN_10034c50` the other
+way round — and the re-place is what reaches the screen.
+
+Three things settle it. The **sheet**: widget 1's four records all draw to
+`(10, 21, 106, 24)` and differ only in source, resting at `x` 1 (record 20,
+playing) or `x` 108 (record 21, paused) on row `y` 81, with the same two columns
+in the hover row at `y` 1, record 1 at `x` 1 and record 16 at `x` 108.
+`FUN_10034c50` takes the hover record from the column the resting record is in;
+`FUN_100335f0` crosses them. The **order**: `FUN_100335f0` assigns the hovered
+widget's record only on the frame the hovered widget changes, and then closes
+with `if (host->+0x130() == 1) this->+0x2c()` — after the hit test, after the
+dispatch, after that assignment — so the re-place restates both sprites every
+frame and overwrites the crossed pair inside the same call, before the draw pass
+runs. The **slot**: `+0x130` is the engine's state word, and 1 is the state a
+film plays in, so that re-place is not conditional in any way that matters
+during playback. `FUN_0041da70` returns the host subobject's `+0x228` and
+nothing else; the subobject is installed at engine `+0x2c` (`mov [esi+0x2c],
+0x0048e50c`, whose immediate occurs exactly twice in `.text`, at `0x0041d6c3`
+and `0x0041dcf3`), so the member is engine `+0x254`. `FUN_00418360`, the window
+message pump, reads `engine+0x254 == 1` to gate every one of the bar's keyboard
+shortcuts and asks the same question through `+0x130` a few lines below, which
+ties slot to member a second way.
+
+The art agrees from outside the decompiler. `daysengine ui
+"System/MenuBar/MenuBar" --extra 5` draws record 20 and `--extra 6` record 21;
+`--active 2` draws record 1 and `--extra 1` record 16. Record 20 is a grey pause
+bar and record 1 the same bar lit orange; record 21 is a grey play triangle and
+record 16 the same triangle lit. So `FUN_100335f0`'s crossed pair is dead code
+and there is no shipped bug here: the button shows one glyph, and the pointer
+lights the brighter copy of it.
+School Days HQ's two halves agree — `FUN_10024100` and `FUN_100258f0` both pair
+record 26 (source `x` 311) with record 44 and record 1 (source `x` 1) with
+record 45 — which is the cross-check that the *pairing*, and not the record
+numbers, is the rule.
+
+The re-place's position is also why the glyph turns over on the frame of the
+press: the pause state the re-place re-reads is the one the dispatch in the same
+update just flipped.
 
 ### What widget 4 actually skips to
 
@@ -3316,9 +3349,11 @@ each pair is picked by the same question that makes its widget pressable.
 Widget 0 animates through records 29..41 while its flag is set, at
 `((now - started) / (1000 / (rate_index + 1))) % 13`, so it runs faster the
 faster playback is. The bar fades in over 300ms and out over 1000ms
-(`FUN_100255c0`). Widget 1's hover art is inverted on purpose — it offers
-`pause` while playing — and `FUN_10024100` and `FUN_100258f0` pick the same pair
-independently.
+(`FUN_100255c0`). Widget 1 offers `pause` while playing, so its glyph is the
+opposite of the playback state; `FUN_100258f0`, the `+0x2c` re-place at the end
+of the update, is what pairs the hover record with the resting one, and here
+`FUN_10024100` picks the same pair rather than crossing it the way Shiny Days'
+does. See *The Shiny Days bar*.
 
 See `daysengine::ui::bar`, and `daysengine bar` to print the whole table against a
 real install.

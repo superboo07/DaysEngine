@@ -506,9 +506,11 @@ fn parse_command(line: usize, command: &str, args: &[&str]) -> Result<Option<Eve
         // Shiny Days' ambient bed. Recognised so it is not reported as a gap in
         // our vocabulary, and dropped because acting on it would be a guess:
         // the arm runs behind a gate — host vtable slot `+0x130`, or the film
-        // object's `+0x320` — whose meaning is **not recovered**. See
-        // `docs/FORMATS.md`. Until it is, a looping bed we started where the
-        // original stayed silent would be worse than silence.
+        // object's `+0x320`. `+0x130` is the engine's state word, engine
+        // `+0x254`, and 1 is the state a film plays in; **whether it is 1 while
+        // a script is being parsed is not recovered**. See `docs/FORMATS.md`.
+        // Until it is, a looping bed we started where the original stayed
+        // silent would be worse than silence.
         "PlayES" => return Ok(None),
         "PlayVoice" => {
             need(1, "a voice path")?;
