@@ -86,9 +86,10 @@
 //! ```text
 //!  0        toggles the host's auto-advance flag       host +0x120
 //!  1        toggles pause                              host +0xf4
-//!  2        restart, then step back on a second press   host +0xfc(1) / (2)
-//!  3        jump to the end of this script             host +0xfc(2)
-//!  4        skip                                       host +0x12c(1), +0xfc(5)
+//!  2        rewind: restart, then back a part           host +0x10c(0),
+//!                                                        +0xfc(1) / +0xfc(2) +0x124(0)
+//!  3        skip to the end of this part               host +0xfc(2)
+//!  4        skip to the next choice                    host +0x12c(1), +0xfc(5)
 //!  5..9     playback speed, one widget per rate        host +0x8c(0..4)
 //! 10..12    open a menu: save, load, backlog           host +0xf8(4/5/3)
 //! 13        open the settings menu                     host +0xf8(2)
@@ -96,10 +97,18 @@
 //! 15..24    the replay indicator's transparency        FUN_10026ed0
 //! ```
 //!
-//! Note widgets 3 and 2's second press make the *same* host call. That is the
-//! shipped dispatch, not a transcription slip: widget 2 goes through
-//! `FUN_10025b90`, which asks for `+0xfc(1)` the first time and `+0xfc(2)` the
-//! second, and widget 3 asks for `+0xfc(2)` outright.
+//! The names are the game's own, off the caption strips the sheet carries for
+//! each widget: `Rewind to beginning of current part`, `Skip to end of current
+//! part`, `Skip to next choice`.
+//!
+//! Widgets 2 and 3 both ask `+0xfc(2)`, and they are **not** the same press.
+//! `FUN_10025b90` is widget 2: `+0xfc(1)` the first time, and on the second
+//! `+0xfc(2)` followed by `+0x124(0)` — the flag at `engine + 0x560` that
+//! sends the end-of-script block to `_GetBackScriptFile@12` rather than
+//! `_GetNextScriptFile@12`. So widget 3 goes forward out of the part and
+//! widget 2 goes back, through one seek code and one flag. Widget 3's own
+//! dispatch is `FUN_10025c90(this, 0)`, the same helper widget 4 reaches with
+//! 1.
 //!
 //! # It is a drop-down, and it is translucent
 //!
@@ -551,10 +560,25 @@ impl Fade {
     }
 }
 
-/// Frames within which a second press of widget 2 means "step back".
+/// The frame past which widget 2's latch is dropped.
 ///
-/// `FUN_10024100` clears the latch when its frame argument exceeds `0x48`, so
-/// the window is 72 frames — three seconds at the script's 24 fps.
+/// `FUN_10024100` clears the latch whenever `0x48 < param_1`, and the update's
+/// argument is the **script clock** — `FUN_004252e0` passes `engine + 0x208`,
+/// the same member every other part of the tick reads. So this is not "72
+/// frames since the press": it is frame 72 of the script, three seconds in at
+/// 24 fps.
+///
+/// That is a window all the same, because the press that sets the latch is the
+/// one that puts the clock back to the script's first frame. A restart at
+/// 20:00 leaves three seconds of replayed script in which the second press
+/// means "back a part", and after that the button restarts again.
+///
+/// The engine drops the latch on every script change as well — vtable slot
+/// `+0x28` (`FUN_10027230`, which writes `this + 0xe0` outright) called with 0
+/// at the end of `FUN_00424020`, the pass that has just loaded what comes
+/// next. The original needs that call because its `FILM::MenuBar` is a static
+/// that outlives the script; this engine builds a [`Bar`] per script, so the
+/// latch it starts with is already down.
 pub const RESTART_LATCH_FRAMES: u32 = 0x48;
 
 /// Which menu widgets 10..13 ask the host to open, by the number they pass to
@@ -582,11 +606,9 @@ pub struct MenuRequest(pub i32);
 /// host slot `+0xfc`.
 ///
 /// `FUN_00425bf0` is the state-4 handler that consumes these, and the three
-/// codes below are the ones the bar can produce. Code 1 restarts the script in
-/// place; codes 2 and 5 both end up at the "this script is finished" path,
-/// which loads whatever `_GetNextScriptFile@12` names. The codes travel out of
-/// here unresolved: which script that is belongs to the branch graph, not to
-/// this module.
+/// codes below are the ones the bar can produce. The codes travel out of here
+/// unresolved: which script a code lands on belongs to the branch graph, not
+/// to this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seek(pub i32);
 
@@ -594,14 +616,28 @@ impl Seek {
     /// Restart the current script from its first frame. `FUN_00425bf0` case 3
     /// under code 1 rewinds the timeline and replays it.
     pub const RESTART: Seek = Seek(1);
-    /// Leave the current script. Widget 3, and widget 2's second press.
-    pub const END_OF_SCRIPT: Seek = Seek(2);
+    /// End this part: widget 3, and widget 2's second press. Named for the
+    /// game's own caption, `Skip to end of current part`, because the seek is
+    /// not always out of the script.
+    ///
+    /// **Not simply "leave the script".** `FUN_00425bf0`'s case 3 under code 2
+    /// asks the timeline the same question case 6 does — is the `[SkipFRAME]`
+    /// target ahead of the clock and different from the `[Next]` end? — and
+    /// when it is, seeks to that target less `DAT_0050c468` (24 frames) and
+    /// keeps playing. Only when there is no target ahead does it seek to the
+    /// end and let the end-of-script block chain. The rewind flag forces the
+    /// second branch: the test is `(skip == end) || (skip < clock) ||
+    /// engine + 0x560`.
+    ///
+    /// So the landing is [`crate::playback::stage::Stage::skip_target`]'s,
+    /// which is why both widgets ask it.
+    pub const END_OF_PART: Seek = Seek(2);
     /// Widget 4's code, reached only after host `+0x12c(1)`.
     ///
-    /// The only code that is not "this script is over": `FUN_00425bf0`'s case 2
-    /// routes it to case 6, which jumps to the choice this script raises — or,
-    /// when it raises none, chases one across the scripts that follow. See
-    /// [`crate::playback::stage::Stage::skip_target`].
+    /// `FUN_00425bf0`'s case 2 routes it to case 6, which jumps to the choice
+    /// this script raises — or, when it raises none, chases one across the
+    /// scripts that follow, which is case 7 and is reachable from nowhere
+    /// else. See [`crate::playback::stage::Stage::skip_target`].
     pub const SKIP: Seek = Seek(5);
 }
 
@@ -616,9 +652,17 @@ pub enum Act {
     /// Pause if playing, resume if paused. Host `+0xf4`.
     TogglePause,
     /// Move the timeline. Host `+0xfc`; widget 4 additionally sets the host's
-    /// skip request through `+0x12c(1)` first, which [`Act::Seek`] carries as
+    /// skip request through `+0x12c(1)` first, which [`Seek::SKIP`] carries as
     /// its own code rather than as a separate action.
-    Seek(Seek),
+    ///
+    /// `rewind` is host `+0x124(0)` (`FUN_0042bfd0`), which widget 2's second
+    /// press makes straight after the seek. It raises `engine + 0x560` and
+    /// clears the moving flag beside it, and that is what makes the
+    /// end-of-script block take `_GetBackScriptFile@12` and skip the read
+    /// mark — the *previous* part rather than the next one. It is on the same
+    /// action as the code because the original makes both calls from one
+    /// dispatch arm and the engine has to see them together.
+    Seek { code: Seek, rewind: bool },
     /// Select a playback rate by index into [`SPEEDS`]. Host `+0x8c`.
     Speed(usize),
     /// Open a menu over playback. Host `+0xf8`.
@@ -659,11 +703,30 @@ pub struct State {
     /// Host `+0x104`: the replay menu started this playback. Disables widgets
     /// 4 and 10..12.
     pub replay: bool,
-    /// Host `+0x110`: `FUN_00428210`, which answers false unless the host's
-    /// own draw-message flag is set and the asset it names resolves. Disables
-    /// widgets 4 and 5..9.
+    /// Host `+0x110`: `FUN_00428210`. Disables widgets 4 and 5..9.
+    ///
+    /// ```text
+    /// if (engine+0x5c8 == 0)        return 0
+    /// if (engine+0x188 is non-empty and host->+0x18(it) != 0)  return 0
+    /// return 1
+    /// ```
+    ///
+    /// So it is the draw-message flag at `engine + 0x5c8` **and** a script
+    /// name at `engine + 0x188` that is empty or does not resolve in the
+    /// packs. `FUN_004281a0` — host `+0x10c`, the one writer of the flag —
+    /// tests the same name and drops the rate to 1x when it fails to resolve,
+    /// so the pair is about a script that is about to be missing.
+    ///
+    /// Widget 2 calls `+0x10c(0)` before either of its presses, so a restart
+    /// or a rewind takes the message off. The engine's own writes of the flag
+    /// are the zero `FUN_00423130` gives it and the clear at the end of
+    /// `FUN_00424020`; a scan of the executable finds no third.
+    ///
+    /// **What raises it is not recovered.** So this engine never sets it, and
+    /// the two widgets it gates are never disabled by it.
     pub message: bool,
-    /// Host `+0x88`: `FUN_00427490`. Required by widgets 4 and 5..9.
+    /// Host `+0x88`: `FUN_00427490`. Required by widgets 5..9, and by nothing
+    /// else on the strip.
     ///
     /// Two branches, and the second is the one that matters:
     ///
@@ -706,8 +769,8 @@ pub struct State {
     /// Host `+0x140`: while set, `FUN_10024ca0` draws none of the bar's own
     /// widgets.
     pub hidden: bool,
-    /// `_GetSuperSkipFlag@0`, the `SuperSkip` setting. Required by widget 4,
-    /// and it picks widget 4's resting sprite.
+    /// `_GetSuperSkipFlag@0`, the `SuperSkip` setting. It both gates widget 4
+    /// — see [`Layout::enabled`] — and picks its resting sprite.
     pub super_skip: bool,
     /// Host `+0x118`: the rate in force as a number rather than an index. The
     /// rate readout is drawn only once it is at least 2.0 — the threshold is
@@ -825,7 +888,13 @@ impl Layout {
     pub fn enabled(&self, widget: usize, state: State) -> bool {
         match widget {
             0..=3 | 0xd | 0xe => true,
-            4 => !state.replay && !state.message && state.skippable,
+            // Widget 4 asks `_GetSuperSkipFlag@0` here, not host `+0x88`:
+            // `FUN_10023fb0`'s case 4 is `!replay && !message &&
+            // _GetSuperSkipFlag@0()`, and `FUN_100334d0`'s is the same. So
+            // the skip button is dead — and, because the enabled test is what
+            // gates them, silent, unhovered and captionless — for a player
+            // who has `SuperSkip` off. Only the speed row asks `+0x88`.
+            4 => !state.replay && !state.message && state.super_skip,
             5..=9 => !state.message && state.skippable,
             10..=12 => !state.replay,
             0xf..=0x18 => matches!(self.knob, Knob::Cells) && state.following_record,
@@ -868,18 +937,39 @@ impl Layout {
             0 => Act::ToggleAuto,
             1 => Act::TogglePause,
             // `FUN_10025b90`, and Shiny Days' `FUN_10034ef0` at vtable slot
-            // `+0x30`. The second press is refused outright while the replay
-            // menu is driving playback or the host's own "following a record"
-            // member is set, so in those cases the button restarts every time.
-            2 => {
-                if latched && !state.replay && !state.following_record {
-                    Act::Seek(Seek::END_OF_SCRIPT)
-                } else {
-                    Act::Seek(Seek::RESTART)
-                }
-            }
-            3 => Act::Seek(Seek::END_OF_SCRIPT),
-            4 => Act::Seek(Seek::SKIP),
+            // `+0x30`. Both are the same three-armed press:
+            //
+            //   unlatched            +0xfc(1), and latch unless replay or
+            //                        following a record
+            //   latched, allowed     +0xfc(2) then +0x124(0), and unlatch
+            //   latched, refused     nothing at all
+            //
+            // The third arm cannot be reached by pressing: the latch is only
+            // ever set with both members clear and neither turns back on
+            // inside a script. It is here because the shipped dispatch asks
+            // the question on the second press rather than trusting the
+            // latch, and a press it refuses does nothing — it does not fall
+            // back to restarting.
+            2 => match (latched, state.replay || state.following_record) {
+                (false, _) => Act::Seek {
+                    code: Seek::RESTART,
+                    rewind: false,
+                },
+                (true, false) => Act::Seek {
+                    code: Seek::END_OF_PART,
+                    rewind: true,
+                },
+                (true, true) => Act::None,
+            },
+            // `FUN_10025c90(this, 0)`; widget 4 is the same helper with 1.
+            3 => Act::Seek {
+                code: Seek::END_OF_PART,
+                rewind: false,
+            },
+            4 => Act::Seek {
+                code: Seek::SKIP,
+                rewind: false,
+            },
             5..=9 => Act::Speed(widget - 5),
             10 => Act::Menu(MenuRequest(4)),
             11 => Act::Menu(MenuRequest(5)),
@@ -928,14 +1018,31 @@ pub mod widget {
     }
 }
 
-/// How widget 2's latch moves when it is pressed or time passes.
+/// Where widget 2's latch stands after a press, from `FUN_10025b90` and Shiny
+/// Days' `FUN_10034ef0`.
 ///
-/// `FUN_10025b90` sets the latch on the first press but only when playback is
-/// neither a replay nor a followed recording, and clears it on the second;
-/// `FUN_10024100`
-/// clears it once its frame argument passes [`RESTART_LATCH_FRAMES`].
+/// The first press sets it, but only while playback is neither a replay nor a
+/// followed recording. The second clears it — and a second press the same two
+/// members refuse leaves it **set**, because the arm that clears it is inside
+/// the test rather than around it, so the button stays armed rather than
+/// falling back to restarting. [`Bar::expire_latch`] and [`Bar::clear_latch`]
+/// are the two ways it comes down without a press.
+/// Whether the update drops widget 2's latch at this frame, from
+/// `FUN_10024100`'s `0x48 < param_1`.
+///
+/// The argument is the script clock — see [`RESTART_LATCH_FRAMES`] — so this
+/// is a position in the script and not an age.
+pub fn latch_expired(frame: u32) -> bool {
+    frame > RESTART_LATCH_FRAMES
+}
+
 pub fn restart_latch(latched: bool, state: State) -> bool {
-    !latched && !state.replay && !state.following_record
+    let refused = state.replay || state.following_record;
+    if latched {
+        refused
+    } else {
+        !refused
+    }
 }
 
 /// The caption strip shown for the hovered widget, as an offset from
@@ -1003,8 +1110,10 @@ impl Solidity {
 /// The bar, loaded and ready to hit-test and draw.
 pub struct Bar {
     screen: Screen,
-    /// Widget 2's latch, and the frame it was set on.
-    latch: Option<u32>,
+    /// Widget 2's latch: `this + 0xe0` in `FUN_10025b90`, one bit and no
+    /// timestamp — what expires it is the clock, not an elapsed time. See
+    /// [`RESTART_LATCH_FRAMES`].
+    latch: bool,
     fade: Fade,
     /// How solid the replay-mode indicator is drawn.
     solidity: Solidity,
@@ -1039,7 +1148,7 @@ impl Bar {
         };
         Ok(Bar {
             screen,
-            latch: None,
+            latch: false,
             fade: Fade::default(),
             solidity,
             gripped: false,
@@ -1142,7 +1251,7 @@ impl Bar {
     /// Hides the bar again, for the start of a script.
     pub fn reset(&mut self) {
         self.fade.reset();
-        self.latch = None;
+        self.latch = false;
     }
 
     /// The widget under a point in the bar's own space, or `None`.
@@ -1171,14 +1280,13 @@ impl Bar {
             return Act::None;
         };
         self.expire_latch(frame);
-        let latched = self.latch.is_some();
+        let latched = self.latch;
         let act = layout.action(widget, state, latched);
-        if widget == 2 && act != Act::None {
-            self.latch = if restart_latch(latched, state) {
-                Some(frame)
-            } else {
-                None
-            };
+        // Widget 2 is always enabled, so the latch moves on every press of it
+        // — including the one the replay members refuse, which returns
+        // [`Act::None`] and leaves the latch where it was.
+        if widget == 2 {
+            self.latch = restart_latch(latched, state);
         }
         match act {
             // `FUN_10026ed0` stores the level in the bar itself and applies it
@@ -1263,12 +1371,11 @@ impl Bar {
         state.gauge_raised || self.rate_readout(state).is_some()
     }
 
-    /// Drops widget 2's latch once its window has passed.
+    /// Drops widget 2's latch once the clock is past
+    /// [`RESTART_LATCH_FRAMES`], which is what the update does on every tick.
     pub fn expire_latch(&mut self, frame: u32) {
-        if let Some(set) = self.latch {
-            if frame.saturating_sub(set) > RESTART_LATCH_FRAMES {
-                self.latch = None;
-            }
+        if latch_expired(frame) {
+            self.latch = false;
         }
     }
 
@@ -1909,17 +2016,19 @@ mod tests {
         assert!(enabled(0xe, replay));
     }
 
-    /// With host `+0x88` false — no script loaded — the skip button and the
-    /// speed row go dead together, and nothing else does.
+    /// With host `+0x88` false — no script loaded — the speed row goes dead,
+    /// and nothing else on the strip does. The skip button beside it answers
+    /// `_GetSuperSkipFlag@0` instead.
     #[test]
-    fn the_speed_row_and_skip_go_dead_together_without_a_script() {
+    fn only_the_speed_row_goes_dead_without_a_script() {
         let no_script = State {
             skippable: false,
             ..live()
         };
-        for widget in 4..=9 {
+        for widget in 5..=9 {
             assert!(!enabled(widget, no_script));
         }
+        assert!(enabled(4, no_script));
         assert!(enabled(3, no_script));
     }
 
@@ -1951,7 +2060,7 @@ mod tests {
     }
 
     #[test]
-    fn widget_two_restarts_then_steps_back() {
+    fn widget_two_restarts_then_rewinds_a_part() {
         // `FUN_10025b90` takes the second press only while neither the replay
         // menu nor the host's `+0x98` member is driving playback, so the state
         // here is not following a recording.
@@ -1959,30 +2068,103 @@ mod tests {
             following_record: false,
             ..live()
         };
-        assert_eq!(action(2, plain, false), Act::Seek(Seek::RESTART));
-        assert_eq!(action(2, plain, true), Act::Seek(Seek::END_OF_SCRIPT));
-        // With it set, the button restarts however many times it is pressed.
-        assert_eq!(action(2, live(), true), Act::Seek(Seek::RESTART));
+        assert_eq!(
+            action(2, plain, false),
+            Act::Seek {
+                code: Seek::RESTART,
+                rewind: false,
+            }
+        );
+        // The second press is the rewind: `+0xfc(2)` and then `+0x124(0)`.
+        assert_eq!(
+            action(2, plain, true),
+            Act::Seek {
+                code: Seek::END_OF_PART,
+                rewind: true,
+            }
+        );
+        // With the host following a record the latch never goes up, so the
+        // button restarts however many times it is pressed.
+        assert!(!restart_latch(false, live()));
+        assert_eq!(
+            action(2, live(), false),
+            Act::Seek {
+                code: Seek::RESTART,
+                rewind: false,
+            }
+        );
     }
 
+    /// A latch that is up while the replay members are set cannot be reached
+    /// by pressing — they are what put it up — but the shipped dispatch asks
+    /// the question again on the second press, and a press it refuses does
+    /// nothing at all rather than restarting.
     #[test]
-    fn widget_two_never_latches_during_a_replay() {
+    fn a_refused_second_press_does_nothing_and_stays_armed() {
         let replay = State {
             replay: true,
             ..live()
         };
         assert!(!restart_latch(false, replay));
-        // ...so the second press restarts again rather than jumping to the end.
-        assert_eq!(action(2, replay, true), Act::Seek(Seek::RESTART));
+        assert_eq!(action(2, replay, true), Act::None);
+        assert!(restart_latch(true, replay));
+    }
+
+    /// The latch is dropped by the clock passing frame 72, not by 72 frames
+    /// passing since the press: `FUN_10024100`'s test is `0x48 < param_1` and
+    /// `FUN_004252e0` passes `engine + 0x208`.
+    #[test]
+    fn the_latch_expires_on_the_clock_rather_than_on_elapsed_frames() {
+        assert!(!latch_expired(0));
+        assert!(!latch_expired(RESTART_LATCH_FRAMES));
+        assert!(latch_expired(RESTART_LATCH_FRAMES + 1));
+        // The press that arms it is the one that puts the clock back to the
+        // script's first frame, so the window is the three seconds after a
+        // restart however late in the script that restart was.
+        assert!(!latch_expired(0));
     }
 
     #[test]
-    fn widget_three_asks_for_the_same_code_as_a_second_press_of_widget_two() {
+    fn widget_three_ends_the_part_without_rewinding() {
         let plain = State {
             following_record: false,
             ..live()
         };
-        assert_eq!(action(3, plain, false), action(2, plain, true));
+        assert_eq!(
+            action(3, plain, false),
+            Act::Seek {
+                code: Seek::END_OF_PART,
+                rewind: false,
+            }
+        );
+        // The same code as widget 2's second press, and not the same press:
+        // the rewind flag is what tells them apart.
+        assert_ne!(action(3, plain, false), action(2, plain, true));
+    }
+
+    /// `FUN_10023fb0` case 4 asks `_GetSuperSkipFlag@0`, where the speed row
+    /// asks host `+0x88`. A player with `SuperSkip` off has a dead — and so
+    /// silent, unhovered, captionless — skip button and a live speed row.
+    #[test]
+    fn the_skip_button_is_the_super_skip_setting_and_the_speed_row_is_not() {
+        let without = State {
+            super_skip: false,
+            ..live()
+        };
+        assert!(!HQ.enabled(4, without));
+        assert!(HQ.enabled(5, without));
+        assert_eq!(action(4, without, false), Act::None);
+        assert!(HQ.enabled(4, live()));
+        assert_eq!(
+            action(4, live(), false),
+            Act::Seek {
+                code: Seek::SKIP,
+                rewind: false,
+            }
+        );
+        // And the same on the other module's table.
+        assert!(!Layout::SHINY_DAYS.enabled(4, without));
+        assert!(Layout::SHINY_DAYS.enabled(5, without));
     }
 
     #[test]

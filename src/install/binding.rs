@@ -85,10 +85,10 @@ pub enum Action {
     SeekBack,
     /// Jump five seconds on.
     SeekForward,
-    /// Play this script again from its first frame. Bar widget 2, latch and
-    /// all: a second press inside `RESTART_LATCH_FRAMES` leaves the script
-    /// instead, because this presses the widget rather than short-circuiting
-    /// to what the widget usually does.
+    /// Play this part again from its first frame. Bar widget 2, latch and
+    /// all: a second press before the clock passes `RESTART_LATCH_FRAMES`
+    /// rewinds to the part before this one instead, because this presses the
+    /// widget rather than short-circuiting to what the widget usually does.
     Restart,
     /// Toggle auto-advance. Bar widget 0.
     Auto,
@@ -96,7 +96,9 @@ pub enum Action {
     Faster,
     /// One step down it.
     Slower,
-    /// Jump to the choice this script raises. Bar widget 4.
+    /// Jump to the choice this part raises, or chase one across the parts
+    /// after it. Bar widget 4, so it is dead while `SuperSkip` is off, exactly
+    /// as the button is.
     SkipToChoice,
     /// Open the save screen over playback. Bar widget 10.
     SaveMenu,

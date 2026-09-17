@@ -2320,6 +2320,7 @@ static `FILM::MenuBar` (constructor `FUN_100216e0`, which writes the vtable at
 | `+0x1c` | take the renderer and host pointers |
 | `+0x20` | update: hit test, fade, dispatch — `FUN_10024100` |
 | `+0x2c` | re-place the play/pause widget — `FUN_100258f0` |
+| `+0x28` | set widget 2's latch — `FUN_10027230` |
 | `+0x30` | widget 2's action — `FUN_10025b90` |
 | `+0x34` | widget 0's action — `FUN_10025cf0` |
 
@@ -2331,10 +2332,17 @@ bracket the 25 into the same twelve groups:
 |---|---|---|
 | 0 | `+0x120`, flip the auto flag and save the settings | always |
 | 1 | `+0xf4`, toggle pause | always |
-| 2 | `+0xfc(1)`, then `+0xfc(2)` on a second press | always |
+| 2 | `+0x10c(0)`, then `+0xfc(1)` — or `+0xfc(2)` and `+0x124(0)` on a second press | always |
 | 3 | `+0xfc(2)` | always |
 | 4 | `+0x12c(1)` then `+0xfc(5)` | `!+0x104 && !+0x110 && SuperSkip` |
 | 5..9 | `+0x8c(0..4)`, the playback rate | `!+0x110 && +0x88` |
+
+`+0x110` is `FUN_00428210`: the draw-message flag at `engine + 0x5c8` **and** a
+script name at `engine + 0x188` that is empty or does not resolve in the packs
+— it returns 0 the moment the lookup through `+0x18` answers. Its one writer is
+host `+0x10c` (`FUN_004281a0`), which tests the same name and drops the rate to
+1x when it fails; widget 2 calls that with 0 before either of its presses. What
+*raises* the flag is not recovered, so DaysEngine never sets it.
 | 10..12 | `+0xf8(4)`, `+0xf8(5)`, `+0xf8(3)` | `!+0x104` |
 | 13 | `+0xf8(2)` | always |
 | 14 | `+0x100(1)` | always |
@@ -2345,6 +2353,107 @@ asks the enabled test before playing SE index 2. The enabled test is also what
 gates the hover sprite and the caption — the dispatch zeroes both flags for a
 widget it answers false for — so a dead button shows nothing under the pointer
 either.
+
+### What the three seek buttons actually do
+
+The game names them itself. Each widget's caption strip is a piece of the chip
+sheet, and in an English install widget 2's reads `Rewind to beginning of
+current part`, widget 3's `Skip to end of current part` and widget 4's `Skip to
+next choice`. `daysengine ui "System/MenuBar/MenuBar" --extra 30` draws the
+first of them.
+
+Widgets 2 and 3 both ask `+0xfc(2)`, and they are not the same press.
+`FUN_10025b90` — vtable `+0x30`, and Shiny Days' `FUN_10034ef0` is the same
+function — is widget 2:
+
+```text
+host->+0x10c(0)                          clear the draw-message flag
+if (this+0xe0 == 0) {                    not armed
+    host->+0xfc(1)                       restart this part
+    if (!+0x104 && !+0x98) this+0xe0 = 1 arm, unless replay or following
+} else if (!+0x104 && !+0x98) {
+    host->+0xfc(2)                       end this part...
+    host->+0x124(0)                      ...backwards
+    this+0xe0 = 0
+}
+```
+
+The third arm is the one that matters: `+0x124` is `FUN_0042bfd0`, which sets
+`engine + 0x560`, clears the moving flag at `engine + 0x210` and stores its
+argument at `engine + 0x562`. `FUN_00424020`, the end-of-script block, reads
+exactly those two:
+
+```text
+if (!replay) {
+    if (engine+0x560 == 0)        mark read, then _GetNextScriptFile@12
+    else if (engine+0x562 == 0)   _GetBackScriptFile@12 -> host +0x128
+    else                          searchRoot(), the route-map jump
+}
+```
+
+So the bar's second press plays the **previous** part, and the part it leaves is
+not recorded as read — the mark is on the other branch. `engine + 0x560` is
+cleared again at the end of the same block, once the next script is up, so a
+rewind is one step and not a mode. Widget 3 makes the same seek without the
+flag, and so goes forward.
+
+Neither is "leave the script" on its own. `FUN_00425bf0`'s case 3 under code 2
+asks the same question its case 6 asks for the skip:
+
+```text
+skip = FUN_004315c0()    the script object's +0x22c, from [SkipFRAME]
+end  = FUN_004315a0()    its +0x21c, from [Next]
+if (skip == end || skip < clock || engine+0x560)   seek to end, let the block chain
+else                                               seek to skip - 0x18, keep playing
+```
+
+So `Skip to end of current part` stops one second before a choice the part still
+raises, exactly where the skip button stops, and only leaves the part when there
+is no choice ahead. The rewind flag is the third term, which is why a rewind
+always leaves. The difference between widget 3 and widget 4 is what happens when
+there is nothing ahead: widget 4 falls into case 7 and chases a choice across
+the parts that follow, and widget 3 does not.
+
+**The latch is not a timer.** `FUN_10024100` drops it with `if (this+0xe0 != 0
+&& 0x48 < param_1)`, and the update's argument is the script clock —
+`FUN_004252e0` passes `engine + 0x208`. So the window is the first 72 frames of
+the script, three seconds at 24 fps, and it is a window at all only because the
+press that arms it is the press that puts the clock back to the script's start.
+The engine also drops it on every script change: `FUN_00424020` ends with
+`MenuBar->+0x28(0)`, the setter `FUN_10027230`.
+
+### `[SkipFRAME]` is only recorded while the skip flag is up
+
+Both of those seeks read the script object's `+0x22c`, and it is written in one
+place: `FUN_0043b640`, the line parser `FUN_0043c110` runs over the `.ORS` as it
+opens the file. Its `[SkipFRAME]` arm is inside `if (FUN_004401c0(engine))` —
+the flag at `engine + 0x5c9`.
+
+That flag has exactly one writer, host `+0x12c` (`FUN_0042c000`), whose only
+caller is the vtable slot; and exactly one caller of *that* with a 1, the bar's
+widget 4 in `FUN_10025c90`. `FUN_00425bf0`'s cases 6 and 7 put it back to 0 as
+soon as the chase settles, and `FUN_00423130` zeroes it when the engine is
+built.
+
+So a part reached by ordinary chaining carries **no skip target**, and the first
+press of widget 3 or widget 4 inside it leaves the part; a part the chase itself
+loaded carries one, and a press inside it lands on the choice. The other arm of
+the same parser sets `+0x22c` to the end for an `[EndRoll]` in replay mode,
+which is "no choice here".
+
+What the shipped engine compares when nothing was recorded is **uninitialised
+memory** — whatever was already in that heap block. The script object is a
+plain `malloc(0x418)` in `FUN_00430d20`, its
+constructor `FUN_004388c0` never writes `+0x22c`, and the only two writes to
+that member anywhere in `.text` are the pair in `FUN_0043b640` — Ghidra's
+listing and a raw byte scan of the section for the `disp32` agree on that, and
+the byte scan also rules out the two `c7 4x 2c` sequences that look like it and
+are not. (`engine + 0x22c` is a different member of a different object and is
+written all over the executable; the one that matters here is the script
+object's.) DaysEngine does not reproduce that: with the flag down the script is
+given no target at all, which is the answer the comparison reaches on any clock
+past the stale frame. `daysengine::playback::stage::apply_skip_flag` is the
+gate.
 
 ### The Shiny Days bar
 
@@ -2468,7 +2577,7 @@ Case 6 compares two members of the timeline object:
 
 | Member | Getter | Written by | Meaning |
 |---|---|---|---|
-| `+0x22c` | `FUN_004315c0` | `[SkipFRAME]` in `FUN_0043b640` | the skip target |
+| `+0x22c` | `FUN_004315c0` | `[SkipFRAME]` in `FUN_0043b640`, **only while the skip flag is up** | the skip target |
 | `+0x21c` | `FUN_004315a0` | `[Exit]` / `[Next]` in `FUN_0043b640` | the end of the script |
 
 If the target is ahead of the clock (`+0x208`) and not equal to the end, it
@@ -2499,8 +2608,9 @@ one.
 The chase is gated by host `+0x88` (`FUN_00427490`): when that answers 0 the
 new script is played whether or not it has a choice.
 
-The target is the choice. Across all 1,857 retail scripts, `[SkipFRAME]` equals
-`[Next]` in the 1,570 that raise no choice, and in all 287 that do it is exactly
+The target is the choice — in the scripts that have one recorded; see
+*`[SkipFRAME]` is only recorded while the skip flag is up*. Across all 1,857
+retail scripts, `[SkipFRAME]` equals `[Next]` in the 1,570 that raise no choice, and in all 287 that do it is exactly
 the `[SetSELECT]` start — no exceptions either way. So `[SkipFRAME]` is **not**
 the script's length, which is `[Next]`; the two coincide only when there is
 nothing to skip to.
@@ -2631,9 +2741,10 @@ Where the host slots land is the executable's own state machine. `FUN_00427300`
 switches on `engine + 0x220`, which is host `+0x1f4` — an independent
 confirmation that the host interface sits at `engine + 0x2c`. State 1 plays,
 state 3 opens a menu (`FUN_00425550`), state 4 moves the timeline
-(`FUN_00425bf0`, where code 1 restarts the script in place and codes 2 and 5
-chain to whatever `_GetNextScriptFile@12` names) and state 5 leaves. The
-chaining codes are route-system territory.
+(`FUN_00425bf0`) and state 5 leaves. Code 1 restarts the script in place; codes
+2 and 5 first look for a choice still ahead in this script and seek to it, and
+chain only when there is none — see *What the three seek buttons actually do*,
+which is where that test and the direction the chain takes are written down.
 
 `+0xf8`'s numbers are `setSystemInit`'s own codes, so 4 is the save screen, 5
 the load screen and 2 the Option screen — the same three the title menu reaches.
@@ -4834,6 +4945,43 @@ There is no table of edges anywhere: they exist only as compiled x86.
 user's own DLL**, with no address written down — the handler addresses come
 from `_GetNextScriptFile@12`'s own dispatch switch, which is found through the
 PE export table.
+
+### `GetBackScriptFile`, the control bar's rewind
+
+`_GetBackScriptFile@12` is the mirror of it and is decoded the same way: a
+55-way `switch (ROUTE)` whose handlers take the same three arguments and call
+the **same** per-route emitters, with the scene *before* this one. Three arm
+shapes and no others:
+
+```text
+FUN_1000d3d0(host, buf, len, 3, 0)          a literal previous scene
+FUN_1000d3d0(host, buf, len, get("BS0000B00"), 0)   through a bookmark
+FUN_10006760(host, buf, len, 0); return 0   nothing before this: ROUTE = -1
+```
+
+The bookmarked arms are the merges: where more than one scene leads into this
+one, the forward edge wrote `BS<script> = SCENE` on the way in and the rewind
+reads it back. Resolving one needs the save, so `Machine::back_step` keeps the
+name and `Machine::back` answers it — `Next::Bookmark`.
+
+Each handler also **un-credits the part it is leaving** before it names
+anything: `FUN_10005eb0(host, table[scene], 0)` is the same `[%s]="` reader
+`_SetFeeling@8` calls with 1, and the third argument picks `FUN_10005ce0`,
+which subtracts each `(name, amount)` pair, over `FUN_10005c60`, which adds.
+Both raise the gauge for `001` and `002`. That arrives as `Act::Uncredit` and
+`feeling::uncredit` applies it.
+
+The recovery is checked against the forward graph, which works its answer out
+independently: `daysengine route --edges` reports that of School Days HQ's
+1,506 rewind edges naming a literal scene, 1,471 are scenes the branch graph
+leads back from, 2 name the scene itself — nothing before it — and 33 name a
+scene whose own forward edge goes somewhere else. Those 33 are almost all a
+route's scene 1, whose predecessor is scene 0 while scene 0 plays the chapter's
+`OP1` opening first: the rewind steps back over the opening. The rest are
+`[route 1] 45/46` and its like, where the shipped handler sends two scenes back
+to the first of them. 441 more arms read a bookmark, and one stops.
+`daysengine route --play <script> --steps N --rewind N` walks a route forward
+and then back out of it, which round-trips exactly, counters included.
 
 The decoder does not try to recognise the two shapes of `switch` the compiler
 emitted (a jump table for the big routes, an `if`/`else if` chain for the small

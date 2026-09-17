@@ -252,6 +252,11 @@ pub struct Script {
     /// `FUN_0043b640` parses it into the timeline object's `+0x22c` and
     /// `FUN_004315c0` reads it back.
     ///
+    /// This is what the file says. Whether the engine *records* it is a
+    /// separate question — the parse arm is gated on the engine's skip flag —
+    /// and that belongs to the player, not to the format: see
+    /// `daysengine::playback::stage::apply_skip_flag`.
+    ///
     /// In the 287 retail scripts that raise a choice this is exactly the
     /// `[SetSELECT]` start; in the other 1,570 it equals [`Script::length`],
     /// which is how the engine tells "no choice ahead" from "a choice at

@@ -752,6 +752,14 @@ struct Player<'a> {
     /// one resolves to `FUN_00428a80`, the recorded answer, and the moment the
     /// player answers one themselves it comes back down.
     following_record: bool,
+    /// The skip flag, `engine + 0x5c9`: the bar's widget 4 raises it through
+    /// host `+0x12c(1)` and `FUN_00425bf0`'s cases 6 and 7 lower it again when
+    /// the chase settles. `FUN_00423130` zeroes it as the engine is built.
+    ///
+    /// It outlives a script, and it has to: it is read at the *load*, by the
+    /// line parser that decides whether the script records a `[SkipFRAME]`
+    /// target at all. See `daysengine::playback::stage::apply_skip_flag`.
+    skip_flag: bool,
     /// The controllers, and whichever one the SOMCON tab has taken. This is
     /// the [`Device`] the game's own `[MoveSom]` statements drive.
     pads: Pads,
@@ -1031,6 +1039,7 @@ fn main() -> Result<()> {
             .get("TypeMiniNote")
             .is_some_and(|v| v.trim() != "0"),
         following_record: false,
+        skip_flag: false,
         last_choice: replay::NO_CHOICE,
         backlog: Vec::new(),
         backlog_mark: 0,
@@ -1117,7 +1126,7 @@ fn main() -> Result<()> {
                 // a run starts from nothing: see `Progress::film_start`. A New
                 // Game after a finished route must not inherit that route's
                 // flags, and this is where the original drops them.
-                Outcome::Play | Outcome::Finished | Outcome::SkipToChoice => {
+                Outcome::Play | Outcome::Finished | Outcome::SkipToChoice | Outcome::Rewound => {
                     next = wanted.clone();
                     if let Some(p) = progress.as_mut() {
                         p.film_start();
@@ -1197,6 +1206,9 @@ fn main() -> Result<()> {
         if let Some(p) = progress.as_ref() {
             daysengine::playback::stage::apply_end_roll(&mut script, p.end_roll());
         }
+        // And whether this script records a skip target at all, which is the
+        // engine's skip flag as it stands *now*, at the load.
+        daysengine::playback::stage::apply_skip_flag(&mut script, player.skip_flag);
         log::info!(
             "{} events, length {} ({:.1}s)",
             script.events.len(),
@@ -1234,6 +1246,11 @@ fn main() -> Result<()> {
         }
         if !chasing_choice {
             passed_over = 0;
+            // Both of case 7's landings put the skip flag down — the one that
+            // found a choice and the one host `+0x88` waved through — so the
+            // script about to be played keeps the target it was loaded with
+            // and the next press starts from a clear flag.
+            player.skip_flag = false;
         }
         canvas
             .window_mut()
@@ -1307,6 +1324,26 @@ fn main() -> Result<()> {
             // The slot would not read. The script that was playing has already
             // been torn down, so there is nothing to go back to and this falls
             // through to where a finished session goes.
+        }
+        // The rewind, which is the branch graph asked backwards. It is the
+        // ordinary chain in every other respect — the same `chained`, so the
+        // position the graph just set is not looked up again — and a rewind
+        // the graph cannot answer leaves the player where they were, which
+        // here means falling through to the end of the run the way a route
+        // that has run out does.
+        // It cannot arrive out of a replay: the latch that arms the second
+        // press is refused while host `+0x104` is up, so `replaying` is
+        // untouched here.
+        if outcome == Outcome::Rewound {
+            match progress.as_mut().and_then(Progress::back) {
+                Some(script) => {
+                    log::info!("the rewind goes back to {script}");
+                    next = script.rsplit('/').next().unwrap_or(&script).to_string();
+                    chained = true;
+                    continue;
+                }
+                None => log::info!("there is nothing before this part to rewind to"),
+            }
         }
         if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
             // A replay walks the scene's own list, by its branch table where it
@@ -1394,6 +1431,15 @@ enum Outcome {
     Play,
     /// The script reached its end, so the branch graph decides what follows.
     Finished,
+    /// The control bar's rewind was armed and pressed: widget 2 a second time,
+    /// which asks `+0xfc(2)` and then `+0x124(0)`.
+    ///
+    /// Like [`Outcome::Finished`] except for the two things the flag at
+    /// `engine + 0x560` changes in `FUN_00424020`: the branch graph is asked
+    /// backwards — `_GetBackScriptFile@12`, which is
+    /// [`daysengine::install::progress::Progress::back`] — and the script
+    /// being left is **not** marked read.
+    Rewound,
     /// The skip button was pressed and this script had no choice ahead of the
     /// clock. Like [`Outcome::Finished`], except the chain keeps going — past
     /// whole scripts, without playing them — until it reaches one that raises
@@ -3499,7 +3545,7 @@ fn run_script(
                                 player.mixer.set_rate(bar_state.rate);
                             }
                         }
-                        bar::Act::Seek(code) if code == bar::Seek::RESTART => {
+                        bar::Act::Seek { code, .. } if code == bar::Seek::RESTART => {
                             offset = Frame::ZERO;
                             origin = now;
                             // `FUN_00425bf0` case 3 calls `FUN_004348e0` on
@@ -3508,27 +3554,65 @@ fn run_script(
                             // the restart rather than repeating in the backlog.
                             player.backlog.truncate(player.backlog_mark);
                             player.backlog_logged = None;
+                            // And `FUN_0042a290`, which zeroes the engine's
+                            // three peripheral members and calls `_SomStop@0`:
+                            // a restart puts the SOM down rather than leaving
+                            // it at whatever the part it is replaying had
+                            // reached. The pictures and the statement list go
+                            // with it (`FUN_004295a0`, `FUN_00431f80`), which
+                            // is `Stage::reset` — the seek backwards on the
+                            // next tick does that by itself.
+                            player.pads.stop();
                         }
-                        // Skip jumps to the choice this script raises, if it
-                        // still has one ahead. `FUN_00425bf0`'s case 6 is the
-                        // state `+0xfc(5)` selects, and it is the only seek
-                        // that is not "this script is over" — see
-                        // `Stage::skip_target` for the rule and the landing
-                        // frame. With nothing to skip to here, the chase moves
-                        // on to the scripts after this one.
-                        bar::Act::Seek(code) if code == bar::Seek::SKIP => match skip_target {
-                            Some(to) => {
-                                log::info!("skipping from {at} to the choice at {to}");
-                                offset = to;
-                                origin = now;
+                        // Codes 2 and 5 — widget 3, widget 4 and widget 2's
+                        // second press — ask the same question, because the
+                        // shipped handler asks it twice: `FUN_00425bf0`'s case
+                        // 3 under code 2 and its case 6 under code 5 both seek
+                        // to a choice this script still raises, one second
+                        // before it. See `Stage::skip_target`.
+                        //
+                        // They differ in the answer to "and if there is none":
+                        //
+                        //   code 5   fall into case 7 and chase a choice
+                        //            across the scripts that follow
+                        //   code 2   seek to the end and let the end-of-script
+                        //            block chain forward
+                        //   + rewind `+0x124(0)` is the third term of case 3's
+                        //            test, so the seek always ends the script,
+                        //            and the flag it raised sends
+                        //            `FUN_00424020` to `_GetBackScriptFile@12`
+                        //            and past the read mark
+                        //
+                        // The skip's own `+0x12c(1)` is what puts the engine's
+                        // skip flag up, and cases 6 and 7 put it down the
+                        // moment they settle. Not a detail: that flag is what
+                        // decides whether the script the chase lands on
+                        // records a skip target at all — see
+                        // `stage::apply_skip_flag`.
+                        bar::Act::Seek { code, rewind } => {
+                            if rewind {
+                                return Ok(Outcome::Rewound);
                             }
-                            None => return Ok(Outcome::SkipToChoice),
-                        },
-                        // Everything past a restart lands in the executable's
-                        // state 4, which is the "this script is finished" path:
-                        // it asks `_GetNextScriptFile@12` what follows and
-                        // plays that.
-                        bar::Act::Seek(_) => return Ok(Outcome::Finished),
+                            let chases = code == bar::Seek::SKIP;
+                            if chases {
+                                player.skip_flag = true;
+                            }
+                            match skip_target {
+                                Some(to) => {
+                                    log::info!("skipping from {at} to the choice at {to}");
+                                    offset = to;
+                                    origin = now;
+                                    // Case 6's `+0x12c(0)`, which is the
+                                    // skip's alone: case 3 leaves the flag
+                                    // where it found it.
+                                    if chases {
+                                        player.skip_flag = false;
+                                    }
+                                }
+                                None if chases => return Ok(Outcome::SkipToChoice),
+                                None => return Ok(Outcome::Finished),
+                            }
+                        }
                         // Host `+0x100(1)` leaves playback rather than moving
                         // along it, so this one goes back to the title.
                         bar::Act::Leave => return Ok(Outcome::Play),

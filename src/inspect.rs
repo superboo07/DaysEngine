@@ -226,6 +226,11 @@ pub enum Cmd {
         /// How many scripts to play before stopping.
         #[arg(long, default_value_t = 40)]
         steps: usize,
+        /// After the walk, rewind this many parts the way the control bar's
+        /// widget 2 does — `_GetBackScriptFile@12`, with each part's feeling
+        /// deltas taken back off the counters.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        rewind: usize,
         /// The dress to walk in, as the dress-select screen commits it. Only
         /// Shiny Days has the mechanism; non-zero is the left dress, which is
         /// the one the `Z` recordings are of.
@@ -280,6 +285,17 @@ pub struct BarArgs {
     /// default here.
     #[arg(long)]
     no_script: bool,
+    /// Arm widget 2's latch, as its first press does: the second press then
+    /// rewinds a part instead of restarting this one. The latch lives until
+    /// the script clock passes frame 72 — see `bar::RESTART_LATCH_FRAMES`.
+    #[arg(long)]
+    latched: bool,
+    /// Answer `_GetSuperSkipFlag@0` true whatever the player's `Config.DAT`
+    /// says. That setting is what gates widget 4, the skip button — with it
+    /// off the button is dead, and a dead widget is also silent, unhovered and
+    /// captionless.
+    #[arg(long)]
+    super_skip: bool,
     /// Answer host `+0x98` true: playback is following a save's recorded
     /// answers, which is what the replay screen's play-data list starts. It is
     /// what lights the transparency slider on the right of the strip, makes its
@@ -660,9 +676,10 @@ pub fn run() -> Result<()> {
             play,
             choices,
             steps,
+            rewind,
             dress,
         } => match play {
-            Some(from) => cmd_route_play(&game, &from, &choices, steps, dress)?,
+            Some(from) => cmd_route_play(&game, &from, &choices, steps, rewind, dress)?,
             None => cmd_route(&game, name.as_deref(), scenes, edges)?,
         },
         Cmd::Bar(args) => cmd_bar(&game, &args)?,
@@ -1295,6 +1312,11 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         replay: args.replay,
         message: args.message,
         skippable: !args.no_script && State::from_config(&config).skippable,
+        // The skip button's own gate, which is the `SuperSkip` setting and
+        // not `+0x88`: `FUN_10023fb0` case 4 asks `_GetSuperSkipFlag@0`. Off
+        // in the player's own `Config.DAT` means a dead skip button, so it
+        // comes from there unless `--super-skip` overrides it.
+        super_skip: args.super_skip || State::from_config(&config).super_skip,
         following_record: args.following_record,
         ..State::default()
     };
@@ -1386,12 +1408,13 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     );
     println!(
         "state: auto {} paused {} replay {} message {} skippable {} \
-         following-record {} speed x{}",
+         super-skip {} following-record {} speed x{}",
         state.auto,
         state.paused,
         state.replay,
         state.message,
         state.skippable,
+        state.super_skip,
         state.following_record,
         bar::SPEEDS[state.speed],
     );
@@ -1529,16 +1552,24 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         let rect = bar.screen().atlas().widgets[widget].dst;
         let act = bar
             .layout()
-            .map_or(Act::None, |l| l.action(widget, state, false));
+            .map_or(Act::None, |l| l.action(widget, state, args.latched));
         let shown = match act {
             Act::None => "-".to_string(),
             Act::ToggleAuto => "toggle the auto flag".to_string(),
             Act::TogglePause => "toggle pause".to_string(),
-            Act::Seek(code) => match code {
-                bar::Seek::RESTART => "seek: restart this script".to_string(),
-                bar::Seek::END_OF_SCRIPT => "seek: end of script".to_string(),
-                bar::Seek::SKIP => "seek: to this script's choice, else its end".to_string(),
-                other => format!("seek code {}", other.0),
+            Act::Seek { code, rewind } => match (code, rewind) {
+                (bar::Seek::RESTART, _) => "seek: restart this part".to_string(),
+                (bar::Seek::END_OF_PART, true) => {
+                    "seek: out of this part, and back to the one before it".to_string()
+                }
+                (bar::Seek::END_OF_PART, false) => {
+                    "seek: to this part's choice, else out of it".to_string()
+                }
+                (bar::Seek::SKIP, _) => {
+                    "seek: to this part's choice, else chase one across the parts after it"
+                        .to_string()
+                }
+                (other, _) => format!("seek code {}", other.0),
             },
             Act::Speed(i) => format!("speed x{}", bar::SPEEDS[i]),
             Act::Menu(m) => format!("open menu {}", m.0),
@@ -3443,7 +3474,14 @@ fn route_dll(game: &Path) -> Result<Vec<u8>> {
 /// This drives the same [`Progress`] the game does — `enter` to place the
 /// player, `decide` when a choice settles, `advance` when a script ends — so
 /// what it prints is what would be played.
-fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize, dress: u32) -> Result<()> {
+fn cmd_route_play(
+    game: &Path,
+    from: &str,
+    choices: &str,
+    steps: usize,
+    rewind: usize,
+    dress: u32,
+) -> Result<()> {
     use daysengine::install::progress::Progress;
 
     let vfs = daysengine::install::vfs::Vfs::mount(game)?;
@@ -3506,13 +3544,39 @@ fn cmd_route_play(game: &Path, from: &str, choices: &str, steps: usize, dress: u
             None => {
                 println!("     the graph names nothing after this");
                 read_record(&progress, &was_read, &walked);
+                rewind_from(&mut progress, rewind);
                 return Ok(());
             }
         }
     }
     println!("     stopped after {steps} scripts");
     read_record(&progress, &was_read, &walked);
+    rewind_from(&mut progress, rewind);
     Ok(())
+}
+
+/// Walks the rewind back from where the forward walk stopped.
+///
+/// This is the control bar's widget 2 pressed twice, over and over: each step
+/// asks `_GetBackScriptFile@12` where this part came from and takes the part's
+/// feeling deltas back off the counters on the way. The counters are printed
+/// beside each step because they are the half that is easy to get wrong — a
+/// rewind that moved but did not un-credit would read the same here and play
+/// differently three branches later.
+fn rewind_from(progress: &mut daysengine::install::progress::Progress, steps: usize) {
+    if steps == 0 {
+        return;
+    }
+    println!("rewinding {steps} parts:");
+    for step in 0..steps {
+        let Some(back) = progress.back() else {
+            println!("     there is nothing before this part");
+            return;
+        };
+        let (route, scene) = progress.position();
+        let ((first, second), _) = progress.gauge();
+        println!("{step:>3}  ROUTE {route:>2} SCENE {scene:>3}  {back}   001={first} 002={second}");
+    }
 }
 
 /// Reports the per-script read record the walk built, against the record the
@@ -3614,6 +3678,17 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
                 for line in transitions(&step) {
                     println!("  next: {line}");
                 }
+            }
+            // And where the control bar's rewind goes from here, which is a
+            // second export with its own 55-way switch — see
+            // `days_route::Machine::back_step`.
+            match machine.back_step(route, scene as u16) {
+                Some(step) => {
+                    for line in transitions(&step) {
+                        println!("  back: {line}");
+                    }
+                }
+                None => println!("  back: this module exports no rewind"),
             }
             // What `_SetFeeling@8` credits here, which is its own switch and
             // not the branch graph's destination.
@@ -3731,6 +3806,11 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
                         }
                         None => println!("           -> (no handler)"),
                     }
+                    if let Some(step) = machine.back_step(route, scene as u16) {
+                        for line in transitions(&step) {
+                            println!("           <- {line}");
+                        }
+                    }
                 }
             }
         }
@@ -3789,6 +3869,7 @@ fn transitions(step: &days_route::Transition) -> Vec<String> {
     use days_route::Next;
     paths(step, &|n| match n {
         Next::Scene { route, scene } => format!("ROUTE {route} SCENE {scene}"),
+        Next::Bookmark { route, name } => format!("ROUTE {route} SCENE the {name} bookmark"),
         Next::Named { names, scene } => format!("SCENE {scene}, playing {}", names.join(" or ")),
         Next::Stop => "the route ends".into(),
         Next::Nothing => "nothing".into(),
@@ -3840,6 +3921,7 @@ fn paths<L>(step: &days_route::Step<L>, leaf: &dyn Fn(&L) -> String) -> Vec<Stri
                 Act::ClearStory(n) => Some(format!("clear SP{n}")),
                 Act::Ending(n) => Some(format!("register ending {n}")),
                 Act::ClearRouteFlags => Some("clear the route's flags".into()),
+                Act::Uncredit(n) => Some(format!("take back {n}'s deltas")),
                 Act::Host(_) => None,
             })
             .collect();
@@ -3960,6 +4042,61 @@ fn check_edges(routes: &days_route::Routes, machine: &days_route::Machine) {
         }
     }
 
+    // The rewind is its own export and works its answer out independently, so
+    // the two agreeing is a check on both: from wherever `_GetBackScriptFile@12`
+    // says this scene came, the branch graph has to be able to reach it again.
+    // A bookmarked arm reads the scene out of the save and cannot be checked
+    // without one, and an arm that stops has nothing to check.
+    let (mut backs, mut agree, mut bookmarked, mut stops, mut blind_back) = (0, 0, 0, 0, 0);
+    let mut stays = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    for route in 0..routes.len() {
+        let table = routes.route(route).unwrap_or_default();
+        for scene in 0..table.len() {
+            let scene = scene as u16;
+            let Some(step) = machine.back_step(route, scene) else {
+                continue;
+            };
+            let mut out = Vec::new();
+            leaves(&step, &mut out);
+            if out.is_empty() {
+                blind_back += 1;
+                continue;
+            }
+            for n in out {
+                match n {
+                    Next::Scene { route: r, scene: s } => {
+                        backs += 1;
+                        let forward = machine.step(*r as usize, *s);
+                        let mut onward = Vec::new();
+                        if let Some(f) = forward.as_ref() {
+                            leaves(f, &mut onward);
+                        }
+                        let reaches = onward.iter().any(|f| {
+                            matches!(f, Next::Scene { route: fr, scene: fs }
+                                if *fr as usize == route && *fs == scene)
+                        });
+                        if reaches {
+                            agree += 1;
+                        } else if (*r as usize, *s) == (route, scene) {
+                            // The handler names this very scene: there is
+                            // nothing before it, so the rewind replays it.
+                            stays += 1;
+                        } else {
+                            skipped.push(format!(
+                                "    ROUTE {route} SCENE {scene} <- ROUTE {r} SCENE {s}, \
+                                 whose own edge goes elsewhere"
+                            ));
+                        }
+                    }
+                    Next::Bookmark { .. } => bookmarked += 1,
+                    Next::Stop => stops += 1,
+                    Next::Named { .. } | Next::Nothing => {}
+                }
+            }
+        }
+    }
+
     println!();
     println!("the recovered graph:");
     println!("  {scenes} scenes, {answered} with a transition");
@@ -3972,6 +4109,21 @@ fn check_edges(routes: &days_route::Routes, machine: &days_route::Machine) {
     );
     let stories = machine.stories().count();
     println!("  {stories} scenes mark a story number");
+    println!(
+        "  the rewind: {backs} edges naming a scene, {agree} of which the branch graph \
+         leads back from and {stays} naming the scene itself"
+    );
+    println!(
+        "  {bookmarked} rewind arms read a BS**** bookmark, {stops} stop, \
+         {blind_back} undecoded"
+    );
+    println!(
+        "  {} rewind edges name a scene whose own forward edge goes somewhere else",
+        skipped.len()
+    );
+    for line in skipped.iter().take(20) {
+        println!("{line}");
+    }
 
     // `_SetFeeling@8` works out the destination itself rather than being told
     // it, so the two exports agreeing is a check on both: for every scene and

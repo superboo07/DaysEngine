@@ -67,6 +67,46 @@ pub fn apply_end_roll(script: &mut Script, decision: crate::install::progress::E
     }
 }
 
+/// Applies the engine's skip flag to a script as it is loaded.
+///
+/// `[SkipFRAME]` is **not** always recorded. `FUN_0043b640` is the line parser
+/// `FUN_0043c110` runs over the `.ORS` as it opens it, and its `[SkipFRAME]`
+/// arm sits inside `if (FUN_004401c0(engine))` — the skip flag at
+/// `engine + 0x5c9`. With the flag down, the script object's `+0x22c` is never
+/// written at all, and the two seeks that read it back through `FUN_004315c0`
+/// — the skip button's case 6 and the end-of-part button's case 3 — compare
+/// something the parse never set.
+///
+/// The flag is raised by exactly one thing: the control bar's widget 4,
+/// through host `+0x12c(1)` (`FUN_0042c000`, whose only caller is that vtable
+/// slot), and `FUN_00425bf0`'s cases 6 and 7 put it down again as soon as the
+/// chase settles. So a script reached by ordinary chaining has no skip target
+/// and the first press of either button leaves it, while a script the chase
+/// itself loaded has one and a press inside it jumps to the choice.
+///
+/// **The one place this engine does not reproduce the original.** With the
+/// flag down the shipped member holds whatever was already in that heap block
+/// — the object is a plain `malloc(0x418)` in `FUN_00430d20`,
+/// `FUN_004388c0` never writes `+0x22c`, and the only two writes to it
+/// anywhere in `.text` are the pair in `FUN_0043b640` (Ghidra's listing and a
+/// raw byte scan of the section agree on that). There is no right value to
+/// substitute for an uninitialised one, so the script is given **no target**,
+/// which is the answer the comparison reaches on any clock past the stale
+/// frame. Note `engine + 0x22c` is a different member of a different object
+/// and is written all over the executable; the one that matters here is the
+/// script object's.
+pub fn apply_skip_flag(script: &mut Script, flag: bool) {
+    if flag || script.skip_to >= script.length {
+        return;
+    }
+    log::info!(
+        "{}: the skip flag is down, so {} is not recorded as a skip target",
+        script.name,
+        script.skip_to
+    );
+    script.skip_to = script.length;
+}
+
 /// A movie being played, with its position on the script timeline.
 struct Movie {
     decoder: VideoDecoder,
@@ -503,11 +543,20 @@ impl Stage {
         self.script.length
     }
 
-    /// Where the control bar's skip button lands from `at`, or `None` when
-    /// there is nothing ahead to skip to.
+    /// Where a control bar seek lands from `at`, or `None` when there is
+    /// nothing ahead to skip to.
     ///
-    /// `FUN_00425bf0`'s case 6, which is the state the bar's `+0xfc(5)` request
-    /// selects. It compares the script's skip target (`FUN_004315c0`, the
+    /// **Two buttons ask this, not one.** `FUN_00425bf0`'s case 6 is the state
+    /// the skip's `+0xfc(5)` selects, and its case 3 under code 2 — widget 3,
+    /// `Skip to end of current part` — asks the same question with the same
+    /// two members and lands on the same frame. They differ in what happens
+    /// when the answer is `None`: the skip chases across scripts (case 7)
+    /// while the end-of-part button simply ends the script. Widget 2's second
+    /// press is code 2 as well, with the rewind flag, which is a third term in
+    /// case 3's test and forces the "nothing ahead" branch — see
+    /// [`crate::ui::bar::Seek::END_OF_SCRIPT`].
+    ///
+    /// The question compares the script's skip target (`FUN_004315c0`, the
     /// `[SkipFRAME]` frame) against its end (`FUN_004315a0`, the `[Next]`
     /// frame): equal means the script has no choice to skip to, and a target
     /// already behind the clock means the choice has been passed. Either way
@@ -523,6 +572,10 @@ impl Stage {
     /// cut. That is also why this returns a frame to seek to rather than just
     /// the choice's: landing on the choice exactly would skip the line that
     /// sets it up.
+    ///
+    /// A script whose `[SkipFRAME]` was never recorded has no target and this
+    /// answers `None` for every frame — that is the engine's skip flag, and
+    /// [`apply_skip_flag`] is where it is applied.
     pub fn skip_target(&self, at: Frame) -> Option<Frame> {
         let to = self.script.skip_to;
         if to >= self.script.length || to < at {
@@ -1122,6 +1175,39 @@ mod tests {
     fn a_script_without_a_choice_has_nothing_to_skip_to() {
         let stage = staged("01:35:06", "01:35:06");
         assert_eq!(stage.skip_target(Frame::parse("00:10:00").unwrap()), None);
+    }
+
+    /// `[SkipFRAME]` is only recorded while the engine's skip flag is up, and
+    /// the flag is up only during a chase. So the choice a script raises is
+    /// not a target for the script the player is simply watching: the press
+    /// leaves the part instead, and the chase reaches the choice from outside.
+    #[test]
+    fn a_script_loaded_with_the_skip_flag_down_records_no_target() {
+        let mut script = Script {
+            skip_to: Frame::parse("01:02:09").unwrap(),
+            length: Frame::parse("01:09:00").unwrap(),
+            ..Script::default()
+        };
+        apply_skip_flag(&mut script, false);
+        let stage = Stage::new(script);
+        assert_eq!(stage.skip_target(Frame::parse("00:10:00").unwrap()), None);
+    }
+
+    /// And a script the chase loaded keeps it, which is what makes the second
+    /// press inside that script land on the choice.
+    #[test]
+    fn a_script_loaded_with_the_skip_flag_up_keeps_its_target() {
+        let mut script = Script {
+            skip_to: Frame::parse("01:02:09").unwrap(),
+            length: Frame::parse("01:09:00").unwrap(),
+            ..Script::default()
+        };
+        apply_skip_flag(&mut script, true);
+        let stage = Stage::new(script);
+        assert_eq!(
+            stage.skip_target(Frame::parse("00:10:00").unwrap()),
+            Some(Frame::parse("01:01:09").unwrap())
+        );
     }
 
     /// The script runs past its choice. Taking the length from `[SkipFRAME]`

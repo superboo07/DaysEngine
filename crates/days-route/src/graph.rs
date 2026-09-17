@@ -24,6 +24,12 @@
 //! transitions visible: route 0's last scene calls route 1's emitter, so the
 //! recovered edge is `(0, 0x14) -> (1, 0)` and not a fall-through.
 //!
+//! `_GetBackScriptFile@12` — the control bar's rewind — is the same switch
+//! over the same emitters, read the same way and reached through
+//! [`Machine::back`]. Its arms name the scene *before* this one, through a
+//! `BS****` bookmark where more than one leads here, and each un-credits the
+//! scene it is leaving. See [`Machine::back_step`].
+//!
 //! # How far this was checked
 //!
 //! Against a Ghidra decompilation of all 55 handlers, the trees here reproduce
@@ -141,6 +147,14 @@ pub enum Act {
     /// Clear this route's numbered flags. Gated by a DLL word that only a
     /// developer machine sets — see [`Machine::dll_word`].
     ClearRouteFlags,
+    /// Take a script's `FeelingScript.ini` deltas back off the counters.
+    ///
+    /// The `[%s]="` reader `FUN_10005eb0` hands each `(name, amount)` pair to
+    /// `FUN_10005c60` when its third argument is non-zero and to
+    /// `FUN_10005ce0` when it is zero, and those two differ only in that one
+    /// adds the amount and the other subtracts it. `_SetFeeling@8` passes 1;
+    /// every `_GetBackScriptFile@12` handler passes 0.
+    Uncredit(String),
     /// A host vtable slot the recovery does not name, by slot number.
     Host(i32),
 }
@@ -150,6 +164,19 @@ pub enum Act {
 pub enum Next {
     /// Set `ROUTE`/`SCENE` and play that route's table entry.
     Scene { route: u8, scene: u16 },
+    /// Set `ROUTE` and play the scene a `BS****` bookmark names.
+    ///
+    /// Only `_GetBackScriptFile@12` produces this. Where more than one scene
+    /// leads into the one being left, the forward handler wrote the scene it
+    /// branched at into a `BS<script>` int — the `Act::SetInt` on the forward
+    /// edge — and the rewind reads it straight back into the emitter's scene
+    /// argument: `FUN_1000da10`'s case 8 is
+    /// `FUN_1000d3d0(host, buf, len, get_int(L"BS0000B00"), 0)`.
+    ///
+    /// Resolving it needs the save, so the static tree
+    /// ([`Machine::back_step`]) keeps the name and [`Machine::back`] answers
+    /// it against the store.
+    Bookmark { route: u8, name: String },
     /// Park at `SCENE` and play a name written straight into the buffer.
     /// More than one name means the DLL rotates between them.
     Named { names: Vec<String>, scene: u16 },
@@ -249,6 +276,10 @@ pub struct Machine {
     sections: Vec<Section>,
     /// One handler address per `ROUTE`, out of the export's own switch.
     handlers: Vec<u32>,
+    /// The same, for `_GetBackScriptFile@12`, which the control bar's rewind
+    /// asks — see [`Machine::back`]. Empty in a module that does not export
+    /// it.
+    back: Vec<u32>,
     /// The same, for `_SetFeeling@8`.
     feeling: Vec<u32>,
     /// `_GetStory@4`, which is one function rather than a dispatch.
@@ -270,6 +301,14 @@ impl Machine {
             .get("_GetNextScriptFile@12")
             .ok_or(Error::NoExport("_GetNextScriptFile@12"))?;
         let handlers = dispatch(&img, entry)?;
+        // `_GetBackScriptFile@12` is the same 55-way switch on `ROUTE`, with
+        // handlers of the same signature that call the same emitters — so the
+        // walker needs nothing new to read it. A module without the export
+        // simply has no rewind.
+        let back = match img.exports.get("_GetBackScriptFile@12") {
+            Some(&at) => dispatch(&img, at).unwrap_or_default(),
+            None => Vec::new(),
+        };
         // `_SetFeeling@8` switches on `ROUTE` the same way. It is not fatal
         // for it to be missing: without it the engine credits nothing, which
         // is wrong but playable, where refusing to load the DLL is not.
@@ -290,6 +329,7 @@ impl Machine {
             base: img.base,
             sections: img.sections.clone(),
             handlers,
+            back,
             feeling,
             chapters,
             endings,
@@ -361,6 +401,25 @@ impl Machine {
     /// The decision tree a route runs for one scene.
     pub fn step(&self, route: usize, scene: u16) -> Option<Transition> {
         let raw = self.step_raw(route, scene)?;
+        Some(self.build(&raw, route, scene, Vec::new(), &|l| self.next_of(l)))
+    }
+
+    /// The decision tree `_GetBackScriptFile@12` runs for one scene: where
+    /// the control bar's rewind goes from here.
+    ///
+    /// Its 55 handlers are the mirror of the branch graph's — a switch on
+    /// `SCENE` that calls the **same** route emitters with the scene before
+    /// this one, and consults a `BS****` bookmark wherever more than one scene
+    /// leads here (`FUN_1000da10` case 8 reads `BS0000B00`). An arm with no
+    /// scene before it calls the stop emitter, which is `Next::Stop`.
+    ///
+    /// Each handler also un-credits this scene's feeling deltas on the way
+    /// out: `FUN_10005eb0(host, name, 0)` is the same reader `_SetFeeling@8`
+    /// calls with 1, and its third argument picks `FUN_10005ce0`, which
+    /// subtracts, over `FUN_10005c60`, which adds. That arrives as
+    /// [`Act::Uncredit`].
+    pub fn back_step(&self, route: usize, scene: u16) -> Option<Transition> {
+        let raw = self.back_raw(route, scene)?;
         Some(self.build(&raw, route, scene, Vec::new(), &|l| self.next_of(l)))
     }
 
@@ -462,6 +521,12 @@ impl Machine {
                     if let Some(raw) = self.step_raw(r, scene) {
                         visit(&raw, &mut out);
                     }
+                    // The rewind's handlers call the same emitters, but its
+                    // stop emitter and its feeling reader have to be
+                    // classified too or `Machine::back` reads them as nothing.
+                    if let Some(raw) = self.back_raw(r, scene) {
+                        visit(&raw, &mut out);
+                    }
                     if let Some(&at) = self.feeling.get(r) {
                         visit(
                             &walk::run(
@@ -535,10 +600,22 @@ impl Machine {
     }
 
     fn step_raw(&self, route: usize, scene: u16) -> Option<Raw> {
-        let entry = *self.handlers.get(route)?;
+        self.walk_handler(self.handlers.get(route).copied(), scene)
+    }
+
+    fn back_raw(&self, route: usize, scene: u16) -> Option<Raw> {
+        self.walk_handler(self.back.get(route).copied(), scene)
+    }
+
+    /// One route handler of either export, walked for one scene.
+    ///
+    /// The two exports' handlers take the same three arguments in the same
+    /// order — `(wchar_t *buf, rsize_t size, int *host)` — and read `SCENE`
+    /// out of the host themselves, so one seeding serves both.
+    fn walk_handler(&self, entry: Option<u32>, scene: u16) -> Option<Raw> {
         Some(walk::run(
             &self.image(),
-            entry,
+            entry?,
             &[("SCENE", scene as i32)],
             &[
                 (8, Val::Arg("buf")),
@@ -664,6 +741,14 @@ impl Machine {
                     }
                 }
                 Some(Helper::ClearRouteFlags) => out.push(Act::ClearRouteFlags),
+                // Only the subtracting form is an act: the adding one is what
+                // `Machine::credited` already answers for, out of its own
+                // export, and crediting it here as well would double it.
+                Some(Helper::Credit) => {
+                    if let (Some(Val::Str(name)), Some(Val::Imm(0))) = (args.get(1), args.get(2)) {
+                        out.push(Act::Uncredit(name.clone()));
+                    }
+                }
                 _ => {}
             }
         }
@@ -690,13 +775,18 @@ impl Machine {
             let Some(va) = e.call else { continue };
             match self.helpers.get(&va) {
                 Some(Helper::Emit { route }) => {
-                    let scene = match e.args.get(3) {
-                        Some(Val::Imm(n)) => *n as u16,
+                    next = match e.args.get(3) {
+                        Some(Val::Imm(n)) => Next::Scene {
+                            route: *route,
+                            scene: *n as u16,
+                        },
+                        // The rewind's bookmarked arms, which name an int in
+                        // the save rather than a scene.
+                        Some(Val::Int(name)) => Next::Bookmark {
+                            route: *route,
+                            name: name.clone(),
+                        },
                         _ => continue,
-                    };
-                    next = Next::Scene {
-                        route: *route,
-                        scene,
                     };
                 }
                 Some(Helper::Named(names)) => {
@@ -1027,6 +1117,32 @@ impl Machine {
     /// stores, which this crate does not own.
     pub fn next(&self, route: usize, scene: u16, cx: &dyn Context) -> Option<(Vec<Act>, Next)> {
         self.decide(self.step(route, scene)?, route, scene, cx)
+    }
+
+    /// Runs the rewind: what `_GetBackScriptFile@12` would answer.
+    ///
+    /// The same shape as [`Machine::next`] — the acts are applied by the
+    /// caller — and `None` from a module that does not export it, which is a
+    /// rewind that cannot move rather than one that ends the route.
+    pub fn back(&self, route: usize, scene: u16, cx: &dyn Context) -> Option<(Vec<Act>, Next)> {
+        let (acts, next) = self.decide(self.back_step(route, scene)?, route, scene, cx)?;
+        // The bookmarked arms read their scene out of the save, which is the
+        // host's job in the shipped DLL and the caller's here.
+        let next = match next {
+            Next::Bookmark { route, name } => match u16::try_from(cx.int(&name)) {
+                Ok(scene) => Next::Scene { route, scene },
+                // A bookmark the save has never held reads 0 through the host
+                // and would rewind to the route's first scene. Refusing is not
+                // what the original does, so this says what it saw and lets
+                // the emitter's own answer stand.
+                Err(_) => {
+                    log::warn!("the rewind bookmark {name} holds {}", cx.int(&name));
+                    Next::Nothing
+                }
+            },
+            other => other,
+        };
+        Some((acts, next))
     }
 
     /// Runs `_SetFeeling@8`: the script whose deltas this scene's choice
@@ -1362,6 +1478,7 @@ mod tests {
         // addresses the code has not been laid out at yet, so reserve the
         // space and fill it in once the code is assembled.
         let jump_table = put(&[0u8; 8], &mut blob);
+        let back_table = put(&[0u8; 8], &mut blob);
         let exports = put(&[0u8; 0x40], &mut blob);
         let s_first = put(&wide("001"), &mut blob);
         let s_second = put(&wide("002"), &mut blob);
@@ -1451,6 +1568,75 @@ mod tests {
         a.label("h1_out");
         a.mov_eax(0).ret();
 
+        // ---- the rewind export: the same switch, its own handlers ----
+        a.label("back_entry");
+        a.prologue();
+        a.push_imm32(s_route);
+        a.vcall(8, 8); // get_int("ROUTE")
+        a.store(-4);
+        a.cmp_local(-4, 1);
+        a.jcc(0x7, "back_out"); // ja default
+        a.put(&[0x8b, 0x55, 0xfc]);
+        a.put(&[0xff, 0x24, 0x95]).imm32(back_table);
+        a.label("back_arm0");
+        a.load_arg(0, 8).push_reg(0);
+        a.load_arg(0, 0x10).push_reg(0);
+        a.load_arg(0, 0xc).push_reg(0);
+        a.call("back0");
+        a.put(&[0x83, 0xc4, 0x0c]);
+        a.ret();
+        a.label("back_arm1");
+        a.load_arg(0, 8).push_reg(0);
+        a.load_arg(0, 0x10).push_reg(0);
+        a.load_arg(0, 0xc).push_reg(0);
+        a.call("back1");
+        a.put(&[0x83, 0xc4, 0x0c]);
+        a.ret();
+        a.label("back_out");
+        a.mov_eax(0).ret();
+
+        // Route 0 backwards: scene 1 came from scene 0, and scene 2 came from
+        // wherever the `BS0000B00` bookmark says — the shape `FUN_1000da10`'s
+        // case 8 has.
+        a.label("back0");
+        a.prologue();
+        a.push_imm32(s_scene);
+        a.vcall(0x10, 8);
+        a.store(-4);
+        a.cmp_local(-4, 1);
+        a.jcc(0x5, "back0_s2"); // jne
+        emit(&mut a, "emit0", 0);
+        a.mov_eax(1).ret();
+        a.label("back0_s2");
+        a.cmp_local(-4, 2);
+        a.jcc(0x5, "back0_out"); // jne
+        a.push_imm8(1); // the emitter's flag argument
+        a.push_imm32(s_bs);
+        a.vcall(0x10, 8); // eax = get_int("BS0000B00")
+        a.push_reg(0); // ...which is the scene
+        a.load_arg(0, 0xc).push_reg(0);
+        a.load_arg(0, 8).push_reg(0);
+        a.load_arg(0, 0x10).push_reg(0);
+        a.call("emit0");
+        a.put(&[0x83, 0xc4, 0x14]);
+        a.mov_eax(1).ret();
+        a.label("back0_out");
+        a.mov_eax(0).ret();
+
+        // Route 1 backwards: its first scene goes back across the boundary,
+        // into route 0's last.
+        a.label("back1");
+        a.prologue();
+        a.push_imm32(s_scene);
+        a.vcall(0x10, 8);
+        a.store(-4);
+        a.cmp_local(-4, 0);
+        a.jcc(0x5, "back1_out");
+        emit(&mut a, "emit0", 2);
+        a.mov_eax(1).ret();
+        a.label("back1_out");
+        a.mov_eax(0).ret();
+
         // ---- the two emitters: (host, buf, size, scene, flag) ----
         for (label, route, table) in [("emit0", 0u32, table0), ("emit1", 1, table1)] {
             a.label(label);
@@ -1470,22 +1656,46 @@ mod tests {
         // Fill in the jump table and the export directory now that the code
         // has addresses.
         let off = |va: u32| (va - VA) as usize;
-        let arms = [labels["arm0"], labels["arm1"]];
-        for (i, arm) in arms.iter().enumerate() {
-            blob[off(jump_table) + i * 4..off(jump_table) + i * 4 + 4]
-                .copy_from_slice(&arm.to_le_bytes());
+        for (table, arms) in [
+            (jump_table, [labels["arm0"], labels["arm1"]]),
+            (back_table, [labels["back_arm0"], labels["back_arm1"]]),
+        ] {
+            for (i, arm) in arms.iter().enumerate() {
+                blob[off(table) + i * 4..off(table) + i * 4 + 4]
+                    .copy_from_slice(&arm.to_le_bytes());
+            }
         }
-        let name_at = VA + blob.len() as u32;
-        blob.extend_from_slice(b"_GetNextScriptFile@12\0");
+        // Two exports, in the order a real directory holds them: the names are
+        // sorted, and `_GetBackScriptFile@12` sorts before
+        // `_GetNextScriptFile@12`.
+        let exported: [(&[u8], u32); 2] = [
+            (b"_GetBackScriptFile@12\0", labels["back_entry"]),
+            (b"_GetNextScriptFile@12\0", labels["entry"]),
+        ];
+        let name_ats: Vec<u32> = exported
+            .iter()
+            .map(|(name, _)| {
+                let at = VA + blob.len() as u32;
+                blob.extend_from_slice(name);
+                at
+            })
+            .collect();
         let fn_table = VA + blob.len() as u32;
-        blob.extend_from_slice(&labels["entry"].to_le_bytes());
+        for (_, entry) in exported {
+            blob.extend_from_slice(&entry.to_le_bytes());
+        }
         let name_table = VA + blob.len() as u32;
-        blob.extend_from_slice(&name_at.to_le_bytes());
+        for at in &name_ats {
+            blob.extend_from_slice(&at.to_le_bytes());
+        }
         let ord_table = VA + blob.len() as u32;
-        blob.extend_from_slice(&0u16.to_le_bytes());
+        for i in 0..exported.len() as u16 {
+            blob.extend_from_slice(&i.to_le_bytes());
+        }
         let d = off(exports);
-        blob[d + 20..d + 24].copy_from_slice(&1u32.to_le_bytes()); // NumberOfFunctions
-        blob[d + 24..d + 28].copy_from_slice(&1u32.to_le_bytes()); // NumberOfNames
+        let n = exported.len() as u32;
+        blob[d + 20..d + 24].copy_from_slice(&n.to_le_bytes()); // NumberOfFunctions
+        blob[d + 24..d + 28].copy_from_slice(&n.to_le_bytes()); // NumberOfNames
         blob[d + 28..d + 32].copy_from_slice(&fn_table.to_le_bytes());
         blob[d + 32..d + 36].copy_from_slice(&name_table.to_le_bytes());
         blob[d + 36..d + 40].copy_from_slice(&ord_table.to_le_bytes());
@@ -1532,6 +1742,65 @@ mod tests {
     fn finds_both_handlers_through_the_exports_own_switch() {
         let m = Machine::recover(&two_route_dll()).expect("recovers");
         assert_eq!(m.len(), 2);
+    }
+
+    /// The rewind is its own export with its own switch, and it is walked the
+    /// same way: `_GetBackScriptFile@12`'s route 0 says scene 1 came from
+    /// scene 0.
+    #[test]
+    fn the_rewind_names_the_scene_before_this_one() {
+        let m = Machine::recover(&two_route_dll()).unwrap();
+        assert_eq!(
+            m.back_step(0, 1),
+            Some(Step::Do {
+                acts: vec![],
+                next: Next::Scene { route: 0, scene: 0 },
+            })
+        );
+        // And across a route boundary, the way route 1's first scene goes back
+        // into route 0's last.
+        assert_eq!(
+            m.back(1, 0, &Cx::default()),
+            Some((vec![], Next::Scene { route: 0, scene: 2 }))
+        );
+    }
+
+    /// A scene more than one path reaches is rewound through the `BS****`
+    /// bookmark the forward edge wrote. The static tree keeps the name; the
+    /// runner reads it out of the save.
+    #[test]
+    fn a_bookmarked_rewind_reads_the_scene_out_of_the_save() {
+        let m = Machine::recover(&two_route_dll()).unwrap();
+        assert_eq!(
+            m.back_step(0, 2),
+            Some(Step::Do {
+                acts: vec![],
+                next: Next::Bookmark {
+                    route: 0,
+                    name: "BS0000B00".into(),
+                },
+            })
+        );
+        let mut cx = Cx::default();
+        cx.ints.insert("BS0000B00".into(), 1);
+        assert_eq!(
+            m.back(0, 2, &cx),
+            Some((vec![], Next::Scene { route: 0, scene: 1 }))
+        );
+        // The same scene, a save that took the other path in.
+        cx.ints.insert("BS0000B00".into(), 0);
+        assert_eq!(
+            m.back(0, 2, &cx),
+            Some((vec![], Next::Scene { route: 0, scene: 0 }))
+        );
+    }
+
+    /// An arm the rewind has nothing for answers nothing, and the caller
+    /// leaves the player where they are.
+    #[test]
+    fn a_scene_the_rewind_does_not_name_answers_nothing() {
+        let m = Machine::recover(&two_route_dll()).unwrap();
+        assert_eq!(m.back(0, 0, &Cx::default()), Some((vec![], Next::Nothing)));
     }
 
     #[test]

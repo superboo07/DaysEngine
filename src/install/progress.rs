@@ -493,6 +493,36 @@ impl Progress {
         let (acts, next) = self
             .machine
             .next(usize::try_from(route).ok()?, scene, &self.stores)?;
+        self.take(acts, next)
+    }
+
+    /// Runs the rewind and moves to whatever it names: the control bar's
+    /// second press of widget 2.
+    ///
+    /// The same shape as [`Progress::advance`] with two differences, both of
+    /// them the shipped block's. `FUN_00424020` takes this branch when the
+    /// engine's rewind flag (`engine + 0x560`, raised by host `+0x124`) is
+    /// set, and there it calls `_GetBackScriptFile@12` **instead of** the
+    /// mark: a screen the player is rewinding out of is not recorded as read.
+    /// The acts the rewind's handlers carry include taking the scene's
+    /// feeling deltas back off the counters — see `days_route::Act::Uncredit`.
+    ///
+    /// `None` is a rewind that cannot move: the route module exports no
+    /// `_GetBackScriptFile@12`, the position is not in the graph, or the
+    /// handler named nothing. The shipped block answers the same way by
+    /// leaving `engine + 0x188` alone, so nothing is loaded.
+    pub fn back(&mut self) -> Option<String> {
+        let (route, scene) = self.position();
+        let scene = u16::try_from(scene).ok()?;
+        let (acts, next) = self
+            .machine
+            .back(usize::try_from(route).ok()?, scene, &self.stores)?;
+        self.take(acts, next)
+    }
+
+    /// Applies what a handler did and moves to what it named, for either
+    /// direction. Everything below the export is the same on both.
+    fn take(&mut self, acts: Vec<Act>, next: Next) -> Option<String> {
         let here = self.script.clone();
         for act in &acts {
             self.apply(act, &here);
@@ -516,6 +546,13 @@ impl Progress {
             Next::Stop => {
                 self.stores.save.set_int(ROUTE, -1);
                 log::info!("the route ended");
+                return None;
+            }
+            // `Machine::back` has already read the save for these, and the
+            // forward handlers never pass anything but a literal, so this is
+            // unreachable from either export.
+            Next::Bookmark { name, .. } => {
+                log::warn!("the graph named the bookmark {name}, which is not resolved here");
                 return None;
             }
             Next::Nothing => return None,
@@ -832,6 +869,15 @@ impl Progress {
             // this never runs in a shipped game -- see `days_route`.
             Act::ClearRouteFlags => log::info!("the route asked to clear its flags"),
             Act::Host(slot) => log::debug!("the route called host slot {slot:#04x}"),
+            // The rewind's half of the feeling table: every
+            // `_GetBackScriptFile@12` handler takes the scene it is leaving
+            // off the counters again before it names the one before it.
+            Act::Uncredit(name) => {
+                if feeling::uncredit(&mut self.stores.save, &self.deltas, name) {
+                    self.gauge_raised = true;
+                }
+                log::info!("the rewind takes back the deltas of {name}");
+            }
         }
     }
 
