@@ -347,7 +347,29 @@ pub struct Screen {
     out_scale: f64,
     out_letterbox: f64,
     atlas: Atlas,
+    /// Realized [`Art::Cut`]s, keyed the way a texture cache keys them.
+    ///
+    /// Bringing a cut to the size it is drawn at is the expensive half of
+    /// compositing one — at the 1280x720 art set every sprite goes through the
+    /// cubic on the way up — and the answer depends on nothing but the key. The
+    /// SDL path keeps textures against the same key and never asks twice; this
+    /// is the same saving for the path that draws on the CPU, which is the one
+    /// the control bar takes on every frame of a fade or a gauge ramp.
+    ///
+    /// `RefCell` because compositing takes `&self`: it is a memo of a pure
+    /// function, not state. Nothing re-enters it — realizing a cut does not
+    /// draw anything.
+    realized: std::cell::RefCell<std::collections::HashMap<Key, Image>>,
 }
+
+/// How many realized cuts a screen keeps before it starts again.
+///
+/// A screen's own sprites are bounded by its widget count, but a [`Cut`] slides
+/// its source — the gauge's level piece moves by 2.5 pixels per point of lead —
+/// so the keys a long session produces are bounded only by how far it has
+/// ramped. Well past what any screen holds at once, and cheaper to drop the lot
+/// than to track which of them is coldest.
+const REALIZED_MAX: usize = 512;
 
 /// Reads `path` from the VFS case-insensitively, accepting the mixed casing the
 /// `.INI` and DLL path strings use against the packs' upper-case entry names.
@@ -481,6 +503,7 @@ impl Screen {
             out_scale: scale,
             out_letterbox: letterbox,
             atlas,
+            realized: Default::default(),
         })
     }
 
@@ -974,9 +997,23 @@ impl Screen {
 
     /// Draws one layer onto an image, which is always a 1:1 alpha blit of its
     /// realized pixels.
+    ///
+    /// A cut is realized once and kept; see [`Screen::realized`]. An
+    /// [`Art::Whole`] is not — it is already the pixels it needs to be, and
+    /// copying the base art into a cache to read it back is work for nothing.
     pub fn draw(&self, out: &mut Image, layer: &Layer) {
-        let art = layer.realize();
-        out.blit_scaled(&art, (0, 0, art.width, art.height), layer.rect());
+        if let Art::Whole(art) = &layer.art {
+            out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect());
+            return;
+        }
+        let mut realized = self.realized.borrow_mut();
+        if realized.len() >= REALIZED_MAX {
+            realized.clear();
+        }
+        let art = realized
+            .entry(layer.key())
+            .or_insert_with(|| layer.realize().into_owned());
+        out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect());
     }
 }
 
