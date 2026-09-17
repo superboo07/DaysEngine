@@ -64,7 +64,7 @@ use crate::ui::replay::{self, Scenes};
 use crate::ui::replay_pages;
 use crate::ui::routemap;
 use crate::ui::saveload::{self, Kind, Slots};
-use crate::ui::screen::{Error, Resolution, Screen, WidgetState};
+use crate::ui::screen::{Art, Composite, Error, Layer, Resolution, Screen, WidgetState};
 use days_save::FlagStore;
 
 /// A menu screen id, as the game itself numbers them.
@@ -712,6 +712,16 @@ pub struct Menu {
     /// screens loaded by [`Menu::enter`] keep the size the caller asked for.
     /// See [`Menu::set_output_size`].
     out_scale: f64,
+    /// The backlog's lines, rasterised into a buffer of their own.
+    ///
+    /// Held rather than drawn into each frame because the module holds it:
+    /// `FUN_10003600` redraws the buffer when the view scrolls and nothing
+    /// else touches it, so the sprite that shows it is the same one frame
+    /// after frame. See [`Menu::prepare`].
+    backlog_art: Option<days_ui::Image>,
+    /// What the dress-select popup is composited over; see
+    /// [`Menu::dress_under`]. Held for the same reason as `backlog_art`.
+    dress_art: Option<days_ui::Image>,
 }
 
 impl Menu {
@@ -817,6 +827,8 @@ impl Menu {
         )?;
         let backlog_at = backlog::opening_entry(session.lines.len());
         let mut menu = Menu {
+            backlog_art: None,
+            dress_art: None,
             showing,
             paths,
             variant,
@@ -1598,62 +1610,100 @@ impl Menu {
 
     /// Composites the current frame over an optional backdrop and marks it
     /// clean. The backdrop is in display space; see [`Screen::compose_over`].
+    ///
+    /// This is [`Menu::prepare`] and [`Menu::layers`] with the screen's own
+    /// rasteriser behind them, and it is the headless path — the one
+    /// `daysengine menu` and the tests go through. The SDL player calls the
+    /// same two and draws the layers as textured quads instead.
     pub fn compose(&mut self, backdrop: Option<&days_ui::Image>) -> days_ui::Image {
-        self.dirty = false;
+        self.prepare(backdrop);
+        let layers = self.layers(backdrop);
+        self.screen.rasterize(true, &layers)
+    }
+
+    /// Redraws whatever art the menu rasterises for itself, and marks the menu
+    /// clean.
+    ///
+    /// Two things on these screens are not art out of the packs: the backlog's
+    /// lines and, while the dress popup is up, the two dresses under it. Both
+    /// are built here rather than while the frame is being drawn, because both
+    /// stay put until something changes them — and what changes them is what
+    /// sets [`Menu::dirty`]. A caller that draws every frame therefore pays for
+    /// them only on the frames they moved.
+    pub fn prepare(&mut self, backdrop: Option<&days_ui::Image>) {
         self.refit_page();
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        // The two dresses go *under* the popup's own base art, which is the
+        // only thing on any screen that does — `FUN_1000c740` draws them from
+        // the previous map's sheet before it draws the popup. So they are part
+        // of what the popup is composited over rather than a layer inside it.
+        self.dress_art = self.dress_under(backdrop);
+        self.backlog_art = match (self.showing == Showing::BackLog, &self.font) {
+            (true, Some(font)) => Some(backlog::draw(
+                font,
+                &self.session.lines,
+                self.backlog_at,
+                self.session.flow,
+                self.session.english,
+            )),
+            (true, None) => {
+                log::warn!("no font, so the backlog's lines stay undrawn");
+                None
+            }
+            (false, _) => None,
+        };
+    }
+
+    /// Everything this frame draws, in the order it is drawn.
+    ///
+    /// [`Menu::prepare`] first: the layers borrow the art it builds.
+    pub fn layers<'a>(&'a self, backdrop: Option<&'a days_ui::Image>) -> Vec<Layer<'a>> {
         let page_sprites = self.page_sprites();
         let sprites = self.sprites();
         let page = self.page_art().map(|art| crate::ui::screen::Page {
             art,
             sprites: &page_sprites,
         });
-        // The two dresses go *under* the popup's own base art, which is the
-        // only thing on any screen that does — `FUN_1000c740` draws them from
-        // the previous map's sheet before it draws the popup. So they are part
-        // of what the popup is composited over rather than a layer inside it.
-        let under = self.dress_under(backdrop);
-        let backdrop = under.as_ref().or(backdrop);
-        let mut out = self
-            .screen
-            .compose_over_page(backdrop, page, &self.states, &sprites);
-        // The caption is the other way round: `FUN_1000c740` draws it after the
-        // dresses and their highlight, and only while the main map is loaded,
-        // so the popup covers it rather than sitting under it.
+        let mut layers = self.screen.layers(&Composite {
+            backdrop: self.dress_art.as_ref().or(backdrop),
+            base: true,
+            page,
+            states: &self.states,
+            sprites: &sprites,
+            ..Default::default()
+        });
+        // The caption is the other way round from the dresses: `FUN_1000c740`
+        // draws it after them and their highlight, and only while the main map
+        // is loaded, so the popup covers it rather than sitting under it.
+        //
+        // It is placed at the display map's letterbox rather than the output's,
+        // which is what the code this replaced did; the two are the same except
+        // in 4:3, where this screen has no caption to draw.
         if let (dress::Phase::Choosing, Some(caption)) = (
             self.dress_phase,
             self.dress.as_ref().and_then(|d| d.scaled.as_ref()),
         ) {
-            let (w, h) = (caption.width, caption.height);
-            out.blit_scaled(
-                caption,
-                (0, 0, w, h),
-                (0, self.screen.letterbox().round() as i64, w, h),
-            );
+            layers.push(Layer {
+                art: Art::Whole(caption),
+                at: (0, self.screen.letterbox().round() as i64),
+                size: (caption.width, caption.height),
+            });
         }
-        // The backlog's lines are drawn into a buffer of its own and shown by
-        // one sprite over the whole screen, created after the base art and the
-        // widget sprites and so on top of both. See [`crate::ui::backlog`].
-        if self.showing == Showing::BackLog {
-            match &self.font {
-                Some(font) => {
-                    let buffer = backlog::draw(
-                        font,
-                        &self.session.lines,
-                        self.backlog_at,
-                        self.session.flow,
-                        self.session.english,
-                    );
-                    backlog::blit(&mut out, &self.screen, &buffer);
-                }
-                None => log::warn!("no font, so the backlog's lines stay undrawn"),
-            }
+        // The backlog's lines are shown by one sprite over the whole screen,
+        // created after the base art and the widget sprites and so on top of
+        // both. See [`crate::ui::backlog`].
+        if let Some(buffer) = &self.backlog_art {
+            layers.push(backlog::layer(&self.screen, buffer));
         }
         // The save/load rows are not widget sprites: their source is twice the
-        // size of their destination, so they are blitted with the averaging
-        // downscale.
+        // size of their destination, so they are averaged down rather than
+        // point-sampled.
         if let Some(rows) = &self.rows {
             for quad in &rows.quads {
-                out.blit_downscaled(&rows.surface, quad.src, self.screen.place_layout(quad.dst));
+                layers.push(self.screen.averaged(&rows.surface, quad.src, quad.dst));
             }
             // The expanded comment goes over the list, panel first. The panel
             // is cut from the chip sheet at the record's full height however
@@ -1668,14 +1718,14 @@ impl Menu {
                     _ => self.screen.chip(),
                 };
                 let panel = &tip.panel;
-                out.blit_downscaled(chip, panel.src, self.screen.place_layout(panel.dst));
+                layers.push(self.screen.averaged(chip, panel.src, panel.dst));
                 let from = rows.tip_surface.as_ref().unwrap_or(&rows.surface);
                 for line in &tip.lines {
-                    out.blit_downscaled(from, line.src, self.screen.place_layout(line.dst));
+                    layers.push(self.screen.averaged(from, line.src, line.dst));
                 }
             }
         }
-        out
+        layers
     }
 
     /// Redraws the page's art at the size the screen is composited at.

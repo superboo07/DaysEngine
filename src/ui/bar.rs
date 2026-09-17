@@ -1655,7 +1655,7 @@ impl Bar {
         let mut layer = self
             .screen
             .compose_layer_cuts(&self.states_of(&records), &faded_cuts);
-        modulate(&mut layer, self.fade.alpha());
+        layer.modulate(self.fade.alpha());
         if !pinned.is_empty() || !pinned_cuts.is_empty() {
             let mut over = self
                 .screen
@@ -1664,7 +1664,7 @@ impl Bar {
             // `FUN_10026b40`'s first step, and the rate readout because it is
             // never in `FUN_10025690`'s list at all, so it keeps the opaque
             // colour `FUN_10022650` gave it.
-            modulate(&mut over, self.fade.gauge_alpha(state.gauge_raised));
+            over.modulate(self.fade.gauge_alpha(state.gauge_raised));
             let (w, h) = (over.width, over.height);
             layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }
@@ -1677,18 +1677,6 @@ fn cut(src: gauge::Rect, dst: gauge::Rect) -> Cut {
     Cut {
         src: (src.x, src.y, src.w, src.h),
         dst: (dst.x, dst.y, dst.w, dst.h),
-    }
-}
-
-/// Multiplies a layer's alpha through, for the headless path that has no
-/// texture to modulate.
-fn modulate(layer: &mut Image, alpha: u8) {
-    if alpha == 255 {
-        return;
-    }
-    let alpha = u32::from(alpha);
-    for px in layer.rgba.as_chunks_mut::<4>().0 {
-        px[3] = (u32::from(px[3]) * alpha / 255) as u8;
     }
 }
 

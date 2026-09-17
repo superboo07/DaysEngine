@@ -1608,9 +1608,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             // Through the indicator's own alpha, onto transparency, so the PNG
             // stays a layer rather than gaining a black band under the strip.
             let mut art = sign.art;
-            for px in art.rgba.as_chunks_mut::<4>().0 {
-                px[3] = (u32::from(px[3]) * u32::from(sign.alpha) / 255) as u8;
-            }
+            art.modulate(sign.alpha);
             taller.blit_scaled(
                 &art,
                 (0, 0, art.width, art.height),

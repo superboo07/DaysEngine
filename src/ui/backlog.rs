@@ -52,7 +52,7 @@
 //! installs ship `0`, the horizontal one. See [`Flow`].
 
 use crate::playback::text::kerning;
-use crate::ui::screen::{Screen, WidgetState};
+use crate::ui::screen::{Layer, Screen, WidgetState};
 use days_font::Font;
 use days_ui::Image;
 
@@ -458,17 +458,17 @@ pub fn draw(font: &Font, entries: &[Entry], at: usize, flow: Flow, english: bool
 /// widget is placed.
 pub fn compose(screen: &Screen, states: &[WidgetState], buffer: &Image) -> Image {
     let mut out = screen.compose(states);
-    blit(&mut out, screen, buffer);
+    screen.draw(&mut out, &layer(screen, buffer));
     out
 }
 
-/// Puts [`VIEW`] of the buffer onto [`DEST`] of an already-composited frame.
+/// [`VIEW`] of the buffer, as the layer that puts it on [`DEST`].
 ///
-/// The half of [`compose`] a caller that has built the frame some other way
-/// still needs — [`crate::ui::menu`] composites through the screen's own page
-/// and sprite layers first.
-pub fn blit(out: &mut Image, screen: &Screen, buffer: &Image) {
-    out.blit_downscaled(buffer, (0, 0, VIEW.0, VIEW.1), screen.place_layout(DEST));
+/// The half of [`compose`] a caller assembling its own list needs —
+/// [`crate::ui::menu`] draws the screen's own page and sprite layers first and
+/// this one over them.
+pub fn layer<'a>(screen: &Screen, buffer: &'a Image) -> Layer<'a> {
+    screen.averaged(buffer, (0, 0, VIEW.0, VIEW.1), DEST)
 }
 
 /// `FUN_100022a0`'s guard on one row: the vertical flow draws every row it is

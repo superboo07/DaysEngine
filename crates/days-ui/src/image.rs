@@ -9,23 +9,67 @@
 //! rectangle of one image onto another with the right alpha.
 
 use crate::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// An 8-bit RGBA image.
-#[derive(Debug, Clone)]
+///
+/// Every image also carries a [`version`](Image::version): a number that is
+/// new on each one built and changes whenever its pixels do. It exists so a
+/// caller that turns images into something expensive -- a GPU texture -- can
+/// tell whether the one it is holding is still the one in front of it, without
+/// comparing eight megabytes to find out. See [`crate::Layer`]'s users.
+#[derive(Debug)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    version: u64,
+}
+
+/// Hands out [`Image::version`]s. Wrapping is 2^64 images into a run.
+static VERSIONS: AtomicU64 = AtomicU64::new(1);
+
+fn next_version() -> u64 {
+    VERSIONS.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Clone for Image {
+    /// A clone is a **different image**: it can be written to without the
+    /// original changing, so it gets a version of its own.
+    fn clone(&self) -> Image {
+        Image {
+            width: self.width,
+            height: self.height,
+            rgba: self.rgba.clone(),
+            version: next_version(),
+        }
+    }
 }
 
 impl Image {
     /// A transparent image.
     pub fn empty(width: u32, height: u32) -> Image {
+        Image::from_rgba(width, height, vec![0; width as usize * height as usize * 4])
+    }
+
+    /// An image over pixels that are already RGBA.
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Image {
         Image {
             width,
             height,
-            rgba: vec![0; width as usize * height as usize * 4],
+            rgba,
+            version: next_version(),
         }
+    }
+
+    /// This image's identity, for a cache that holds something built from it.
+    ///
+    /// No two live images share one, and it changes whenever the pixels are
+    /// written to, so a cache keyed on it can never serve a stale copy. It says
+    /// nothing about *contents*: two images of the same thing have different
+    /// versions, which costs a rebuild and never a wrong picture.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// An opaque black image, the background a screen composites onto.
@@ -61,11 +105,23 @@ impl Image {
                 .collect(),
             png::ColorType::Indexed => return Err(Error::UnsupportedPng),
         };
-        Ok(Image {
-            width: info.width,
-            height: info.height,
-            rgba,
-        })
+        Ok(Image::from_rgba(info.width, info.height, rgba))
+    }
+
+    /// Multiplies `alpha` through every pixel's own.
+    ///
+    /// The headless counterpart of an SDL alpha modulation: a layer that is
+    /// drawn through a fade has one texture-wide alpha on the GPU, and this is
+    /// the same thing done to the pixels for the path that has no texture.
+    pub fn modulate(&mut self, alpha: u8) {
+        if alpha == 255 {
+            return;
+        }
+        self.version = next_version();
+        let alpha = u32::from(alpha);
+        for px in self.rgba.as_chunks_mut::<4>().0 {
+            px[3] = (u32::from(px[3]) * alpha / 255) as u8;
+        }
     }
 
     /// One pixel, or `None` outside the image.
@@ -92,20 +148,29 @@ impl Image {
         src_rect: (u32, u32, u32, u32),
         dst: (i64, i64, u32, u32),
     ) {
+        let (dx, dy, dw, dh) = dst;
+        let cell = src.downscaled(src_rect, (dw, dh));
+        self.blit_scaled(&cell, (0, 0, cell.width, cell.height), (dx, dy, dw, dh));
+    }
+
+    /// `src_rect` averaged down into an image of `size`.
+    ///
+    /// The averaging half of [`Image::blit_downscaled`], on its own, because a
+    /// caller that draws through something other than a blit needs the pixels
+    /// rather than the blend -- see `daysengine::ui::screen::Layer`. Drawing
+    /// this 1:1 is what `blit_downscaled` is: an averaged cell composites
+    /// exactly as the one source pixel it stands for would.
+    pub fn downscaled(&self, src_rect: (u32, u32, u32, u32), size: (u32, u32)) -> Image {
         let (sx, sy, sw, sh) = src_rect;
-        let (dx0, dy0, dw, dh) = dst;
+        let (dw, dh) = size;
+        let mut out = Image::empty(dw, dh);
         if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
-            return;
-        }
-        let (col_from, col_to) = clip(dx0, dw, self.width);
-        let (row_from, row_to) = clip(dy0, dh, self.height);
-        if col_from == col_to || row_from == row_to {
-            return;
+            return out;
         }
 
         // The run of source bytes each destination column averages over, in
         // the source row's own coordinates and worked out once for the whole
-        // blit -- the same footprint serves every row. Inline it cost four
+        // image -- the same footprint serves every row. Inline it cost four
         // 64-bit divisions per destination pixel.
         let span = |at: u32, n: u32, out: u32, from: u32, limit: u32| {
             let lo = u64::from(at) * u64::from(n) / u64::from(out);
@@ -115,28 +180,23 @@ impl Image {
                 .min(u64::from(limit.saturating_sub(from)));
             (lo.min(end) as usize, end as usize)
         };
-        let cols: Vec<(usize, usize)> = (col_from..col_to)
+        let cols: Vec<(usize, usize)> = (0..dw)
             .map(|col| {
-                let (lo, hi) = span(col, sw, dw, sx, src.width);
+                let (lo, hi) = span(col, sw, dw, sx, self.width);
                 ((sx as usize + lo) * 4, (sx as usize + hi) * 4)
             })
             .collect();
 
-        let dst_w = self.width as usize;
-        let src_w = src.width as usize;
-        for row in row_from..row_to {
-            let (y0, y1) = span(row, sh, dh, sy, src.height);
-            let dy = (dy0 + i64::from(row)) as usize;
-            let d_row = dy * dst_w * 4 + (dx0 + i64::from(col_from)) as usize * 4;
-            let dr = &mut self.rgba[d_row..dy * dst_w * 4 + dst_w * 4];
-
-            for (d, (from, to)) in dr.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+        let src_w = self.width as usize;
+        for (row, line) in out.rgba.chunks_exact_mut(dw as usize * 4).enumerate() {
+            let (y0, y1) = span(row as u32, sh, dh, sy, self.height);
+            for (px, (from, to)) in line.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
                 let mut cells = 0u32;
                 let mut alpha = 0u32;
                 let mut colour = [0u32; 3];
                 for y in y0..y1 {
                     let base = (sy as usize + y) * src_w * 4;
-                    let row = &src.rgba[base.min(src.rgba.len())..];
+                    let row = &self.rgba[base.min(self.rgba.len())..];
                     let run = &row[(*from).min(row.len())..(*to).min(row.len())];
                     for p in run.as_chunks::<4>().0 {
                         cells += 1;
@@ -153,21 +213,18 @@ impl Image {
                 if a == 0 {
                     continue;
                 }
-                // The averaged cell is one source pixel as far as the blend is
-                // concerned -- `sum / alpha` is its colour with the weighting
-                // taken back out -- so it composites through the same
-                // source-over, and the two divisionless cases apply to it too.
-                blend(
-                    d,
-                    [
-                        (colour[0] / alpha) as u8,
-                        (colour[1] / alpha) as u8,
-                        (colour[2] / alpha) as u8,
-                        a as u8,
-                    ],
-                );
+                // `sum / alpha` is the average colour of the covered area with
+                // the alpha weighting taken back out, which is the colour the
+                // cell composites with.
+                *px = [
+                    (colour[0] / alpha) as u8,
+                    (colour[1] / alpha) as u8,
+                    (colour[2] / alpha) as u8,
+                    a as u8,
+                ];
             }
         }
+        out
     }
 
     /// Alpha-blends a rectangle of `src` onto `self`, stretching it to `dst`.
@@ -190,6 +247,8 @@ impl Image {
         if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
             return;
         }
+
+        self.version = next_version();
 
         // Clipped once, into a range of destination rows and columns. Testing
         // each pixel against all four edges as it was written meant a

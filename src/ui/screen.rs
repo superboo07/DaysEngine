@@ -181,7 +181,7 @@ pub struct Cut {
 /// its contents, and only after both the frame's own highlight and hover sprite
 /// — so a page is not a backdrop and not a sprite, it is a layer between the
 /// two. See [`crate::ui::option_pages`] and [`crate::ui::replay_pages`].
-pub struct Page<'a> {
+pub struct Page<'a, 'b> {
     /// The page's full-screen art, **already in display space**: run it
     /// through [`Screen::to_display`] first, the same as a backdrop.
     pub art: &'a Image,
@@ -190,7 +190,138 @@ pub struct Page<'a> {
     /// from more than one: the replay grid takes its arrows and page buttons
     /// from `ReplayThum_Chip.png` and the thumbnail under the pointer from
     /// `Replay_Thm01.png`, in that one layer.
-    pub sprites: &'a [(&'a Image, Widget)],
+    pub sprites: &'b [(&'a Image, Widget)],
+}
+
+/// One draw in a composite, in the order it is drawn.
+///
+/// Every layer is the same shape, and deliberately so: **realize an image at
+/// its final size, then alpha-blit it 1:1**. Nothing is stretched or filtered
+/// by the blit — a sprite is resampled onto its destination size first, a
+/// [`Cut`] is sampled onto it, a source that is bigger than where it lands is
+/// averaged down onto it — so the pixels a layer contributes do not depend on
+/// what draws it. That is what lets the SDL path draw the same screen as a run
+/// of textured quads while `daysengine ui` composites it on the CPU, and get
+/// the same picture out of both.
+///
+/// The original draws its menus this way too: `FUN_1000c740` and the rest hand
+/// Direct3D one quad per sprite and never touch a pixel themselves.
+pub struct Layer<'a> {
+    pub art: Art<'a>,
+    /// Where it lands, in the screen's output space.
+    pub at: (i64, i64),
+    /// How big it is drawn, which is the size [`Layer::realize`] produces.
+    pub size: (u32, u32),
+}
+
+/// What a [`Layer`] draws, and how its pixels are arrived at.
+pub enum Art<'a> {
+    /// An image that is already in display space and already the right size.
+    /// The base art, a backdrop, a page's art, a buffer drawn elsewhere.
+    Whole(&'a Image),
+    /// A rectangle of a sheet, brought to the layer's size.
+    Cut { sheet: &'a Image, src: Source },
+}
+
+/// Which rectangle of a sheet a [`Art::Cut`] takes, and how it is resized.
+///
+/// The three ways are not interchangeable: they are the three kinds of source
+/// the screens actually have, and each is the sampling that kind needs. See
+/// [`resampled`], [`sampled`] and [`Image::downscaled`].
+pub enum Source {
+    /// Whole source pixels, scaled to the destination by the cubic every piece
+    /// of this game's art goes through. A widget's chip sprite.
+    Sprite((u32, u32, u32, u32)),
+    /// A fractional source rectangle, sampled bilinearly with its edges
+    /// clamped, the way the original's sampler reads a [`Cut`].
+    Sampled((f32, f32, f32, f32)),
+    /// Whole source pixels averaged down. For art rasterised at twice the size
+    /// it is drawn — the save/load rows and the backlog's lines.
+    Average((u32, u32, u32, u32)),
+}
+
+/// What identifies a layer's realized pixels.
+///
+/// A backend that turns them into something expensive — a GPU texture — keys
+/// its cache on this. Two layers with the same key realize to the same pixels,
+/// because an [`Image`]'s version changes whenever its own do (see
+/// [`Image::version`]); two that differ may still look alike, which costs a
+/// rebuild and never a wrong picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Key {
+    art: u64,
+    /// The source rectangle, as bits so a fractional one compares exactly.
+    src: [u32; 4],
+    size: (u32, u32),
+}
+
+impl Layer<'_> {
+    /// The layer's pixels, at [`Layer::size`], ready to be drawn 1:1.
+    ///
+    /// Borrowed for an [`Art::Whole`], which is already what it needs to be.
+    pub fn realize(&self) -> std::borrow::Cow<'_, Image> {
+        use std::borrow::Cow;
+        match &self.art {
+            Art::Whole(img) => Cow::Borrowed(img),
+            Art::Cut { sheet, src } => Cow::Owned(match src {
+                Source::Sprite(rect) => sprite_art(sheet, *rect, self.size),
+                Source::Sampled(rect) => sampled(sheet, *rect, self.size),
+                Source::Average(rect) => sheet.downscaled(*rect, self.size),
+            }),
+        }
+    }
+
+    /// What identifies these pixels; see [`Key`].
+    pub fn key(&self) -> Key {
+        let (art, src) = match &self.art {
+            Art::Whole(img) => (img.version(), [0, 0, img.width, img.height]),
+            Art::Cut { sheet, src } => (
+                sheet.version(),
+                match src {
+                    Source::Sprite((x, y, w, h)) | Source::Average((x, y, w, h)) => {
+                        [*x, *y, *w, *h]
+                    }
+                    Source::Sampled((x, y, w, h)) => {
+                        [x.to_bits(), y.to_bits(), w.to_bits(), h.to_bits()]
+                    }
+                },
+            ),
+        };
+        Key {
+            art,
+            src,
+            size: self.size,
+        }
+    }
+
+    /// Where it lands, as a rectangle.
+    pub fn rect(&self) -> (i64, i64, u32, u32) {
+        (self.at.0, self.at.1, self.size.0, self.size.1)
+    }
+}
+
+/// Everything that goes into one composite, in the order it is drawn.
+///
+/// The screens differ in which of these they have, not in what order they go
+/// in: `FUN_10006110` and `FUN_1000c740` both draw the background, then the
+/// page between, then the widget sprites over it. One list serves all of them,
+/// and the [`Screen::compose`] family are the combinations that are actually
+/// asked for.
+#[derive(Default)]
+pub struct Composite<'a, 'b> {
+    /// Drawn under everything. A screen that does not own its background — the
+    /// title — is composited over one. Already in display space.
+    pub backdrop: Option<&'a Image>,
+    /// Whether the screen's own base art is drawn. A layer over playback
+    /// leaves it out.
+    pub base: bool,
+    pub page: Option<Page<'a, 'b>>,
+    /// Indexed by widget; a shorter slice leaves the rest resting.
+    pub states: &'b [WidgetState],
+    /// Sprites a screen's own module works out, each with its sheet.
+    pub sprites: &'b [(&'a Image, Widget)],
+    /// Cuts drawn last, from the screen's own `_CHIP` sheet.
+    pub cuts: &'b [Cut],
 }
 
 /// A loaded screen at one resolution.
@@ -558,21 +689,77 @@ impl Screen {
         resampled(img, (0, 0, img.width, img.height), size).unwrap_or_else(|| img.clone())
     }
 
-    /// Draws an image that is already in display space, at the letterbox offset
-    /// the widgets get.
-    fn blit_display(&self, out: &mut Image, img: &Image) {
-        out.blit_scaled(
-            img,
-            (0, 0, img.width, img.height),
-            (0, self.out_letterbox.round() as i64, img.width, img.height),
-        );
+    /// An image that is already in display space, as a layer at the letterbox
+    /// offset the widgets get.
+    fn whole<'a>(&self, img: &'a Image) -> Layer<'a> {
+        Layer {
+            art: Art::Whole(img),
+            at: (0, self.out_letterbox.round() as i64),
+            size: (img.width, img.height),
+        }
     }
 
-    /// Draws one widget's chip sprite, resampled to the size the display map
-    /// gives it.
-    fn blit_sprite(&self, out: &mut Image, sheet: &Image, widget: &Widget) {
-        let (art, dst) = self.cut_from(sheet, widget);
-        out.blit_scaled(&art, (0, 0, dst.2, dst.3), dst);
+    /// One widget's chip sprite, as a layer where the display map puts it.
+    fn sprite<'a>(&self, sheet: &'a Image, widget: &Widget) -> Layer<'a> {
+        let dst = self.place(widget);
+        Layer {
+            art: Art::Cut {
+                sheet,
+                src: Source::Sprite((
+                    widget.src_x,
+                    widget.src_y,
+                    widget.dst.width,
+                    widget.dst.height,
+                )),
+            },
+            at: (dst.0, dst.1),
+            size: (dst.2, dst.3),
+        }
+    }
+
+    /// A [`Cut`] as a layer, placed by its own layout-space rectangle.
+    fn cut<'a>(&self, sheet: &'a Image, cut: &Cut) -> Layer<'a> {
+        let dst = self.place_layout(cut.dst);
+        Layer {
+            art: Art::Cut {
+                sheet,
+                src: Source::Sampled(cut.src),
+            },
+            at: (dst.0, dst.1),
+            size: (dst.2, dst.3),
+        }
+    }
+
+    /// A rectangle of a sheet averaged down onto a layout-space rectangle.
+    ///
+    /// For art rasterised at twice the size it is drawn: the save/load rows and
+    /// the backlog's lines. Taking one source pixel in four turns a glyph
+    /// stroke into a row of specks, so the cell is averaged instead.
+    pub fn averaged<'a>(
+        &self,
+        sheet: &'a Image,
+        src: (u32, u32, u32, u32),
+        dst: (f32, f32, f32, f32),
+    ) -> Layer<'a> {
+        let dst = self.place_layout(dst);
+        Layer {
+            art: Art::Cut {
+                sheet,
+                src: Source::Average(src),
+            },
+            at: (dst.0, dst.1),
+            size: (dst.2, dst.3),
+        }
+    }
+
+    /// An image in display space as a layer, for a caller assembling its own
+    /// list — the menu's backlog buffer and dress caption are these.
+    pub fn whole_layer<'a>(&self, img: &'a Image) -> Layer<'a> {
+        Layer {
+            art: Art::Whole(img),
+            at: (0, self.letterbox.round() as i64),
+            size: (img.width, img.height),
+        }
     }
 
     /// One widget's chip sprite alone, at display scale, with where it goes.
@@ -582,33 +769,8 @@ impl Screen {
     /// `REPLAYMODE` indicator at y = 80, below the 800x75 strip, so it is drawn
     /// on the picture instead.
     pub fn cut_widget(&self, widget: &Widget) -> (Image, (i64, i64, u32, u32)) {
-        self.cut_from(&self.chip, widget)
-    }
-
-    fn cut_from(&self, sheet: &Image, widget: &Widget) -> (Image, (i64, i64, u32, u32)) {
-        let src = (
-            widget.src_x,
-            widget.src_y,
-            widget.dst.width,
-            widget.dst.height,
-        );
-        let dst = self.place(widget);
-        let art = match resampled(sheet, src, (dst.2, dst.3)) {
-            Some(scaled) => scaled,
-            None => {
-                let mut cut = Image::empty(dst.2, dst.3);
-                cut.blit_scaled(sheet, src, (0, 0, dst.2, dst.3));
-                cut
-            }
-        };
-        (art, dst)
-    }
-
-    /// Draws a [`Cut`], resampling its source onto its destination.
-    fn blit_cut(&self, out: &mut Image, sheet: &Image, cut: &Cut) {
-        let dst = self.place_layout(cut.dst);
-        let sampled = sampled(sheet, cut.src, (dst.2, dst.3));
-        out.blit_scaled(&sampled, (0, 0, dst.2, dst.3), dst);
+        let layer = self.sprite(&self.chip, widget);
+        (layer.realize().into_owned(), layer.rect())
     }
 
     /// Composites the screen. `states` is indexed by widget; a shorter slice
@@ -636,14 +798,15 @@ impl Screen {
     /// for: `FUN_10024ca0` walks the gauge's three pieces immediately after the
     /// bed record they sit in.
     pub fn compose_layer_cuts(&self, states: &[WidgetState], cuts: &[Cut]) -> Image {
-        let (w, h) = self.size();
-        let mut out = Image::empty(w, h);
-        self.blit_display(&mut out, &self.base);
-        self.draw_states(&mut out, states);
-        for cut in cuts {
-            self.blit_cut(&mut out, &self.chip, cut);
-        }
-        out
+        self.rasterize(
+            false,
+            &self.layers(&Composite {
+                base: true,
+                states,
+                cuts,
+                ..Default::default()
+            }),
+        )
     }
 
     /// The sprites alone, on transparency, with no base art under them.
@@ -652,13 +815,14 @@ impl Screen {
     /// gets: the control bar's gauge keeps its own alpha while the strip fades,
     /// so it is composited separately and laid over the faded strip.
     pub fn compose_sprites(&self, states: &[WidgetState], cuts: &[Cut]) -> Image {
-        let (w, h) = self.size();
-        let mut out = Image::empty(w, h);
-        self.draw_states(&mut out, states);
-        for cut in cuts {
-            self.blit_cut(&mut out, &self.chip, cut);
-        }
-        out
+        self.rasterize(
+            false,
+            &self.layers(&Composite {
+                states,
+                cuts,
+                ..Default::default()
+            }),
+        )
     }
 
     /// Draws cuts from a sheet that is not this screen's onto `out`.
@@ -671,7 +835,7 @@ impl Screen {
     /// [`crate::ui::dress::committed`].
     pub fn draw_cuts_from(&self, out: &mut Image, sheet: &Image, cuts: &[Cut]) {
         for cut in cuts {
-            self.blit_cut(out, sheet, cut);
+            self.draw(out, &self.cut(sheet, cut));
         }
     }
 
@@ -706,23 +870,17 @@ impl Screen {
         states: &[WidgetState],
         sprites: &[(&Image, Widget)],
     ) -> Image {
-        let (w, h) = self.size();
-        let mut out = Image::black(w, h);
-        if let Some(under) = backdrop {
-            self.blit_display(&mut out, under);
-        }
-        self.blit_display(&mut out, &self.base);
-        if let Some(page) = page {
-            self.blit_display(&mut out, page.art);
-            for (sheet, sprite) in page.sprites {
-                self.blit_sprite(&mut out, sheet, sprite);
-            }
-        }
-        self.draw_states(&mut out, states);
-        for (sheet, widget) in sprites {
-            self.blit_sprite(&mut out, sheet, widget);
-        }
-        out
+        self.rasterize(
+            true,
+            &self.layers(&Composite {
+                backdrop,
+                base: true,
+                page,
+                states,
+                sprites,
+                ..Default::default()
+            }),
+        )
     }
 
     /// Composites the screen over a backdrop.
@@ -738,21 +896,38 @@ impl Screen {
     /// frame after frame would otherwise pay for the biggest resample on the
     /// screen every time, and the answer never changes.
     pub fn compose_over(&self, backdrop: Option<&Image>, states: &[WidgetState]) -> Image {
-        let (w, h) = self.size();
-        let mut out = Image::black(w, h);
-
-        if let Some(under) = backdrop {
-            self.blit_display(&mut out, under);
-        }
-
-        self.blit_display(&mut out, &self.base);
-        self.draw_states(&mut out, states);
-        out
+        self.rasterize(
+            true,
+            &self.layers(&Composite {
+                backdrop,
+                base: true,
+                states,
+                ..Default::default()
+            }),
+        )
     }
 
-    /// Draws the non-resting widget sprites onto an already-started frame.
-    fn draw_states(&self, out: &mut Image, states: &[WidgetState]) {
-        for (i, state) in states.iter().enumerate() {
+    /// What a composite draws, in order, without drawing any of it.
+    ///
+    /// This is the composite: [`Screen::rasterize`] is one backend for it and
+    /// the SDL path is the other. A caller with layers of its own — the menu's
+    /// backlog buffer, its save/load rows — appends them to this list rather
+    /// than compositing over the result, so that both backends see one list.
+    pub fn layers<'a>(&'a self, what: &Composite<'a, '_>) -> Vec<Layer<'a>> {
+        let mut layers = Vec::new();
+        if let Some(under) = what.backdrop {
+            layers.push(self.whole(under));
+        }
+        if what.base {
+            layers.push(self.whole(&self.base));
+        }
+        if let Some(page) = &what.page {
+            layers.push(self.whole(page.art));
+            for (sheet, sprite) in page.sprites {
+                layers.push(self.sprite(sheet, sprite));
+            }
+        }
+        for (i, state) in what.states.iter().enumerate() {
             let widget = match state {
                 WidgetState::Resting => continue,
                 WidgetState::Active => self.atlas.widgets.get(i),
@@ -765,7 +940,57 @@ impl Screen {
                 );
                 continue;
             };
-            self.blit_sprite(out, &self.chip, widget);
+            layers.push(self.sprite(&self.chip, widget));
+        }
+        for (sheet, widget) in what.sprites {
+            layers.push(self.sprite(sheet, widget));
+        }
+        for cut in what.cuts {
+            layers.push(self.cut(&self.chip, cut));
+        }
+        layers
+    }
+
+    /// Draws a list of layers into an image of this screen's size.
+    ///
+    /// `opaque` starts it from black rather than from transparency; see
+    /// [`Screen::compose_layer`] for which screens want which.
+    ///
+    /// This is the headless backend, and it is the one the engine is verified
+    /// through: the SDL path draws the same layers through the GPU, which no
+    /// test can read back.
+    pub fn rasterize(&self, opaque: bool, layers: &[Layer]) -> Image {
+        let (w, h) = self.size();
+        let mut out = if opaque {
+            Image::black(w, h)
+        } else {
+            Image::empty(w, h)
+        };
+        for layer in layers {
+            self.draw(&mut out, layer);
+        }
+        out
+    }
+
+    /// Draws one layer onto an image, which is always a 1:1 alpha blit of its
+    /// realized pixels.
+    pub fn draw(&self, out: &mut Image, layer: &Layer) {
+        let art = layer.realize();
+        out.blit_scaled(&art, (0, 0, art.width, art.height), layer.rect());
+    }
+}
+
+/// A widget's source rectangle brought to the size it is drawn at.
+///
+/// [`resampled`] returns `None` when there is nothing to scale, which is every
+/// screen at its native size; then the cut is simply copied out of the sheet.
+fn sprite_art(sheet: &Image, src: (u32, u32, u32, u32), size: (u32, u32)) -> Image {
+    match resampled(sheet, src, size) {
+        Some(scaled) => scaled,
+        None => {
+            let mut cut = Image::empty(size.0, size.1);
+            cut.blit_scaled(sheet, src, (0, 0, size.0, size.1));
+            cut
         }
     }
 }
@@ -825,11 +1050,7 @@ fn resampled(src: &Image, rect: (u32, u32, u32, u32), size: (u32, u32)) -> Optio
             *c = (u32::from(*c) * 255 / a).min(255) as u8;
         }
     }
-    Some(Image {
-        width: size.0,
-        height: size.1,
-        rgba,
-    })
+    Some(Image::from_rgba(size.0, size.1, rgba))
 }
 
 /// Samples `rect` of `src` into an image of `size`, the way the GPU samples a
