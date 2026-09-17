@@ -49,7 +49,7 @@
 //! **both dresses are sprites that are always drawn** — `FUN_1000c740` walks
 //! `+0xc8` and `+0xcc` unconditionally — and the lit record goes over the one
 //! under the pointer. The moving background is `STARTSCRIPT.INI`'s `[DressBG]`
-//! playing behind the plate; see [`BACKGROUND_KEY`].
+//! playing behind the plate; see [`background`].
 //!
 //! `DressSelect_Text.png` is a caption over that, loaded by `FUN_1000cce0` as a
 //! full-screen plate and drawn by `FUN_1000c740` only while [`Phase::Choosing`]
@@ -125,6 +125,7 @@
 
 use days_ui::atlas::{Atlas, Widget};
 
+use crate::install::ini::Ini;
 use crate::ui::screen::Cut;
 
 /// Which of the screen's two hit maps is loaded: `MENU::DressSelect` `+0x140`.
@@ -162,24 +163,91 @@ pub enum Act {
 /// `STARTSCRIPT.INI`'s key for what plays behind the transparent plate.
 ///
 /// The shipped file sets it to `System/DressSelect/sentakuBG_03.wmv`, and the
-/// install ships `sentakuBG_03.png` beside it. **The key chooses between them
-/// by its own extension**, in `FUN_00413250`'s mode-9 arm: it hands the value
-/// and the literal `L".png"` at `0x0048df38` to `wcsstr` — the import at IAT
-/// slot `0x0048c228`, `MSVCR90.dll!wcsstr`, reached through the thunk at
-/// `0x0048330a` — and a hit takes the still arm, `FUN_00420df0` on the object
-/// at `this + 0x74` with `+0x304` cleared, while a miss takes the movie arm,
-/// `FUN_004212a0` then `FUN_00421110` on a different object at `this + 0x178`
-/// with `+0x304` set. Either way `FUN_00408da0` starts it. So the retail value,
-/// ending `.wmv`, takes the movie arm, and pointing the key at the `.png` beside
-/// it would take the still one.
-///
-/// `FUN_004212a0`'s second argument is `1` here; **what that argument selects
-/// is not recovered**, so nothing is claimed about whether the movie loops.
-///
-/// **This engine does not play it yet.** The screen composites over whatever
-/// backdrop it is handed. What the arm does is written down because it is
-/// recovered, not because anything here reads it.
+/// install ships `sentakuBG_03.png` beside it. See [`background`] for which of
+/// the two arms the value takes.
 pub const BACKGROUND_KEY: &str = "DressBG";
+
+/// What the mode-9 arm does with [`BACKGROUND_KEY`]'s value.
+///
+/// **The key chooses between the two by its own spelling**, in
+/// `FUN_00413250`'s mode-9 arm: it hands the value and the literal `L".png"`
+/// at `0x0048df38` to `wcsstr` — the import at IAT slot `0x0048c228`,
+/// `MSVCR90.dll!wcsstr`, reached through the thunk at `0x0048330a` — and a hit
+/// takes the still arm while a miss takes the movie arm. It is `wcsstr` and
+/// not a suffix test, so what it asks is whether `.png` appears anywhere in
+/// the value at all. Either way `FUN_00408da0` starts what was set up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Background {
+    /// One picture, loaded straight into a texture and held: `FUN_00420df0`
+    /// on the object at `this + 0x74`, with `+0x304` cleared so the per-frame
+    /// arm below never runs.
+    Still(String),
+    /// A clip, played on a loop from its first frame: `FUN_004212a0` opens it
+    /// on the `MENU::MovieView` at `this + 0x178` — the class `FUN_00421b20`
+    /// names — `FUN_00421110` sets its frame to 0, and `+0x304` is set so the
+    /// pump advances it. See [`BACKGROUND_FPS`].
+    Movie(String),
+}
+
+impl Background {
+    /// The asset path, as the INI spells it.
+    pub fn path(&self) -> &str {
+        match self {
+            Background::Still(path) | Background::Movie(path) => path,
+        }
+    }
+}
+
+/// What goes behind the transparent plate, from `STARTSCRIPT.INI`.
+///
+/// `None` when the key is absent or empty — the arm still runs in the
+/// original, on an empty string, and both loaders report a file they cannot
+/// open; here that is one more missing asset, so the screen draws over what is
+/// already behind it.
+pub fn background(start: &Ini) -> Option<Background> {
+    let value = start.get(BACKGROUND_KEY)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(if value.contains(".png") {
+        Background::Still(value.to_string())
+    } else {
+        Background::Movie(value.to_string())
+    })
+}
+
+/// The clock the movie arm advances its frame on: 24 frames a second.
+///
+/// The frame is a member of its own — `MENU::MovieView` `+0x3c`, which
+/// `FUN_00421b20` zeroes and only `FUN_00421110` ever writes — and the mode
+/// pump sets it from the wall clock: `FUN_00413250` stores `timeGetTime()` in
+/// `+0x30c` as the screen comes up (case 2) and its two running phases (cases
+/// 3 and 8) set the frame to `round(elapsed_ms * DAT_004b31e0) / 1000`.
+/// `DAT_004b31e0` is written once, `FUN_00437e00`'s `mov dword ptr
+/// [0x004b31e0], 0x18` — 24, the same frame clock `.ORS` timelines are
+/// scheduled on.
+///
+/// # The clip loops
+///
+/// That frame number only ever goes up, and it is **not** evidence that the
+/// clip is played once: the loader rebases its timestamps instead of rewinding
+/// the count. `wmvLoader`'s pump `FUN_004532f0` asks
+/// `IWMSyncReader::GetNextSample` for a sample, and on
+/// `NS_E_NO_MORE_SAMPLES` — `FUN_00451820`'s `0xc00d0bcf` — it raises the
+/// play counter `+0xfc`, adds the clip's whole length `+0x88` to the running
+/// offset `+0x100` that every later sample's timestamp is taken from, and
+/// calls `FUN_00451fe0`. That seeks the reader back to the start —
+/// `IWMSyncReader::SetRange(0, 0)` through `FUN_004511a0`, vtable slot
+/// `+0x14` — and says so in its own debug line, `L"先頭へシーク\n"`.
+///
+/// It stops only when it has played a set number of times: `FUN_00451fe0`
+/// returns without seeking when `+0xf8` is non-zero and has been reached.
+/// `+0xf8` is that play count, `FUN_004523c0` sets it, and `FUN_004212a0`
+/// passes `(its second argument == 0)` — `setz cl` at `0x004213de`. The
+/// mode-9 arm's second argument is 1 (`push ebx` at `0x00413379`, with `ebx`
+/// 1 throughout `FUN_00413250`), so the count is zero and **the background
+/// loops for as long as the screen is up**.
+pub const BACKGROUND_FPS: f64 = 24.0;
 
 /// How many frames the commit slide runs for: `_DAT_1004a750`, a double.
 ///
@@ -326,6 +394,43 @@ mod tests {
             segments: vec![(0, 0, 2)],
             matched: 2,
         }
+    }
+
+    /// The retail key names a clip, so the arm `wcsstr` misses is the one
+    /// taken: `sentakuBG_03.wmv` plays rather than being held as a picture.
+    #[test]
+    fn the_shipped_key_is_a_clip() {
+        let start = Ini::parse("[DressBG]=\"System/DressSelect/sentakuBG_03.wmv\"");
+        assert_eq!(
+            background(&start),
+            Some(Background::Movie(
+                "System/DressSelect/sentakuBG_03.wmv".to_string()
+            ))
+        );
+    }
+
+    /// Pointing the key at the `.png` the install ships beside the clip takes
+    /// the still arm instead. `wcsstr` is a substring test, not a suffix one,
+    /// so a value that only mentions `.png` takes it too.
+    #[test]
+    fn a_png_anywhere_in_the_value_takes_the_still_arm() {
+        let start = Ini::parse("[DressBG]=\"System/DressSelect/sentakuBG_03.png\"");
+        assert_eq!(
+            background(&start),
+            Some(Background::Still(
+                "System/DressSelect/sentakuBG_03.png".to_string()
+            ))
+        );
+        let odd = Ini::parse("[DressBG]=\"System/.png/clip.wmv\"");
+        assert!(matches!(background(&odd), Some(Background::Still(_))));
+    }
+
+    /// A key the file does not carry is a missing asset, not a screen that
+    /// refuses to draw.
+    #[test]
+    fn no_key_is_no_background() {
+        assert_eq!(background(&Ini::parse("[TitleBGM]=\"x\"")), None);
+        assert_eq!(background(&Ini::parse("[DressBG]=\"\"")), None);
     }
 
     /// Widget 0 is the `A` dress: `FUN_1000ded0` calls host `+0x48` with 1 for

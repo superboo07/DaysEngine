@@ -572,9 +572,8 @@ Its background is not art of its own: `FUN_1000d980` hands `FUN_10010620`
 `System/Screen/Transparence.png` paired with
 `System/DressSelect/DressSelect_Chip.png`, because `STARTSCRIPT.INI`'s
 `[DressBG]` — `System/DressSelect/sentakuBG_03.wmv` — plays behind the plate.
-This engine does not play that movie yet: the screen composites over whatever
-backdrop it is handed, and there is nowhere to start it from while what raises
-mode 9 is unrecovered.
+This engine plays it, on the clock and for the length the executable's own arm
+gives it — see *`[DressBG]` picks a movie or a still by its own spelling* below.
 That makes it the one screen whose widgets are **always drawn**: `FUN_1000c740`
 walks `+0xc8` and `+0xcc` before it looks at the selection at all, where every
 other screen leaves a resting widget to its opaque base art.
@@ -679,17 +678,57 @@ object `0x1005b7b0` whose `+0xe0` `getNextMode` case 2 reads — and the whole
 chain was read with `objdump` rather than the decompiler, so it is a second
 method against Ghidra's own index rather than the same one twice.
 
-**`[DressBG]` picks a movie or a still by its own extension.** `FUN_00413250`'s
+**`[DressBG]` picks a movie or a still by its own spelling.** `FUN_00413250`'s
 mode-9 arm hands the key's value and the literal `L".png"` at `0x0048df38` to
 `wcsstr` — `MSVCR90.dll!wcsstr`, IAT slot `0x0048c228`, thunk `0x0048330a`. A
 hit takes the still arm, `FUN_00420df0` on the object at `this + 0x74` with
 `+0x304` cleared; a miss takes the movie arm, `FUN_004212a0` then
 `FUN_00421110` on a different object at `this + 0x178` with `+0x304` set. Either
-way `FUN_00408da0` starts it. The retail value ends `.wmv` and so takes the
-movie arm, and the install ships `sentakuBG_03.png` beside it for the other one.
-`FUN_004212a0`'s second argument is 1 here and **what that argument selects is
-not recovered**, so nothing is claimed about looping. This engine composites the
-screen over whatever backdrop it is handed and does not play either yet.
+way `FUN_00408da0` starts it. It is `wcsstr` and not a suffix test, so what it
+asks is whether `.png` appears anywhere in the value. The retail value ends
+`.wmv` and so takes the movie arm, and the install ships `sentakuBG_03.png`
+beside it for the other one.
+
+**The clip plays at 24 frames a second, on a loop.** The movie object at
+`this + 0x178` is `MENU::MovieView`, the class `FUN_00421b20`'s constructor
+names, and the frame it is showing is its `+0x3c`: that constructor zeroes it
+and `FUN_00421110` is the only thing in the image that writes it — a raw scan
+of `.text` for a write to a `0x3c` displacement finds those two and nothing
+else in the class. The mode pump drives it from the wall clock. `FUN_00413250`
+case 2 stores `timeGetTime()` in `+0x30c` as the screen comes up, and its two
+running phases, cases 3 and 8, set the frame to
+`round(elapsed_ms * DAT_004b31e0) / 1000`. `DAT_004b31e0` has one writer,
+`FUN_00437e00`'s `mov dword ptr [0x004b31e0], 0x18`: 24, the same clock `.ORS`
+timelines are scheduled on.
+
+That the frame number only ever goes up says nothing about looping, because
+the loader rebases its timestamps rather than rewinding the count. `wmvLoader`
+(`WMCreateSyncReader`, `WMVCORE.DLL`) pumps samples in `FUN_004532f0`: on
+`NS_E_NO_MORE_SAMPLES` from `IWMSyncReader::GetNextSample` — `0xc00d0bcf`, the
+value `FUN_00451820` tests — it raises the play counter `+0xfc`, adds the
+clip's whole length `+0x88` to the running offset `+0x100` that every later
+sample's timestamp is taken from, and calls `FUN_00451fe0`, which seeks the
+reader back to the start with `IWMSyncReader::SetRange(0, 0)` (`FUN_004511a0`,
+vtable slot `+0x14`) and prints `L"先頭へシーク\n"` — *seek to the start*. The
+same division by the clip's length is how `FUN_00451de0` turns an arbitrary
+time into a play number and an offset inside the clip.
+
+It stops only after a set number of plays, and the dress-select screen asks
+for no limit: `FUN_00451fe0` returns without seeking when `+0xf8` is non-zero
+and `+0xfc` has reached it, `+0xf8` is set by `FUN_004523c0` from
+`(FUN_004212a0`'s second argument `== 0)` — `setz cl` at `0x004213de` — and
+the mode-9 arm passes 1 (`push ebx` at `0x00413379`, with `ebx` 1 throughout
+`FUN_00413250`). So `+0xf8` is zero and the background loops for as long as
+the screen is up.
+
+This engine plays it that way: `DressBackground` in `src/main.rs` opens the
+clip when the screen comes up, advances it on the same 24 fps clock, draws it
+as the quad under the screen's own, and at the end of the clip rewinds it
+(`VideoDecoder::rewind`) and carries a frame offset of its own, which is the
+same arithmetic as `+0x100`. It is a quad rather than a backdrop handed to the
+compositor because the menu's textures are cached on the pixels behind them,
+and a clip would miss that cache every frame. `daysengine menu --mode 9 --out`
+is a still picture, so there it is the clip's first frame.
 
 **`FILMENGINE.INI` differs by four keys.** Shiny Days adds `[SeMove]` and drops
 `[FeedTime]`, `[Select1]` and `[Select2]`. `STARTSCRIPT.INI` adds `[SystemBGM2]`

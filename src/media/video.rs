@@ -289,6 +289,34 @@ impl VideoDecoder {
         self.frame_rate
     }
 
+    /// Seeks back to the first frame, for a clip that is played on a loop.
+    ///
+    /// The frame indices [`VideoFrame::index`] hands back start again from
+    /// zero, so a caller that counts frames across a loop keeps its own base —
+    /// which is what the original does too, adding the clip's whole length to
+    /// every timestamp after a wrap.
+    pub fn rewind(&mut self) -> Result<(), Error> {
+        // SAFETY: format and codec are live for the lifetime of self.
+        let code = unsafe {
+            ffi::av_seek_frame(
+                self.format,
+                self.stream_index,
+                0,
+                ffi::AVSEEK_FLAG_BACKWARD as c_int,
+            )
+        };
+        Error::check("av_seek_frame", code)?;
+        // The decoder is holding frames from before the seek, and draining may
+        // already have been signalled; both are undone here, or the first
+        // frame after a rewind is the last frame before it.
+        // SAFETY: codec is live.
+        unsafe { ffi::avcodec_flush_buffers(self.codec) };
+        self.draining = false;
+        self.finished = false;
+        self.index = 0;
+        Ok(())
+    }
+
     /// Decodes the next frame, or `None` at the end of the clip.
     pub fn next_frame(&mut self) -> Result<Option<VideoFrame>, Error> {
         if self.finished {

@@ -38,6 +38,7 @@ use daysengine::playback::som::{self, Device};
 use daysengine::ui::backlog;
 use daysengine::ui::bar::{self, Bar};
 use daysengine::ui::comment;
+use daysengine::ui::dress;
 use daysengine::ui::ending;
 use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session, Showing, SystemSe};
 use daysengine::ui::options::{self, Dir, Display, Som};
@@ -1614,9 +1615,10 @@ fn apply_volumes(config: &Config, sound: Sound, mixer: &Mixer) {
 
 /// Runs the menus until they start a script or the game is closed.
 ///
-/// The menu is a still image that only changes when the selection does, so this
-/// recomposites on demand rather than per frame: a frame is a 800x450 software
-/// composite and there is nothing animating between clicks.
+/// What the menu draws for itself only changes when the selection does, so this
+/// recomposites on demand rather than per frame: nothing in a screen animates
+/// between clicks. What is *behind* one can — the dress-select screen has a
+/// clip playing under it, which is [`DressBackground`] and is its own quad.
 fn run_menu(
     player: &mut Player,
     canvas: &mut Canvas<Window>,
@@ -1694,6 +1696,11 @@ fn run_menu(
     // A direction held across the way in, so it does not repeat into a screen
     // the player has only just opened.
     player.controls.clear();
+    // What is behind the dress-select screen, once that screen has come up:
+    // the outer `None` is "not on that screen", and `Some(None)` is "on it
+    // with nothing to draw", so an install missing the clip says so once
+    // rather than once a frame. See `DressBackground`.
+    let mut dress_back: Option<Option<DressBackground>> = None;
     // Paced to the display, and deciding on its grid rather than on whatever
     // moment the last pass ended.
     let mut cadence = Cadence::new(canvas);
@@ -2050,9 +2057,26 @@ fn run_menu(
         // something moved it; the layers below are then the same list as the
         // last frame's, and the textures behind them are still good.
         menu.prepare(under);
+        // The dress-select screen is the one screen with something moving
+        // behind it. It is opened when that screen comes up and dropped when
+        // the player leaves, which is also what the original does: the mode
+        // pump opens the clip on its way into mode 9 and starts it from its
+        // first frame.
+        if menu.showing().is(Mode::DRESS_SELECT) {
+            if let Some(back) = dress_back
+                .get_or_insert_with(|| DressBackground::open(player.vfs, start, creator, whole))
+            {
+                back.advance();
+            }
+        } else {
+            dress_back = None;
+        }
 
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
+        if let Some(Some(back)) = &dress_back {
+            back.draw(canvas, dst);
+        }
         textures.draw(canvas, &menu.layers(under), dst, at, whole)?;
         canvas.present();
         cadence.wait(now);
@@ -2706,6 +2730,159 @@ impl<'r> Layers<'r> {
         let frame = self.frame;
         self.held
             .retain(|_, held| frame.saturating_sub(held.last) < KEEP_FRAMES);
+    }
+}
+
+/// What goes behind the dress-select screen, and how far into it the clock is.
+///
+/// This belongs to the engine rather than to the menu module, the way the
+/// title's backdrop does: the screen's own base art is `Transparence.png`, and
+/// what moves behind it is `STARTSCRIPT.INI [DressBG]`, which
+/// `FUN_00413250`'s mode-9 arm opens on an object of the executable's own.
+/// See [`daysengine::ui::dress::background`].
+///
+/// It is a quad under the menu's own rather than a backdrop handed to
+/// [`Menu::layers`] because it changes every frame: a composite is cached on
+/// the pixels behind it, and a clip would miss that cache 24 times a second
+/// and upload a screen's worth of texture each time. The original draws it the
+/// same way — `FUN_004217e0` hands Direct3D one textured quad the size of the
+/// back buffer, and the screen's sprites go over it.
+struct DressBackground<'r> {
+    texture: Texture<'r>,
+    /// The clip. `None` for the still arm, and for a clip that stopped
+    /// decoding.
+    clip: Option<daysengine::media::VideoDecoder>,
+    /// When the screen came up, which is what the frame is counted from:
+    /// `FUN_00413250` case 2 stores `timeGetTime()` in `+0x30c`.
+    started: Instant,
+    /// The clip position the texture holds, counted from the *first* time
+    /// round: the clip loops and its own frame numbers start again each time,
+    /// so this keeps going up.
+    shown: u64,
+    /// What to add to the clip's own frame number to get [`Self::shown`]:
+    /// every frame of the second time round, and so on. This is the engine's
+    /// `+0x100`, the running offset `FUN_004532f0` adds the clip's whole
+    /// length to at each wrap.
+    base: u64,
+}
+
+impl<'r> DressBackground<'r> {
+    /// Opens whatever the key names, or `None` when there is nothing to draw.
+    ///
+    /// A key the install cannot satisfy costs the screen its background and
+    /// nothing else, as any missing asset does: the dresses and the caption
+    /// still come up, over black.
+    fn open(
+        vfs: &Vfs,
+        start: &Ini,
+        creator: &'r TextureCreator<WindowContext>,
+        whole: bool,
+    ) -> Option<DressBackground<'r>> {
+        let chosen = dress::background(start)?;
+        log::info!("dress-select background {chosen:?}");
+        match DressBackground::load(vfs, &chosen, creator, whole) {
+            Ok(back) => Some(back),
+            Err(err) => {
+                log::warn!("loading {}: {err}", chosen.path());
+                None
+            }
+        }
+    }
+
+    fn load(
+        vfs: &Vfs,
+        chosen: &dress::Background,
+        creator: &'r TextureCreator<WindowContext>,
+        whole: bool,
+    ) -> Result<DressBackground<'r>> {
+        let (image, clip) = match chosen {
+            // The still arm loads one picture into one texture and leaves it
+            // there: `FUN_00413250` clears `+0x304`, so the phase that would
+            // advance a frame never runs.
+            dress::Background::Still(path) => (ending::load_image(vfs, path)?, None),
+            dress::Background::Movie(path) => {
+                let mut clip = daysengine::media::VideoDecoder::open(vfs.read_path(path)?)?;
+                let frame = clip
+                    .next_frame()?
+                    .context("the dress-select background decoded no frames")?;
+                (
+                    days_ui::Image::from_rgba(frame.width, frame.height, frame.rgba),
+                    Some(clip),
+                )
+            }
+        };
+        let mut texture = new_texture(creator, image.width, image.height, art_sampling(whole))?;
+        texture.update(None, &image.rgba, image.width as usize * 4)?;
+        Ok(DressBackground {
+            texture,
+            clip,
+            started: Instant::now(),
+            shown: 0,
+            base: 0,
+        })
+    }
+
+    /// Catches the clip up with the clock, looping it where it runs out.
+    ///
+    /// The original does not decode a frame a tick either: it sets the frame
+    /// number it wants from the elapsed milliseconds and `wmvLoader` drops
+    /// whatever it is behind on. Decoding forward to the wanted index is the
+    /// same picture at the same moment.
+    fn advance(&mut self) {
+        let Some(clip) = &mut self.clip else {
+            return;
+        };
+        let wanted = (self.started.elapsed().as_secs_f64() * dress::BACKGROUND_FPS) as u64;
+        let mut newest = None;
+        while self.shown < wanted {
+            match clip.next_frame() {
+                Ok(Some(frame)) => {
+                    self.shown = self.base + frame.index;
+                    newest = Some(frame);
+                }
+                // The end of the clip, which the original starts again from
+                // the top — see `daysengine::ui::dress::BACKGROUND_FPS`. The
+                // frame it asks for never goes back, so the offset goes up by
+                // however long the clip turned out to be, which is what the
+                // original adds to every timestamp after a wrap.
+                Ok(None) if self.shown >= self.base => {
+                    self.base = self.shown + 1;
+                    if let Err(err) = clip.rewind() {
+                        log::warn!("looping the dress-select background: {err}");
+                        self.clip = None;
+                        break;
+                    }
+                }
+                // A time round that decoded nothing at all: there is no clip
+                // here to loop, and going round again would not end.
+                Ok(None) => {
+                    log::warn!("the dress-select background has no frames to loop");
+                    self.clip = None;
+                    break;
+                }
+                Err(err) => {
+                    log::warn!("decoding the dress-select background: {err}");
+                    self.clip = None;
+                    break;
+                }
+            }
+        }
+        if let Some(frame) = newest {
+            if let Err(err) = self
+                .texture
+                .update(None, &frame.rgba, frame.width as usize * 4)
+            {
+                log::warn!("uploading the dress-select background: {err}");
+                self.clip = None;
+            }
+        }
+    }
+
+    /// Draws it where the screen over it lands.
+    fn draw(&self, canvas: &mut Canvas<Window>, dst: FRect) {
+        if let Err(err) = canvas.copy(&self.texture, None, dst) {
+            log::warn!("drawing the dress-select background: {err}");
+        }
     }
 }
 

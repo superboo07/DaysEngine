@@ -3317,12 +3317,26 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         }
     }
 
+    // The dress-select screen's own base art is the transparent plate, so what
+    // it is drawn over is `[DressBG]`. It is a clip in the shipped install,
+    // which the game plays and a PNG can only hold the first frame of; see
+    // `daysengine::ui::dress::BACKGROUND_FPS`.
+    let dress_back = daysengine::ui::dress::background(&start_script_ini(&vfs));
+    if menu.showing().is(Mode::DRESS_SELECT) {
+        match &dress_back {
+            Some(background) => println!("dress background {background:?}"),
+            None => println!("dress background: [DressBG] names nothing"),
+        }
+    }
+
     if let Some(out) = &args.out {
         // With no override, draw what the save says: the same choice the
         // engine makes, so the PNG shows the title the player would see.
+        let dress_back = dress_back.as_ref().map(|b| b.path());
         let under = match &args.backdrop {
             Some(path) => Some(path.as_str()),
             None if menu.showing().is(Mode::TITLE) => Some(chosen.path.as_str()),
+            None if menu.showing().is(Mode::DRESS_SELECT) => dress_back,
             None => None,
         };
         let backdrop = match under {
