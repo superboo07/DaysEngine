@@ -97,33 +97,52 @@ impl Image {
         if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
             return;
         }
-        for row in 0..dh {
-            let dy = dy0 + row as i64;
-            if dy < 0 || dy >= self.height as i64 {
-                continue;
-            }
-            let y0 = row as u64 * sh as u64 / dh as u64;
-            let y1 = (((row as u64 + 1) * sh as u64) / dh as u64).max(y0 + 1);
-            for col in 0..dw {
-                let dx = dx0 + col as i64;
-                if dx < 0 || dx >= self.width as i64 {
-                    continue;
-                }
-                let x0 = col as u64 * sw as u64 / dw as u64;
-                let x1 = (((col as u64 + 1) * sw as u64) / dw as u64).max(x0 + 1);
+        let (col_from, col_to) = clip(dx0, dw, self.width);
+        let (row_from, row_to) = clip(dy0, dh, self.height);
+        if col_from == col_to || row_from == row_to {
+            return;
+        }
 
+        // The run of source bytes each destination column averages over, in
+        // the source row's own coordinates and worked out once for the whole
+        // blit -- the same footprint serves every row. Inline it cost four
+        // 64-bit divisions per destination pixel.
+        let span = |at: u32, n: u32, out: u32, from: u32, limit: u32| {
+            let lo = u64::from(at) * u64::from(n) / u64::from(out);
+            let hi = ((u64::from(at) + 1) * u64::from(n) / u64::from(out)).max(lo + 1);
+            let end = u64::from(n)
+                .min(hi)
+                .min(u64::from(limit.saturating_sub(from)));
+            (lo.min(end) as usize, end as usize)
+        };
+        let cols: Vec<(usize, usize)> = (col_from..col_to)
+            .map(|col| {
+                let (lo, hi) = span(col, sw, dw, sx, src.width);
+                ((sx as usize + lo) * 4, (sx as usize + hi) * 4)
+            })
+            .collect();
+
+        let dst_w = self.width as usize;
+        let src_w = src.width as usize;
+        for row in row_from..row_to {
+            let (y0, y1) = span(row, sh, dh, sy, src.height);
+            let dy = (dy0 + i64::from(row)) as usize;
+            let d_row = dy * dst_w * 4 + (dx0 + i64::from(col_from)) as usize * 4;
+            let dr = &mut self.rgba[d_row..dy * dst_w * 4 + dst_w * 4];
+
+            for (d, (from, to)) in dr.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
                 let mut cells = 0u32;
                 let mut alpha = 0u32;
                 let mut colour = [0u32; 3];
-                for y in y0..y1.min(sh as u64) {
-                    for x in x0..x1.min(sw as u64) {
-                        let Some(p) = src.pixel(sx + x as u32, sy + y as u32) else {
-                            continue;
-                        };
+                for y in y0..y1 {
+                    let base = (sy as usize + y) * src_w * 4;
+                    let row = &src.rgba[base.min(src.rgba.len())..];
+                    let run = &row[(*from).min(row.len())..(*to).min(row.len())];
+                    for p in run.as_chunks::<4>().0 {
                         cells += 1;
                         alpha += u32::from(p[3]);
                         for (sum, c) in colour.iter_mut().zip(p) {
-                            *sum += u32::from(c) * u32::from(p[3]);
+                            *sum += u32::from(*c) * u32::from(p[3]);
                         }
                     }
                 }
@@ -134,21 +153,19 @@ impl Image {
                 if a == 0 {
                     continue;
                 }
-                let ia = 255 - a;
-                let d = (dy as usize * self.width as usize + dx as usize) * 4;
-                let da = u32::from(self.rgba[d + 3]);
-                let out_a = a + da * ia / 255;
-                if out_a == 0 {
-                    continue;
-                }
-                for (channel, sum) in self.rgba[d..d + 3].iter_mut().zip(colour) {
-                    // `sum / alpha` is the average colour of the covered area,
-                    // un-weighted again, then composited as usual.
-                    let over = sum / alpha * a * 255;
-                    let under = u32::from(*channel) * da * ia;
-                    *channel = ((over + under) / (out_a * 255)) as u8;
-                }
-                self.rgba[d + 3] = out_a as u8;
+                // The averaged cell is one source pixel as far as the blend is
+                // concerned -- `sum / alpha` is its colour with the weighting
+                // taken back out -- so it composites through the same
+                // source-over, and the two divisionless cases apply to it too.
+                blend(
+                    d,
+                    [
+                        (colour[0] / alpha) as u8,
+                        (colour[1] / alpha) as u8,
+                        (colour[2] / alpha) as u8,
+                        a as u8,
+                    ],
+                );
             }
         }
     }
@@ -173,48 +190,126 @@ impl Image {
         if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
             return;
         }
-        for row in 0..dh {
-            let dy = dy0 + row as i64;
-            if dy < 0 || dy >= self.height as i64 {
-                continue;
+
+        // Clipped once, into a range of destination rows and columns. Testing
+        // each pixel against all four edges as it was written meant a
+        // full-screen blit did four comparisons per pixel to discover that
+        // every one of them was inside.
+        let (col_from, col_to) = clip(dx0, dw, self.width);
+        let (row_from, row_to) = clip(dy0, dh, self.height);
+        if col_from == col_to || row_from == row_to {
+            return;
+        }
+
+        // Which source column each destination column samples, worked out once
+        // for the whole blit. The map is the same on every row, and computing
+        // it inline cost two 64-bit divisions per pixel -- on a 1:1 blit, which
+        // is what a menu screen's base art is, that was the bulk of the work
+        // for a map that is the identity.
+        let mut cols: Vec<u32> = Vec::with_capacity((col_to - col_from) as usize);
+        for col in col_from..col_to {
+            let s_x = u64::from(sx) + u64::from(col) * u64::from(sw) / u64::from(dw);
+            // The map only rises, so the first column past the source edge is
+            // the end of what this blit draws.
+            if s_x >= u64::from(src.width) {
+                break;
             }
-            // Point sampling: the source pixel whose cell covers this row.
-            let s_y = sy + (row as u64 * sh as u64 / dh as u64) as u32;
-            for col in 0..dw {
-                let dx = dx0 + col as i64;
-                if dx < 0 || dx >= self.width as i64 {
-                    continue;
+            cols.push(s_x as u32);
+        }
+        let Some(first) = cols.first().copied() else {
+            return;
+        };
+
+        let dst_w = self.width as usize;
+        let src_w = src.width as usize;
+        for row in row_from..row_to {
+            let s_y = u64::from(sy) + u64::from(row) * u64::from(sh) / u64::from(dh);
+            if s_y >= u64::from(src.height) {
+                break;
+            }
+            let dy = (dy0 + i64::from(row)) as usize;
+            let s_row = s_y as usize * src_w * 4;
+            let sr = &src.rgba[s_row.min(src.rgba.len())..(s_row + src_w * 4).min(src.rgba.len())];
+            let d_row = dy * dst_w * 4 + (dx0 + i64::from(col_from)) as usize * 4;
+            let dr = &mut self.rgba[d_row..dy * dst_w * 4 + dst_w * 4];
+
+            if sw == dw {
+                // Unstretched: the source columns are consecutive, so the two
+                // runs are walked side by side and the column map is not read
+                // at all. This is the menus' own case.
+                let run = &sr[(first as usize * 4).min(sr.len())..];
+                for (d, s) in dr
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(run.as_chunks::<4>().0)
+                    .take(cols.len())
+                {
+                    blend(d, *s);
                 }
-                let s_x = sx + (col as u64 * sw as u64 / dw as u64) as u32;
-                let Some(p) = src.pixel(s_x, s_y) else {
-                    continue;
-                };
-                let a = u32::from(p[3]);
-                if a == 0 {
-                    continue;
+            } else {
+                for (d, s_x) in dr.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+                    let o = *s_x as usize * 4;
+                    let Some(s) = sr.get(o..o + 4) else {
+                        continue;
+                    };
+                    blend(d, [s[0], s[1], s[2], s[3]]);
                 }
-                let d = (dy as usize * self.width as usize + dx as usize) * 4;
-                // Source-over, compositing the destination's alpha as well as
-                // its colour. On the opaque black a full screen starts from
-                // this reduces to `src * a + dst * (255 - a)`, but the in-game
-                // overlays — the control bar, whose own art is RGBA — are
-                // composited onto a transparent layer and handed to the caller
-                // to blend over the frame, and there the destination alpha is
-                // the whole point.
-                let ia = 255 - a;
-                let da = u32::from(self.rgba[d + 3]);
-                let out_a = a + da * ia / 255;
-                if out_a == 0 {
-                    continue;
-                }
-                for (channel, src) in self.rgba[d..d + 3].iter_mut().zip(p) {
-                    let c = u32::from(src) * a * 255 + u32::from(*channel) * da * ia;
-                    *channel = (c / (out_a * 255)) as u8;
-                }
-                self.rgba[d + 3] = out_a as u8;
             }
         }
     }
+}
+
+/// The range of destination rows (or columns) a run of `len` placed at `at`
+/// actually lands on, clipped to `limit`.
+fn clip(at: i64, len: u32, limit: u32) -> (u32, u32) {
+    let from = (-at).clamp(0, i64::from(len)) as u32;
+    let to = (i64::from(limit) - at).clamp(0, i64::from(len)) as u32;
+    (from, to.max(from))
+}
+
+/// Source-over of one pixel.
+///
+/// The arithmetic is the general case -- compositing the destination's alpha as
+/// well as its colour, because the in-game overlays are composited onto a
+/// transparent layer and handed to the caller to blend over the frame. What is
+/// taken first are the two cases that need no division by a variable, and
+/// between them they are almost every pixel a screen composites:
+///
+/// * a fully opaque source pixel **is** the result (`out_a` works out to 255
+///   and each channel to the source's own), so it is a copy; and
+/// * over an opaque destination the divisor is 255 whatever the source alpha
+///   is, and a division by a constant is a multiply.
+///
+/// Both are the same values the general form below produces, not an
+/// approximation of them.
+#[inline(always)]
+fn blend(d: &mut [u8; 4], p: [u8; 4]) {
+    let a = u32::from(p[3]);
+    if a == 0 {
+        return;
+    }
+    if a == 255 {
+        *d = p;
+        return;
+    }
+    let ia = 255 - a;
+    let da = u32::from(d[3]);
+    if da == 255 {
+        for (channel, src) in d[..3].iter_mut().zip(p) {
+            *channel = ((u32::from(src) * a + u32::from(*channel) * ia) / 255) as u8;
+        }
+        return;
+    }
+    let out_a = a + da * ia / 255;
+    if out_a == 0 {
+        return;
+    }
+    for (channel, src) in d[..3].iter_mut().zip(p) {
+        let c = u32::from(src) * a * 255 + u32::from(*channel) * da * ia;
+        *channel = (c / (out_a * 255)) as u8;
+    }
+    d[3] = out_a as u8;
 }
 
 #[cfg(test)]
@@ -340,5 +435,43 @@ mod tests {
         assert_eq!(dst.pixel(0, 0), Some([1, 2, 3, 255]));
         dst.blit_scaled(&src, (0, 0, 4, 4), (3, 3, 4, 4));
         assert_eq!(dst.pixel(3, 3), Some([1, 2, 3, 255]));
+    }
+
+    /// [`blend`]'s two shortcuts are the general formula's own answers, not an
+    /// approximation of it, and this is what says so: the general form is
+    /// written out once here and every alpha pair is checked against it.
+    #[test]
+    fn the_divisionless_blends_are_the_general_one() {
+        fn general(d: [u8; 4], p: [u8; 4]) -> [u8; 4] {
+            let a = u32::from(p[3]);
+            if a == 0 {
+                return d;
+            }
+            let ia = 255 - a;
+            let da = u32::from(d[3]);
+            let out_a = a + da * ia / 255;
+            if out_a == 0 {
+                return d;
+            }
+            let mut out = d;
+            for (channel, src) in out[..3].iter_mut().zip(p) {
+                let c = u32::from(src) * a * 255 + u32::from(*channel) * da * ia;
+                *channel = (c / (out_a * 255)) as u8;
+            }
+            out[3] = out_a as u8;
+            out
+        }
+
+        for a in 0..=255u8 {
+            for da in 0..=255u8 {
+                for shade in [0u8, 1, 17, 128, 199, 254, 255] {
+                    let src = [shade, 255 - shade, 64, a];
+                    let dst = [200, 7, shade, da];
+                    let mut got = dst;
+                    blend(&mut got, src);
+                    assert_eq!(got, general(dst, src), "src {src:?} over dst {dst:?}");
+                }
+            }
+        }
     }
 }

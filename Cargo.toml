@@ -119,7 +119,26 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# A debug build has to be playable, because playing it is how this engine is
+# checked against the real game.
+#
+# `[profile.dev.package."*"]` is **dependencies only**: in a workspace it does
+# not cover the workspace's own members. So this table gave miniz_oxide and png
+# their -O2 and left every line we wrote -- the resampler, the mixer, the
+# compositor, the archive decrypt, the glyph decode -- at opt-level 0, which is
+# where all of the per-pixel and per-sample work actually lives. Measured on
+# this machine, with the workspace at 0 against the same code at 1:
+#
+#   800x450 still resampled to 1920x1080     524 ms  ->    18 ms
+#   menu screen's base blit at 1920x1080     104 ms  ->   9.2 ms
+#   one 1024-frame audio callback             82 us  ->     4 us
+#
+# 1 rather than 2 because it is nearly all of the win for a fraction of the
+# compile time, and a build that is still worth stepping through.
 [profile.dev]
-# Asset decode is unusably slow in a debug build; dependencies always get -O2.
+opt-level = 1
+
+# Dependencies get more: nothing here is stepped through, and the media and
+# decompression crates are hot.
 [profile.dev.package."*"]
 opt-level = 2
