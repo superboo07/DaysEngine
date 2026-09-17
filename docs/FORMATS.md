@@ -1894,13 +1894,25 @@ record 6, both at `(637, 301)` over the widget's own `(636, 301)`. They are the
 caption in its two states, cut from the chip sheet's second and third columns:
 white with an orange rule at `src (168, 59)`, grey at `src (334, 59)`.
 
-`FUN_1002f1c0` draws one of them on every pass, before the hover loop:
+`FUN_1002f1c0` draws one of them on every pass, **before** the hover loop:
 `FUN_1002fbd0(this, 2)` — not the trial build **and** host `+0x108(1)` — picks
 `+0xd8`, and anything else picks `+0xd4`. So leaving the widget resting draws
-nothing, which is what `src/ui/menu.rs` did until it was told the difference:
+the caption and nothing else, and pointing at it draws widget 2's own hover
+sprite — `(636, 301)` 165x28 from the chip sheet's first column — *over* the
+caption's `(637, 301)` 164x28 rather than instead of it.
+
 `SysMenuSDHQ.dll` keeps the live caption in the base art and gives the dead one
-its single trailing record, so there the alternate is drawn only when the widget
-is locked.
+its single trailing record, which `FUN_1001fdc0` draws **after** its hover loop
+and only while `FUN_100206e0(this, 2)` says the widget is locked. A locked
+widget is never the selection, so on that module the caption never meets a
+hover sprite at all.
+
+On neither module is the caption a *state* of widget 2: both draw it outside
+the hover loop from a record of their own, and the side of the loop they draw
+it on is the only difference. `src/ui/menu.rs` follows that — the caption is a
+sprite in its own right, placed under the widget sprites on Shiny Days and over
+them on School Days HQ — rather than putting it in the widget's state, which
+withheld the Shiny Days hover art.
 
 The two are told apart by the table rather than by the module. A screen that
 draws both states holds its two alternates **over the same rectangle**; School

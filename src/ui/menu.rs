@@ -1209,29 +1209,43 @@ fn title_action(widget: usize, has_dress_select: bool) -> Option<Mode> {
     })
 }
 
-/// Which widget of the title screen is `REPLAY`, and whether its caption is a
-/// sprite in both of its states.
+/// Which widget of the title screen is `REPLAY`.
+const TITLE_REPLAY: usize = 2;
+
+/// The `REPLAY` caption the title draws as a sprite of its own, and whether it
+/// goes down **before** the widget under the pointer draws its hover art.
+///
+/// The caption is not a widget state on either module: both draw it outside
+/// the hover loop, from a record of their own, and what differs is which side
+/// of that loop they draw it on.
 ///
 /// `SysMenuSD.dll`'s `FUN_1002f550` builds **two** sprites for it, `+0xd8` from
 /// the first alternate and `+0xd4` from the second, and `FUN_1002f1c0` draws
-/// one or the other on every pass: `FUN_1002fbd0(this, 2)` — not the trial
-/// build and host `+0x108(1)` — picks `+0xd8`, and anything else picks `+0xd4`.
-/// So on that module the base art carries no `REPLAY` caption at all and
-/// leaving the widget resting draws nothing, which is what it did here.
+/// one or the other on every pass, *before* the loop: `FUN_1002fbd0(this, 2)`
+/// — not the trial build and host `+0x108(1)` — picks `+0xd8`, and anything
+/// else picks `+0xd4`. So on that module the base art carries no `REPLAY`
+/// caption at all, and widget 2's hover art — `(636, 301)` 165x28 from the
+/// chip sheet's first column — lands over the caption's `(637, 301)` 164x28
+/// rather than instead of it.
+///
 /// `SysMenuSDHQ.dll` keeps the live caption in the base art and gives the dead
-/// one the single alternate.
+/// one the single alternate, which `FUN_1001fdc0` draws *after* the loop and
+/// only while `FUN_100206e0(this, 2)` says the widget is locked. A locked
+/// widget is never the selection, so that one never meets a hover sprite.
 ///
 /// The two are told apart by the table rather than by the module: a screen that
 /// draws both states holds two alternates over the **same rectangle**, where
 /// the other module's second alternate belongs to a different row entirely.
 /// `None` is a title with no alternate at all, which draws nothing either way.
-const TITLE_REPLAY: usize = 2;
-
-fn title_replay_caption(extras: &[days_ui::atlas::Widget], widget: usize) -> Option<bool> {
-    debug_assert_eq!(widget, TITLE_REPLAY);
+fn title_replay_caption(
+    extras: &[days_ui::atlas::Widget],
+    unlocked: bool,
+) -> Option<(usize, bool)> {
     match extras {
-        [first, second, ..] => Some(first.dst == second.dst),
-        [_] => Some(false),
+        // Both states are sprites, and one of the two is always drawn.
+        [first, second, ..] if first.dst == second.dst => Some((usize::from(!unlocked), true)),
+        // Only the dead state is; the live one is in the base art.
+        [_, ..] => (!unlocked).then_some((0, false)),
         [] => None,
     }
 }
@@ -1777,6 +1791,7 @@ impl Menu {
     /// [`Menu::prepare`] first: the layers borrow the art it builds.
     pub fn layers<'a>(&'a self, backdrop: Option<&'a days_ui::Image>) -> Vec<Layer<'a>> {
         let page_sprites = self.page_sprites();
+        let under = self.under_sprites();
         let sprites = self.sprites();
         let page = self.page_art().map(|art| crate::ui::screen::Page {
             art,
@@ -1786,6 +1801,7 @@ impl Menu {
             backdrop: self.dress_art.as_ref().or(backdrop),
             base: self.base_art(),
             page,
+            under: &under,
             states: &self.states,
             sprites: &sprites,
             ..Default::default()
@@ -2037,6 +2053,31 @@ impl Menu {
         self.option_page.as_ref()?.knob_x.get(slider).copied()
     }
 
+    /// The title's `REPLAY` caption, which is a sprite of its own on both
+    /// modules rather than a state of widget 2 — see
+    /// [`title_replay_caption`], which also settles which side of the hover
+    /// loop it goes down on. `under` asks for the one that goes first.
+    fn title_caption(&self, under: bool) -> Option<(&days_ui::Image, days_ui::atlas::Widget)> {
+        if !self.showing.is(Mode::TITLE) {
+            return None;
+        }
+        let extras = &self.screen.atlas().extras;
+        let unlocked = self.session.save.replay_unlocked();
+        let (extra, first) = title_replay_caption(extras, unlocked)?;
+        if first != under {
+            return None;
+        }
+        Some((self.screen.chip(), *extras.get(extra)?))
+    }
+
+    /// The sprites this screen draws before it draws any widget's hover art.
+    ///
+    /// Only the title has any, and only on the module that draws both states
+    /// of its `REPLAY` caption.
+    fn under_sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
+        self.title_caption(true).into_iter().collect()
+    }
+
     /// The sprites this screen draws that are not widget states.
     ///
     /// Three screens have them: the Sound tab's three volume bars, cut from the
@@ -2048,6 +2089,7 @@ impl Menu {
     /// [`Menu::compose`].
     fn sprites(&self) -> Vec<(&days_ui::Image, days_ui::atlas::Widget)> {
         let mut out = Vec::new();
+        out.extend(self.title_caption(false));
         // The value in force on every row of an Option tab, and the tab's own
         // header. Each is one record out of the screen's first alternate run,
         // carrying its own destination, so the highlight sits on whichever
@@ -2182,7 +2224,7 @@ impl Menu {
         }
         match self.mode() {
             Some(Mode::TITLE) => match widget {
-                2 => self.session.save.replay_unlocked(),
+                TITLE_REPLAY => self.session.save.replay_unlocked(),
                 5 => self.session.save.all_clear,
                 _ => true,
             },
@@ -2234,19 +2276,6 @@ impl Menu {
     /// any.
     fn extra_for(&self, widget: usize) -> Option<usize> {
         match self.mode() {
-            Some(Mode::TITLE) if widget == TITLE_REPLAY => {
-                title_replay_caption(&self.screen.atlas().extras, widget).and_then(|both| {
-                    let unlocked = self.session.save.replay_unlocked();
-                    match both {
-                        // Both states are sprites: one of the two is always
-                        // drawn.
-                        true => Some(if unlocked { 0 } else { 1 }),
-                        // Only the dead state is; the live one is in the
-                        // base art.
-                        false => (!unlocked).then_some(0),
-                    }
-                })
-            }
             // Both replay views mark the tab and the page you are on, which no
             // resting/active pair can say. An index past the alternates the
             // screen actually placed draws nothing: see
@@ -2346,9 +2375,10 @@ impl Menu {
 
     /// Recomputes every widget's sprite from the current selection.
     ///
-    /// A disabled `REPLAY` draws the one alternate record that follows the
-    /// title's table in the DLL — `extras[0]`, the greyed-out caption. Only
-    /// that first extra belongs to this screen: the run after it is the next
+    /// The title's `REPLAY` caption is not in here: it is drawn outside the
+    /// hover loop on both modules, so it is a sprite of its own — see
+    /// [`Menu::title_caption`]. Only the first record that follows the title's
+    /// table belongs to this screen anyway; the run after it is the next
     /// screen's table, which the atlas cannot see the end of.
     fn refresh(&mut self) {
         self.load_rows();
@@ -3702,12 +3732,15 @@ mod tests {
         }
     }
 
-    /// ...and Close from the title still goes where it always did.
     /// The title's `REPLAY` caption is a sprite in both states on the module
     /// that gives it two alternates over one rectangle, and only in its dead
     /// state on the module whose base art carries the live one. The shapes are
     /// the two shipped tables: `SysMenuSD.dll` puts both of its at (637, 301),
     /// `SysMenuSDHQ.dll`'s second alternate is a row 50 pixels higher.
+    ///
+    /// The module that draws both draws them *before* the hover loop, so its
+    /// caption goes under whatever hover art widget 2 has; the other draws its
+    /// one after.
     #[test]
     fn a_title_that_draws_both_replay_captions_holds_them_at_one_rectangle() {
         let at = |x: u32, y: u32| days_ui::atlas::Widget {
@@ -3722,11 +3755,17 @@ mod tests {
         };
         let sd = [at(637, 301), at(637, 301)];
         let hq = [at(348, 353), at(348, 303)];
-        assert_eq!(title_replay_caption(&sd, TITLE_REPLAY), Some(true));
-        assert_eq!(title_replay_caption(&hq, TITLE_REPLAY), Some(false));
-        assert_eq!(title_replay_caption(&hq[..1], TITLE_REPLAY), Some(false));
-        assert_eq!(title_replay_caption(&[], TITLE_REPLAY), None);
+        assert_eq!(title_replay_caption(&sd, true), Some((0, true)));
+        assert_eq!(title_replay_caption(&sd, false), Some((1, true)));
+        assert_eq!(title_replay_caption(&hq, true), None);
+        assert_eq!(title_replay_caption(&hq, false), Some((0, false)));
+        assert_eq!(title_replay_caption(&hq[..1], true), None);
+        assert_eq!(title_replay_caption(&hq[..1], false), Some((0, false)));
+        assert_eq!(title_replay_caption(&[], true), None);
+        assert_eq!(title_replay_caption(&[], false), None);
     }
+
+    /// ...and Close from the title still goes where it always did.
 
     #[test]
     fn closing_a_title_rooted_screen_goes_back_to_the_title() {

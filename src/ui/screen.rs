@@ -316,6 +316,11 @@ pub struct Composite<'a, 'b> {
     /// leaves it out.
     pub base: bool,
     pub page: Option<Page<'a, 'b>>,
+    /// Sprites a screen's own module works out and draws **before** it looks at
+    /// the pointer, so the hover art of whatever the pointer is on lands on
+    /// top of them. Only the Shiny Days title has any: see
+    /// [`crate::ui::menu::title_replay_caption`].
+    pub under: &'b [(&'a Image, Widget)],
     /// Indexed by widget; a shorter slice leaves the rest resting.
     pub states: &'b [WidgetState],
     /// Sprites a screen's own module works out, each with its sheet.
@@ -973,6 +978,9 @@ impl Screen {
             for (sheet, sprite) in page.sprites {
                 layers.push(self.sprite(sheet, sprite));
             }
+        }
+        for (sheet, sprite) in what.under {
+            layers.push(self.sprite(sheet, sprite));
         }
         for (i, state) in what.states.iter().enumerate() {
             let widget = match state {
