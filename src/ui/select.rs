@@ -51,6 +51,15 @@
 //! `FUN_0044d6e0` stops drawing, which on a two-choice box is always the
 //! unpicked label. See [`Choice::label_colour`].
 //!
+//! # Where the labels go
+//!
+//! Nowhere the hit map says. `FUN_0044ca10` breaks each label into lines and
+//! `FUN_0044ced0` places them from the object's scale, two anchors and a
+//! handful of constants — see [`place`], which is what both this engine's
+//! drawing paths use. That matters beyond fidelity: Shiny Days ships no choice
+//! map this engine can find, so a label placed from the map's boxes is a label
+//! that is never drawn, on a screen whose clicks still answer.
+//!
 //! # The highlight is a colour, not a sprite
 //!
 //! `System/Select/` ships no art, so there is nothing to light: `FUN_0044d3f0`
@@ -168,33 +177,6 @@ pub fn advance(english: bool) -> u32 {
     }
 }
 
-/// Where each label is anchored, in the layout's own units.
-///
-/// `FUN_0044d890` and `FUN_0044da50` multiply the object's scale member by one
-/// of these and hand it to `FUN_0044ca10`, which treats it as **x** in the
-/// sideways layout and as **y** in the stacked one, pinning x at `533.4` there.
-///
-/// `FUN_0044ca10` ends by setting each line's **source** rectangle — sprite slot
-/// `+0x1c`, where in the shared text texture the label was drawn. The
-/// **destination** is `FUN_0044ced0`, slot `+0xc`:
-///
-/// ```text
-/// x = block->0x18[n] * scale + block->0x10
-/// y = n * 48.0 * scale + 568.0 * scale + base
-/// w = scale * (533.4, or 1066.8 in the stacked layout)
-/// h = scale * 48.0
-/// ```
-///
-/// with `base` centring the block vertically on the anchor —
-/// `anchor - lines * 48.0 * scale / 2.0` in the stacked English case — and
-/// `scale` the same 0.75/0.96/1.2 ladder [`crate::playback::text::Geometry`]
-/// carries.
-///
-/// **This engine does not place labels by that formula yet.** It centres each
-/// one in the box the shipped `.CMAP` gives, which is exact data and lines up
-/// with the hit testing, but it is not the original's arithmetic. The *size* is
-/// the formula's — see [`label_scale`]; it is only where the label sits that
-/// comes from the map instead.
 /// Destination height of one choice label, from `FUN_0044ced0`'s
 /// `h = scale * 48.0`.
 ///
@@ -208,16 +190,211 @@ pub const LABEL_HEIGHT: f32 = 48.0;
 ///
 /// A rendered line is [`crate::playback::text::LINE_PITCH`] tall and its
 /// destination is [`LABEL_HEIGHT`] times the geometry's scale, so the factor is
-/// the geometry's scale and nothing else. Uniform in both axes, because
-/// `FUN_0044ced0` multiplies x and y by the same number.
+/// the geometry's scale and nothing else vertically. Horizontally there is
+/// [`LABEL_STRETCH`] as well.
 pub fn label_scale(geometry: Geometry) -> f32 {
     geometry.scale * LABEL_HEIGHT / crate::playback::text::LINE_PITCH as f32
 }
 
+/// The destination width of a label's strip in layout units, narrow then wide:
+/// `_DAT_004d67a0` and `_DAT_004d67a4`, both floats.
+///
+/// The narrow one is half the 1066.8-unit design width, which is also
+/// [`ANCHOR_ONE`]; the exe holds the two as separate constants and so does
+/// this.
+pub const STRIP: [f32; 2] = [533.4, 1066.8];
+
+/// The horizontal stretch a label gets on top of [`label_scale`].
+///
+/// The labels are drawn into a buffer of their own — the box's constructor
+/// makes it `0x400 x 0x200`, 1024x512, beside the 2048-wide one the dialogue
+/// uses — and `FUN_0044ca10` gives each line a source rectangle `1024/2048` or
+/// `1024/1024` of its width: 512 source pixels for a label in the sideways
+/// English layout and 1024 for any other. `FUN_0044ced0` then draws that strip
+/// `533.4 * scale` or `1066.8 * scale` wide. Both ratios are the same number,
+/// and it is not 1: a label's glyphs come out 4% wider than the dialogue's,
+/// which are drawn source-pixel to layout-unit.
+///
+/// The wrap limits agree from the other side. A line is allowed 33 characters
+/// in the narrow layout and 66 in the wide one, at 16 units each — 528 and 1056
+/// units, which are 512 and 1024 source pixels at exactly this ratio. So the
+/// buffer is sized in source pixels for a design width of 1066.8 layout units,
+/// and the strip is stretched back out to it.
+pub const LABEL_STRETCH: f32 = STRIP[1] / 1024.0;
+
+/// Where the block of lines starts before the anchor moves it: `_DAT_004d6798`.
+const BLOCK_Y: f32 = 568.0;
+
+/// The ybase for a box with `[UseEnglish]` clear on a widescreen display:
+/// `_DAT_004d67a8`. The block lands at `568 - 12` of 600 — along the bottom.
+const PLAIN_Y: f32 = -12.0;
+
+/// The same on a 4:3 display, `_PTR_004d01d0`, where it is added to the
+/// letterbox rather than scaled.
+const PLAIN_Y_LETTERBOXED: f32 = 24.0;
+
+/// The ybase the English sideways layout centres its lines on:
+/// `_DAT_004d67b0`. `568 - 268` is 300 of 600, the middle of the picture.
+const CENTRED_Y: f32 = -268.0;
+
+/// Extra left kick on every line but the last, `_DAT_004d5080`.
+const WRAPPED_KICK: f32 = 4.0;
+
+/// Where each label is anchored, in the layout's own units.
+///
+/// `FUN_0044d890` and `FUN_0044da50` multiply the object's scale member by one
+/// of these and hand it to `FUN_0044ca10`, which takes it as **x** in the
+/// sideways layout and as **y** in the stacked one, pinning x at
+/// [`ANCHOR_ONE`] there.
+///
+/// The sideways pair are the centres of the screen's two halves — 266.7 and
+/// 800.0 of 1066.8 — and the stacked pair put `568 + a` at 149.3 and 450 of
+/// 600, which are the centres of the shipped `_H` map's two 1280x360 boxes.
+/// [`ANCHOR_ONE`] and [`ANCHOR_ONE_STACKED`] are both the middle of the axis
+/// they act on.
 pub const ANCHOR_ONE: f64 = 533.4;
+/// See [`ANCHOR_ONE`]: `_DAT_004d67c0` and `_DAT_004d67b8`.
 pub const ANCHOR_TWO: [f64; 2] = [266.7, 800.0];
+/// See [`ANCHOR_ONE`]: `_DAT_004d67b0`.
 pub const ANCHOR_ONE_STACKED: f64 = -268.0;
+/// See [`ANCHOR_ONE`]: `_DAT_004d67d0` and `_DAT_004d67c8`.
 pub const ANCHOR_TWO_STACKED: [f64; 2] = [-418.7, -118.0];
+
+/// One label's anchor, in layout units before the scale.
+fn anchor(index: usize, choices: usize, layout: Layout) -> f32 {
+    let one = choices < 2;
+    let value = match (layout, one) {
+        (Layout::Sideways, true) => ANCHOR_ONE,
+        (Layout::Sideways, false) => ANCHOR_TWO[index.min(1)],
+        (Layout::Stacked, true) => ANCHOR_ONE_STACKED,
+        (Layout::Stacked, false) => ANCHOR_TWO_STACKED[index.min(1)],
+    };
+    value as f32
+}
+
+/// Whether a box gets the wide strip: the 66-character line and the 1066.8-unit
+/// destination, rather than the 33-character line and 533.4.
+///
+/// `FUN_0044ca10` and `FUN_0044ced0` ask the same question in the same shape —
+/// `[UseEnglish]` set, and either `[SelectType]` set or a one-choice box — for
+/// the line limit, the buffer strip and the destination width, so it is one
+/// test and not three. See [`wrap_limit`].
+fn wide(choices: usize, layout: Layout, english: bool) -> bool {
+    english && (layout == Layout::Stacked || choices < 2)
+}
+
+/// Where one line of a label is drawn, in the picture's own pixels.
+///
+/// The picture is [`crate::playback::text::Geometry::screen`] — the same space
+/// [`crate::playback::text::place`] answers in — so a caller scales both by the
+/// window's letterbox and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// The left edge of the line's strip, which is where its first glyph cell
+    /// lands.
+    pub x: f32,
+    /// The top of the line's row.
+    pub y: f32,
+    /// What one pixel of a rendered line becomes horizontally: [`label_scale`]
+    /// with [`LABEL_STRETCH`] on top.
+    pub x_scale: f32,
+    /// And vertically, which is [`label_scale`] alone.
+    pub y_scale: f32,
+}
+
+/// Places one label's lines, from `FUN_0044ca10` and `FUN_0044ced0`.
+///
+/// `FUN_0044ca10` gives the block an x base and an anchor, and each line an x
+/// offset of its own; `FUN_0044ced0` turns those into the destination
+/// rectangle:
+///
+/// ```text
+/// x = block->0x18[n] * scale + block->0x10
+/// y = n * 48.0 * scale + 568.0 * scale + base
+/// w = scale * (533.4, or 1066.8 on the wide strip)
+/// h = scale * 48.0
+/// ```
+///
+/// The lines are [`Metrics::lines`]'s, the same breaker the limits belong to.
+/// The line offsets are `-(characters * advance / 2)`, so a line is centred on
+/// the anchor by its character count — not by its width, which the kerning in
+/// [`crate::playback::text::advance`] makes a little different. Every line but
+/// the last takes [`WRAPPED_KICK`] more.
+///
+/// `base` is the arm of `FUN_0044ced0` the display mode and the two INI flags
+/// select:
+///
+/// ```text
+/// [UseEnglish] clear        568 - 12         along the bottom
+/// English, sideways         568 - 268        centred, less half the block
+/// English, stacked          568 + anchor     the anchor, less half the block
+/// ```
+///
+/// # The half pixel
+///
+/// Shiny Days' build of this — `FUN_00438e50`, against `FUN_0044ced0` — adds
+/// the half-texel correction the rest of the engine uses: `- 0.5` on x and y
+/// and `+ 1.0` on the width and height. School Days HQ's build has none of it.
+/// This engine does neither, because the half texel is a Direct3D 9 sampling
+/// fixup rather than a layout offset, and reproducing it against a different
+/// sampler would move the label rather than pin it. What is kept is the
+/// vertical offset the mode carries — `Geometry::y_offset`, the member both
+/// builds add on a 4:3 display — which this applies on the widescreen path
+/// too. That is exactly Shiny Days, whose widescreen arm subtracts the same
+/// `0.5`; School Days HQ's widescreen arm omits it, and lands half a pixel
+/// lower.
+pub fn place(
+    lines: &[String],
+    index: usize,
+    choices: usize,
+    layout: Layout,
+    english: bool,
+    geometry: Geometry,
+) -> Vec<Placement> {
+    let scale = geometry.scale;
+    let stacked = layout == Layout::Stacked;
+    let anchor = anchor(index, choices, layout) * scale;
+    // In the stacked layout the anchor is the y and x is pinned to the middle;
+    // in the sideways one the anchor is the x and y comes from the constants.
+    let x_base = if stacked {
+        ANCHOR_ONE as f32 * scale
+    } else {
+        anchor
+    };
+    let half_block = lines.len() as f32 * LABEL_HEIGHT * scale / 2.0;
+    let base = geometry.y_offset
+        + match (english, stacked) {
+            (false, _) if geometry.widescreen() => PLAIN_Y * scale,
+            (false, _) => PLAIN_Y_LETTERBOXED,
+            (true, false) => CENTRED_Y * scale - half_block,
+            (true, true) => anchor - half_block,
+        };
+    let half_advance = crate::playback::text::pitch(english) as f32 / 2.0;
+    let last = lines.len().saturating_sub(1);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(n, line)| {
+            let columns = line.chars().count() as f32;
+            let kick = if n == last { 0.0 } else { WRAPPED_KICK };
+            Placement {
+                x: -(columns * half_advance + kick) * scale + x_base,
+                y: n as f32 * LABEL_HEIGHT * scale + BLOCK_Y * scale + base,
+                x_scale: label_scale(geometry) * LABEL_STRETCH,
+                y_scale: label_scale(geometry),
+            }
+        })
+        .collect()
+}
+
+/// The destination width of a label's strip, which is what the line is drawn
+/// inside: `FUN_0044ced0`'s `w`.
+///
+/// Only a caller drawing the strip itself needs this — the glyphs are placed by
+/// [`Placement`], which carries the same ratio in [`Placement::x_scale`].
+pub fn strip_width(choices: usize, layout: Layout, english: bool, geometry: Geometry) -> f32 {
+    STRIP[usize::from(wide(choices, layout, english))] * geometry.scale
+}
 
 /// The choice box's hit map at one resolution.
 pub struct Select {
@@ -666,14 +843,26 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn from_ini(film: &Ini, choices: usize) -> Metrics {
-        let english = film.get_bool("UseEnglish").unwrap_or(false);
-        let select_type = film.get_bool("SelectType").unwrap_or(false);
+    /// From the two INI flags directly, for a caller that has them already —
+    /// the software compositor is handed the layout rather than the file.
+    ///
+    /// Outside `[UseEnglish]` the limit is 11 whatever `[SelectType]` says, so
+    /// a caller that only knows the layout can pass [`Layout::Stacked`] for
+    /// `select_type` and get the same answer.
+    pub fn new(choices: usize, select_type: bool, english: bool) -> Metrics {
         Metrics {
             wrap: wrap_limit(choices, select_type, english),
             advance: advance(english),
             word_wrap: english,
         }
+    }
+
+    pub fn from_ini(film: &Ini, choices: usize) -> Metrics {
+        Metrics::new(
+            choices,
+            film.get_bool("SelectType").unwrap_or(false),
+            film.get_bool("UseEnglish").unwrap_or(false),
+        )
     }
 
     /// Breaks a label into lines the way `FUN_0044ca10` does.
@@ -738,6 +927,140 @@ mod tests {
             layout,
             choices,
             map: None,
+        }
+    }
+
+    /// The 800x450 picture this engine presents at, English, no left
+    /// arrangement — the geometry every placement test below is in.
+    fn native() -> Geometry {
+        Geometry::native(false)
+    }
+
+    /// Where a placed line's middle lands, which is what the shipped hit maps
+    /// can be checked against.
+    fn centre(at: Placement, columns: usize, english: bool) -> (f32, f32) {
+        let width = columns as f32 * crate::playback::text::pitch(english) as f32;
+        (
+            at.x + width * at.x_scale / 2.0,
+            at.y + LABEL_HEIGHT * at.y_scale / 2.0,
+        )
+    }
+
+    /// The stacked pair lands on the centres of the shipped `_H` map's two
+    /// boxes. That map is 1280x720 and the picture here is 800x450, so its
+    /// 1280x360 halves have their middles at y 112.5 and 337.5 — and the
+    /// formula, which never reads the map, puts the labels there.
+    ///
+    /// Not to the pixel: `568 - 418.7` is 149.3 where the box's own middle is
+    /// 150, so the first label is 0.7 layout units high of it. That is the
+    /// shipped constant, and the agreement between two things that never refer
+    /// to each other is what makes the formula believable.
+    #[test]
+    fn the_stacked_labels_land_on_the_shipped_maps_boxes() {
+        let lines = vec!["Yes".to_string()];
+        for (index, want) in [(0usize, 112.5f32), (1, 337.5)] {
+            let at = place(&lines, index, 2, Layout::Stacked, true, native())[0];
+            let (_, y) = centre(at, 3, true);
+            assert!(
+                (y - want).abs() < 1.5,
+                "label {index} centred at {y}, not {want}"
+            );
+        }
+    }
+
+    /// And the sideways pair on the centres of the other map's two halves:
+    /// `Select_2_Full.cmap` is two 640x720 columns, so x 200 and 600 of 800.
+    #[test]
+    fn the_sideways_labels_land_on_the_other_maps_halves() {
+        let lines = vec!["Yes".to_string()];
+        for (index, want) in [(0usize, 200.0f32), (1, 600.0)] {
+            let at = place(&lines, index, 2, Layout::Sideways, true, native())[0];
+            let (x, _) = centre(at, 3, true);
+            assert!(
+                (x - want).abs() < 2.0,
+                "label {index} centred at {x}, not {want}"
+            );
+        }
+    }
+
+    /// A one-choice box sits in the middle of the axis it is laid out on,
+    /// whichever layout that is.
+    #[test]
+    fn one_choice_is_centred() {
+        let lines = vec!["Go".to_string()];
+        let (x, y) = centre(
+            place(&lines, 0, 1, Layout::Stacked, true, native())[0],
+            2,
+            true,
+        );
+        assert!(
+            (x - 400.0).abs() < 2.0 && (y - 225.0).abs() < 1.0,
+            "{x},{y}"
+        );
+        let (x, _) = centre(
+            place(&lines, 0, 1, Layout::Sideways, true, native())[0],
+            2,
+            true,
+        );
+        assert!((x - 400.0).abs() < 2.0, "{x}");
+    }
+
+    /// Without `[UseEnglish]` the block goes to the bottom of the picture
+    /// instead of the middle: `568 - 12` of 600.
+    #[test]
+    fn a_japanese_box_sits_along_the_bottom() {
+        let lines = vec!["\u{884c}\u{304f}".to_string()];
+        let at = place(&lines, 0, 2, Layout::Sideways, false, native())[0];
+        assert!((at.y - (556.0 * 0.75 - 0.5)).abs() < 0.01, "{}", at.y);
+        // And in 4:3 it follows the letterbox down instead of scaling.
+        let letterboxed = place(
+            &lines,
+            0,
+            2,
+            Layout::Sideways,
+            false,
+            Geometry::standard(false),
+        )[0];
+        assert_eq!(letterboxed.y, 568.0 * 0.75 + 74.5 + 24.0);
+    }
+
+    /// A wrapped label is centred as a block: the extra line lifts the first
+    /// one by half a row rather than pushing the last one down.
+    #[test]
+    fn a_second_line_lifts_the_block() {
+        let one = place(&["A".to_string()], 0, 2, Layout::Stacked, true, native());
+        let two = place(
+            &["A".to_string(), "B".to_string()],
+            0,
+            2,
+            Layout::Stacked,
+            true,
+            native(),
+        );
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].y, one[0].y - LABEL_HEIGHT * 0.75 / 2.0);
+        assert_eq!(two[1].y - two[0].y, LABEL_HEIGHT * 0.75);
+        // Every line but the last takes the extra kick to the left.
+        assert_eq!(two[0].x - two[1].x, -WRAPPED_KICK * 0.75);
+    }
+
+    /// The strip is the wide one for every English box but the sideways pair,
+    /// which is the same question the wrap limit asks.
+    #[test]
+    fn the_strip_and_the_wrap_limit_agree() {
+        for (choices, layout, english, wide_strip) in [
+            (2usize, Layout::Stacked, true, true),
+            (1, Layout::Sideways, true, true),
+            (2, Layout::Sideways, true, false),
+            (2, Layout::Sideways, false, false),
+        ] {
+            let select_type = layout == Layout::Stacked;
+            assert_eq!(wide(choices, layout, english), wide_strip);
+            assert_eq!(
+                strip_width(choices, layout, english, native()),
+                STRIP[usize::from(wide_strip)] * 0.75
+            );
+            assert_eq!(wrap_limit(choices, select_type, english) == 66, wide_strip);
         }
     }
 

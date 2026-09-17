@@ -594,7 +594,10 @@ struct ChoiceLabels<'r> {
     /// The colour each label was rendered in, without its alpha: the alpha is
     /// a modulation on the texture, so a fade is not a re-render.
     colours: Vec<Option<[u8; 3]>>,
-    drawn: Vec<(u32, u32, Texture<'r>)>,
+    /// One entry per label: its lines, each a rendered texture with the size it
+    /// was rendered at, and where the layout puts them. A label is more than
+    /// one line only when `[UseEnglish]` wrapped it — see `ui::select::wrap`.
+    drawn: Vec<Vec<(u32, u32, Texture<'r>, select::Placement)>>,
 }
 
 /// The movie texture and which picture is in it.
@@ -4105,36 +4108,55 @@ fn run_script(
             }
         }
 
-        // The choice labels. The original places these with `FUN_0044ced0`, and
-        // that formula is written down in `ui::select` but not used here yet:
-        // each label is centred in the box the shipped hit map gives, which is
-        // exact data and agrees with the hit testing.
+        // The choice labels, placed by `FUN_0044ced0`'s own formula: there is
+        // no art under them and no widget to light, so this is the whole of
+        // what the box looks like. It does not come from the hit map — Shiny
+        // Days ships no map this engine can find, and drawing from the map's
+        // boxes left that title's choices invisible while they still answered.
+        // See `ui::select::place`.
         if let Some((pending, map)) = &choice {
             if pending.visible(at) {
-                if let Some(((mw, mh), boxes)) = map.map_size().zip(map.bounds()) {
-                    // What colour each label is this frame, and whether it is
-                    // drawn at all: lit or plain while the box is live, and
-                    // ramping to nothing once it has been answered.
-                    let colours: Vec<Option<select::Rgba>> = (0..pending.labels.len())
-                        .map(|index| pending.label_colour(index, at))
-                        .collect();
-                    // Rebuilt when the labels change, which is once, or when
-                    // the colour under one of them changes — the pointer
-                    // moving to another box, or the answer starting the fade.
-                    // The alpha is a modulation on the finished texture, so a
-                    // fade does not re-render a glyph 60 times a second.
-                    let rgb: Vec<Option<[u8; 3]>> = colours
-                        .iter()
-                        .map(|c| c.map(|c| [c.red, c.green, c.blue]))
-                        .collect();
-                    let stale = choice_labels.as_ref().is_none_or(|cached| {
-                        cached.colours != rgb || cached.labels != pending.labels
-                    });
-                    if stale {
-                        let mut drawn = Vec::new();
-                        for (index, label) in pending.labels.iter().enumerate() {
-                            let colour = rgb[index].unwrap_or([0, 0, 0]);
-                            let image = text::render_line(player.font, label, colour, english);
+                // What colour each label is this frame, and whether it is
+                // drawn at all: lit or plain while the box is live, and
+                // ramping to nothing once it has been answered.
+                let colours: Vec<Option<select::Rgba>> = (0..pending.labels.len())
+                    .map(|index| pending.label_colour(index, at))
+                    .collect();
+                // Rebuilt when the labels change, which is once, or when the
+                // colour under one of them changes — the pointer moving to
+                // another box, or the answer starting the fade. The alpha is a
+                // modulation on the finished texture, so a fade does not
+                // re-render a glyph 60 times a second.
+                let rgb: Vec<Option<[u8; 3]>> = colours
+                    .iter()
+                    .map(|c| c.map(|c| [c.red, c.green, c.blue]))
+                    .collect();
+                let stale = choice_labels
+                    .as_ref()
+                    .is_none_or(|cached| cached.colours != rgb || cached.labels != pending.labels);
+                if stale {
+                    // `FUN_0044ced0` gives a label the font's whole 48-pixel
+                    // cell — unlike a dialogue line, which `_DAT_004d6770`
+                    // squashes to 42 — so the geometry is the native one and
+                    // `scale` below is only this window's letterbox, exactly
+                    // as for the dialogue above.
+                    let geometry = text::Geometry::native(left_arrangement);
+                    let metrics = select::Metrics::from_ini(player.film, pending.labels.len());
+                    let mut drawn = Vec::new();
+                    for (index, label) in pending.labels.iter().enumerate() {
+                        let colour = rgb[index].unwrap_or([0, 0, 0]);
+                        let lines = metrics.lines(label);
+                        let places = select::place(
+                            &lines,
+                            index,
+                            pending.labels.len(),
+                            map.layout,
+                            english,
+                            geometry,
+                        );
+                        let mut label_lines = Vec::new();
+                        for (line, at) in lines.iter().zip(places) {
+                            let image = text::render_line(player.font, line, colour, english);
                             let mut texture = new_texture(
                                 creator,
                                 image.width as u32,
@@ -4143,46 +4165,37 @@ fn run_script(
                             )?;
                             texture.set_blend_mode(BlendMode::Blend);
                             texture.update(None, &image.rgba, image.width * 4)?;
-                            drawn.push((image.width as u32, image.height as u32, texture));
+                            label_lines.push((
+                                image.width as u32,
+                                image.height as u32,
+                                texture,
+                                at,
+                            ));
                         }
-                        choice_labels = Some(ChoiceLabels {
-                            labels: pending.labels.clone(),
-                            colours: rgb,
-                            drawn,
-                        });
+                        drawn.push(label_lines);
                     }
-                    if let Some(cached) = &mut choice_labels {
-                        // `FUN_0044ced0` gives a label the font's whole
-                        // 48-pixel cell — unlike a dialogue line, which
-                        // `_DAT_004d6770` squashes to 42 — so a rendered label
-                        // goes into layout space at the geometry's own scale.
-                        // `scale` on top of that is only this window's
-                        // letterbox, exactly as for the dialogue above.
-                        let geometry = text::Geometry::native(left_arrangement);
-                        let text_scale = select::label_scale(geometry) * scale;
-                        for (index, (w, h, texture)) in cached.drawn.iter_mut().enumerate() {
-                            let Some(region) = boxes.get(index) else {
-                                continue;
-                            };
-                            let Some(colour) = colours[index] else {
-                                continue;
-                            };
+                    choice_labels = Some(ChoiceLabels {
+                        labels: pending.labels.clone(),
+                        colours: rgb,
+                        drawn,
+                    });
+                }
+                if let Some(cached) = &mut choice_labels {
+                    for (index, lines) in cached.drawn.iter_mut().enumerate() {
+                        let Some(colour) = colours[index] else {
+                            continue;
+                        };
+                        for (w, h, texture, place) in lines.iter_mut() {
                             texture.set_alpha_mod(colour.alpha);
-                            let tw = *w as f32 * text_scale;
-                            let th = *h as f32 * text_scale;
-                            let cx = (f32::from(region.x as u16) + region.width as f32 / 2.0)
-                                / mw as f32;
-                            let cy = (f32::from(region.y as u16) + region.height as f32 / 2.0)
-                                / mh as f32;
                             canvas
                                 .copy(
                                     texture,
                                     None,
                                     FRect::new(
-                                        dst.x + dst.w * cx - tw / 2.0,
-                                        dst.y + dst.h * cy - th / 2.0,
-                                        tw,
-                                        th,
+                                        dst.x + place.x * scale,
+                                        dst.y + place.y * scale,
+                                        *w as f32 * place.x_scale * scale,
+                                        *h as f32 * place.y_scale * scale,
                                     ),
                                 )
                                 .map_err(|e| anyhow::anyhow!("drawing a choice label: {e}"))?;

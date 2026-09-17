@@ -1706,9 +1706,35 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
         "labels wrap at {} characters, advance {}, word wrap {}",
         metrics.wrap, metrics.advance, metrics.word_wrap
     );
+    // Where each line lands, which is the whole of what the box looks like:
+    // `System/Select` ships no art, so a label that is placed wrong is a label
+    // nobody can see. The picture is 800x450 here, the space
+    // `daysengine::playback::text::Geometry::native` works in.
+    let geometry = daysengine::playback::text::Geometry::native(
+        film.get_bool("LeftArrangement").unwrap_or(false),
+    );
+    let english = film.get_bool("UseEnglish").unwrap_or(false);
+    println!(
+        "placed in {}x{}, strip {:.1} wide",
+        geometry.screen.0,
+        geometry.screen.1,
+        daysengine::ui::select::strip_width(choice.count(), select.layout, english, geometry),
+    );
     for (i, label) in choice.labels.iter().enumerate() {
-        for line in metrics.lines(label) {
-            println!("  label {i}: {line:?}");
+        let lines = metrics.lines(label);
+        let places = daysengine::ui::select::place(
+            &lines,
+            i,
+            choice.count(),
+            select.layout,
+            english,
+            geometry,
+        );
+        for (line, at) in lines.iter().zip(places) {
+            println!(
+                "  label {i}: at ({:7.2},{:7.2}) x{:.3}/{:.3}  {line:?}",
+                at.x, at.y, at.x_scale, at.y_scale
+            );
         }
     }
 

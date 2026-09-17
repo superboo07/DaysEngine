@@ -114,48 +114,43 @@ pub fn frame_rgba_with(
         }
     }
 
-    // The choice box, when one is up. Placed by fractions of the frame rather
-    // than by `FUN_0044ced0`'s formula, which `crate::ui::select` records but
-    // nothing uses yet: the hit maps are shipped only at 1024x576 and 1280x720,
-    // so the split -- x for two boxes side by side, y for two stacked -- is what
-    // carries over to any size. Which axis is the install's own `[SelectType]`
-    // and `[UseEnglish]` answer.
+    // The choice box, when one is up: `FUN_0044ca10` breaks the labels and
+    // `FUN_0044ced0` places them, and there is no art under them — whatever
+    // this draws is the whole of what the box looks like. The layout's axis is
+    // the install's own `[SelectType]` and `[UseEnglish]` answer, and no part
+    // of it comes from the hit maps, which ship for two sizes out of four. See
+    // `crate::ui::select::place`.
     if let Some(window) = &visual.select {
         let labels: Vec<&str> = [Some(window.a), window.b]
             .into_iter()
             .flatten()
             .filter(|l| !l.eq_ignore_ascii_case("null"))
             .collect();
+        let layout = if stacked {
+            select::Layout::Stacked
+        } else {
+            select::Layout::Sideways
+        };
+        let geometry = text::Geometry::native(left_arrangement);
+        let metrics = select::Metrics::new(labels.len(), stacked, english);
         for (index, label) in labels.iter().enumerate() {
-            let (cx, cy) = match (labels.len(), stacked) {
-                (1, _) => (0.5, 0.5),
-                (_, true) => (0.5, 0.25 + 0.5 * index as f32),
-                (_, false) => (0.25 + 0.5 * index as f32, 0.5),
-            };
-            let image = text::render_line(font, label, [255, 255, 255], english);
-            // `FUN_0044ced0`'s `h = scale * 48.0`: a label keeps the font's
-            // whole cell where a dialogue line is squashed to 42 of it, so the
-            // factor into layout space is the geometry's own scale. See
-            // `crate::ui::select::label_scale`.
-            let k = select::label_scale(text::Geometry::native(left_arrangement));
-            let (sw, sh) = (
-                (image.width as f32 * k).round().max(1.0) as usize,
-                (image.height as f32 * k).round().max(1.0) as usize,
-            );
-            let x = width as f32 * cx - sw as f32 / 2.0;
-            let y = height as f32 * cy - sh as f32 / 2.0;
-            blit_stretched(
-                &mut out,
-                width,
-                height,
-                &image,
-                text::Placement {
-                    x,
-                    y,
-                    width: sw as f32,
-                    height: sh as f32,
-                },
-            );
+            let lines = metrics.lines(label);
+            let places = select::place(&lines, index, labels.len(), layout, english, geometry);
+            for (line, at) in lines.iter().zip(places) {
+                let image = text::render_line(font, line, [255, 255, 255], english);
+                blit_stretched(
+                    &mut out,
+                    width,
+                    height,
+                    &image,
+                    text::Placement {
+                        x: at.x,
+                        y: at.y,
+                        width: image.width as f32 * at.x_scale,
+                        height: image.height as f32 * at.y_scale,
+                    },
+                );
+            }
         }
     }
 

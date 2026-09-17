@@ -182,6 +182,16 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// Whether the display mode is the widescreen one: `FUN_0040ea90`.
+    ///
+    /// `FUN_0044bc90` sets [`Geometry::y_offset`] from exactly that test and
+    /// nothing else — `-0.5` when it answers 1 and the 4:3 letterbox otherwise
+    /// — so the sign of the offset is the same question asked again. The
+    /// choice box asks it directly; see [`crate::ui::select::place`].
+    pub fn widescreen(self) -> bool {
+        self.y_offset < 0.0
+    }
+
     /// The windowed 800x450 case, which is the one this engine presents at.
     pub fn native(left_arrangement: bool) -> Geometry {
         Geometry {

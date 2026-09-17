@@ -3411,19 +3411,48 @@ path word-wraps**, breaking at a space when the next word would pass the limit,
 so a single over-long word is never broken. Each label's anchor is the object's
 scale times one of `533.4` (one choice), `266.7`/`800.0` (two) or, stacked,
 `-268.0` and `-418.7`/`-118.0`; the anchor is x in the sideways layout and y in
-the stacked one. `FUN_0044ca10`'s tail sets each line's **source** rectangle,
-where in the shared text texture it was drawn; the **destination** is
-`FUN_0044ced0`:
+the stacked one, where x is pinned to `533.4` instead. `FUN_0044ca10`'s tail
+sets each line's **source** rectangle, where in the shared text texture it was
+drawn; the **destination** is `FUN_0044ced0`:
 
     x = block->0x18[n] * scale + block->0x10
     y = n * 48.0 * scale + 568.0 * scale + base
-    w = scale * (533.4, or 1066.8 stacked)
+    w = scale * (533.4, or 1066.8 on the wide strip)
     h = scale * 48.0
 
-with `base` centring the block on its anchor — `anchor - lines * 48 * scale / 2`
-in the stacked English case. `daysengine::ui::select` records that formula but
-does not use it yet: it centres each label in the box the shipped `.CMAP` gives,
-which is exact data and agrees with the hit testing.
+The line offsets `block->0x18[n]` are `-(characters * advance / 2)`, plus 4 more
+on every line but the last, so a line is centred on the anchor **by its
+character count** rather than by its width — the kerning makes those a little
+different. `base` is the arm the display mode and the two flags select:
+`568 - 12` outside `[UseEnglish]` (along the bottom), `568 - 268` for the
+English sideways layout and `568 + anchor` stacked, the last two less half the
+block so a wrapped label grows upwards. On a 4:3 display the letterbox is added
+to all three.
+
+The labels are drawn into a buffer of their own, `0x400 x 0x200` from the box's
+constructor, beside the 2048-wide one the dialogue shares; a line's source
+rectangle is 512 or 1024 of its 1024 pixels, drawn `533.4 * scale` or
+`1066.8 * scale` wide. Both are the same ratio and it is not 1: **a label's
+glyphs come out 4% wider than a dialogue line's**, which are drawn source pixel
+to layout unit. The wrap limits agree from the other side — 33 and 66 characters
+at 16 units are 528 and 1056 units, which are those 512 and 1024 pixels at
+exactly that ratio.
+
+`daysengine::ui::select::place` is that formula, and it is what both the SDL
+path and the software compositor draw with. Nothing in it reads a `.CMAP`,
+which is what makes the box visible in Shiny Days: that title ships no choice
+map this engine can find, so labels placed from the map's boxes were placed
+nowhere at all. The maps agree with it where they exist — the stacked pair land
+within 0.7 layout units of the centres of `Select_2_Full_H.cmap`'s two boxes,
+and the sideways pair on the centres of `Select_2_Full.cmap`'s two halves.
+
+Shiny Days' build of the draw, `FUN_00438e50`, adds the half-texel correction
+the rest of that engine uses — `- 0.5` on x and y, `+ 1.0` on width and height —
+where School Days HQ's `FUN_0044ced0` has none of it. Every constant is the same
+in both. This engine applies neither, because the half texel is a Direct3D 9
+sampling fixup rather than a layout offset; what it keeps is the mode's own
+vertical offset, which makes it exact for Shiny Days and half a pixel high for
+School Days HQ.
 
 See `daysengine::ui::select`, and `daysengine select` to print the map and metrics a
 resolution really gets.
