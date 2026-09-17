@@ -788,6 +788,7 @@ impl Stage {
                 // later tick of its window offers it again. See
                 // [`Stage::held_voices`].
                 if *men_voice && !self.men_voice {
+                    log::debug!("{path}: male line held, MenVoice is off");
                     self.held_voices.push(HeldVoice {
                         path: path.clone(),
                         tag: tag.clone(),

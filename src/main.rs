@@ -730,6 +730,19 @@ struct Player<'a> {
     flags: FlagStore,
     /// The install root, which is where `Config.DAT` is written back.
     game: PathBuf,
+    /// The game's settings, live for the whole session.
+    ///
+    /// **A setting is in force from the moment the button is pressed, not from
+    /// the moment the file is written.** The menu module keeps every setting in
+    /// the members of its own singleton at `0x1005b468`: `FUN_10009430` stores
+    /// the new value in `+0xd4` as the widget is confirmed, and
+    /// `_GetMenVoice@0` — which `FUN_0043b110` asks before starting a male
+    /// voice line — returns that member. The file is a copy taken later, when
+    /// the Option screen's CLOSE flushes it (`FUN_10007ef0` widget 3). So the
+    /// settings live here, for as long as the process does; a screen gets a
+    /// copy of them in its [`Session`] and hands it back changed, and playback
+    /// reads this rather than the file.
+    config: Config,
     /// The game executable, which is where the comment dialog template lives.
     executable: PathBuf,
     /// `FILMENGINE.INI`, which names the choice box's hit maps among much else.
@@ -1038,6 +1051,7 @@ fn main() -> Result<()> {
         mini_note: boot_config
             .get("TypeMiniNote")
             .is_some_and(|v| v.trim() != "0"),
+        config: boot_config,
         following_record: false,
         skip_flag: false,
         last_choice: replay::NO_CHOICE,
@@ -1580,7 +1594,10 @@ fn load_title_backdrop(player: &Player, start: &Ini) -> Option<days_ui::Image> {
 /// an empty grid and says why, which is the same rule every other missing asset
 /// follows.
 fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progress>) -> Session {
-    let config = Config::load(&player.game);
+    // A copy of the live settings, not a fresh read of the file: the module's
+    // own are members that outlive the screen, so a change the player made and
+    // then backed out of is still in force. See [`Player::config`].
+    let config = player.config.clone();
     let scenes = match Scenes::recover(&player.dll) {
         Ok(scenes) => scenes,
         Err(err) => {
@@ -1877,6 +1894,12 @@ fn run_menu(
                 // engine picks the new volumes up.
                 Action::SettingsChanged => {
                     apply_settings(menu.session(), player.mixer);
+                    // The press is what puts a setting in force, so it goes
+                    // back to the session's own copy here rather than waiting
+                    // on the flush — `FUN_10009430` writes the member and
+                    // then stores the key, in that order, and the member is
+                    // what the engine reads. See [`Player::config`].
+                    player.config = menu.session().config.clone();
                 }
                 // The Option screen's close button. `FUN_10007ef0` widget 3
                 // flushes the config object and then leaves the menus with
@@ -1892,6 +1915,7 @@ fn run_menu(
                         }
                         menu.session_mut().config = config;
                     }
+                    player.config = menu.session().config.clone();
                     if let Action::Play = menu.leave(player.vfs, &player.dll)? {
                         return Ok(Outcome::Play);
                     }
@@ -1913,6 +1937,7 @@ fn run_menu(
                     // `FUN_0040db00` and `FUN_0040c700` storing the keys as the
                     // mode is applied and the close flushing the file.
                     remember_display(&mut menu.session_mut().config, player.display);
+                    player.config = menu.session().config.clone();
                     // Every screen's art is chosen by the mode, so whatever is
                     // showing has to be reloaded at the new size.
                     menu.set_resolution(player.vfs, &player.dll, player.resolution())?;
@@ -1968,6 +1993,7 @@ fn run_menu(
                     }
                     menu.set_som(player.vfs, &player.dll, som)?;
                     apply_settings(menu.session(), player.mixer);
+                    player.config = menu.session().config.clone();
                 }
                 Action::Sound(se) => {
                     player
@@ -3081,7 +3107,7 @@ fn run_script(
     // Whole-number scaling, and what it means for how the art is sampled.
     let whole = player.whole_pixels();
     let art = art_sampling(whole);
-    let mut config = Config::load(&player.game);
+    let mut config = player.config.clone();
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
     let english = player.film.get_bool("UseEnglish").unwrap_or(false);
     // `[LeftArrangement]` picks per-line centring or a left-aligned block.
@@ -3667,13 +3693,14 @@ fn run_script(
                             player.pads.stop();
                             // The Sound tab may have moved `MenVoice`, which
                             // the loop hands to the stage on its next tick.
-                            // Re-reading the file lands on the same value at
-                            // the same frame as the original does: the DLL
-                            // writes the member `GetMenVoice` reads the moment
-                            // the widget is pressed (`FUN_10008260`, widgets 10
-                            // and 11), the close button flushes it, and the
-                            // script clock is stopped for all of it.
-                            config = Config::load(&player.game);
+                            // It comes from the settings the session carries,
+                            // not from the file: the DLL writes the member
+                            // `GetMenVoice` reads the moment the widget is
+                            // pressed (`FUN_10009430` here, `FUN_10008260` on
+                            // the other module), and that member is in force
+                            // whether or not the player left through the close
+                            // button that flushes it. See [`Player::config`].
+                            config = player.config.clone();
                             // The Option screen can change the display mode,
                             // which moves both the art set the bar draws from
                             // and the rate the window is presented at.

@@ -331,6 +331,18 @@ weight rather than a bug the player can see.
 widget 3 calls the write and then host `+0x58(0)` to leave the menus, which is
 the same "flush, then leave" School Days HQ does.
 
+**The members are where a setting lives; the file is a copy taken at the
+flush.** `FUN_100075d0` fills the members of the menu singleton at
+`0x1005b468` once, and every getter the engine asks — `_GetMenVoice@0`,
+`_GetMute@0`, `_GetSkipFlag@0` and the rest — returns a member, never a re-read
+of `Config.DAT`. A widget writes its member first and stores the key second
+(`FUN_10009430`), so **a setting is in force from the next frame whether or not
+the player leaves through the button that flushes it**, and a change backed out
+of with the close key is still in force for the rest of the session. So this
+engine holds one `Config` for the process, hands each screen a copy of it, and
+takes the copy back as the widget changes it; the write to disk stays on the
+close button.
+
 | key | member | default |
 | --- | --- | --- |
 | `MasterVolume` | `+0xc0` | `-1.0` |
