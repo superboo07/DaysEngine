@@ -319,6 +319,11 @@ pub struct BarArgs {
     /// `--feeling`. Defaults to `--feeling`, which is a ramp that never moves.
     #[arg(long)]
     feeling_was: Option<String>,
+    /// Composite the strip at this width in pixels rather than its art set's
+    /// own, the way the player's window does when it is not that wide. This is
+    /// the scaling path, so it is what a stair-stepped edge would show up in.
+    #[arg(long)]
+    at_width: Option<u32>,
     /// PNG to write the composited bar to. It has an alpha channel: the strip
     /// is a layer the engine draws over the frame, not a picture with a black
     /// bar in it.
@@ -1256,7 +1261,14 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
-    let bar = Bar::load(&vfs, &dll, resolution)?;
+    let mut bar = Bar::load(&vfs, &dll, resolution)?;
+    // The scaling the SDL path does every frame: the strip is composited at
+    // the width it is drawn at. See `Bar::set_output_width`.
+    if let Some(width) = args.at_width {
+        bar.set_output_width(width);
+        let (w, h) = bar.strip();
+        println!("compositing the strip at {w}x{h}");
+    }
 
     let config = daysengine::install::config::Config::load(game);
     let counters = |pair: &str, flag: &str| -> anyhow::Result<(i32, i32)> {
@@ -1293,7 +1305,6 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
 
     // The level is the bar's own, and the only thing that moves it is a press
     // on one of the ten cells -- so that is how it is set here too.
-    let mut bar = bar;
     // Settling takes one update to start the ramp and one past its end to
     // finish it, exactly as the original's two calls per frame do.
     let settled = args

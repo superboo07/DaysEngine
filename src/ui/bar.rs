@@ -1092,10 +1092,36 @@ impl Bar {
         Ok(())
     }
 
-    /// The strip's size in display pixels — an 800x75 band at the top of the
-    /// screen, scaled like any other UI art.
+    /// The strip's size in the pixels it is composited at — an 800x75 band at
+    /// the top of the screen in its own art set, and whatever
+    /// [`Bar::set_output_width`] has since asked for.
     pub fn strip(&self) -> (u32, u32) {
         self.screen.size()
+    }
+
+    /// Composites the strip at the width it will be drawn at.
+    ///
+    /// The strip runs the full width of the picture, so how much it is
+    /// magnified is the window's width over its art set's — which is not the
+    /// stage's ladder and need not be a whole number even when the stage's is.
+    /// Left to the GPU that is a bilinear stretch, or, under whole-number
+    /// scaling, nearest sampling at a fractional factor, which stair-steps
+    /// every edge on the strip. So the strip goes up the way the menus do:
+    /// composited once, straight to the size it is seen at, through
+    /// [`crate::playback::scale`]'s band-limited pixel filter, and blitted
+    /// 1:1. See [`crate::ui::screen::Screen::fit_to`].
+    ///
+    /// A width that is already the art set's own costs nothing: `fit_to`
+    /// returns without touching anything when the size has not moved.
+    pub fn set_output_width(&mut self, width: u32) {
+        let (map_w, map_h) = self.screen.map_size();
+        if map_w == 0 || width == 0 {
+            return;
+        }
+        let height = (f64::from(map_h) * f64::from(width) / f64::from(map_w))
+            .round()
+            .max(1.0) as u32;
+        self.screen.fit_to(width, height);
     }
 
     /// One frame of the drop-down, given the pointer in the strip's own pixels.
@@ -1162,7 +1188,9 @@ impl Bar {
             // `FUN_100335f0` case `0xf`: the grip is taken only when
             // `FUN_10035cb0` agrees the pointer is on the knob.
             Act::GrabKnob => {
-                let x = at.map_or(0.0, |(x, _)| (f64::from(x) / self.screen.scale()) as f32);
+                let x = at.map_or(0.0, |(x, _)| {
+                    (f64::from(x) / self.screen.out_scale()) as f32
+                });
                 self.gripped =
                     matches!(self.solidity, Solidity::Knob(knob) if slider::on_knob(knob, x));
                 if !self.gripped {

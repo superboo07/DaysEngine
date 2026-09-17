@@ -561,6 +561,17 @@ impl Screen {
         self.scale
     }
 
+    /// How many output pixels one pixel of the 800x450 layout space is.
+    ///
+    /// [`Screen::scale`] and [`Screen::output_scale`] multiplied together: the
+    /// art set's own scale, and whatever [`Screen::fit_to`] has since asked
+    /// for. This is the divisor that takes a point in the space
+    /// [`Screen::hit`] works in back to the space the module's records are
+    /// written in, which [`Screen::to_layout`] does for a point.
+    pub fn out_scale(&self) -> f64 {
+        self.out_scale
+    }
+
     /// How much larger than its hit map this screen composites.
     ///
     /// 1.0 until [`Screen::fit_to`] has said otherwise, and after that the

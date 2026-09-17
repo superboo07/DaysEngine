@@ -1,7 +1,8 @@
 //! Resampling, for getting the game's art onto a window that is not its size.
 //!
 //! This is the engine's own scaler, and what goes through it is the game's
-//! **art**: the menus, the still backgrounds. Movie frames do not — libswscale
+//! **art**: the menus, the control bar's strip, the still backgrounds. Movie
+//! frames do not — libswscale
 //! scales those inside the colour conversion they already go through, which is
 //! both faster and already written; see
 //! [`crate::media::VideoDecoder::set_output_size`].

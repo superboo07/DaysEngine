@@ -2583,11 +2583,16 @@ type BarLayer = (Vec<usize>, (f32, f32), Option<u8>);
 
 /// Where the control bar's strip lands in the window.
 ///
-/// `strip` is the strip's size in the art set the display mode chose — 800x75
-/// windowed, 1280x120 full screen — and it is the full width of the picture in
-/// every one of them. So it scales by its own width. Scaling it by the stage's
-/// instead, as though the two shared a ladder, drew the bar 1.6x oversized off
-/// the right of a full-screen window and put every widget's hit box there too.
+/// `strip` is the size the strip was composited at — its art set's own, 800x75
+/// windowed and 1280x120 full screen, or whatever `Bar::set_output_width` has
+/// since asked for — and it is the full width of the picture in every one of
+/// them. So it scales by its own width. Scaling it by the stage's instead, as
+/// though the two shared a ladder, drew the bar 1.6x oversized off the right of
+/// a full-screen window and put every widget's hit box there too.
+///
+/// The playback loop composites at the width it is about to draw, so in that
+/// path this is a 1:1 rectangle; it is still a scale here because the headless
+/// path and a strip that has not been fitted both go through it.
 fn bar_strip(dst: FRect, strip: (u32, u32)) -> FRect {
     let scale = dst.w / strip.0.max(1) as f32;
     FRect::new(dst.x, dst.y, dst.w, strip.1 as f32 * scale)
@@ -3373,6 +3378,11 @@ fn run_script(
         // a session that has not touched a speed widget yet.
         bar_state.rate = rate;
         if let Some(control) = &mut control {
+            // The strip is composited at the width it is drawn at, so what
+            // reaches the window is one pass of the band-limited pixel filter
+            // rather than a GPU stretch of the art set's own size. See
+            // `Bar::set_output_width`.
+            control.set_output_width(dst.w.round().max(1.0) as u32);
             let (bw, bh) = control.strip();
             let strip = bar_strip(dst, (bw, bh));
             // The strip's own space, which is where its hit map is indexed.
@@ -3405,7 +3415,7 @@ fn run_script(
             // the grip the moment the button is up — so this is the movement,
             // in the strip's own units, and the grip itself was taken by the
             // press below.
-            let here = (f64::from(sx) / control.screen().scale()) as f32;
+            let here = (f64::from(sx) / control.screen().out_scale()) as f32;
             let moved = bar_pointer.map_or(0.0, |was| here - was);
             bar_pointer = Some(here);
             if control.drag(left_held, moved) {
@@ -4125,9 +4135,13 @@ fn run_script(
                 bar_state.gauge_leads,
                 alphas,
             );
+            // The size as well as the records: the strip is composited at
+            // the width it is drawn at, so a window resize changes the picture
+            // without changing a single record.
+            let composited = control.strip();
             let stale = bar_texture
                 .as_ref()
-                .is_none_or(|(cached, ..)| cached != &records);
+                .is_none_or(|(cached, w, h, _)| cached != &records || (*w, *h) != composited);
             if stale {
                 let image = if pinned {
                     control.compose_faded(hovered, bar_state, elapsed)
@@ -4448,6 +4462,29 @@ mod tests {
         assert_eq!(windowed.h, full.h);
         assert!((full.h - dst.w * 75.0 / 800.0).abs() < 0.01, "{full:?}");
         assert_eq!((windowed.x, windowed.y), (dst.x, dst.y));
+    }
+
+    /// Once the strip is composited at the width it is drawn at, the blit is
+    /// 1:1 and there is nothing for the GPU to sample: the stair-stepping the
+    /// band-limited filter was brought in to answer cannot come back through
+    /// this rectangle. See `Bar::set_output_width`.
+    #[test]
+    fn a_strip_composited_at_its_drawn_width_is_blitted_one_to_one() {
+        let dst = FRect::new(0.0, 0.0, 1600.0, 904.0);
+        // What `set_output_width` leaves `Bar::strip` answering, for each of
+        // the art sets: the drawn width, and the height its aspect gives.
+        for art in [(800u32, 75u32), (1280, 120)] {
+            let composited = (
+                dst.w as u32,
+                (f64::from(art.1) * f64::from(dst.w as u32) / f64::from(art.0)).round() as u32,
+            );
+            let strip = bar_strip(dst, composited);
+            assert_eq!(strip.w, composited.0 as f32);
+            assert!(
+                (strip.h - composited.1 as f32).abs() < 0.5,
+                "{strip:?} against {composited:?}"
+            );
+        }
     }
 
     /// A screen whose hit map failed to load leaves the strip zero-sized, and
