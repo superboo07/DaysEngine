@@ -3275,7 +3275,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                     // down, so it is the same motion event and the drag latch
                     // is what makes it one.
                     "drag" => (pointed, format!("drag {x},{y}")),
-                    "press" => (menu.press(x), format!("press {x},{y}")),
+                    "press" => (menu.press(x, y), format!("press {x},{y}")),
                     _ => (menu.confirm(&vfs, &dll)?, format!("click {x},{y}")),
                 }
             }
@@ -3387,7 +3387,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             daysengine::ui::saveload::PAGES,
             slots.len()
         );
-        for (slot, line) in slots.page(menu.page()) {
+        // The ten rows the records have under them, which a drag can leave
+        // starting part-way into a page — see `saveload::slot_at`.
+        let rest = menu
+            .list_slide()
+            .map_or(0, daysengine::ui::saveload::Slide::rest_row);
+        let live = (0..daysengine::ui::saveload::PER_PAGE).map(|row| {
+            let slot = daysengine::ui::saveload::slot_at(menu.page(), rest, row);
+            (slot, slots.get(slot))
+        });
+        for (slot, line) in live {
             match line {
                 Some(line) => println!(
                     "    slot {slot:>3}  {:<24} {:<6} {}",
@@ -3403,10 +3412,11 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         if let Some(slide) = menu.list_slide() {
             let offset = slide.offset(slide.shown());
             println!(
-                "    strip: banks from page {}, shown page {} offset {offset:.1}{}",
+                "    strip: banks from page {}, shown page {} row {} offset {offset:.1}{}",
                 slide.window_top() + 1,
                 slide.page() + 1,
-                if slide.moving() {
+                slide.rest_row(),
+                if slide.busy() {
                     ", sliding"
                 } else {
                     " (at rest)"

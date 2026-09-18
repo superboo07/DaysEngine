@@ -719,6 +719,14 @@ pub struct Menu {
     /// changing on the spot — the rule every asset in this engine follows.
     list_strip: Option<days_ui::Image>,
     list_slide: Option<saveload::Slide>,
+    /// Where the pointer was last frame while it is held down on the
+    /// save/load list, in layout space.
+    ///
+    /// The module's `+0x40`, which its base keeps for the whole screen; here
+    /// it is only wanted while a drag is running, so `None` is the button
+    /// being up. The drag moves the strip by this delta rather than to the
+    /// pointer — see [`saveload::Slide::drag`].
+    list_grab: Option<f32>,
     /// One opaque black pixel, for the two bands the save/load list paints
     /// over the letterbox. An [`Art::Whole`] layer is scaled by the blit and
     /// never resampled, so one pixel serves every size — see
@@ -888,6 +896,7 @@ impl Menu {
             rows: None,
             list_strip: None,
             list_slide: None,
+            list_grab: None,
             black: days_ui::Image::black(1, 1),
             list_layout: saveload::Layout::of(dll),
             pending_save: None,
@@ -1366,6 +1375,7 @@ impl Menu {
                     &self.screen.atlas().widgets,
                     self.session.text_input,
                     hovered,
+                    self.list_slide.as_ref(),
                 )
             }
             _ => false,
@@ -1738,23 +1748,40 @@ impl Menu {
         self.rows.as_ref()
     }
 
+    /// The slot one of the save/load list's ten rows names.
+    ///
+    /// Not `page * 10 + row` on the list that slides: a drag can leave the
+    /// strip resting between two pages, and then the ten records have the ten
+    /// rows from that row on under them. See [`saveload::slot_at`].
+    fn list_slot(&self, row: usize) -> u32 {
+        saveload::slot_at(
+            self.page,
+            self.list_slide
+                .as_ref()
+                .map_or(0, saveload::Slide::rest_row),
+            row,
+        )
+    }
+
     /// The save/load list's page slide, for a tool that wants to report it.
     pub fn list_slide(&self) -> Option<&saveload::Slide> {
         self.list_slide.as_ref()
     }
 
-    /// Whether the save/load list's strip is mid-travel, which is the module's
-    /// `+0x624`.
+    /// Whether the save/load list's strip is anywhere but at rest, which is
+    /// the module's `+0x624 || +0x62c`.
     ///
-    /// `FUN_10017e70` tests it twice: the row under the pointer is not
-    /// highlighted and the expanded comment is not drawn while the strip moves.
-    /// Everything else on the screen is — the page buttons keep their hover art
-    /// and their clicks, which is how a click part-way through a slide redirects
-    /// it.
-    fn list_moving(&self) -> bool {
-        self.list_slide
-            .as_ref()
-            .is_some_and(saveload::Slide::moving)
+    /// `FUN_10017e70` tests the pair twice: the row under the pointer is not
+    /// highlighted and the expanded comment is not drawn while the strip is
+    /// sliding *or* being dragged. Everything else on the screen is — the page
+    /// buttons keep their hover art and their clicks, which is how a click
+    /// part-way through a slide redirects it.
+    ///
+    /// This is the drawing question, not the ticking one: a drag with the
+    /// pointer held still is not at rest and has nothing for a tick to do. See
+    /// [`Menu::moving`].
+    fn list_busy(&self) -> bool {
+        self.list_slide.as_ref().is_some_and(saveload::Slide::busy)
     }
 
     /// Everything the save/load list draws, in `FUN_10017e70`'s order.
@@ -2077,7 +2104,7 @@ impl Menu {
             // is cut from the chip sheet at the record's full height however
             // short it is drawn, so a one- or two-line panel is that art
             // squashed — the shipped sprite's own source rectangle.
-            if let Some(tip) = rows.tooltip.as_ref().filter(|_| !self.list_moving()) {
+            if let Some(tip) = rows.tooltip.as_ref().filter(|_| !self.list_busy()) {
                 // The panel is cut from the sheet the list's own sprites come
                 // from: the view's chip sheet on the module that draws its
                 // views from a record run, and the screen's own otherwise.
@@ -2597,7 +2624,7 @@ impl Menu {
                 // and `+0x62c` are both clear, so a row under the pointer goes
                 // dark for the length of the slide. The page buttons' own hover
                 // art is drawn either way.
-                .filter(|widget| *widget >= saveload::PER_PAGE || !self.list_moving()),
+                .filter(|widget| *widget >= saveload::PER_PAGE || !self.list_busy()),
             Some(Mode::REPLAY) if self.view == replay::View::PlayData => {
                 playdata::highlight(selection)
             }
@@ -2658,6 +2685,19 @@ impl Menu {
         if self.dragging().is_some() {
             return self.drag_to(x);
         }
+        // The list's drag does not own the pointer the way a slider's does:
+        // `FUN_1001ce60` refreshes the selection before `FUN_1001e1f0` ever
+        // looks at `+0x58`, so the row under the pointer keeps up while the
+        // strip follows it. Only the drawing of that row is taken away, by the
+        // same `+0x624`/`+0x62c` gate the expanded comment has.
+        if let Some(from) = self.list_grab {
+            let (_, at) = self.screen.to_layout(x, y);
+            if let Some(slide) = &mut self.list_slide {
+                slide.drag(at - from);
+            }
+            self.list_grab = Some(at);
+            self.dirty = true;
+        }
         let hit = match self.screen.hit(x, y) {
             Some(widget) => Some(widget),
             None => self.page_hit(x, y),
@@ -2686,7 +2726,18 @@ impl Menu {
     /// Only the pointer's `x` is wanted: the widget is already named by the
     /// selection, the way `FUN_10009430` is handed one, and `FUN_1000c280`
     /// tests `x` alone.
-    pub fn press(&mut self, x: u32) -> Action {
+    pub fn press(&mut self, x: u32, y: u32) -> Action {
+        // The save/load list is the other thing a press starts, and it is
+        // gated on nothing: `FUN_1001e1f0`'s drag arm tests `+0x58`, the
+        // base's held flag, and never asks where the pointer is. The screen
+        // has no slider for the flag to mean anything else.
+        if self.list_slide.is_some() {
+            let (_, at) = self.screen.to_layout(x, y);
+            self.list_grab = Some(at);
+            if let Some(slide) = &mut self.list_slide {
+                slide.hold();
+            }
+        }
         let Some(widget) = self.selection else {
             return Action::Stay;
         };
@@ -2708,6 +2759,13 @@ impl Menu {
     pub fn release(&mut self) -> Action {
         if let Some(page) = &mut self.option_page {
             page.drag = None;
+        }
+        // Letting go of the list does not settle it here either: the `+0x62c`
+        // arm runs on the tick that finds `+0x58` down again, so the settle is
+        // [`saveload::Slide::tick`]'s.
+        self.list_grab = None;
+        if let Some(slide) = &mut self.list_slide {
+            slide.let_go();
         }
         Action::Stay
     }
@@ -3051,10 +3109,13 @@ impl Menu {
     pub fn tick(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<(), Error> {
         if self.showing.is(Mode::SAVELOAD) {
             self.dirty |= self.list_moving();
-            // `FUN_1001ef80` re-seats the scroll and calls `FUN_10018fd0` on
-            // every settle, whether or not the page it decided on is a new one.
+            // Both settles end in `FUN_10018fd0`, whether or not the page they
+            // decided on is a new one, so the banks are rebuilt on every one:
+            // the window they hold moves with the page, and the ten live rows
+            // move with `+0x5d0`.
             if let Some(page) = self.list_slide.as_mut().and_then(saveload::Slide::tick) {
                 self.page = page;
+                self.load_rows();
                 self.refresh();
             }
             return Ok(());
@@ -3088,6 +3149,18 @@ impl Menu {
     pub fn moving(&self) -> bool {
         (self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving())
             || (self.showing.is(Mode::SAVELOAD) && self.list_moving())
+    }
+
+    /// Whether a tick of the save/load list's strip would move it.
+    ///
+    /// Not [`Menu::list_busy`]: a drag with the pointer still is not at rest,
+    /// but the pointer is what moves it and a tick would do nothing. A caller
+    /// pumping ticks until nothing moves has to be told that, or it never
+    /// stops.
+    fn list_moving(&self) -> bool {
+        self.list_slide
+            .as_ref()
+            .is_some_and(saveload::Slide::moving)
     }
 
     /// The screen the two dresses' records and sheet come from.
@@ -3154,7 +3227,7 @@ impl Menu {
     fn confirm_saveload(&mut self, vfs: &Vfs, dll: &[u8], widget: usize) -> Result<Action, Error> {
         match saveload::action(self.kind, widget) {
             saveload::Act::Row(row) => {
-                let slot = saveload::slot_of(self.page, row);
+                let slot = self.list_slot(row);
                 Ok(match self.kind {
                     Kind::Load if !self.session.slots.filled(slot) => Action::Stay,
                     Kind::Load => Action::Load(slot),

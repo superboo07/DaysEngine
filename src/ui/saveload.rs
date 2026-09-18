@@ -80,20 +80,53 @@
 //! step starts from wherever the strip has got to. Only the keyboard waits —
 //! `FUN_1001ce60` wraps its whole arrow block in the same two flags.
 //!
-//! ## The drag-scroll is recovered and not implemented
+//! ## The list can also be dragged
 //!
-//! The same members carry a second interaction. `FUN_1001e1f0`'s `+0x58` arm
-//! drags the strip with the pointer and its `+0x62c` arm settles the drag:
-//! clamped at 0 and at `pitch * 5`, it divides the scroll by a tenth of a page
-//! to find the **row** it has come to rest on, keeps that row in `+0x5d0` and
-//! slides to `(pitch / 10) * row`. `+0x5d0` is why [`Strip::rest`] has a
-//! row-granular term and why `FUN_10018fd0` offsets the ten live rows by it.
-//! That settle has a page decision of its own, `FUN_1001f130`, which is not
-//! `FUN_1001f8c0` — see [`Settled::Same`].
+//! The same members carry a second way of moving the strip, and it is the same
+//! `+0x58` the Option screen's volume sliders latch on: the base's held flag.
+//! **Nothing gates it.** `FUN_1001e1f0`'s drag arm tests `+0x58` and never asks
+//! where the pointer is, and this screen has no slider for the flag to mean
+//! anything else, so a press anywhere takes hold of the list.
 //!
-//! None of it is implemented here: it is a different interaction from the page
-//! slide, and this engine always leaves `+0x5d0` at zero.
+//! ```text
+//! held, pointer moved   +0xb4 += height * (+0x40 - +0x48)   and +0x62c = 1
+//! let go                +0x62c arm: clamp or snap, then slide there
+//! that slide settles    FUN_1001f130 for the page, not FUN_1001f8c0
+//! ```
 //!
+//! The strip tracks the pointer one for one and is never put anywhere
+//! absolute, so a press that takes hold mid-page keeps its grip — the same
+//! relative drag the sliders have. It is not clamped while it runs, so the
+//! strip can be pulled off either end and springs back on release.
+//!
+//! **The release snaps to a row**, a row being a tenth of a page. The
+//! arithmetic is integer and `_ftol2` truncates both sides before dividing, so
+//! on the shipped 301 pitch the scroll is measured in 30-pixel rows and landed
+//! on 30.1-pixel ones; a scroll already an exact number of truncated rows up
+//! starts nothing. The row it lands on is `+0x5d0`, and that member is why
+//! [`Strip::rest`] has a row-granular term and why `FUN_10018fd0` fills the ten
+//! live rows from `k * 10 + +0x5d0` rather than from the page — see
+//! [`slot_at`]. So the list really does rest between two pages, with ten rows
+//! spanning the join.
+//!
+//! **`FUN_1001f130` is the page decision for that settle**, not
+//! `FUN_1001f8c0`, and it asks a different question: not which way a step went
+//! but which bank the scroll has ended up over. The window does not move while
+//! a drag runs, so the page is `window_top(page) + bank_at(scroll)` —
+//! [`Strip::dragged`]. The shipped function is six arms of nested compares, one
+//! per bank the page can be in, each reaching [`Strip::reach`] boundaries
+//! either side and no further. Nothing is lost by that limit: one press moves
+//! the strip by the pointer's own travel, and the pointer cannot move further
+//! than the screen it is on — 450 against a 301 pitch, under a page and a half.
+//!
+//! One divergence is worth naming because it looks like a gap and is not.
+//! `FUN_1001f6f0`'s **last** arm leaves the row term out, so a drag settled on
+//! page 9 loses the row offset and the strip lands flush while `+0x5d0` keeps
+//! the row — the ten live rows stay offset and the strip does not. That is
+//! reproduced rather than smoothed over: there is no value to substitute that
+//! would not be invented.
+//!
+//! # The display line
 //! # The display line
 //!
 //! A slot's file says nothing about itself. The line the screen shows lives in
@@ -474,7 +507,21 @@ const TRAILING_RECORDS: usize = 32;
 
 /// The slot a row of a page stands for, from `FUN_10011d50`.
 pub fn slot_of(page: usize, row: usize) -> u32 {
-    (page * PER_PAGE + row) as u32
+    slot_at(page, 0, row)
+}
+
+/// The slot one of the hit map's ten rows stands for, from `FUN_10018fd0`'s
+/// live-row fill.
+///
+/// The ten records do not move, but on a list that slides the rows under them
+/// do: with the strip resting `rest_row` rows past a page boundary, record `i`
+/// has the row `rest_row + i` of the page under it. `FUN_10018fd0` fills
+/// `+0x1a8 + i * 4` for exactly the entries whose index
+/// `(bank * 10 + row) - (k * 10 + +0x5d0)` falls in `0 .. 10`, and that array
+/// is what the load arm asks whether a row has a file. A list that does not
+/// slide always has `rest_row` zero, which is [`slot_of`].
+pub fn slot_at(page: usize, rest_row: usize, row: usize) -> u32 {
+    (page * PER_PAGE + rest_row + row) as u32
 }
 
 /// Where one module puts the three columns of a row, and its expanded comment.
@@ -553,6 +600,16 @@ pub struct Strip {
     /// Where the first panel's top edge sits down the screen, `_DAT_1004bd60` —
     /// an `faddl`, so the double 122.0.
     pub top: f32,
+    /// How far the drag settle may move the page in one release, from
+    /// `FUN_1001f130`.
+    ///
+    /// Each of that function's six arms tests the scroll against the bank
+    /// boundaries within this many of the bank the page is on, and no further.
+    /// Nothing is lost by the limit: the drag moves the scroll by the
+    /// pointer's own travel, so one press can move it at most the height of
+    /// the window — 450 against a 301 pitch, under a page and a half — and
+    /// two is more than that can reach. See [`Strip::dragged`].
+    pub reach: usize,
     /// How much of a step's travel one frame covers, `_DAT_10049738` — an
     /// `fdivl`, so the double 20.0.
     pub frames: f32,
@@ -587,12 +644,97 @@ impl Strip {
 
     /// Where the scroll comes to rest with `page` showing, from `FUN_1001f6f0`.
     ///
-    /// The shipped function adds a row-granular term, `(pitch / 10) * +0x5d0`,
-    /// which only the drag-scroll ever makes non-zero — see the module docs for
-    /// why that interaction is not implemented here. Page 9's arm leaves the
-    /// term out altogether.
-    pub fn rest(&self, page: usize, pitch: f32) -> f32 {
-        pitch * (page - self.window_top(page)) as f32
+    /// `rest_row` is `+0x5d0`, the row the strip is resting between pages on,
+    /// which only a drag ever makes non-zero: every arm but the last adds
+    /// `(pitch / 10) * rest_row` to the page's own multiple of the pitch.
+    ///
+    /// **The last page's arm leaves the term out**, so releasing a drag on
+    /// page 9 loses the row offset and the strip lands flush. That is the
+    /// shipped arithmetic and it is reproduced: `+0x5d0` still holds the row,
+    /// so the ten live rows keep the offset even though the strip does not,
+    /// and there is no value to substitute that would not be invented.
+    pub fn rest(&self, page: usize, pitch: f32, rest_row: i32) -> f32 {
+        let offset = if page + 1 == PAGES {
+            0.0
+        } else {
+            pitch / PER_PAGE as f32 * rest_row as f32
+        };
+        pitch * (page - self.window_top(page)) as f32 + offset
+    }
+
+    /// Which bank boundary the scroll has reached, from the ladder of
+    /// `pitch * n` tests `FUN_1001f8c0` and `FUN_1001f130` both run.
+    ///
+    /// The largest `n` with `n * pitch <= scroll`, which is where the `<=` in
+    /// both functions' compares lands: a scroll exactly on a boundary belongs
+    /// to the bank below it.
+    pub fn bank_at(&self, scroll: f32, pitch: f32) -> usize {
+        (0..self.banks)
+            .rev()
+            .find(|n| *n as f32 * pitch <= scroll)
+            .unwrap_or(0)
+    }
+
+    /// The row a released drag snaps to, from `FUN_1001e1f0`'s `+0x62c` arm.
+    ///
+    /// The scroll is clamped to `0 ..= pitch * (banks - 1)` and otherwise
+    /// snapped to the nearest row **below** it, a row being a tenth of a page.
+    /// The arithmetic is integer and that is the shipped arithmetic:
+    /// `_ftol2` truncates both the scroll and the row height before the
+    /// division, so on the shipped 301 pitch the step is measured in 30-pixel
+    /// rows and landed on 30.1-pixel ones. `None` is the arm that does
+    /// nothing — a scroll already an exact number of truncated rows up.
+    ///
+    /// The row returned is absolute, counted from the top of the strip; see
+    /// [`Strip::rest_row`] for the reduction to a row of a page.
+    pub fn snap(&self, scroll: f32, pitch: f32) -> Option<f32> {
+        let top = pitch * (self.banks - 1) as f32;
+        if scroll < 0.0 {
+            return Some(0.0);
+        }
+        if scroll > top {
+            return Some(top);
+        }
+        let step = (pitch / PER_PAGE as f32) as i32;
+        if step == 0 || (scroll as i32).rem_euclid(step) == 0 {
+            return None;
+        }
+        Some(pitch / PER_PAGE as f32 * (scroll as i32 / step) as f32)
+    }
+
+    /// The row of a page a snapped scroll stands on, the `+0x5d0` the arm
+    /// keeps after its `10 <= +0x5d0` reduction.
+    ///
+    /// The absolute row less ten for every whole page of scroll, both
+    /// truncated the way `_ftol2` truncates them.
+    pub fn rest_row(&self, scroll: f32, pitch: f32) -> i32 {
+        let step = (pitch / PER_PAGE as f32) as i32;
+        if step == 0 {
+            return 0;
+        }
+        let row = scroll as i32 / step;
+        if row < PER_PAGE as i32 {
+            return row;
+        }
+        row - PER_PAGE as i32 * (scroll / pitch) as i32
+    }
+
+    /// The page a released drag leaves showing, from `FUN_1001f130`.
+    ///
+    /// The bank the scroll has reached becomes the bank the page sits in, so
+    /// the page is `window_top(page) + bank_at(scroll)` — the window does not
+    /// move during a drag, and this is the page whose rows are now where the
+    /// records are. The shipped function is six arms of nested compares, one
+    /// per bank the page can be in, and each reaches only [`Strip::reach`]
+    /// boundaries either side; `the_drag_ladder_is_the_bank_the_scroll_reached`
+    /// asserts the two agree everywhere the arms can be entered.
+    pub fn dragged(&self, page: usize, scroll: f32, pitch: f32) -> usize {
+        let was = page - self.window_top(page);
+        let now = self
+            .bank_at(scroll, pitch)
+            .clamp(was.saturating_sub(self.reach), was + self.reach)
+            .min(self.banks - 1);
+        self.window_top(page) + now
     }
 
     /// Where a step to `next` is heading, from `FUN_1001ed40`.
@@ -735,6 +877,17 @@ pub struct Slide {
     counter: f32,
     /// `+0x624`: a step is running.
     running: bool,
+    /// `+0x5d0`: the row of a page the strip is resting on, which only a drag
+    /// ever makes non-zero.
+    rest_row: i32,
+    /// `+0x58` as this screen reads it: the pointer is down and the strip is
+    /// following it.
+    holding: bool,
+    /// `+0x62c`: the strip has been dragged and has not been settled yet.
+    dragged: bool,
+    /// `+0x630`: the step that is running came from a page button rather than
+    /// from a drag, which is what picks the settle.
+    from_button: bool,
     /// `+0x628`, `+0x634`, `+0x638` and `+0x63c` together.
     run: Option<Run>,
 }
@@ -761,11 +914,15 @@ impl Slide {
             art,
             pitch,
             page,
-            scroll: strip.rest(page, pitch),
+            scroll: strip.rest(page, pitch, 0),
             target: 0.0,
             travel: 0.0,
             counter: 0.0,
             running: false,
+            rest_row: 0,
+            holding: false,
+            dragged: false,
+            from_button: false,
             run: None,
         }
     }
@@ -793,8 +950,30 @@ impl Slide {
     }
 
     /// Whether the next tick moves the strip.
+    ///
+    /// A drag is not moving by itself — the pointer moves it — but a drag that
+    /// has been let go of has a settle owed to it, and that settle starts a
+    /// step. So a caller pumping ticks until nothing moves has to wait for it.
     pub fn moving(&self) -> bool {
-        self.running
+        self.running || (self.dragged && !self.holding)
+    }
+
+    /// Whether the strip is not at rest, which is `+0x624 || +0x62c`.
+    ///
+    /// The draw gate rather than the tick one: `FUN_10017e70` takes the row
+    /// highlight and the expanded comment away for exactly this, so they go
+    /// the moment the strip is dragged and not only once it is let go of.
+    pub fn busy(&self) -> bool {
+        self.running || self.dragged
+    }
+
+    /// The row of a page the strip is resting on: the module's `+0x5d0`.
+    ///
+    /// Zero unless a drag has left the strip between two pages. The ten rows
+    /// the hit map covers are the ten from this row on, which is
+    /// [`slot_at`].
+    pub fn rest_row(&self) -> usize {
+        self.rest_row.clamp(0, PER_PAGE as i32 - 1) as usize
     }
 
     /// How far down one bank's rows are drawn from where their records put
@@ -862,10 +1041,77 @@ impl Slide {
 
     /// Starts one step, from `FUN_1001ed40`.
     fn step(&mut self, next: usize, forward: bool) {
-        self.target = self.strip.target(self.page, next, forward, self.pitch);
-        self.travel = self.target - self.scroll;
+        self.aim(self.strip.target(self.page, next, forward, self.pitch));
+        self.rest_row = 0;
+        self.from_button = true;
+    }
+
+    /// Sends the strip at a scroll: the four lines every step start shares.
+    fn aim(&mut self, target: f32) {
+        self.target = target;
+        self.travel = target - self.scroll;
         self.counter = 0.0;
         self.running = true;
+    }
+
+    /// The pointer went down, which is the module's `+0x58` going up.
+    ///
+    /// **Nothing gates this on where the pointer is.** `FUN_1001e1f0`'s drag
+    /// arm tests `+0x58` and nothing else, so a press anywhere on the screen
+    /// takes hold of the strip; the screen has no slider of its own for the
+    /// flag to mean anything else. A step already running wins, because the
+    /// whole of `FUN_1001e1f0` past `+0x624` is the other arm.
+    pub fn hold(&mut self) {
+        self.holding = true;
+    }
+
+    /// One frame of the drag, from `FUN_1001e1f0`'s `+0x58` arm.
+    ///
+    /// `by` is how far the pointer has moved **down** since the last frame, in
+    /// layout pixels; the strip goes the other way. The shipped line is
+    /// `+0xb4 += height * (+0x40 - +0x48)`, the two being the previous and
+    /// current pointer as fractions of the client height, so the strip tracks
+    /// the pointer one for one and is never put anywhere absolute — a press
+    /// that takes hold mid-page keeps its grip. It is not clamped here either:
+    /// only the release clamps, which is why a drag can run the strip off
+    /// either end and spring back.
+    pub fn drag(&mut self, by: f32) {
+        if self.running || !self.holding || by == 0.0 {
+            return;
+        }
+        self.scroll -= by;
+        self.dragged = true;
+    }
+
+    /// The pointer came up. The settle happens on the tick that follows, which
+    /// is where `FUN_1001e1f0` puts it: the `+0x62c` arm runs only once
+    /// `+0x58` is down again.
+    pub fn let_go(&mut self) {
+        self.holding = false;
+    }
+
+    /// The drag's settle, from `FUN_1001e1f0`'s `+0x62c` arm.
+    ///
+    /// Clamps the strip to the strip, or snaps it to the row it has come to
+    /// rest on, and slides there — the same twenty frames a page button gets.
+    /// A scroll already on a row starts nothing at all.
+    fn settle_drag(&mut self) {
+        self.dragged = false;
+        let Some(target) = self.strip.snap(self.scroll, self.pitch) else {
+            return;
+        };
+        // The two clamped arms put `+0x5d0` back to zero; the snap keeps the
+        // row it landed on. `FUN_1001e1f0` works the row out before the
+        // reduction and stores the reduced one, so the target is the absolute
+        // row's and the member is the page's.
+        self.rest_row =
+            if self.scroll < 0.0 || self.scroll > self.pitch * (self.strip.banks - 1) as f32 {
+                0
+            } else {
+                self.strip.rest_row(self.scroll, self.pitch)
+            };
+        self.aim(target);
+        self.from_button = false;
     }
 
     /// One host tick of the slide, from `FUN_1001e1f0`'s `+0x624` arm.
@@ -875,6 +1121,13 @@ impl Slide {
     /// changed, so this answers on every settle.
     pub fn tick(&mut self) -> Option<usize> {
         if !self.running {
+            // `FUN_1001e1f0`'s other two arms, in its order: the strip follows
+            // the pointer while it is held, and settles the frame after it is
+            // let go. The drag itself is moved by [`Slide::drag`], because the
+            // pointer's own movement is what it is made of.
+            if !self.holding && self.dragged {
+                self.settle_drag();
+            }
             return None;
         }
         self.counter += self.strip.step;
@@ -885,6 +1138,20 @@ impl Slide {
         self.scroll = self.target;
         self.counter = 0.0;
         self.running = false;
+
+        // Which of the two settles the step gets is `+0x630`: a step a page
+        // button started goes to `FUN_1001ef80`, one a drag started to
+        // `FUN_1001f130`. The drag's is not a step of a run and never starts
+        // one, and it re-seats the scroll only when the page moved — which is
+        // what leaves the strip resting on a row.
+        if !self.from_button {
+            let was = self.page;
+            self.page = self.strip.dragged(self.page, self.scroll, self.pitch);
+            if self.page != was {
+                self.scroll = self.strip.rest(self.page, self.pitch, self.rest_row);
+            }
+            return Some(self.page);
+        }
 
         // The run's bookkeeping happens before the settle, so that the settle
         // sees whether there is another step to start.
@@ -909,7 +1176,7 @@ impl Slide {
                 }
             }
         }
-        self.scroll = self.strip.rest(self.page, self.pitch);
+        self.scroll = self.strip.rest(self.page, self.pitch, self.rest_row);
         if let Some(run) = self.run {
             let next = if run.forward {
                 self.page + 1
@@ -1091,6 +1358,7 @@ impl Layout {
             art: "System/SaveLoad/SaveLoadList.png",
             banks: 6,
             lead: 2,
+            reach: 2,
             top: 122.0,
             frames: 20.0,
             step: 0.05,
@@ -1551,6 +1819,7 @@ impl Rows {
             Some(slide) => slide.window(),
             None => page..page + 1,
         };
+        let rest_row = slide.map_or(0, Slide::rest_row);
         let shown = page - window.start;
         let mut banks: Vec<Bank> = window
             .map(|page| Rows::bank(layout, font, slots, page, english, records, comments))
@@ -1570,7 +1839,7 @@ impl Rows {
             layout,
             font,
             slots,
-            page,
+            (page, rest_row),
             english,
             records,
             comments,
@@ -1604,6 +1873,7 @@ impl Rows {
         records: &[days_ui::atlas::Widget],
         comments: bool,
         hovered: Option<usize>,
+        slide: Option<&Slide>,
     ) -> bool {
         let Some(tip) = &mut self.tip_surface else {
             return false;
@@ -1615,7 +1885,7 @@ impl Rows {
             layout,
             font,
             slots,
-            page,
+            (page, slide.map_or(0, Slide::rest_row)),
             english,
             records,
             comments,
@@ -1693,7 +1963,7 @@ impl Rows {
         layout: &Layout,
         font: &days_font::Font,
         slots: &Slots,
-        page: usize,
+        showing: (usize, usize),
         english: bool,
         records: &[days_ui::atlas::Widget],
         comments: bool,
@@ -1704,7 +1974,7 @@ impl Rows {
             Some(tip) => tip,
             None => &mut shown?.surface,
         };
-        Rows::expand(layout, surface, font, slots, page, row, english, records)
+        Rows::expand(layout, surface, font, slots, showing, row, english, records)
     }
 
     /// Rasterises the expanded comment and lays it out, from `FUN_10012900`.
@@ -1720,12 +1990,12 @@ impl Rows {
         surface: &mut days_ui::Image,
         font: &days_font::Font,
         slots: &Slots,
-        page: usize,
+        (page, rest_row): (usize, usize),
         row: usize,
         english: bool,
         records: &[days_ui::atlas::Widget],
     ) -> Option<Tooltip> {
-        let comment = &slots.get(slot_of(page, row))?.comment;
+        let comment = &slots.get(slot_at(page, rest_row, row))?.comment;
         let lines = wrap_comment(comment, english);
         if lines.is_empty() {
             return None;
@@ -2835,6 +3105,169 @@ mod tests {
         while slide.tick() != Some(3) {}
         assert_eq!(slide.page(), 3);
         assert_eq!(slide.offset(slide.page() - slide.window_top()), 0.0);
+    }
+
+    /// `FUN_1001f130`'s six arms of nested compares, transcribed, against
+    /// [`Strip::dragged`] — the two ways of arriving at the page a released
+    /// drag leaves showing. Every scroll a drag can reach is checked on every
+    /// page.
+    #[test]
+    fn the_drag_ladder_is_the_bank_the_scroll_reached() {
+        let strip = strip();
+        // The shipped ladder. `t(n)` is `n * pitch`, every compare is
+        // `t(n) <= scroll`, and each arm reaches two boundaries either way.
+        fn shipped(page: usize, scroll: f32, pitch: f32) -> usize {
+            let t = |n: usize| n as f32 * pitch;
+            let mut page = page as i32;
+            match page {
+                0 => {
+                    if t(1) <= scroll {
+                        page += 1;
+                        if t(2) <= scroll {
+                            page += 1;
+                        }
+                    }
+                }
+                1 => {
+                    if t(1) <= scroll {
+                        if t(2) <= scroll {
+                            page += 1;
+                            if t(3) <= scroll {
+                                page += 1;
+                            }
+                        }
+                    } else {
+                        page -= 1;
+                    }
+                }
+                7 => {
+                    if t(3) <= scroll {
+                        if t(4) <= scroll {
+                            page += 1;
+                            if t(5) <= scroll {
+                                page += 1;
+                            }
+                        }
+                    } else {
+                        page -= 1;
+                        if scroll < t(2) {
+                            page -= 1;
+                        }
+                    }
+                }
+                8 => {
+                    if t(4) <= scroll {
+                        if t(5) <= scroll {
+                            page += 1;
+                        }
+                    } else {
+                        page -= 1;
+                        if scroll < t(3) {
+                            page -= 1;
+                        }
+                    }
+                }
+                9 => {
+                    if scroll < t(5) {
+                        page -= 1;
+                        if scroll < t(4) {
+                            page -= 1;
+                        }
+                    }
+                }
+                _ => {
+                    if t(2) <= scroll {
+                        if t(3) <= scroll {
+                            page += 1;
+                            if t(4) <= scroll {
+                                page += 1;
+                            }
+                        }
+                    } else {
+                        page -= 1;
+                        if scroll < t(1) {
+                            page -= 1;
+                        }
+                    }
+                }
+            }
+            page as usize
+        }
+        for page in 0..PAGES {
+            // Every tenth of a page across the whole strip, and both sides of
+            // every boundary.
+            for step in 0..=(strip.banks - 1) * PER_PAGE {
+                for nudge in [-0.25, 0.0, 0.25] {
+                    let scroll = PITCH / PER_PAGE as f32 * step as f32 + nudge;
+                    if scroll < 0.0 {
+                        continue;
+                    }
+                    assert_eq!(
+                        strip.dragged(page, scroll, PITCH),
+                        shipped(page, scroll, PITCH),
+                        "page {page}, scroll {scroll}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A drag cannot outrun the ladder's two-boundary reach: one press moves
+    /// the strip by the pointer's own travel, and the pointer cannot move
+    /// further than the screen it is on — 450 against a 301 pitch.
+    #[test]
+    fn one_drag_cannot_reach_past_the_ladder() {
+        let reach = strip().reach as f32 * PITCH;
+        assert!(450.0 < reach, "a screen of travel is under {reach} pixels");
+    }
+
+    /// The release snaps the strip to a row and clamps it to the strip, and
+    /// the row it keeps is a row of a page.
+    #[test]
+    fn a_released_drag_snaps_to_a_row() {
+        let strip = strip();
+        let row = PITCH / PER_PAGE as f32;
+        // Truncated the way `_ftol2` truncates: the step is measured in
+        // 30-pixel rows on a 301 pitch and landed on 30.1-pixel ones.
+        assert_eq!(strip.snap(row * 3.0 + 1.0, PITCH), Some(row * 3.0));
+        assert_eq!(strip.snap(-40.0, PITCH), Some(0.0));
+        assert_eq!(strip.snap(PITCH * 9.0, PITCH), Some(PITCH * 5.0));
+        // Already an exact number of truncated rows up: nothing to do.
+        assert_eq!(strip.snap(30.0 * 4.0, PITCH), None);
+        assert_eq!(strip.rest_row(row * 3.0 + 1.0, PITCH), 3);
+        assert_eq!(strip.rest_row(PITCH * 2.0 + row * 4.0 + 1.0, PITCH), 4);
+    }
+
+    /// A drag that moves the strip less than half a row and is let go of
+    /// leaves the page alone and the strip resting on the row it snapped to,
+    /// with the ten records showing the ten rows from there on.
+    #[test]
+    fn a_drag_leaves_the_list_between_two_pages() {
+        let mut slide = Slide::new(strip(), ART, 0);
+        slide.hold();
+        slide.drag(-95.0);
+        assert!(slide.busy(), "the row highlight goes as soon as it moves");
+        slide.let_go();
+        while slide.tick().is_none() {}
+        assert_eq!(slide.page(), 0);
+        assert_eq!(slide.rest_row(), 3);
+        assert_eq!(slot_at(slide.page(), slide.rest_row(), 0), 3);
+        assert!(!slide.busy());
+    }
+
+    /// Dragging a page and a bit and letting go lands on the page whose rows
+    /// the records now have under them.
+    #[test]
+    fn a_drag_of_a_whole_page_turns_it() {
+        let mut slide = Slide::new(strip(), ART, 4);
+        let was = slide.offset(slide.shown());
+        slide.hold();
+        slide.drag(-PITCH);
+        slide.let_go();
+        while slide.tick().is_none() {}
+        assert_eq!(slide.page(), 5);
+        assert_eq!(slide.rest_row(), 0);
+        assert_eq!(slide.offset(slide.shown()), was);
     }
 
     /// Both banks of a list that slides are filled from the window, not from

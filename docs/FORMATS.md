@@ -4912,22 +4912,79 @@ School Days HQ's draw order has not been re-read for this, and there it cannot
 matter: its list shows one page and does not scroll, so it never leaves the
 window its own base art gives it and the two orders draw the same picture.
 
-#### The drag-scroll is recovered and not implemented
+#### The list can also be dragged
 
-The same members carry a second interaction. `FUN_1001e1f0`'s `+0x58` arm drags
-the strip with the pointer and its `+0x62c` arm settles the drag: clamped at 0
-and at `pitch * 5`, it divides the scroll by a tenth of a page to find the row
-it has come to rest on, keeps that row in `+0x5d0` and slides to
-`(pitch / 10) * row`. `+0x5d0` is why `FUN_1001f6f0`'s rest has a row-granular
-term and why `FUN_10018fd0` offsets the ten live rows by it. That settle has a
-page decision of its own, `FUN_1001f130`.
+The same members carry a second way of moving the strip, on the same `+0x58`
+the Option screen's volume sliders latch on: the base's held flag.
+**Nothing gates it** — `FUN_1001e1f0`'s drag arm tests `+0x58` and never asks
+where the pointer is, and this screen has no slider for the flag to mean
+anything else, so a press anywhere takes hold of the list.
 
-None of it is implemented in DaysEngine: it is a different interaction from the
-page slide, and the engine always leaves `+0x5d0` at zero.
+```text
+held, pointer moved   +0xb4 += height * (+0x40 - +0x48)   and +0x62c = 1
+let go                +0x62c arm: clamp or snap to a row, then slide there
+that slide settles    FUN_1001f130 for the page, not FUN_1001f8c0
+```
+
+The strip tracks the pointer one for one and is never put anywhere absolute, so
+a press that takes hold mid-page keeps its grip — the same relative drag the
+sliders have, written the same way. It is not clamped while it runs, so the
+strip can be pulled off either end and springs back on release.
+
+**The release snaps to a row**, a row being a tenth of a page:
+
+```text
+row_px = (int)(pitch * scale / 10.0)                  _DAT_1004bda8, double 10.0
+if scroll < 0          -> slide to 0,               +0x5d0 = 0
+if scroll > pitch * 5  -> slide to pitch * 5,       +0x5d0 = 0
+else if (int)scroll % row_px != 0 {
+    +0x5d0 = (int)scroll / row_px                    the absolute row
+    target = (pitch * scale / 10.0) * +0x5d0
+    if +0x5d0 >= 10 { +0x5d0 -= 10 * (int)(scroll / (pitch * scale)) }
+}
+```
+
+`FUN_10037ef0` is `_ftol2`, so both sides of the division are truncated: on the
+shipped 301 pitch the scroll is measured in 30-pixel rows and landed on
+30.1-pixel ones, and ten of those land on an exact page. A scroll already an
+exact number of truncated rows up starts nothing at all.
+
+`+0x5d0` is why `FUN_1001f6f0`'s rest has a row-granular term and why
+`FUN_10018fd0` fills the ten live rows — the `+0x1a8` array the load arm asks
+whether a row has a file — from `k * 10 + +0x5d0` rather than from the page. So
+the list really does rest between two pages, with its ten records spanning the
+join.
+
+**`FUN_1001f130` is the page decision for that settle**, and it asks a
+different question from `FUN_1001f8c0`: not which way a step went but which
+bank the scroll has ended up over. The window does not move while a drag runs,
+so the page is `window_top(page) + bank_at(scroll)`, where `bank_at` is the
+largest `n` with `n * pitch <= scroll`. The shipped function is six arms of
+nested compares, one per bank the page can be in, each reaching two boundaries
+either side and no further — every compare is `FCOMPP; TEST AH,0x41` with the
+threshold spilled to the stack and re-loaded, so it is `threshold <= scroll`
+throughout, with `JNZ` taken when that holds and `JP` when it does not.
+
+Nothing is lost by the two-boundary reach: the drag moves the strip by the
+pointer's own travel, and one press cannot move the pointer further than the
+screen it is on — 450 against a 301 pitch, under a page and a half. DaysEngine
+transcribes the six arms in a test and asserts them against `bank_at` for every
+scroll a drag can reach on every page.
+
+The tail is `if (the page changed) FUN_1001f6f0(); FUN_10018fd0();` — so the
+banks are always refilled and the scroll is re-seated only when the page moved.
+That is what leaves the strip resting on a row: with the page unchanged there is
+nothing to re-seat it to.
+
+One shipped asymmetry, reproduced rather than smoothed over: `FUN_1001f6f0`'s
+**last** arm leaves the row term out, so a drag settled on page 10 lands the
+strip flush while `+0x5d0` keeps the row. The ten live rows stay offset and the
+strip does not. There is no value to substitute that would not be invented.
 
 `FUN_100293e0` loads the same `ReplayList.png` art for the replay module's
-play-data list. Whether that screen slides its strip too is **not recovered**;
-its grid comes out of `Replay_PlayData.png`, so the list draws right without it.
+play-data list, and `FUN_1002c1f0` tests the same `+0x58`. Whether that screen
+slides and drags its strip too is **not recovered**; its grid comes out of
+`Replay_PlayData.png`, so the list draws right without it.
 
 ### Naming a save — a Win32 dialog, not game art
 

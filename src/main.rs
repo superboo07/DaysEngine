@@ -1839,10 +1839,10 @@ fn run_menu(
             // The press latches a slider drag before the activation runs, the
             // way `FUN_10009430`'s last arm does: the three sliders activate
             // nothing, so the two never collide.
-            if let Some((sx, _)) =
+            if let Some((sx, sy)) =
                 pointed.and_then(|(x, y)| to_screen(canvas, &menu, whole, x as f32, y as f32))
             {
-                actions.push(menu.press(sx));
+                actions.push(menu.press(sx, sy));
             }
             actions.push(confirm(&mut menu, player)?);
         }
