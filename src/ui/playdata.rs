@@ -80,8 +80,8 @@
 use crate::ui::options::Dir;
 use crate::ui::replay::View;
 use crate::ui::saveload::{
-    self, Column, Line, Quad, Rows, Slots, Tooltip, DEST_HEIGHT, DEST_Y, LAST_ROW_OPENING_DOWN,
-    PANEL_ROWS, PER_PAGE, SURFACE, SURFACE_ROW_HEIGHT, SURFACE_ROW_PITCH,
+    self, Column, Layout, Line, Quad, Rows, Slots, Tooltip, DEST_HEIGHT, LAST_ROW_OPENING_DOWN,
+    PER_PAGE, SURFACE_ROW_HEIGHT, SURFACE_ROW_PITCH,
 };
 use days_ui::atlas::{self, Atlas, Widget};
 use days_ui::cmap::Rect;
@@ -158,6 +158,19 @@ pub fn opens_page(dir: Dir, next: usize) -> Option<usize> {
         Dir::Up | Dir::Down => None,
     }
 }
+
+/// Which module's column geometry this screen shares.
+///
+/// `FUN_1001c850` places its columns from the same globals the save/load screen
+/// reads, at the same widths, so this screen is laid out by
+/// [`Layout::SCHOOL_DAYS_HQ`] rather than by numbers of its own. The module doc
+/// records the three places it departs from that layout, and each of them is
+/// spelled out here rather than taken from the layout.
+///
+/// **This is `SysMenuSDHQ.dll`'s screen.** Shiny Days lays its own play-data
+/// list out differently and is [`crate::ui::replay_pages`], which is a separate
+/// recovery against `SysMenuSD.dll` and does not come through here.
+const LAYOUT: &Layout = &Layout::SCHOOL_DAYS_HQ;
 
 /// Record indices, from the functions named in the module doc.
 const PAGE_RECORD: usize = 7;
@@ -290,34 +303,26 @@ pub fn relocate(atlas: &mut Atlas, dll: &[u8], boxes: &[Rect]) -> bool {
     // too. See the module doc.
     let mut anchors: Vec<(usize, Rect)> = (0..3).map(|i| (i, boxes[i])).collect();
     anchors.extend((0..PER_PAGE).map(|row| (PAGE_RECORD + row, boxes[FIRST_PAGE + row])));
-    let Some(base) = atlas::table_at(dll, &anchors) else {
+    let bands = [
+        atlas::Band {
+            region: FIRST_ROW,
+            record: ROW_RECORD,
+            count: PER_PAGE,
+        },
+        atlas::Band {
+            region: FIRST_COMMENT,
+            record: COMMENT_RECORD,
+            count: PER_PAGE,
+        },
+    ];
+    let Some(base) = atlas::relocate(atlas, dll, boxes, &anchors, &bands) else {
         log::warn!("no record table in the DLL places the play-data list's rows");
         return false;
     };
-
-    let mut rows: Vec<(Widget, Widget)> = Vec::with_capacity(PER_PAGE);
-    for row in 0..PER_PAGE {
-        let bar = atlas::record_at(dll, base, ROW_RECORD + row);
-        let panel = atlas::record_at(dll, base, COMMENT_RECORD + row);
-        let (Some(bar), Some(panel)) = (bar, panel) else {
-            log::warn!("the play-data table stops before row {row}");
-            return false;
-        };
-        if !spans(&bar, &boxes[FIRST_ROW + row]) || !spans(&panel, &boxes[FIRST_COMMENT + row]) {
-            log::warn!("the play-data table's row {row} does not cover the band it is drawn over");
-            return false;
-        }
-        rows.push((bar, panel));
-    }
-    for (row, (bar, panel)) in rows.into_iter().enumerate() {
-        atlas.widgets[FIRST_ROW + row] = bar;
-        atlas.widgets[FIRST_COMMENT + row] = panel;
-    }
     atlas.extras = (ALTERNATES..ROW_RECORD)
         .map(|index| atlas::record_at(dll, base, index))
         .collect::<Option<_>>()
         .unwrap_or_default();
-    atlas.offset = base;
     log::info!(
         "play-data list: {WIDGETS} widgets and {} alternate records from the table at {base:#x}",
         atlas.extras.len()
@@ -346,15 +351,6 @@ pub fn extra_for(widget: usize, view: View, page: usize, selected: bool) -> Opti
     record.checked_sub(ALTERNATES)
 }
 
-/// Whether a record covers the hit band it is drawn over: the same top edge,
-/// no shorter, and no narrower at either end.
-fn spans(record: &Widget, band: &Rect) -> bool {
-    record.dst.y == band.y
-        && record.dst.height >= band.height
-        && record.dst.x <= band.x
-        && record.dst.x + record.dst.width >= band.x + band.width
-}
-
 /// Which record places a column of a row.
 ///
 /// `FUN_1001c850` reads `row + 0x25` for the timestamp and the chapter and
@@ -375,7 +371,7 @@ pub fn surface_pen(column: Column, row: usize) -> (i32, i32) {
         Column::Comment => PEN_COMMENT_Y,
     };
     (
-        column.surface_span().0 as i32,
+        column.surface_span(LAYOUT).0 as i32,
         (row as f32 * SURFACE_ROW_PITCH + base) as i32,
     )
 }
@@ -383,7 +379,7 @@ pub fn surface_pen(column: Column, row: usize) -> (i32, i32) {
 /// The rectangle of the surface a column of a row is cut from, from
 /// `FUN_1001c850`. Two pixels below [`surface_pen`] — see the module doc.
 pub fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
-    let (x, width) = column.surface_span();
+    let (x, width) = column.surface_span(LAYOUT);
     let base = match column {
         Column::When | Column::Chapter => CUT_LINE_Y,
         Column::Comment => CUT_COMMENT_Y,
@@ -403,9 +399,9 @@ pub fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
 /// offsets are the ones save/load uses for Japanese, on every language.
 pub fn dest_rect(column: Column, record: Rect) -> (f32, f32, f32, f32) {
     (
-        record.x as f32 + column.dest_x(false),
-        record.y as f32 + DEST_Y,
-        column.dest_width(),
+        record.x as f32 + column.dest_x(LAYOUT, false),
+        record.y as f32 + LAYOUT.dest_y,
+        column.dest_width(LAYOUT),
         DEST_HEIGHT,
     )
 }
@@ -424,7 +420,7 @@ pub fn render(
     comments: bool,
     hovered: Option<usize>,
 ) -> Rows {
-    let (width, height) = SURFACE;
+    let (width, height) = LAYOUT.surface;
     let mut surface = days_ui::Image::empty(width, height);
     let mut quads = Vec::new();
 
@@ -502,7 +498,7 @@ fn expand(
     let slots_used = comment.chars().count().min(CAP * saveload::TIP_LINES) / CAP;
     let deep = row > LAST_ROW_OPENING_DOWN;
     let height = record.dst.height as f32;
-    let row_of_panel = height / PANEL_ROWS;
+    let row_of_panel = height / LAYOUT.tip.panel_rows;
 
     // `FUN_1001bc80` writes the panel's shift only on the branches a deep row
     // takes and zeroes it only on the three-line one, so a shallow row with one
@@ -558,9 +554,9 @@ fn expand(
             TIP_CUT.3 as u32,
         ),
         dst: (
-            record.dst.x as f32 + Column::Comment.dest_x(false),
-            record.dst.y as f32 + DEST_Y,
-            Column::Comment.dest_width(),
+            record.dst.x as f32 + Column::Comment.dest_x(LAYOUT, false),
+            record.dst.y as f32 + LAYOUT.dest_y,
+            Column::Comment.dest_width(LAYOUT),
             TIP_DEST_HEIGHT,
         ),
     };
@@ -606,7 +602,7 @@ mod tests {
         assert_eq!(Tooltip::record_row(9), 7);
         // 97 is the shipped record height; a third of it, less two, is the
         // one-line panel.
-        let third = 97.0 / PANEL_ROWS;
+        let third = 97.0 / LAYOUT.tip.panel_rows;
         assert!((third - 32.333332).abs() < 1e-4);
         assert!((third - 2.0 - 30.333332).abs() < 1e-4);
     }

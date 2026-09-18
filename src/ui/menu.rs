@@ -709,6 +709,11 @@ pub struct Menu {
     font: Option<days_font::Font>,
     /// The save/load screen's rasterised rows for the page it is showing.
     rows: Option<saveload::Rows>,
+    /// Where this module puts the three columns of a slot row, from
+    /// [`saveload::Layout::of`]. The two titles' modules draw the same screen
+    /// from different constants, and a row laid out with the other module's set
+    /// is not slightly off — the chapter and the timestamp swap places.
+    list_layout: &'static saveload::Layout,
     /// A save the screen has taken and not yet committed: the module's `+0x98`,
     /// with the comment its `+0x200` holds.
     ///
@@ -866,6 +871,7 @@ impl Menu {
             dress: None,
             font: load_font(vfs),
             rows: None,
+            list_layout: saveload::Layout::of(dll),
             pending_save: None,
             out_scale: 1.0,
         };
@@ -1321,6 +1327,7 @@ impl Menu {
             .filter(|w| (0x16..0x20).contains(w))
             .map(|w| w - 0x16);
         self.rows = Some(saveload::Rows::render(
+            self.list_layout,
             font,
             &self.session.slots,
             self.page,

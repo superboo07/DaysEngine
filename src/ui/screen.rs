@@ -37,6 +37,7 @@ use crate::install::vfs::Vfs;
 use crate::playback::scale::Scaler;
 use crate::ui::playdata;
 use crate::ui::replay;
+use crate::ui::saveload;
 use days_ui::atlas::{self, Atlas, Widget};
 use days_ui::cmap::Cmap;
 use days_ui::Image;
@@ -476,6 +477,12 @@ impl Screen {
         if stem.ends_with("replay_playdata")
             && !playdata::relocate(&mut atlas, dll, native.all_bounds())
         {
+            return Err(Error::NoAtlasFor(path.to_string()));
+        }
+        // The save/load screen's rows are the same shape of problem, and on one
+        // module the generic search does not merely extrapolate them, it anchors
+        // on another screen's table outright. See `saveload::relocate`.
+        if stem.ends_with("saveload") && !saveload::relocate(&mut atlas, dll, native.all_bounds()) {
             return Err(Error::NoAtlasFor(path.to_string()));
         }
         // The grid needs only the second half of that: its own widgets are

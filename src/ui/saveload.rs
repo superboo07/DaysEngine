@@ -55,8 +55,14 @@
 //! its pitch at `+0x118` — and `FUN_10011ec0` clears it and rasterises all
 //! thirty columns into it at once. Each column then has its own sprite, whose
 //! source rectangle cuts that surface and whose destination rectangle puts it
-//! on the screen. [`SURFACE`], [`source_rect`] and [`dest_rect`] are those
-//! three facts.
+//! on the screen. [`Layout::surface`], [`source_rect`] and [`dest_rect`] are
+//! those three facts.
+//!
+//! **The numbers below are School Days HQ's.** Shiny Days' `FUN_1001b240` and
+//! `FUN_10018fd0` do all of the same things with a different set, and the two
+//! sets are [`Layout`]. The largest difference is the order: this module puts
+//! the timestamp at the left of the row and the chapter after it, and Shiny Days
+//! puts the chapter in a narrow cell at the left with the timestamp beside it.
 //!
 //! The classes are RTTI names, not inferences: host `+0xac` allocates by type
 //! code, and codes 0, 3 and 4 construct `DX9Texture`, `DX9Sprite2D` and
@@ -104,7 +110,8 @@
 //! English shifts three things, all off host `+0x5c`: the timestamp moves right
 //! by 5.0, the chapter by 15.0, and the comment is centred in its column by
 //! `235.5 - width / 4` clamped at zero, measured on the advance total
-//! `FUN_10011ec0` accumulates. See [`comment_centre`].
+//! `FUN_10011ec0` accumulates. See [`comment_centre`]. Shiny Days makes the
+//! same three shifts by the same two constants and centres from 226.5.
 //!
 //! # The comment column's gate is `[TextInput]`
 //!
@@ -133,6 +140,18 @@
 //! So the column is on when the player's `FILMENGINE.INI` says
 //! `[TextInput]="1"`, which the shipped INI does.
 //!
+//! # The table cannot be found from the hit map alone
+//!
+//! Twenty of the thirty-two records do not look like the region they place: a
+//! row is one sprite the width of the row behind two hit regions covering half
+//! of it each, and a comment panel is three rows tall. Only the twelve buttons
+//! in between can anchor [`days_ui::atlas::find`], and on Shiny Days that is not
+//! enough — `SysMenuSD.dll` holds the play-data list's table, whose records
+//! reproduce all thirty-two of this screen's hit boxes to the pixel, and the
+//! generic search anchors there and draws every row a third of its width.
+//! [`relocate`] is the way in: anchor on the buttons and read the rest at the
+//! indices the shipped code reads them at.
+//!
 //! # One sprite between the two bands
 //!
 //! Only the first band of ten has hover art. `FUN_10011600` draws it in a loop
@@ -152,7 +171,9 @@
 //! `+0x1bc + n * 4` rasterised into the same surface at
 //! `(0x400, 0x202 + n * 0x40)`. The panel's height grows with the line count,
 //! and rows 8 and 9 borrow rows 6 and 7's record so three lines cannot run off
-//! the bottom of the screen.
+//! the bottom of the screen. Shiny Days' `FUN_10019a40` is the same screen with
+//! a buffer of its own for the lines and its own trims; both sets are
+//! [`Layout::tip`].
 //!
 //! [`Tooltip`] is that, and [`wrap_comment`] is its wrapping rule: Japanese breaks
 //! every twenty characters and English wraps on whole words at forty, both
@@ -212,6 +233,8 @@ use crate::install::ini::Ini;
 use crate::install::save;
 use crate::playback::text;
 use days_save::{FlagStore, Value};
+use days_ui::atlas::{self, Atlas};
+use days_ui::cmap::Rect;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -299,16 +322,339 @@ pub fn enabled(popup_up: bool, widget: usize) -> bool {
     !popup_up && widget < 0x20
 }
 
+/// How many widgets the screen has, from its own hit map.
+pub const WIDGETS: usize = 0x20;
+
+/// The first record of the ten page buttons, which is where this screen's table
+/// can be anchored: `FUN_100135c0` and `FUN_1001b240` both place button `n`
+/// from record `n + 10`, CLOSE from record 20 and the route map from record 21.
+const PAGE_RECORD: usize = 10;
+
+/// Puts the whole table into an atlas the hit map could only half place.
+///
+/// Every one of the thirty-two regions is record `region` of one run — rows
+/// 0..9, page buttons 10..19, CLOSE 20, the route map 21, the comment panels
+/// 22..31 — but twenty of those records do not look like the region they place.
+/// A row is one sprite the width of the row behind two hit regions covering
+/// half of it each, and a comment panel is about three rows tall because it
+/// doubles as the expanded comment's panel, so
+/// [`days_ui::atlas::find`] can only anchor the twelve buttons in between.
+///
+/// On School Days HQ it extrapolates the other twenty from those twelve at the
+/// table's own stride and gets them right. On Shiny Days it does not:
+/// `SysMenuSD.dll` holds a second run — the play-data list's, which splits a row
+/// into the two records this screen only splits into two hit regions — that
+/// reproduces all thirty-two boxes to the pixel, so the search anchors there
+/// and every row is drawn a third of its width. This anchors on the buttons,
+/// whose records the hit map does reproduce, and reads the rest at the indices
+/// the shipped code reads them at.
+///
+/// Returns whether it did. A table that will not anchor leaves the screen with
+/// no list to draw, so the caller refuses the screen rather than drawing one
+/// from the wrong offsets.
+pub fn relocate(atlas: &mut Atlas, dll: &[u8], boxes: &[Rect]) -> bool {
+    if boxes.len() != WIDGETS || atlas.widgets.len() != WIDGETS {
+        log::warn!(
+            "the save/load screen has {} regions and {} widgets, not {WIDGETS} of each",
+            boxes.len(),
+            atlas.widgets.len()
+        );
+        return false;
+    }
+    // Every record between the last row and the first comment panel: the ten
+    // page buttons, CLOSE and the route map.
+    let anchors: Vec<(usize, Rect)> = (PAGE_RECORD..COMMENT_RECORD)
+        .map(|record| (record, boxes[record]))
+        .collect();
+    let bands = [
+        atlas::Band {
+            region: 0,
+            record: 0,
+            count: PER_PAGE,
+        },
+        atlas::Band {
+            region: COMMENT_RECORD,
+            record: COMMENT_RECORD,
+            count: PER_PAGE,
+        },
+    ];
+    let Some(base) = atlas::relocate(atlas, dll, boxes, &anchors, &bands) else {
+        log::warn!("no record table in the DLL places the save/load screen's rows");
+        return false;
+    };
+    atlas.segments = vec![(0, base, WIDGETS)];
+    // What follows the table is the page indicator — School Days HQ binds two
+    // sprites to records `page + 0x20` and `page + 0x2a`, Shiny Days one to
+    // `page + 0x20` — and nothing on this screen draws either yet. They are
+    // carried as [`Atlas::extras`] on the same best-effort terms every other
+    // screen's trailing records are.
+    atlas.extras = (WIDGETS..)
+        .map_while(|index| atlas::record_at(dll, base, index))
+        .take(TRAILING_RECORDS)
+        .collect();
+    log::info!(
+        "save/load: {WIDGETS} widgets and {} trailing records from the table at {base:#x}",
+        atlas.extras.len()
+    );
+    true
+}
+
+/// The first of the ten comment panels, which is [`Column::record_of`] for row
+/// zero: the same `+ 0x16` the shipped code adds.
+const COMMENT_RECORD: usize = Column::Comment.record_of(0);
+
+/// How far past the table to keep reading the page indicator's records.
+const TRAILING_RECORDS: usize = 32;
+
 /// The slot a row of a page stands for, from `FUN_10011d50`.
 pub fn slot_of(page: usize, row: usize) -> u32 {
     (page * PER_PAGE + row) as u32
 }
 
-/// The off-screen surface every column is rasterised into, from
-/// `FUN_100135c0`: `FrameBuffer` slot `+8` is called with `(0x800, 0x400,
-/// 0x208888)`, and `FUN_10011ec0` clears it as 0x400 rows of 0x2000 bytes,
-/// which is the same 2048 pixels of 32 bits.
-pub const SURFACE: (u32, u32) = (0x800, 0x400);
+/// Where one module puts the three columns of a row, and its expanded comment.
+///
+/// The two titles draw this screen from the same code with different numbers,
+/// and the numbers are not a variation on a theme: School Days HQ puts the
+/// timestamp first and the chapter after it, Shiny Days puts the chapter in a
+/// narrow cell at the left and the timestamp beside it, squeezed harder. A row
+/// laid out with the wrong set is not a few pixels off — it draws the timestamp
+/// across the cell divider its own art has.
+///
+/// Every field is the constant the module's own instruction loads, with the
+/// operand width taken from the mnemonic rather than from Ghidra's
+/// `(float)_DAT_...`, which narrows a double at the use site.
+///
+/// ```text
+/// School Days HQ   SysMenuSDHQ.dll   sprites  FUN_100135c0
+///                                    glyphs   FUN_10011ec0
+///                                    tooltip  FUN_10012900
+///
+/// Shiny Days       SysMenuSD.dll     sprites  FUN_1001b240
+///                                    glyphs   FUN_10018fd0
+///                                    tooltip  FUN_10019a40
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    /// Which module this is, for diagnostics.
+    pub module: &'static str,
+    /// The off-screen surface the columns are rasterised into, from the
+    /// `FrameBuffer` slot `+8` call that builds it.
+    pub surface: (u32, u32),
+    /// The three columns, in [`Column::ALL`] order.
+    pub columns: [ColumnLayout; 3],
+    /// How far down its record every column is drawn.
+    pub dest_y: f32,
+    /// What an English comment's centring is measured back from — see
+    /// [`comment_centre`].
+    pub centre_from: f32,
+    /// The expanded comment.
+    pub tip: Tip,
+}
+
+/// One column's place on the surface and on the screen.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnLayout {
+    /// Where this column's pen starts across the surface, and how wide the
+    /// sprite cuts it.
+    pub span: (f32, f32),
+    /// The x it is offset by inside its record, and the extra shift English
+    /// adds. The comment has no shift — it is centred instead.
+    pub x: f32,
+    pub english_shift: f32,
+    /// How wide it is drawn. Every column is cut wider than it is drawn, so
+    /// every one is squeezed horizontally.
+    pub width: f32,
+}
+
+/// The expanded comment's geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct Tip {
+    /// A buffer of its own, or `None` when the lines go into the same surface
+    /// as the rows.
+    pub surface: Option<(u32, u32)>,
+    /// Where line 0 is rasterised and cut, and the step to the next.
+    pub origin: (f32, f32),
+    pub pitch: f32,
+    /// How tall each line's slice of that surface is.
+    pub height: f32,
+    /// How far apart the lines are drawn, and how tall each is drawn.
+    pub line_pitch: f32,
+    pub line_height: f32,
+    /// How many rows of the list the panel's record spans. The record is about
+    /// three rows tall and the panel is that divided by the lines it needs.
+    pub panel_rows: f32,
+    /// What comes off the panel when it is showing fewer than three lines, and
+    /// what comes off again when it opens upwards.
+    pub trim: [f32; 2],
+    pub deep_trim: f32,
+    /// What a panel opening upwards is pushed down by, past the rows it gave
+    /// back, and how far its lines move with it.
+    pub deep_step: f32,
+    pub deep_text: [f32; 2],
+}
+
+impl Layout {
+    /// School Days HQ's, from `SysMenuSDHQ.dll`.
+    ///
+    /// The surface is `(0x800, 0x400)` — `FUN_10011ec0` clears it as 0x400 rows
+    /// of 0x2000 bytes, which is the same 2048 pixels of 32 bits. The columns
+    /// are `_DAT_1003b138` (548.0f) and `_DAT_1003b110` (986.0f) wide on it, at
+    /// pen starts 0, `0x400` and 0; they are drawn at `_DAT_10039798` (1.0),
+    /// `_DAT_1003b118` (262.5) and `_DAT_10039748` (2.0) into their records,
+    /// `_DAT_1003b128` (252.0) and `_DAT_1003b0d0` (494.0) wide, `_DAT_1003b0c8`
+    /// (4.5) down. The English shifts are `_DAT_1003b140` (5.0f) and
+    /// `_DAT_1003b13c` (15.0f).
+    pub const SCHOOL_DAYS_HQ: Layout = Layout {
+        module: "SysMenuSDHQ.dll",
+        surface: (0x800, 0x400),
+        columns: [
+            ColumnLayout {
+                span: (0.0, 548.0),
+                x: 1.0,
+                english_shift: 5.0,
+                width: 252.0,
+            },
+            ColumnLayout {
+                span: (1024.0, 548.0),
+                x: 262.5,
+                english_shift: 15.0,
+                width: 252.0,
+            },
+            ColumnLayout {
+                span: (0.0, 986.0),
+                x: 2.0,
+                english_shift: 0.0,
+                width: 494.0,
+            },
+        ],
+        dest_y: 4.5,
+        centre_from: 235.5,
+        tip: Tip {
+            surface: None,
+            origin: (1024.0, 514.0),
+            pitch: 64.0,
+            height: 64.0,
+            line_pitch: 32.0,
+            line_height: 32.0,
+            panel_rows: 3.0,
+            trim: [2.0, 0.0],
+            deep_trim: 0.0,
+            deep_step: 0.0,
+            deep_text: [64.0, 32.0],
+        },
+    };
+
+    /// Shiny Days', from `SysMenuSD.dll`.
+    ///
+    /// Six surfaces rather than one — `FUN_1001b240` builds a `(0x400, 0x400,
+    /// 0x208888)` `FrameBuffer` per page-bank for the page slide, and
+    /// `FUN_10018fd0` fills each with ten rows — so a page is 1024 wide here,
+    /// not 2048. The chapter's cut starts at `_DAT_1004bd78` (600.0f) and runs
+    /// `_DAT_1004bd98` (548.0f), so it ends at 1148 on a surface 1024 wide; the
+    /// two characters it ever holds are nowhere near that edge. The columns are
+    /// drawn at `_DAT_1004bd80` (95.0), `_DAT_10049738` (20.0) and
+    /// `_DAT_10049760` (2.0) into their records, `_DAT_1004bd88` (189.0),
+    /// `_DAT_1004bd70` (252.0) and `_DAT_1004bd10` (494.0) wide, `_DAT_10049760`
+    /// (2.0) down, with the same English shifts `_DAT_1004bda0` (5.0f) and
+    /// `_DAT_1004bd9c` (15.0f).
+    ///
+    /// **The chapter is the left-hand column here**, at 20 into the row against
+    /// the timestamp's 95, which is why the two cells of the row's hover art
+    /// are one narrow and one wide. Its 252-wide slot overlaps the timestamp's
+    /// and is drawn under it; only the two characters at its left edge are ever
+    /// filled, so nothing collides.
+    ///
+    /// The same numbers place the module's other slot list — see
+    /// [`crate::ui::replay_pages`], which reaches them through `FUN_10027c10`
+    /// and `FUN_100267c0` instead and differs only in rasterising two pixels
+    /// above its own cut.
+    ///
+    /// The tooltip has a buffer of its own, `(0x400, 0x100, 0x208888)`, with
+    /// the pen at `(0, 2)` stepping `_DAT_1004bd30` (64.0) and the sprite
+    /// cutting `_DAT_1004bd38` (986.0f) by `_DAT_1004bd3c` (64.0f) there. Its
+    /// lines are drawn `_DAT_1004bd40` (29.0) apart and `_DAT_1004bd28` (32.0)
+    /// tall, and a panel opening upwards gives back `_DAT_1004bd50` (3.0f) and
+    /// moves its lines by `_DAT_1004bd4c` (58.0f) or `_DAT_1004bd48` (29.0f).
+    pub const SHINY_DAYS: Layout = Layout {
+        module: "SysMenuSD.dll",
+        surface: (0x400, 0x400),
+        columns: [
+            ColumnLayout {
+                span: (0.0, 548.0),
+                x: 95.0,
+                english_shift: 5.0,
+                width: 189.0,
+            },
+            ColumnLayout {
+                span: (600.0, 548.0),
+                x: 20.0,
+                english_shift: 15.0,
+                width: 252.0,
+            },
+            ColumnLayout {
+                span: (0.0, 986.0),
+                x: 2.0,
+                english_shift: 0.0,
+                width: 494.0,
+            },
+        ],
+        dest_y: 2.0,
+        centre_from: 226.5,
+        tip: Tip {
+            surface: Some((0x400, 0x100)),
+            origin: (0.0, 2.0),
+            pitch: 64.0,
+            height: 64.0,
+            line_pitch: 29.0,
+            line_height: 32.0,
+            panel_rows: 3.0,
+            trim: [3.0, 3.0],
+            deep_trim: 3.0,
+            deep_step: 3.0,
+            deep_text: [58.0, 29.0],
+        },
+    };
+
+    /// Which module's save/load screen this is.
+    ///
+    /// By the menu module's own export table, which is how
+    /// [`crate::install::binaries`] recognises a menu module in the first place:
+    /// `SysMenuSD.dll` publishes `_GetBGMVolume@0` and `_GetSEVolume@0` and
+    /// `SysMenuSDHQ.dll` publishes neither, and those two names are the whole of
+    /// the difference between the two export tables. That is a statement about
+    /// the module, which is what owns the layout — the alternative, keying on
+    /// the shape of the recovered table, would be reading the answer off the
+    /// thing being laid out.
+    ///
+    /// **The test is one-sided**, and that is not a tidy answer: Shiny Days is
+    /// recognised by what it publishes and School Days HQ is what is left, not
+    /// what was recognised. `SysMenuSDHQ.dll`'s export table is a subset of
+    /// `SysMenuSD.dll`'s, so it offers nothing to test for, and a module that is
+    /// neither is laid out as School Days HQ — which is what this engine did for
+    /// every module before either set existed.
+    pub fn of(dll: &[u8]) -> &'static Layout {
+        let shiny = days_route::pe::Image::parse(dll).is_ok_and(|image| {
+            SHINY_DAYS_EXPORTS
+                .iter()
+                .all(|name| image.exports.contains_key(*name))
+        });
+        if shiny {
+            &Layout::SHINY_DAYS
+        } else {
+            &Layout::SCHOOL_DAYS_HQ
+        }
+    }
+
+    /// This column's place, indexed the way [`Column::ALL`] is ordered.
+    pub fn column(&self, column: Column) -> &ColumnLayout {
+        &self.columns[column as usize]
+    }
+}
+
+/// The two exports `SysMenuSD.dll` adds to what `SysMenuSDHQ.dll` publishes,
+/// and the only difference between the two tables. See [`Layout::of`] and
+/// [`crate::install::binaries`].
+const SHINY_DAYS_EXPORTS: [&str; 2] = ["_GetBGMVolume@0", "_GetSEVolume@0"];
 
 /// Which of the three things a row shows.
 ///
@@ -328,22 +674,14 @@ impl Column {
     pub const ALL: [Column; 3] = [Column::When, Column::Chapter, Column::Comment];
 
     /// Where in the surface this column's glyphs start, and how wide the sprite
-    /// cuts it.
-    ///
-    /// The x origins are `FUN_10011ec0`'s own pen starts — 0, `0x400` and 0 —
-    /// and the widths are `_DAT_1003b138` (a `flds`, so 548.0f) and
-    /// `_DAT_1003b110` (986.0f).
-    pub const fn surface_span(self) -> (f32, f32) {
-        match self {
-            Column::When => (0.0, 548.0),
-            Column::Chapter => (1024.0, 548.0),
-            Column::Comment => (0.0, 986.0),
-        }
+    /// cuts it. The origins are the rasterising loop's own pen starts.
+    pub fn surface_span(self, layout: &Layout) -> (f32, f32) {
+        layout.column(self).span
     }
 
-    /// The width of the sprite that cuts this column out of [`SURFACE`].
-    pub const fn width(self) -> f32 {
-        self.surface_span().1
+    /// The width of the sprite that cuts this column out of the surface.
+    pub fn width(self, layout: &Layout) -> f32 {
+        self.surface_span(layout).1
     }
 
     /// How many characters of the column are drawn, from `FUN_10011ec0`.
@@ -364,6 +702,7 @@ impl Column {
     /// `FUN_100135c0` reads `DAT_1004b048 + row * 0x18` for the timestamp and
     /// the chapter and `DAT_1004b048 + (row + 0x16) * 0x18` for the comment, so
     /// the second band of ten is not a duplicate: it is where the comment goes.
+    /// `FUN_1001b240` reads `DAT_10057000` at the same two indices.
     pub const fn record_of(self, row: usize) -> usize {
         match self {
             Column::When | Column::Chapter => row,
@@ -371,30 +710,16 @@ impl Column {
         }
     }
 
-    /// The x this column is offset by inside its record, and the extra shift
-    /// English adds.
-    ///
-    /// `_DAT_10039798` (1.0), `_DAT_1003b118` (262.5) and `_DAT_10039748` (2.0),
-    /// all `faddl` so all doubles; the English shifts are `_DAT_1003b140`
-    /// (5.0f) and `_DAT_1003b13c` (15.0f), and the comment has none here —
-    /// it is centred instead, in [`comment_centre`].
-    pub const fn dest_x(self, english: bool) -> f32 {
-        let shift = if english { 1.0 } else { 0.0 };
-        match self {
-            Column::When => 1.0 + 5.0 * shift,
-            Column::Chapter => 262.5 + 15.0 * shift,
-            Column::Comment => 2.0,
-        }
+    /// The x this column is offset by inside its record, with the extra shift
+    /// English adds already in it. See [`Layout`] for both modules' values.
+    pub fn dest_x(self, layout: &Layout, english: bool) -> f32 {
+        let column = layout.column(self);
+        column.x + if english { column.english_shift } else { 0.0 }
     }
 
-    /// How wide this column is drawn: `_DAT_1003b128` (252.0) for the two
-    /// halves of the stored line and `_DAT_1003b0d0` (494.0) for the comment,
-    /// both `fmull` so both doubles.
-    pub const fn dest_width(self) -> f32 {
-        match self {
-            Column::When | Column::Chapter => 252.0,
-            Column::Comment => 494.0,
-        }
+    /// How wide this column is drawn.
+    pub fn dest_width(self, layout: &Layout) -> f32 {
+        layout.column(self).width
     }
 }
 
@@ -410,10 +735,6 @@ pub const SURFACE_ROW_HEIGHT: f32 = 48.0;
 const SURFACE_LINE_Y: f32 = 2.0;
 const SURFACE_COMMENT_Y: f32 = 514.0;
 
-/// How far down its record every column is drawn, `_DAT_1003b0c8` — an `faddl`,
-/// so the double 4.5.
-pub const DEST_Y: f32 = 4.5;
-
 /// How tall every column is drawn, `_DAT_1003a860` — an `fmull`, so the double
 /// 24.0. Half the surface's row, which is why the text is rasterised at the
 /// font's own cell and comes down to size in the blit.
@@ -425,8 +746,8 @@ pub const DEST_HEIGHT: f32 = 24.0;
 /// From `FUN_100135c0`'s `DX9Sprite2D` slot `+0x1c` calls, whose two `/ width`
 /// arguments are the x pair and whose two `/ height` arguments are the y pair.
 /// `FUN_10011ec0` rasterises into the same places, which is the cross-check.
-pub fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
-    let (x, width) = column.surface_span();
+pub fn source_rect(layout: &Layout, column: Column, row: usize) -> (f32, f32, f32, f32) {
+    let (x, width) = column.surface_span(layout);
     let base = match column {
         Column::When | Column::Chapter => SURFACE_LINE_Y,
         Column::Comment => SURFACE_COMMENT_Y,
@@ -443,8 +764,8 @@ pub fn source_rect(column: Column, row: usize) -> (f32, f32, f32, f32) {
 ///
 /// The same origin [`source_rect`] cuts from, offset by nothing: `FUN_10011ec0`
 /// draws each glyph at the top of its slice.
-pub fn surface_pen(column: Column, row: usize) -> (i32, i32) {
-    let (x, y, _, _) = source_rect(column, row);
+pub fn surface_pen(layout: &Layout, column: Column, row: usize) -> (i32, i32) {
+    let (x, y, _, _) = source_rect(layout, column, row);
     (x as i32, y as i32)
 }
 
@@ -455,68 +776,45 @@ pub fn surface_pen(column: Column, row: usize) -> (i32, i32) {
 /// two bands — and `centre` is [`comment_centre`], which is zero for every
 /// column but an English comment.
 pub fn dest_rect(
+    layout: &Layout,
     column: Column,
     record: days_ui::cmap::Rect,
     english: bool,
     centre: f32,
 ) -> (f32, f32, f32, f32) {
     (
-        record.x as f32 + column.dest_x(english) + centre,
-        record.y as f32 + DEST_Y,
-        column.dest_width(),
+        record.x as f32 + column.dest_x(layout, english) + centre,
+        record.y as f32 + layout.dest_y,
+        column.dest_width(layout),
         DEST_HEIGHT,
     )
 }
 
-/// How far right an English comment is pushed, from `FUN_10011ec0`.
+/// How far right an English comment is pushed, from `FUN_10011ec0` and
+/// `FUN_10018fd0`.
 ///
-/// `_DAT_1003b0d8 - width / _DAT_1003b0e0`, clamped to zero below
-/// `_DAT_10039758` — an `fsubrl`, an `fdivl` and an `fcompl`, so 235.5, 4.0 and
-/// 0.0. `width` is the advance total the rasterising loop accumulated, in
-/// surface pixels, and the column comes down to the screen at very nearly half,
-/// so dividing by four is half the drawn width on screen. Taking that from
-/// 235.5 centres the comment in its 494-wide column, 11.5 short of true centre.
-/// Japanese comments are not moved at all.
-pub fn comment_centre(width: i32, english: bool) -> f32 {
+/// `centre_from - width / 4`, clamped to zero. Both are an `fsubrl` and an
+/// `fdivl` against an `fcompl` zero — `_DAT_1003b0d8` (235.5) and
+/// `_DAT_1003b0e0` (4.0) in School Days HQ, `_DAT_1004bd18` (226.5) and
+/// `_DAT_1004bd20` (4.0) in Shiny Days. `width` is the advance total the
+/// rasterising loop accumulated, in surface pixels, and the column comes down
+/// to the screen at very nearly half, so dividing by four is half the drawn
+/// width on screen. Taking that from [`Layout::centre_from`] centres the
+/// comment in its 494-wide column, a few pixels short of true centre. Japanese
+/// comments are not moved at all.
+pub fn comment_centre(layout: &Layout, width: i32, english: bool) -> f32 {
     if !english {
         return 0.0;
     }
-    let shift = 235.5 - width as f32 / 4.0;
-    if shift < 0.0 {
-        0.0
-    } else {
-        shift
-    }
+    (layout.centre_from - width as f32 / 4.0).max(0.0)
 }
 
 /// How many lines the expanded comment can run to, from `FUN_10012900`'s own
 /// clamp.
 pub const TIP_LINES: usize = 3;
 
-/// Where the expanded comment's lines are rasterised, and how they are cut.
-///
-/// `FUN_10012900` starts its pen at `(0x400, 0x202)` and steps down by `0x40`,
-/// and `FUN_100135c0` cuts the sprites at `_DAT_1003b120` (1024.0f),
-/// `_DAT_1003b108` (514.0) + n * `_DAT_1003b100` (64.0), `_DAT_1003b110`
-/// (986.0f) wide and `_DAT_1003b0f4` (64.0f) tall. The two agree, which is the
-/// cross-check.
-const TIP_SURFACE_X: f32 = 1024.0;
-const TIP_SURFACE_Y: f32 = 514.0;
-const TIP_SURFACE_PITCH: f32 = 64.0;
-const TIP_SURFACE_HEIGHT: f32 = 64.0;
-
-/// How far apart the lines are drawn and how tall each is, `_DAT_1003b0e8` —
-/// an `fmull`, so the double 32.0. Half the surface pitch, the same halving the
-/// rows get.
-const TIP_LINE_HEIGHT: f32 = 32.0;
-
-/// How many rows of the list the panel's record spans, `_DAT_1003b0f8` — an
-/// `fdivl`, so the double 3.0. The record is about three rows tall and the
-/// panel is that divided by the lines it needs.
-pub const PANEL_ROWS: f32 = 3.0;
-
-/// The last row whose panel can open downwards, from `FUN_10012900`'s
-/// `param_1 < 8` test.
+/// The last row whose panel can open downwards, from `FUN_10012900`'s and
+/// `FUN_10019a40`'s `param_1 < 8` test.
 pub const LAST_ROW_OPENING_DOWN: usize = 7;
 
 /// Splits a comment the way `FUN_10012900` splits it.
@@ -587,37 +885,48 @@ impl Tooltip {
     /// the screen. [`Tooltip::record_row`] is that swap.
     ///
     /// The panel's height comes from the **character count**, not from the
-    /// wrapped line count: `FUN_10012900` divides the capped length by the
-    /// per-line cap and switches on that. The two agree for Japanese and can
+    /// wrapped line count: both modules divide the capped length by the
+    /// per-line cap and switch on that. The two agree for Japanese and can
     /// differ for English, where the wrap is by word; the shipped formula is
     /// kept rather than the one that would agree.
+    ///
+    /// A panel showing one line is a third of its record and one showing two is
+    /// two thirds, less [`Tip::trim`]; a panel opening upwards gives back
+    /// [`Tip::deep_trim`] as well and is pushed down past the thirds it did not
+    /// use by [`Tip::deep_step`].
     pub fn place(
+        layout: &Layout,
         row: usize,
         record: days_ui::atlas::Widget,
         widths: &[i32],
         chars: usize,
         english: bool,
     ) -> Tooltip {
+        let tip = &layout.tip;
         let cap = Column::Comment.cap(english);
         let height = record.dst.height as f32;
-        let row_of_panel = height / PANEL_ROWS;
+        let row_of_panel = height / tip.panel_rows;
         let deep = row > LAST_ROW_OPENING_DOWN;
 
-        // `FUN_10012900` writes the panel's shift and the text's only on the
-        // branches a deep row takes, and zeroes them only on the three-line
-        // one. A shallow row with one or two lines therefore reads **two
-        // uninitialised floats** -- a shipped bug. Zero is what the branch that
-        // does initialise them uses, and what puts the panel on its own row.
+        // School Days HQ's `FUN_10012900` writes the panel's shift and the
+        // text's only on the branches a deep row takes, and zeroes them only on
+        // the three-line one. A shallow row with one or two lines therefore
+        // reads **two uninitialised floats** -- a shipped bug, and one with no
+        // right value to substitute, so it is reproduced rather than fixed.
+        // Zero is what the branch that does initialise them uses, and what puts
+        // the panel on its own row. Shiny Days' `FUN_10019a40` zeroes all three
+        // on entry and has no such branch.
         let (panel_shift, text_shift, panel_height) = match chars.min(cap * TIP_LINES) / cap {
-            0 => (
-                if deep { row_of_panel * 2.0 } else { 0.0 },
-                if deep { TIP_SURFACE_HEIGHT } else { 0.0 },
-                row_of_panel - 2.0,
-            ),
-            1 => (
-                if deep { row_of_panel } else { 0.0 },
-                if deep { TIP_LINE_HEIGHT } else { 0.0 },
-                row_of_panel * 2.0,
+            lines @ (0 | 1) => (
+                if deep {
+                    row_of_panel * (2 - lines) as f32 + tip.deep_step
+                } else {
+                    0.0
+                },
+                if deep { tip.deep_text[lines] } else { 0.0 },
+                row_of_panel * (lines + 1) as f32
+                    - tip.trim[lines]
+                    - if deep { tip.deep_trim } else { 0.0 },
             ),
             _ => (0.0, 0.0, height),
         };
@@ -645,18 +954,18 @@ impl Tooltip {
             .enumerate()
             .map(|(n, width)| Quad {
                 src: (
-                    TIP_SURFACE_X as u32,
-                    (TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH) as u32,
-                    Column::Comment.width() as u32,
-                    TIP_SURFACE_HEIGHT as u32,
+                    tip.origin.0 as u32,
+                    (tip.origin.1 + n as f32 * tip.pitch) as u32,
+                    Column::Comment.width(layout) as u32,
+                    tip.height as u32,
                 ),
                 dst: (
                     record.dst.x as f32
-                        + Column::Comment.dest_x(english)
-                        + comment_centre(*width, english),
-                    record.dst.y as f32 + DEST_Y + n as f32 * TIP_LINE_HEIGHT + text_shift,
-                    Column::Comment.dest_width(),
-                    TIP_LINE_HEIGHT,
+                        + Column::Comment.dest_x(layout, english)
+                        + comment_centre(layout, *width, english),
+                    record.dst.y as f32 + layout.dest_y + n as f32 * tip.line_pitch + text_shift,
+                    Column::Comment.dest_width(layout),
+                    tip.line_height,
                 ),
             })
             .collect();
@@ -664,8 +973,8 @@ impl Tooltip {
         Tooltip { panel, lines }
     }
 
-    /// Which row's second-band record places the panel, from
-    /// `FUN_10012900`'s `param_1 < 8 ? param_1 : param_1 - 2`.
+    /// Which row's second-band record places the panel, from `FUN_10012900`'s
+    /// and `FUN_10019a40`'s `param_1 < 8 ? param_1 : param_1 - 2`.
     pub fn record_row(row: usize) -> usize {
         if row > LAST_ROW_OPENING_DOWN {
             row - 2
@@ -678,9 +987,10 @@ impl Tooltip {
 /// The ten rows of a page, rasterised into one surface with the rectangles that
 /// put each column on the screen.
 ///
-/// This is `FUN_10011ec0` and the sprite set-up in `FUN_100135c0` together: one
-/// [`SURFACE`]-sized buffer holding up to thirty columns of text, and a quad per
-/// column cutting it out and placing it.
+/// This is `FUN_10011ec0` and the sprite set-up in `FUN_100135c0` together —
+/// `FUN_10018fd0` and `FUN_1001b240` on the other module: one
+/// [`Layout::surface`]-sized buffer holding up to thirty columns of text, and a
+/// quad per column cutting it out and placing it.
 pub struct Rows {
     /// The glyph surface, RGB carrying the font's luminance plane and alpha its
     /// outline plane — the same two planes the shipped blitter writes.
@@ -693,10 +1003,12 @@ pub struct Rows {
     /// The surface [`Tooltip::lines`] are cut from, when the screen gives the
     /// expanded comment one of its own.
     ///
-    /// This screen does not: `FUN_10012900` rasterises the tooltip into the
+    /// School Days HQ does not: `FUN_10012900` rasterises the tooltip into the
     /// same buffer as the rows, clear of all three columns, so this is `None`
-    /// and the lines come out of [`Rows::surface`]. The Shiny Days list keeps a
-    /// seventh buffer for it — see [`crate::ui::replay_pages`].
+    /// and the lines come out of [`Rows::surface`]. Shiny Days keeps a buffer
+    /// of its own for it on both of its slot lists — `FUN_10019a40` here and
+    /// `FUN_100271f0` in [`crate::ui::replay_pages`] — which is
+    /// [`Tip::surface`].
     pub tip_surface: Option<days_ui::Image>,
 }
 
@@ -718,7 +1030,9 @@ impl Rows {
     /// is skipped rather than placed somewhere this engine chose.
     /// `hovered` is the row the pointer is expanding, if any — the selection's
     /// `widget - 0x16`, which is the only thing that opens the tooltip.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
+        layout: &Layout,
         font: &days_font::Font,
         slots: &Slots,
         page: usize,
@@ -727,7 +1041,7 @@ impl Rows {
         comments: bool,
         hovered: Option<usize>,
     ) -> Rows {
-        let (width, height) = SURFACE;
+        let (width, height) = layout.surface;
         let mut surface = days_ui::Image::empty(width, height);
         let mut quads = Vec::new();
 
@@ -754,38 +1068,63 @@ impl Rows {
                     continue;
                 };
 
-                let drawn = draw_line(&mut surface, font, &text, surface_pen(column, row), &|c| {
-                    text::menu_advance(c, english)
-                });
+                let drawn = draw_line(
+                    &mut surface,
+                    font,
+                    &text,
+                    surface_pen(layout, column, row),
+                    &|c| text::menu_advance(c, english),
+                );
                 let centre = match column {
-                    Column::Comment => comment_centre(drawn, english),
+                    Column::Comment => comment_centre(layout, drawn, english),
                     _ => 0.0,
                 };
-                let (sx, sy, sw, sh) = source_rect(column, row);
+                let (sx, sy, sw, sh) = source_rect(layout, column, row);
                 quads.push(Quad {
                     src: (sx as u32, sy as u32, sw as u32, sh as u32),
-                    dst: dest_rect(column, record.dst, english, centre),
+                    dst: dest_rect(layout, column, record.dst, english, centre),
                 });
             }
         }
 
-        let tooltip = hovered
-            .filter(|_| comments)
-            .and_then(|row| Rows::expand(&mut surface, font, slots, page, row, english, records));
+        // Shiny Days rasterises the expanded comment into a buffer of its own;
+        // School Days HQ puts it in the corner of this one, clear of all three
+        // columns. `tip` is whichever the module says, and the tooltip's quads
+        // cut whichever they were drawn into.
+        let mut tip = layout
+            .tip
+            .surface
+            .map(|(width, height)| days_ui::Image::empty(width, height));
+        let tooltip = hovered.filter(|_| comments).and_then(|row| {
+            Rows::expand(
+                layout,
+                tip.as_mut().unwrap_or(&mut surface),
+                font,
+                slots,
+                page,
+                row,
+                english,
+                records,
+            )
+        });
         Rows {
             surface,
             quads,
             tooltip,
-            tip_surface: None,
+            tip_surface: tip,
         }
     }
 
     /// Rasterises the expanded comment and lays it out, from `FUN_10012900`.
     ///
-    /// Draws into the same surface the rows use, at the same place the shipped
-    /// code draws it: `(0x400, 0x202 + n * 0x40)`, which is clear of all three
-    /// columns — they end at x 986 above y 514 and at x 1024 below it.
+    /// Draws at the place the shipped code draws it: `[`Tip::origin`]` stepped
+    /// by [`Tip::pitch`], which on School Days HQ is `(0x400, 0x202 + n * 0x40)`
+    /// in the rows' own surface — clear of all three columns, since they end at
+    /// x 986 above y 514 and at x 1024 below it — and on Shiny Days is
+    /// `(0, 2 + n * 0x40)` in a buffer of its own.
+    #[allow(clippy::too_many_arguments)]
     fn expand(
+        layout: &Layout,
         surface: &mut days_ui::Image,
         font: &days_font::Font,
         slots: &Slots,
@@ -806,8 +1145,8 @@ impl Rows {
             .enumerate()
             .map(|(n, line)| {
                 let pen = (
-                    TIP_SURFACE_X as i32,
-                    (TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH) as i32,
+                    layout.tip.origin.0 as i32,
+                    (layout.tip.origin.1 + n as f32 * layout.tip.pitch) as i32,
                 );
                 draw_line(surface, font, line, pen, &|c| {
                     text::menu_advance(c, english)
@@ -816,6 +1155,7 @@ impl Rows {
             .collect::<Vec<i32>>();
 
         Some(Tooltip::place(
+            layout,
             row,
             record,
             &widths,
@@ -1086,6 +1426,10 @@ mod tests {
     }
     use super::*;
 
+    /// Every one of these was recovered against `SysMenuSDHQ.dll`, so that is
+    /// the layout they are checked at; [`Layout::SHINY_DAYS`] has its own tests.
+    const HQ: &Layout = &Layout::SCHOOL_DAYS_HQ;
+
     fn at(year: i32, month: u32, day: u32, weekday: u32, hour: u32, minute: u32) -> Civil {
         Civil {
             year,
@@ -1269,9 +1613,9 @@ mod tests {
     /// take all of it.
     #[test]
     fn the_panel_grows_with_the_comment() {
-        let one = Tooltip::place(0, panel_record(), &[0], 10, false);
-        let two = Tooltip::place(0, panel_record(), &[0, 0], 25, false);
-        let three = Tooltip::place(0, panel_record(), &[0, 0, 0], 50, false);
+        let one = Tooltip::place(HQ, 0, panel_record(), &[0], 10, false);
+        let two = Tooltip::place(HQ, 0, panel_record(), &[0, 0], 25, false);
+        let three = Tooltip::place(HQ, 0, panel_record(), &[0, 0, 0], 50, false);
         assert!((one.panel.dst.3 - (97.0 / 3.0 - 2.0 + 1.0)).abs() < 0.01);
         assert!((two.panel.dst.3 - (97.0 * 2.0 / 3.0 + 1.0)).abs() < 0.01);
         assert!((three.panel.dst.3 - 98.0).abs() < 0.01);
@@ -1281,7 +1625,7 @@ mod tests {
     /// short it is drawn, so a one-line panel is that art squashed.
     #[test]
     fn the_panel_cuts_the_whole_record_however_short_it_is_drawn() {
-        let tip = Tooltip::place(0, panel_record(), &[0], 10, false);
+        let tip = Tooltip::place(HQ, 0, panel_record(), &[0], 10, false);
         assert_eq!(tip.panel.src, (1, 442, 472, 97));
         assert!(tip.panel.dst.3 < 97.0);
     }
@@ -1301,13 +1645,13 @@ mod tests {
     /// on the row the pointer is on, and the text with it.
     #[test]
     fn a_borrowed_record_is_pushed_back_down() {
-        let deep = Tooltip::place(8, panel_record(), &[0], 10, false);
-        let shallow = Tooltip::place(0, panel_record(), &[0], 10, false);
+        let deep = Tooltip::place(HQ, 8, panel_record(), &[0], 10, false);
+        let shallow = Tooltip::place(HQ, 0, panel_record(), &[0], 10, false);
         assert!((deep.panel.dst.1 - shallow.panel.dst.1 - 97.0 * 2.0 / 3.0).abs() < 0.01);
         assert!((deep.lines[0].dst.1 - shallow.lines[0].dst.1 - 64.0).abs() < 0.01);
 
-        let deep = Tooltip::place(9, panel_record(), &[0, 0], 25, false);
-        let shallow = Tooltip::place(1, panel_record(), &[0, 0], 25, false);
+        let deep = Tooltip::place(HQ, 9, panel_record(), &[0, 0], 25, false);
+        let shallow = Tooltip::place(HQ, 1, panel_record(), &[0, 0], 25, false);
         assert!((deep.panel.dst.1 - shallow.panel.dst.1 - 97.0 / 3.0).abs() < 0.01);
         assert!((deep.lines[0].dst.1 - shallow.lines[0].dst.1 - 32.0).abs() < 0.01);
     }
@@ -1315,8 +1659,8 @@ mod tests {
     /// Three lines fill the record, so there is nothing to push down.
     #[test]
     fn a_full_panel_is_not_shifted_at_all() {
-        let deep = Tooltip::place(9, panel_record(), &[0, 0, 0], 60, false);
-        let shallow = Tooltip::place(1, panel_record(), &[0, 0, 0], 60, false);
+        let deep = Tooltip::place(HQ, 9, panel_record(), &[0, 0, 0], 60, false);
+        let shallow = Tooltip::place(HQ, 1, panel_record(), &[0, 0, 0], 60, false);
         assert_eq!(deep.panel.dst.1, shallow.panel.dst.1);
         assert_eq!(deep.lines[0].dst.1, shallow.lines[0].dst.1);
     }
@@ -1325,11 +1669,11 @@ mod tests {
     /// `FUN_10012900` writes them.
     #[test]
     fn the_lines_cut_where_they_were_written() {
-        let tip = Tooltip::place(0, panel_record(), &[0, 0, 0], 60, false);
+        let tip = Tooltip::place(HQ, 0, panel_record(), &[0, 0, 0], 60, false);
         for (n, line) in tip.lines.iter().enumerate() {
             assert_eq!(line.src, (1024, 514 + n as u32 * 64, 986, 64));
-            assert!((line.dst.1 - (96.0 + DEST_Y + n as f32 * 32.0)).abs() < 0.01);
-            assert_eq!(line.dst.2, Column::Comment.dest_width());
+            assert!((line.dst.1 - (96.0 + HQ.dest_y + n as f32 * 32.0)).abs() < 0.01);
+            assert_eq!(line.dst.2, Column::Comment.dest_width(HQ));
         }
     }
 
@@ -1338,11 +1682,11 @@ mod tests {
     #[test]
     fn the_tooltip_does_not_overwrite_the_rows() {
         for n in 0..TIP_LINES {
-            let y = TIP_SURFACE_Y + n as f32 * TIP_SURFACE_PITCH;
-            assert!(TIP_SURFACE_X >= Column::Comment.width());
-            assert!(y + TIP_SURFACE_HEIGHT <= SURFACE.1 as f32);
+            let y = HQ.tip.origin.1 + n as f32 * HQ.tip.pitch;
+            assert!(HQ.tip.origin.0 >= Column::Comment.width(HQ));
+            assert!(y + HQ.tip.height <= HQ.surface.1 as f32);
             // Clear of the chapter column, which stops at y 482.
-            assert!(y >= source_rect(Column::Chapter, PER_PAGE - 1).1 + SURFACE_ROW_HEIGHT);
+            assert!(y >= source_rect(HQ, Column::Chapter, PER_PAGE - 1).1 + SURFACE_ROW_HEIGHT);
         }
     }
 
@@ -1351,16 +1695,16 @@ mod tests {
     #[test]
     fn the_tooltip_opens_only_on_a_hovered_row() {
         let slots = filled(3);
-        let open = Rows::render(&font(), &slots, 0, false, &records(), true, Some(3));
+        let open = Rows::render(HQ, &font(), &slots, 0, false, &records(), true, Some(3));
         assert!(open.tooltip.is_some());
         assert!(
-            Rows::render(&font(), &slots, 0, false, &records(), true, None)
+            Rows::render(HQ, &font(), &slots, 0, false, &records(), true, None)
                 .tooltip
                 .is_none()
         );
         // A row with no file has nothing to expand.
         assert!(
-            Rows::render(&font(), &slots, 0, false, &records(), true, Some(4))
+            Rows::render(HQ, &font(), &slots, 0, false, &records(), true, Some(4))
                 .tooltip
                 .is_none()
         );
@@ -1370,7 +1714,16 @@ mod tests {
     /// which is what the one host answer gates.
     #[test]
     fn text_input_off_takes_the_comment_and_its_tooltip() {
-        let rows = Rows::render(&font(), &filled(3), 0, false, &records(), false, Some(3));
+        let rows = Rows::render(
+            HQ,
+            &font(),
+            &filled(3),
+            0,
+            false,
+            &records(),
+            false,
+            Some(3),
+        );
         assert!(rows.tooltip.is_none());
         assert_eq!(rows.quads.len(), 2);
     }
@@ -1392,18 +1745,21 @@ mod tests {
     fn the_surface_rows_are_where_the_rasteriser_writes_them() {
         for row in 0..PER_PAGE {
             let y = row as f32 * 48.0;
-            assert_eq!(source_rect(Column::When, row), (0.0, y + 2.0, 548.0, 48.0));
             assert_eq!(
-                source_rect(Column::Chapter, row),
+                source_rect(HQ, Column::When, row),
+                (0.0, y + 2.0, 548.0, 48.0)
+            );
+            assert_eq!(
+                source_rect(HQ, Column::Chapter, row),
                 (1024.0, y + 2.0, 548.0, 48.0)
             );
             assert_eq!(
-                source_rect(Column::Comment, row),
+                source_rect(HQ, Column::Comment, row),
                 (0.0, y + 514.0, 986.0, 48.0)
             );
-            assert_eq!(surface_pen(Column::When, row), (0, y as i32 + 2));
-            assert_eq!(surface_pen(Column::Chapter, row), (1024, y as i32 + 2));
-            assert_eq!(surface_pen(Column::Comment, row), (0, y as i32 + 514));
+            assert_eq!(surface_pen(HQ, Column::When, row), (0, y as i32 + 2));
+            assert_eq!(surface_pen(HQ, Column::Chapter, row), (1024, y as i32 + 2));
+            assert_eq!(surface_pen(HQ, Column::Comment, row), (0, y as i32 + 514));
         }
     }
 
@@ -1413,9 +1769,15 @@ mod tests {
     fn every_source_rect_lies_inside_the_surface() {
         for row in 0..PER_PAGE {
             for column in Column::ALL {
-                let (x, y, w, h) = source_rect(column, row);
-                assert!(x + w <= SURFACE.0 as f32, "{column:?} row {row} runs wide");
-                assert!(y + h <= SURFACE.1 as f32, "{column:?} row {row} runs long");
+                let (x, y, w, h) = source_rect(HQ, column, row);
+                assert!(
+                    x + w <= HQ.surface.0 as f32,
+                    "{column:?} row {row} runs wide"
+                );
+                assert!(
+                    y + h <= HQ.surface.1 as f32,
+                    "{column:?} row {row} runs long"
+                );
             }
         }
     }
@@ -1425,8 +1787,8 @@ mod tests {
     #[test]
     fn the_rows_abut_without_overlapping() {
         for row in 0..PER_PAGE - 1 {
-            let (_, y, _, h) = source_rect(Column::When, row);
-            let (_, next, _, _) = source_rect(Column::When, row + 1);
+            let (_, y, _, h) = source_rect(HQ, Column::When, row);
+            let (_, next, _, _) = source_rect(HQ, Column::When, row + 1);
             assert_eq!(y + h, next);
         }
     }
@@ -1442,19 +1804,117 @@ mod tests {
         }
     }
 
+    /// Shiny Days' own layout, from `FUN_1001b240` and `FUN_10018fd0`.
+    ///
+    /// The chapter is the **left-hand** column here and the timestamp is beside
+    /// it, squeezed 548 into 189 where School Days HQ squeezes it into 252 —
+    /// which is why laying a Shiny Days row out with School Days HQ's set draws
+    /// the timestamp from the left edge of the row, across the cell divider its
+    /// own art has, and puts the chapter where the comment column starts.
+    #[test]
+    fn shiny_days_puts_the_chapter_first() {
+        let sd = &Layout::SHINY_DAYS;
+        let row = rect(30, 126);
+        assert_eq!(
+            dest_rect(sd, Column::Chapter, row, false, 0.0),
+            (50.0, 128.0, 252.0, 24.0)
+        );
+        assert_eq!(
+            dest_rect(sd, Column::When, row, false, 0.0),
+            (125.0, 128.0, 189.0, 24.0)
+        );
+        // The chapter is left of the timestamp, which is the whole difference.
+        assert!(Column::Chapter.dest_x(sd, false) < Column::When.dest_x(sd, false));
+        assert!(Column::When.dest_x(HQ, false) < Column::Chapter.dest_x(HQ, false));
+        // Its cut starts at 600, not at 1024, because the surface is half as
+        // wide -- and runs past that surface's right edge, which is the shipped
+        // rectangle and harmless: two characters never reach it.
+        assert_eq!(
+            source_rect(sd, Column::Chapter, 0),
+            (600.0, 2.0, 548.0, 48.0)
+        );
+        assert!(600.0 + 548.0 > sd.surface.0 as f32);
+        assert_eq!(sd.surface, (0x400, 0x400));
+    }
+
+    /// The English shifts are the same pair on both modules; only what the
+    /// comment is centred back from differs.
+    #[test]
+    fn english_moves_the_same_two_columns_on_both_modules() {
+        for layout in [HQ, &Layout::SHINY_DAYS] {
+            assert_eq!(
+                Column::When.dest_x(layout, true) - Column::When.dest_x(layout, false),
+                5.0
+            );
+            assert_eq!(
+                Column::Chapter.dest_x(layout, true) - Column::Chapter.dest_x(layout, false),
+                15.0
+            );
+            assert_eq!(
+                Column::Comment.dest_x(layout, true),
+                Column::Comment.dest_x(layout, false)
+            );
+        }
+        assert_eq!(comment_centre(HQ, 0, true), 235.5);
+        assert_eq!(comment_centre(&Layout::SHINY_DAYS, 0, true), 226.5);
+    }
+
+    /// Shiny Days keeps the expanded comment in a buffer of its own, so its
+    /// lines do not have to dodge the columns the way School Days HQ's do.
+    #[test]
+    fn shiny_days_expands_the_comment_into_its_own_buffer() {
+        let sd = &Layout::SHINY_DAYS;
+        assert_eq!(sd.tip.surface, Some((0x400, 0x100)));
+        assert_eq!(sd.tip.origin, (0.0, 2.0));
+        assert_eq!(HQ.tip.surface, None);
+        let tip = Tooltip::place(sd, 0, panel_record(), &[0, 0, 0], 60, false);
+        for (n, line) in tip.lines.iter().enumerate() {
+            assert_eq!(line.src, (0, 2 + n as u32 * 64, 986, 64));
+        }
+    }
+
+    /// A short panel gives back a third of its record on both modules, and on
+    /// Shiny Days three pixels more again — and another three when it opens
+    /// upwards, which `FUN_10019a40` takes off and `FUN_10012900` does not.
+    #[test]
+    fn a_short_panel_is_trimmed_the_way_each_module_trims_it() {
+        let sd = &Layout::SHINY_DAYS;
+        let third = 97.0 / 3.0;
+        let height = |layout, row| {
+            Tooltip::place(layout, row, panel_record(), &[0], 10, false)
+                .panel
+                .dst
+                .3
+                - 1.0
+        };
+        assert!((height(HQ, 0) - (third - 2.0)).abs() < 0.01);
+        assert!((height(HQ, 8) - (third - 2.0)).abs() < 0.01);
+        assert!((height(sd, 0) - (third - 3.0)).abs() < 0.01);
+        assert!((height(sd, 8) - (third - 6.0)).abs() < 0.01);
+    }
+
+    /// [`Layout::of`] reads the module's export table, not the table it is
+    /// about to lay out. A module that publishes neither of Shiny Days' two
+    /// extra exports — including a byte slice that is no PE at all — is laid
+    /// out as School Days HQ, which is the one-sided answer the doc records.
+    #[test]
+    fn a_module_that_is_not_shiny_days_is_laid_out_as_school_days_hq() {
+        assert_eq!(Layout::of(&[]).module, Layout::SCHOOL_DAYS_HQ.module);
+    }
+
     #[test]
     fn the_columns_sit_where_the_dll_puts_them() {
         let r = rect(20, 100);
         assert_eq!(
-            dest_rect(Column::When, r, false, 0.0),
+            dest_rect(HQ, Column::When, r, false, 0.0),
             (21.0, 104.5, 252.0, 24.0)
         );
         assert_eq!(
-            dest_rect(Column::Chapter, r, false, 0.0),
+            dest_rect(HQ, Column::Chapter, r, false, 0.0),
             (282.5, 104.5, 252.0, 24.0)
         );
         assert_eq!(
-            dest_rect(Column::Comment, r, false, 0.0),
+            dest_rect(HQ, Column::Comment, r, false, 0.0),
             (22.0, 104.5, 494.0, 24.0)
         );
     }
@@ -1464,21 +1924,21 @@ mod tests {
     #[test]
     fn english_shifts_the_stored_line_but_not_the_comment() {
         let r = rect(20, 100);
-        assert_eq!(dest_rect(Column::When, r, true, 0.0).0, 26.0);
-        assert_eq!(dest_rect(Column::Chapter, r, true, 0.0).0, 297.5);
-        assert_eq!(dest_rect(Column::Comment, r, true, 0.0).0, 22.0);
+        assert_eq!(dest_rect(HQ, Column::When, r, true, 0.0).0, 26.0);
+        assert_eq!(dest_rect(HQ, Column::Chapter, r, true, 0.0).0, 297.5);
+        assert_eq!(dest_rect(HQ, Column::Comment, r, true, 0.0).0, 22.0);
     }
 
     /// `235.5 - width / 4`, clamped at zero, and nothing at all in Japanese.
     #[test]
     fn an_english_comment_is_centred_in_its_column() {
-        assert_eq!(comment_centre(0, true), 235.5);
-        assert_eq!(comment_centre(942, true), 0.0);
+        assert_eq!(comment_centre(HQ, 0, true), 235.5);
+        assert_eq!(comment_centre(HQ, 942, true), 0.0);
         // Past the point where the text fills the column, it stops moving
         // rather than going negative.
-        assert_eq!(comment_centre(4000, true), 0.0);
-        assert_eq!(comment_centre(0, false), 0.0);
-        assert_eq!(comment_centre(400, false), 0.0);
+        assert_eq!(comment_centre(HQ, 4000, true), 0.0);
+        assert_eq!(comment_centre(HQ, 0, false), 0.0);
+        assert_eq!(comment_centre(HQ, 400, false), 0.0);
     }
 
     /// A comment of exactly half the column's source width centres at a quarter
@@ -1486,10 +1946,10 @@ mod tests {
     #[test]
     fn the_centring_is_half_the_column_less_half_the_drawn_width() {
         let drawn = 400;
-        let column = Column::Comment.dest_width();
-        let on_screen = drawn as f32 * column / Column::Comment.width();
+        let column = Column::Comment.dest_width(HQ);
+        let on_screen = drawn as f32 * column / Column::Comment.width(HQ);
         // 11.5 short of true centre, which is the shipped constant, not 247.
-        assert!(((column - on_screen) / 2.0 - comment_centre(drawn, true) - 11.5).abs() < 0.5);
+        assert!(((column - on_screen) / 2.0 - comment_centre(HQ, drawn, true) - 11.5).abs() < 0.5);
     }
 
     #[test]
@@ -1510,8 +1970,8 @@ mod tests {
         // The height is the only exact halving.
         assert_eq!(SURFACE_ROW_HEIGHT / DEST_HEIGHT, 2.0);
         // Neither width is: 494 doubled is 988, not 986.
-        assert!((Column::Comment.width() / Column::Comment.dest_width() - 1.996).abs() < 0.001);
-        assert!((Column::When.width() / Column::When.dest_width() - 2.175).abs() < 0.001);
+        assert!((Column::Comment.width(HQ) / Column::Comment.dest_width(HQ) - 1.996).abs() < 0.001);
+        assert!((Column::When.width(HQ) / Column::When.dest_width(HQ) - 2.175).abs() < 0.001);
     }
 
     fn font() -> days_font::Font {
@@ -1558,7 +2018,7 @@ mod tests {
     }
 
     fn saveload_rows(slots: &Slots, page: usize) -> Rows {
-        Rows::render(&font(), slots, page, false, &records(), true, None)
+        Rows::render(HQ, &font(), slots, page, false, &records(), true, None)
     }
 
     /// The surface is the size the `FrameBuffer` is created at, and every quad
@@ -1566,7 +2026,7 @@ mod tests {
     #[test]
     fn the_rendered_quads_cut_the_surface_they_were_drawn_into() {
         let rows = saveload_rows(&filled(7), 0);
-        assert_eq!((rows.surface.width, rows.surface.height), SURFACE);
+        assert_eq!((rows.surface.width, rows.surface.height), HQ.surface);
         for quad in &rows.quads {
             let (x, y, w, h) = quad.src;
             assert!(x + w <= rows.surface.width);
@@ -1579,7 +2039,7 @@ mod tests {
     #[test]
     fn a_row_with_no_record_is_left_undrawn() {
         let short: Vec<days_ui::atlas::Widget> = records().into_iter().take(10).collect();
-        let rows = Rows::render(&font(), &filled(0), 0, false, &short, true, None);
+        let rows = Rows::render(HQ, &font(), &filled(0), 0, false, &short, true, None);
         // The comment's record is in the second band, which this table stops
         // short of, so only the stored line's two columns are placed.
         assert_eq!(rows.quads.len(), 2);

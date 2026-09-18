@@ -97,8 +97,15 @@
 //! the hit map. A row is two hit regions, each covering half of it, while its
 //! record is the row entire, so no box reproduces a record and no run anchors.
 //! [`table_at`] is the other way in: it anchors a table on records whose
-//! **index** is known from the code that reads them, and the caller indexes the
-//! rest itself.
+//! **index** is known from the code that reads them, and [`relocate`] puts the
+//! records that follow from it back into the atlas.
+//!
+//! Leaving a screen to the generic search there is not merely imprecise, it can
+//! land on another screen's table outright. Shiny Days' `SysMenuSD.dll` holds a
+//! second run whose records reproduce `SAVELOAD`'s thirty-two hit boxes to the
+//! pixel — it is the play-data list's, which splits a row into the two records
+//! the save/load screen only splits into two hit regions — so the search
+//! anchored there and drew the rows from it, at a third of their width.
 //!
 //! # Native resolution
 //!
@@ -139,7 +146,7 @@ pub struct Atlas {
     pub extras: Vec<Widget>,
     /// Byte offset of region 1's record in the DLL image, for diagnostics.
     ///
-    /// For a screen whose leading regions are laid out at runtime this is
+    /// For a screen whose leading regions no run reproduces this is
     /// extrapolated back from the first segment, so it is where the record
     /// *would* be rather than somewhere a match was seen.
     pub offset: usize,
@@ -255,8 +262,9 @@ fn find_within(dll: &[u8], boxes: &[Rect], chip: (u32, u32), slop: u32) -> Resul
     let mut at = 0usize;
     while at < boxes.len() {
         let Some((offset, len)) = longest_run(dll, boxes, at, slop) else {
-            // No record anywhere reproduces this region's box. That is a region
-            // laid out at runtime; skip it and look for the next segment.
+            // No record anywhere reproduces this region's box — a region whose
+            // record does not look like its own hit box, which is what the
+            // module doc's rows are. Skip it and look for the next segment.
             at += 1;
             continue;
         };
@@ -280,10 +288,10 @@ fn find_within(dll: &[u8], boxes: &[Rect], chip: (u32, u32), slop: u32) -> Resul
         }
     }
 
-    // A region no segment reproduced is one laid out at runtime — the save/load
-    // screen's slot rows are the case this exists for. Its record is still in
-    // the table, at the stride from the nearest segment; it just does not look
-    // like its own hit region.
+    // A region no segment reproduced still has a record — the save/load screen's
+    // slot rows are the case this exists for. It is still in the table, at the
+    // stride from the nearest segment; it just does not look like its own hit
+    // region.
     for (i, slot) in slots.iter_mut().enumerate() {
         if slot.is_some() {
             continue;
@@ -431,11 +439,14 @@ fn near(rect: &Rect, box_: &Rect, slop: u32) -> bool {
 /// The return is the byte offset of record 0, or `None` when no position in the
 /// image satisfies every pair. Read records out of it with [`record_at`].
 ///
-/// The **first** anchor is matched exactly, because it is the byte pattern the
-/// search scans for; the rest are matched the way [`find`] matches a run, so a
-/// region whose box is a pixel wider than the sprite it belongs to still
-/// anchors. Pass a region with an exact record first — a caption or a button
-/// the art does not bleed past.
+/// One anchor is matched exactly, because its four floats are the byte pattern
+/// the search scans for; the rest are matched the way [`find`] matches a run, so
+/// a region whose box is a pixel wider than the sprite it belongs to still
+/// anchors. **Which** one that is, the anchors are tried in order to find out:
+/// whether a map's author drew a region on its sprite or a pixel around it is
+/// their business and not something a caller can know, and `SAVELOAD`'s page
+/// buttons are a set where the first box is not the exact one and the fourth
+/// is.
 ///
 /// A caller that passes one anchor learns nothing a byte search would not tell
 /// it; the point is passing enough of them that the position is unambiguous.
@@ -443,7 +454,18 @@ fn near(rect: &Rect, box_: &Rect, slop: u32) -> bool {
 /// for byte, so its tabs alone match both tables and the page buttons are what
 /// tell them apart.
 pub fn table_at(dll: &[u8], anchors: &[(usize, Rect)]) -> Option<usize> {
-    let (first, anchor) = *anchors.first()?;
+    anchors
+        .iter()
+        .find_map(|(first, anchor)| table_anchored_on(dll, anchors, *first, anchor))
+}
+
+/// [`table_at`] with the anchor to scan for already chosen.
+fn table_anchored_on(
+    dll: &[u8],
+    anchors: &[(usize, Rect)],
+    first: usize,
+    anchor: &Rect,
+) -> Option<usize> {
     let needle: Vec<u8> = [anchor.x, anchor.y, anchor.width, anchor.height]
         .iter()
         .flat_map(|v| (*v as f32).to_le_bytes())
@@ -463,6 +485,94 @@ pub fn table_at(dll: &[u8], anchors: &[(usize, Rect)]) -> Option<usize> {
         }
     }
     None
+}
+
+/// A stretch of a table the hit map cannot anchor: which region it starts at,
+/// which record places that region, and how many regions follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Band {
+    pub region: usize,
+    pub record: usize,
+    pub count: usize,
+}
+
+/// Puts records the hit map cannot reach into an atlas, by the indices the
+/// shipped code reads them at.
+///
+/// `anchors` fix the table — see [`table_at`] for what makes a good set — and
+/// each [`Band`] then names a run of records and the regions they place. A
+/// record must **cover** the region it is drawn over: the same top edge, no
+/// shorter, and no narrower at either end. That is what catches an anchor that
+/// landed on a different table with the same leading bytes, and it is a test a
+/// row passes and a half-row does not.
+///
+/// Returns the table's base offset, having written [`Atlas::offset`] too, or
+/// `None` with `atlas` untouched when nothing anchors or a record does not
+/// cover its region. Nothing here fills [`Atlas::extras`]: which records follow
+/// a table and what they mean is per-screen knowledge, so the caller does that.
+pub fn relocate(
+    atlas: &mut Atlas,
+    dll: &[u8],
+    boxes: &[Rect],
+    anchors: &[(usize, Rect)],
+    bands: &[Band],
+) -> Option<usize> {
+    let Some(base) = table_at(dll, anchors) else {
+        log::warn!(
+            "no table in the image satisfies all {} anchors",
+            anchors.len()
+        );
+        return None;
+    };
+
+    let mut placed: Vec<(usize, Widget)> = Vec::new();
+    for band in bands {
+        for i in 0..band.count {
+            let region = band.region + i;
+            let (Some(widget), Some(box_)) = (
+                record_at(dll, base, band.record + i),
+                boxes.get(region).filter(|_| region < atlas.widgets.len()),
+            ) else {
+                log::warn!(
+                    "no record {} to place region {}",
+                    band.record + i,
+                    region + 1
+                );
+                return None;
+            };
+            if !spans(&widget, box_) {
+                log::warn!(
+                    "record {} at {:?} does not cover region {}'s box {box_:?}",
+                    band.record + i,
+                    widget.dst,
+                    region + 1
+                );
+                return None;
+            }
+            placed.push((region, widget));
+        }
+    }
+
+    for (region, widget) in placed {
+        atlas.widgets[region] = widget;
+    }
+    atlas.offset = base;
+    Some(base)
+}
+
+/// Whether a record covers the hit region it is drawn over: the same top edge,
+/// and no narrower at either end.
+///
+/// Nothing is asked of the height, because a region's bounding box is the
+/// extent of that region's **pixels** and those need not stay inside the row
+/// they belong to: `SAVELOAD`'s ten rows are 31 tall in `SysMenuSDHQ.dll` and
+/// their boxes run 199, because the map carries each row's index over the rows
+/// below it as well. The width is the half a band covers, which is exactly what
+/// this is here to catch — a record that covers half a row is not the row.
+pub fn spans(record: &Widget, region: &Rect) -> bool {
+    record.dst.y == region.y
+        && record.dst.x <= region.x
+        && record.dst.x + record.dst.width >= region.x + region.width
 }
 
 /// The layout every stored rect is authored in, so a run that leaves it is not
@@ -587,6 +697,61 @@ mod tests {
                 height: b[3],
             })
             .collect()
+    }
+
+    /// A row is one record behind two hit regions covering half of it each, so
+    /// the record is wider than either box and may be shorter than it: the hit
+    /// map's bounding box is the extent of the region's pixels and `SAVELOAD`'s
+    /// run past the row they belong to. What must not pass is the half-row —
+    /// the record of another screen's table that splits the row where this one
+    /// only splits the hit map.
+    #[test]
+    fn a_record_covers_a_band_when_it_spans_it_however_tall_the_box_is() {
+        let row = Widget {
+            dst: Rect {
+                x: 0,
+                y: 96,
+                width: 799,
+                height: 31,
+            },
+            src_x: 1,
+            src_y: 122,
+        };
+        let left = boxes(&[[0, 96, 329, 199]]);
+        let right = boxes(&[[328, 96, 472, 199]]);
+        let panel = Widget {
+            dst: Rect {
+                x: 328,
+                y: 96,
+                width: 472,
+                height: 97,
+            },
+            ..row
+        };
+        assert!(spans(&row, &left[0]));
+        assert!(spans(&panel, &right[0]));
+
+        // The half-row from the other screen's table covers the left band and
+        // nothing else, which is what catches an anchor that landed on it.
+        let half = Widget {
+            dst: left[0],
+            ..row
+        };
+        assert!(!spans(&half, &right[0]));
+        // A record on the wrong row is not this row's however wide it is.
+        assert!(!spans(&row, &boxes(&[[0, 129, 329, 31]])[0]));
+    }
+
+    /// `table_at` scans for whichever anchor reproduces its record exactly, so a
+    /// set whose first box is a pixel out still finds the table.
+    #[test]
+    fn an_anchor_set_need_not_lead_with_its_exact_box() {
+        let mut dll = vec![0xaau8; 24];
+        dll.extend(rec([10.0, 20.0, 30.0, 40.0, 0.0, 0.0]));
+        dll.extend(rec([50.0, 20.0, 30.0, 40.0, 0.0, 0.0]));
+        let want = boxes(&[[10, 20, 29, 40], [50, 20, 30, 40]]);
+        let anchors = [(1, want[0]), (2, want[1])];
+        assert_eq!(table_at(&dll, &anchors), Some(0));
     }
 
     #[test]
@@ -719,7 +884,7 @@ mod tests {
 
     #[test]
     fn a_table_that_does_not_start_at_region_one_is_still_found() {
-        // Regions 1 and 2 are laid out at runtime and appear nowhere, so the
+        // Regions 1 and 2 reproduce no record anywhere, so the
         // run has to be reached by anchoring on region 3 instead.
         let mut dll = vec![0u8; 16];
         let start = dll.len();

@@ -210,7 +210,7 @@
 
 use crate::ui::options::Dir;
 use crate::ui::replay::View;
-use crate::ui::saveload::{self, Column, Line, Quad, Rows, Slots, Tooltip};
+use crate::ui::saveload::{self, Column, Layout, Line, Quad, Rows, Slots, Tooltip};
 use days_ui::atlas::{self, Widget};
 
 /// The first widget of a view. Widgets 0 to 2 are the frame's, and
@@ -930,10 +930,22 @@ pub fn hit_in(records: &[Widget], x: u32, y: u32) -> Option<usize> {
         .map(|index| index + FIRST)
 }
 
+/// Which module's column geometry this screen shares.
+///
+/// `FUN_10027c10` places its columns from the same globals `FUN_1001b240`
+/// reads for the save/load screen — the surface `FUN_100296a0` builds is the
+/// same `(0x400, 0x400, 0x208888)`, the chapter cuts from 600 in both, and the
+/// three widths and offsets are the same six doubles — so the layout is
+/// [`Layout::SHINY_DAYS`] rather than numbers of its own. What this screen does
+/// not share is recorded below: its pen sits two pixels above its own cut, it
+/// never asks the host whether the install is English, and its expanded comment
+/// is one sprite over three line slots rather than three sprites.
+const LAYOUT: &Layout = &Layout::SHINY_DAYS;
+
 /// The surface one panel's ten rows are rasterised into, from `FUN_100296a0`:
 /// six `FrameBuffer`s built `(0x400, 0x400, 0x208888)`, one per panel, and
 /// `FUN_100267c0` clears its own as 0x400 rows of 0x1000 bytes.
-pub const LIST_SURFACE: (u32, u32) = (0x400, 0x400);
+pub const LIST_SURFACE: (u32, u32) = LAYOUT.surface;
 
 /// How many characters of any column are drawn, from `FUN_100267c0`'s
 /// `if (0x14 < n) n = 0x14`. The same cap on all three, English or not.
@@ -958,8 +970,8 @@ const CUT_COMMENT_Y: f32 = 514.0;
 /// how tall, `_DAT_1004b288` (24.0) — half the surface row, which is why the
 /// text is rasterised at the font's own cell and comes down to size in the
 /// blit.
-const DEST_Y: f32 = 2.0;
-const DEST_HEIGHT: f32 = 24.0;
+const DEST_Y: f32 = LAYOUT.dest_y;
+const DEST_HEIGHT: f32 = saveload::DEST_HEIGHT;
 
 /// The advance for one character, from `FUN_100267c0` and `FUN_100271f0`.
 ///
@@ -977,56 +989,17 @@ pub fn advance(c: char) -> i32 {
 }
 
 /// Where in the surface a column's glyphs start, and how wide the sprite cuts
-/// it.
+/// it — [`LAYOUT`]'s, and `FUN_100267c0`'s pen starts agree with it.
 ///
-/// The x origins are `FUN_100267c0`'s own pen starts — 0, 600 and 0 — the
-/// chapter's being `_DAT_1004bd78` (600.0f) again on the cutting side, and the
-/// widths are `_DAT_1004bd98` (548.0f) and `_DAT_1004bd38` (986.0f). The
-/// chapter's cut therefore ends at 1148 on a surface 1024 wide; see the module
-/// doc.
+/// The chapter's cut therefore ends at 1148 on a surface 1024 wide; see the
+/// module doc.
 fn surface_span(column: Column) -> (f32, f32) {
-    match column {
-        Column::When => (0.0, 548.0),
-        Column::Chapter => (600.0, 548.0),
-        Column::Comment => (0.0, 986.0),
-    }
+    column.surface_span(LAYOUT)
 }
 
-/// The x this column is offset by inside its record, and the extra shift
-/// English adds.
-///
-/// `_DAT_1004bd80` (95.0), `_DAT_10049738` (20.0) and `_DAT_10049760` (2.0),
-/// all `faddl` so all doubles; the English shifts are `_DAT_1004bda0` (5.0f)
-/// and `_DAT_1004bd9c` (15.0f), the same pair the save/load screen uses. The
-/// comment has none — it is centred instead, in [`comment_centre`].
-fn dest_x(column: Column, english: bool) -> f32 {
-    let shift = if english { 1.0 } else { 0.0 };
-    match column {
-        Column::When => 95.0 + 5.0 * shift,
-        Column::Chapter => 20.0 + 15.0 * shift,
-        Column::Comment => 2.0,
-    }
-}
-
-/// How wide this column is drawn: `_DAT_1004bd88` (189.0), `_DAT_1004bd70`
-/// (252.0) and `_DAT_1004bd10` (494.0), all `fmull` so all doubles. Each is
-/// cut wider than it is drawn, so every column is squeezed horizontally — the
-/// timestamp's 548 into 189 hardest of the three.
-fn dest_width(column: Column) -> f32 {
-    match column {
-        Column::When => 189.0,
-        Column::Chapter => 252.0,
-        Column::Comment => 494.0,
-    }
-}
-
-/// How far right an English comment is pushed, from `FUN_100267c0`.
-///
-/// `_DAT_1004bd18 - width / _DAT_1004bd20`, clamped to zero below
-/// `_DAT_10049770` — an `fsubrl`, an `fdivl` and an `fcompl`, so 226.5, 4.0 and
-/// 0.0. `width` is the advance total the rasterising loop accumulated, in
-/// surface pixels, and the column comes down to the screen at half, so dividing
-/// by four is half the drawn width. Japanese comments are not moved at all.
+/// How far right an English comment is pushed, from `FUN_100267c0` — which is
+/// [`saveload::comment_centre`] at [`LAYOUT`], the same 226.5 and 4.0 the
+/// save/load screen's own `FUN_10018fd0` uses.
 ///
 /// The clamp is unreachable here: [`CAP`] characters at the widest advance
 /// total 900, which leaves 1.5. It is kept because it is what the function
@@ -1038,10 +1011,7 @@ fn dest_width(column: Column) -> f32 {
 /// module doc. It is recorded here because it is recovered, not because the
 /// screen draws it.
 pub fn comment_centre(width: i32, english: bool) -> f32 {
-    if !english {
-        return 0.0;
-    }
-    (226.5 - width as f32 / 4.0).max(0.0)
+    saveload::comment_centre(LAYOUT, width, english)
 }
 
 /// Where the expanded comment's line `n` is really rasterised, from
@@ -1105,9 +1075,9 @@ fn dest_rect(
     centre: f32,
 ) -> (f32, f32, f32, f32) {
     (
-        record.x as f32 + dest_x(column, english) + centre,
+        record.x as f32 + column.dest_x(LAYOUT, english) + centre,
         record.y as f32 + DEST_Y,
-        dest_width(column),
+        column.dest_width(LAYOUT),
         DEST_HEIGHT,
     )
 }
@@ -1151,9 +1121,10 @@ const TIP_DEST_HEIGHT: f32 = 96.0;
 /// How many rows of the list the panel's record spans, `_DAT_1004bd58` — an
 /// `fdivl`, so the double 3.0 — and how much a shortened panel gives back,
 /// which is that same 3.0 and `_DAT_1004bd50` (3.0f) again for a row opening
-/// upwards.
-const PANEL_ROWS: f32 = 3.0;
-const PANEL_INSET: f32 = 3.0;
+/// upwards. Both are [`LAYOUT`]'s, read by `FUN_100271f0` here and by
+/// `FUN_10019a40` on the save/load screen.
+const PANEL_ROWS: f32 = LAYOUT.tip.panel_rows;
+const PANEL_INSET: f32 = LAYOUT.tip.deep_trim;
 
 /// The last row whose panel can open downwards, from `FUN_100271f0`'s
 /// `7 < param_1` test.
@@ -1328,9 +1299,9 @@ fn expand(
             TIP_CUT.3 as u32,
         ),
         dst: (
-            record.dst.x as f32 + dest_x(Column::Comment, false),
+            record.dst.x as f32 + Column::Comment.dest_x(LAYOUT, false),
             record.dst.y as f32 + DEST_Y,
-            dest_width(Column::Comment),
+            Column::Comment.dest_width(LAYOUT),
             TIP_DEST_HEIGHT,
         ),
     };

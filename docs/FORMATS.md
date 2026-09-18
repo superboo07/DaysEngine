@@ -1771,21 +1771,25 @@ run* below for why one run is not enough. Within a run:
   or sits inside it. A region's box can legitimately differ from its sprite rect
   — regions that abut have their boxes clipped by the neighbour. The route map's
   episode tabs do this, hence e.g. 11/15 boxes matching a table that is correct.
-- A region no run reproduces is one laid out at runtime. Its record is taken at
-  the stride from the nearest run instead; the save/load screen's slot rows are
-  why that exists.
+- A region no run reproduces still has a record; it just does not look like its
+  own hit box. Its record is taken at the stride from the nearest run instead;
+  the save/load screen's slot rows are why that exists.
 - Below a threshold — 3 exact matches, a majority of regions, and an average of
   at least 3 regions per segment — the search reports failure rather than
   drawing sprites from a wrong offset.
 
-### Screens whose layout is not in a table
+### Screens the search cannot reach from the hit map alone
 
-`SAVELOAD` and `REPLAY_PLAYDATA` are refused by the search, correctly: their
-slot rows are laid out by a loop at runtime — ten rows at a 33px pitch — so
-those rects exist nowhere in the binary. Those two screens need their layout
-reproduced in code. Every other screen recovers: title (all three variants),
-menubar, all three options pages, both backlogs, the exit popup, the replay
-popups, `REPLAY_HSCENE` and all 15 route maps.
+`SAVELOAD` and `REPLAY_PLAYDATA` both have a record for every region, and the
+search cannot anchor most of them: a row is one sprite the width of the row
+behind two hit regions covering half of it each, and a comment panel is about
+three rows tall, so twenty of `SAVELOAD`'s thirty-two regions reproduce nothing.
+Both screens are placed by `days_ui::atlas::relocate` instead, which anchors the
+table on the records the hit map does reproduce and then reads the rest at the
+**indices the shipped code reads them at**. Each screen's section gives the
+indices. Every other screen recovers from the search alone: title (all three
+variants), menubar, all three options pages, both backlogs, the exit popup, the
+replay popups, `REPLAY_HSCENE` and all 15 route maps.
 
 ### A table is not always one run
 
@@ -4656,9 +4660,22 @@ nothing.
 screen's does.** Ten of its thirty-two regions are half of a row the sprite
 covers whole, and ten more are about three rows tall, so only twelve regions
 can ever reproduce a record. The twelve that do are consecutive, which is
-enough to anchor the table and fill the rest in at its stride —
-`days_ui::atlas` now believes a long exact run whatever proportion of the
-screen it covers.
+enough to anchor the table; every one of the thirty-two is then record `region`
+of that same run — rows 0..9, page buttons 10..19, CLOSE 20, the route map 21,
+the comment panels 22..31 — and `ui::saveload::relocate` reads them at those
+indices.
+
+Filling the rest in at the table's stride was enough on `SysMenuSDHQ.dll` and is
+not enough in general. `SysMenuSD.dll` holds a **second run whose records
+reproduce all thirty-two of this screen's hit boxes to the pixel**: the
+play-data list's, at `0x10058248`, which splits a row into the two records the
+save/load screen only splits into two hit regions. The generic search anchored
+there and drew every row 287 wide instead of 740, which put the timestamp across
+the cell divider the row's own art has and lit a third of the row on hover.
+Anchoring on the buttons, whose records the hit map does reproduce, is what
+tells the two apart: no base anywhere in that image puts the page buttons,
+CLOSE and the route map at records 10 to 21 except the real table at
+`0x10057000`.
 
 Neither mismatch is an error in the table, and `FUN_10011600` says why. Its
 hover loop runs over the ten rows and lights `+0xa8 + row * 4` when
@@ -4695,7 +4712,56 @@ One shipped bug here. The panel's y shift and the text's are written only on
 the branches a row past the eighth takes, and zeroed only on the three-line
 branch, so a shallow row with one or two lines reads **two uninitialised
 floats**. DaysEngine uses zero, which is what the branch that does initialise
-them uses and what puts the panel on its own row.
+them uses and what puts the panel on its own row. It is `SysMenuSDHQ.dll`'s
+alone: Shiny Days' `FUN_10019a40` zeroes all three shifts on entry.
+
+### The two modules lay the row out differently
+
+Everything above is `SysMenuSDHQ.dll`. `SysMenuSD.dll` draws the same screen
+through the same shape of code — `FUN_1001b240` builds the sprites,
+`FUN_10018fd0` rasterises the glyphs, `FUN_10019a40` expands the comment — with
+a different set of constants, and the difference is not a nudge. **Shiny Days
+puts the chapter first**, in a narrow cell at the left of the row, with the
+timestamp beside it squeezed harder:
+
+```text
+                       School Days HQ            Shiny Days
+surface                0x800 x 0x400, one        0x400 x 0x400, six (one per
+                                                 page-bank, for the page slide)
+timestamp cut          x 0     548 wide          x 0     548 wide
+chapter cut            x 1024  548 wide          x 600   548 wide
+comment cut            x 0     986 wide          x 0     986 wide
+timestamp drawn        record.x + 1.0    252     record.x + 95.0   189
+chapter drawn          record.x + 262.5  252     record.x + 20.0   252
+comment drawn          record.x + 2.0    494     record.x + 2.0    494
+down the record        4.5                       2.0
+English shifts         +5.0, +15.0               +5.0, +15.0
+comment centred from   235.5 - width / 4         226.5 - width / 4
+```
+
+The chapter's 252-wide slot overlaps the timestamp's and is drawn under it; only
+the two characters at its left edge are ever filled, so nothing collides. Its
+cut runs from 600 to 1148 on a surface 1024 wide, which is the shipped rectangle
+and equally harmless for the same reason.
+
+The expanded comment has a buffer of its own there, `(0x400, 0x100, 0x208888)`,
+with the pen at `(0, 2)` stepping `0x40` and the sprite cutting 986 by 64; its
+lines are drawn 29 apart and 32 tall, and a panel opening upwards gives back 3
+and moves its lines by 58 or 29. School Days HQ puts the same lines in the
+corner of the rows' own surface at `(0x400, 0x202 + n * 0x40)` and steps them 32.
+
+Every one of those numbers was read with its operand width taken from the
+instruction rather than from Ghidra's `(float)_DAT_...`. The same set places
+Shiny Days' other slot list, the replay module's play-data view, reached through
+`FUN_10027c10` and `FUN_100267c0` — see that screen's section for the three
+things it does differently.
+
+Which set a screen uses is decided by the **menu module's export table**, which
+is how an install's menu module is recognised in the first place: `SysMenuSD.dll`
+publishes `_GetBGMVolume@0` and `_GetSEVolume@0` and `SysMenuSDHQ.dll` publishes
+neither. The test is one-sided — School Days HQ's exports are a subset of Shiny
+Days', so there is nothing to test *for*, and a module that is neither is laid
+out as School Days HQ.
 
 One more departure from `FUN_10014910`: the route map's sprite is drawn behind
 one condition more than the enablement carries, `+0x94 == 0`. On the Save
