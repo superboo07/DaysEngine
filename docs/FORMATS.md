@@ -4768,6 +4768,167 @@ one condition more than the enablement carries, `+0x94 == 0`. On the Save
 screen the widget is still pointable and still does nothing, and lights
 nothing.
 
+### Shiny Days' list slides, and its base art is what clips it
+
+`SysMenuSDHQ.dll` changes the page on the spot: `FUN_10011ec0` refills its one
+surface and the new ten rows are simply there. `SysMenuSD.dll` does not. Its
+list is a strip of six page-panels stacked down the screen, and a page button
+slides the strip one page at a time.
+
+`FUN_1001a710` loads `System/SaveLoad/SaveLoadList.png` — 800x300, ten white
+row cells with `#aaa` borders — and takes the strip's whole geometry from the
+file: `+0x5d4` and `+0x5d8` are the image's own width and height **plus one**,
+and `+0x5d8` is the pitch between banks. So on the shipped art the panels are
+301 apart and each is drawn 801x301, and they tile with no seam. `FUN_1001b240`
+gives each bank a 1024x1024 `FrameBuffer` and `FUN_10018fd0` fills bank `b`
+from page `window_top + b`. The members:
+
+```text
++0x0b4  scroll, in output pixels (the display scale +0x98 already in it)
++0x5c4  the page showing
++0x5d0  a row-granular rest offset; only the drag sets it
++0x5d4  strip art width  + 1
++0x5d8  strip art height + 1  == the pitch between banks
++0x614  written 0 by every step start, read nowhere in these functions
++0x618  the distance this step has to travel
++0x61c  the counter the step runs on, 0.0 .. 1.0
++0x620  the scroll this step is heading for
++0x624  a step is running
++0x628  a run of one-page steps is in progress (a multi-page jump)
++0x630  this step came from a page button rather than a drag
++0x634  how many steps the run has     +0x638  how many are done
++0x63c  the run's direction, 1 forward
+```
+
+Panel `b` is placed at `x = -0.5`,
+`y = (b * pitch + letterbox + 122.0) * scale - 0.5 - scroll`, sized
+`scale * (801, 301)` — `_DAT_1004bd60` is an `faddl`, the double 122.0, and
+`_DAT_1004978c` / `_DAT_10049758` are the half-pixel outset. Every row sprite
+gets `pitch * scale * b - scroll` added to its own destination, all sixty of
+them, every frame.
+
+**The window bank 0 starts at** is `page - 2` held inside `0 ..= 4`. Three
+independent ladders agree on it, each written out one page at a time:
+`FUN_10018fd0`'s fill, `FUN_1001f6f0`'s re-seat and `FUN_1001f8c0`'s page test.
+The scroll's rest is `pitch * (page - window_top(page))`, and
+`FUN_1001b240` calls `FUN_1001f6f0` on the way in, so the strip is seated under
+whatever page the list was left on.
+
+**Starting a step**, `FUN_1001ed40(next, forward)`: the target is a seven-arm
+switch on the page being left, the page being entered and the direction, and it
+is **identical to `pitch * (next - window_top(page))`** for all eighteen
+transitions a page button can ask for. DaysEngine transcribes the switch and
+asserts the identity.
+
+**Each frame**, `FUN_1001e1f0`'s `+0x624` arm, in this order:
+
+```text
+counter += 0.05                 (_DAT_1004a020, faddl)
+scroll  += travel / 20.0        (_DAT_10049738, fdivl)
+if counter >= 1.0 { scroll = target; counter = 0; running = false; settle }
+```
+
+Twenty frames, linear, and the twentieth **snaps** onto the target rather than
+keeping the twentieth accumulation. The two constants are an independent check
+on each other: twenty accumulations of the double nearest float 0.05 reach
+1.0000001, so the step ends on the twentieth frame and not the twenty-first.
+
+**Settling**, `FUN_1001ef80`: decide the page from the scroll, re-seat the
+scroll, refill the banks, then start the next step if a jump is still running.
+The page decision is `FUN_1001f8c0(k)` with `k = page - window_top(page)`:
+
+```text
+if (k - 1) * pitch <  scroll {
+    if (k + 1) * pitch <= scroll { page += 1 }   // else: page unchanged
+} else { page -= 1 }
+```
+
+**The second compare is `<=`, not `<`.** Ghidra prints both as
+`a < b != (a == b)`; the instructions are `TEST AH,0x41; JP` for the `<=` at
+`0x1001f94f` against `TEST AH,0x1; JNZ` for the `<` at `0x1001f8fc`. Read as
+`<`, a step that lands exactly on `(k + 1) * pitch` — which is every step from
+a page button — never advances the page, and the screen looks like it ships a
+bug it does not. `FUN_1001ef80`'s arms for pages 0 and 9 are this function
+inlined with the unreachable half dropped, and the general form gives the same
+answer on both.
+
+The middle arm, page unchanged, leaves the direction it reports
+**uninitialised**, and nothing in the retail build reaches it: `FUN_1001f8c0`'s
+four callers are all in `FUN_1001ef80`, `FUN_1001ef80` runs only for a step
+`FUN_1001ed40` started, and every target `FUN_1001ed40` sets is `pitch * k`.
+Both caller sets were read from Ghidra's reference index and from a raw scan of
+`.text` for the call displacement, which agree.
+
+**A multi-page jump**, `FUN_1001eee0`, records the direction and
+`|target - page|` steps and runs that many one-page steps back to back, so page
+0 to page 9 really is 9 x 20 = 180 frames.
+
+#### Nothing scissors the strip — the base art does
+
+The strip runs from y 122 to y 1627 while the screen is 450 tall, so most of it
+is outside the list at any moment, and at rest on page 2 two whole panels sit
+above the list where the header is. Nothing clips them: the DLL sets only blend
+(`D3DRS_SRCBLEND`/`DESTBLEND`) and texture-stage states before each draw, and
+`DX9Sprite2D`'s draw writes four vertices and calls `DrawPrimitive`.
+
+What confines it is the screen's own base art. `FUN_1001ad60` loads `Load.png`
+or `Save.png` into a **full-screen sprite of the module's own** at `+0xd4`, and
+`FUN_10017e70` draws that sprite *after* the list:
+
+```text
++0x5e0   the strip's six panels                  FUN_1001a710
++0x80    the row under the pointer, one sprite   gated on +0x624, +0x62c
+         the six banks' rows, ten each           FUN_1001b240
++0x5e4   two black bands over the letterbox      FUN_1001abb0
++0x5ec   the base art, full screen               FUN_1001ad60
++0x80    the page indicator and the rest of the hover art
+         the expanded comment                    gated on +0x624, +0x62c
+```
+
+`Load.png` is opaque everywhere but the list: its only fully transparent pixels
+are the window x 26..773, y 122..426. So drawing it over the strip is the clip,
+and that is the second, non-decompiler check on `_DAT_1004bd60` — the constant
+the panels are stacked from, 122.0, is exactly the first transparent row of the
+player's own art, and the strip's own ink, y 3..299 of a 301 pitch, fits the
+window to the pixel at rest.
+
+The two black bands are the other half of the same idea. The base art is only
+the 800x450 layout, so in 4:3 the strip runs into the letterbox instead;
+`FUN_1001abb0` builds two `DX9Sprite2D`s coloured `0xff000000`, the width of
+the display and the height of the letterbox plus one, at `y = -0.5` and
+`y = height - letterbox - 0.5`. It builds them only when host `+0xcc`, the
+display setting, says 4:3 — the one display with a letterbox to spill into.
+DaysEngine draws them whatever it says, which is the same picture: with no
+letterbox they have no height.
+
+**The row highlight and the expanded comment are the two things the slide takes
+away**, both gated on `+0x624` and `+0x62c`. Nothing else is: `FUN_1001ca60`
+gates every widget on the confirm popup and on nothing else, so a page button
+clicked mid-slide is answered and the new step starts from wherever the strip
+has got to. Only the keyboard waits — `FUN_1001ce60` wraps its whole arrow
+block in the same two flags.
+
+School Days HQ's draw order has not been re-read for this, and there it cannot
+matter: its list shows one page and does not scroll, so it never leaves the
+window its own base art gives it and the two orders draw the same picture.
+
+#### The drag-scroll is recovered and not implemented
+
+The same members carry a second interaction. `FUN_1001e1f0`'s `+0x58` arm drags
+the strip with the pointer and its `+0x62c` arm settles the drag: clamped at 0
+and at `pitch * 5`, it divides the scroll by a tenth of a page to find the row
+it has come to rest on, keeps that row in `+0x5d0` and slides to
+`(pitch / 10) * row`. `+0x5d0` is why `FUN_1001f6f0`'s rest has a row-granular
+term and why `FUN_10018fd0` offsets the ten live rows by it. That settle has a
+page decision of its own, `FUN_1001f130`.
+
+None of it is implemented in DaysEngine: it is a different interaction from the
+page slide, and the engine always leaves `+0x5d0` at zero.
+
+`FUN_100293e0` loads the same `ReplayList.png` art for the replay module's
+play-data list. Whether that screen slides its strip too is **not recovered**;
+its grid comes out of `Replay_PlayData.png`, so the list draws right without it.
+
 ### Naming a save — a Win32 dialog, not game art
 
 The save screen does not draw the box that asks for a comment. It hands the

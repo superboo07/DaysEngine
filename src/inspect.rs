@@ -3362,6 +3362,19 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         }
     }
 
+    // The last event gets the frames that follow it too, on the same terms as
+    // every event before it: a player who clicks and then stops still watches
+    // whatever it started finish. A run that counted its own frames keeps
+    // them, so a slide stopped part-way stays stopped.
+    if menu.moving() && !stepping {
+        let mut ticks = 0;
+        while menu.moving() {
+            menu.tick(&vfs, &dll)?;
+            ticks += 1;
+        }
+        println!("  {:<12} -> {ticks} frames of the slide", "(settling)");
+    }
+
     // The save/load screen's rows carry text the composite draws itself rather
     // than cutting out of art. Print the lines, so what the screen shows is
     // checkable against the install without reading pixels.
@@ -3382,6 +3395,23 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 ),
                 None => println!("    slot {slot:>3}  (empty)"),
             }
+        }
+        // The list slides a strip of page-panels on the module that has one,
+        // and a page button starts that slide rather than changing the page.
+        // Report where the strip is, so a run stopped part-way with `tick:N`
+        // says so instead of looking like a page that did not turn.
+        if let Some(slide) = menu.list_slide() {
+            let offset = slide.offset(slide.shown());
+            println!(
+                "    strip: banks from page {}, shown page {} offset {offset:.1}{}",
+                slide.window_top() + 1,
+                slide.page() + 1,
+                if slide.moving() {
+                    ", sliding"
+                } else {
+                    " (at rest)"
+                }
+            );
         }
         match menu.rows().and_then(|rows| rows.tooltip.as_ref()) {
             Some(tip) => {

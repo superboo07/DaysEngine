@@ -707,8 +707,23 @@ pub struct Menu {
     /// picking out of its art. Absent when the install has no readable
     /// `FONTDATA`, which leaves that text undrawn and the screen usable.
     font: Option<days_font::Font>,
-    /// The save/load screen's rasterised rows for the page it is showing.
+    /// The save/load screen's rasterised rows, one bank per page the list
+    /// holds at once.
     rows: Option<saveload::Rows>,
+    /// The art the save/load list's strip of page-panels is cut from, in the
+    /// native layout space, and the slide that carries it.
+    ///
+    /// Both absent on School Days HQ, whose list has no strip, and on any
+    /// screen but the save/load one. Absent too when the art will not load,
+    /// which leaves the list drawn over whatever the base art has and the pages
+    /// changing on the spot — the rule every asset in this engine follows.
+    list_strip: Option<days_ui::Image>,
+    list_slide: Option<saveload::Slide>,
+    /// One opaque black pixel, for the two bands the save/load list paints
+    /// over the letterbox. An [`Art::Whole`] layer is scaled by the blit and
+    /// never resampled, so one pixel serves every size — see
+    /// [`crate::ui::screen::Screen::band`].
+    black: days_ui::Image,
     /// Where this module puts the three columns of a slot row, from
     /// [`saveload::Layout::of`]. The two titles' modules draw the same screen
     /// from different constants, and a row laid out with the other module's set
@@ -871,6 +886,9 @@ impl Menu {
             dress: None,
             font: load_font(vfs),
             rows: None,
+            list_strip: None,
+            list_slide: None,
+            black: days_ui::Image::black(1, 1),
             list_layout: saveload::Layout::of(dll),
             pending_save: None,
             out_scale: 1.0,
@@ -879,6 +897,7 @@ impl Menu {
         menu.load_page(vfs, dll);
         menu.load_replay_page(vfs, dll);
         menu.load_dress(vfs, dll);
+        menu.load_strip(vfs);
         menu.refresh();
         Ok(menu)
     }
@@ -900,6 +919,12 @@ impl Menu {
         if self.showing != showing {
             self.dress_phase = dress::Phase::default();
             self.dress_slide = dress::Slide::default();
+            // Arriving at the save/load screen seats the strip under whatever
+            // page the list was left on, with nothing moving: `FUN_1001b240`
+            // builds the six banks and `FUN_1001a710` places the six panels
+            // against a scroll of rest. A display-mode change keeps the slide
+            // where it is, the same as the dress screen's.
+            self.list_slide = None;
         }
         let variant = variant_for(
             &self.session,
@@ -933,8 +958,53 @@ impl Menu {
         self.load_page(vfs, dll);
         self.load_replay_page(vfs, dll);
         self.load_dress(vfs, dll);
+        self.load_strip(vfs);
         self.refresh();
         Ok(())
+    }
+
+    /// Loads the save/load list's strip art and seats the slide on it.
+    ///
+    /// `FUN_1001a710` reads `System/SaveLoad/SaveLoadList.png` and takes the
+    /// strip's whole geometry from it: `+0x5d4` and `+0x5d8` are the image's
+    /// own width and height plus one, and `+0x5d8` is the distance between
+    /// banks. So nothing here is written down — the pitch is the art's height,
+    /// measured at runtime, on the player's own file.
+    ///
+    /// The module that has no strip loads nothing, and neither does a screen
+    /// that is not the list. Art that will not read logs and leaves the list
+    /// unstripped: the pages then change on the spot, which is worse than the
+    /// original and better than no list at all.
+    fn load_strip(&mut self, vfs: &Vfs) {
+        self.list_strip = None;
+        let Some(strip) = self.list_layout.strip else {
+            self.list_slide = None;
+            return;
+        };
+        if !self.showing.is(Mode::SAVELOAD) {
+            self.list_slide = None;
+            return;
+        }
+        let art = match vfs
+            .read_path(strip.art)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| days_ui::Image::decode_png(&bytes).map_err(|e| e.to_string()))
+        {
+            Ok(art) => art,
+            Err(err) => {
+                log::warn!("no save/load list strip ({}): {err}", strip.art);
+                self.list_slide = None;
+                return;
+            }
+        };
+        if self.list_slide.is_none() {
+            self.list_slide = Some(saveload::Slide::new(
+                strip,
+                (art.width, art.height),
+                self.page,
+            ));
+        }
+        self.list_strip = Some(art);
     }
 
     /// Loads the dress-select screen's art that is not the loaded map's own.
@@ -1272,10 +1342,55 @@ enum List {
 }
 
 impl Menu {
-    /// Rasterises the save/load screen's rows for the page it is showing.
+    /// Re-lays only what moving the pointer changes.
     ///
-    /// Rebuilt on entering the screen and on turning a page, which is when the
-    /// shipped `FUN_10011ec0` runs: the surface holds one page at a time.
+    /// The expanded comment is the one thing a selection changes about the
+    /// list, and on the module whose tooltip has a buffer of its own that is
+    /// all this has to redo — which matters, because that is the module with
+    /// six 1024x1024 banks behind the slide. `FUN_10017e70` calls
+    /// `FUN_10019a40` out of the draw and leaves `FUN_10018fd0` alone, so it is
+    /// also what the shipped screen does. The other module rasterises its
+    /// tooltip into the rows' own surface and does go back through the whole
+    /// row loop, so [`saveload::Rows::rehover`] declines and this rebuilds.
+    fn refresh_rows(&mut self) {
+        let hovered = self.hovered_row();
+        let redone = match (&mut self.rows, self.showing) {
+            (Some(rows), Showing::Mode(Mode::SAVELOAD)) => {
+                let Some(font) = &self.font else { return };
+                rows.rehover(
+                    self.list_layout,
+                    font,
+                    &self.session.slots,
+                    self.page,
+                    self.session.english,
+                    &self.screen.atlas().widgets,
+                    self.session.text_input,
+                    hovered,
+                )
+            }
+            _ => false,
+        };
+        if redone {
+            self.dirty = true;
+            return;
+        }
+        self.load_rows();
+    }
+
+    /// The row whose expanded comment the pointer is opening, from the
+    /// selection's `widget - 0x16`.
+    fn hovered_row(&self) -> Option<usize> {
+        self.selection
+            .filter(|w| (0x16..0x20).contains(w))
+            .map(|w| w - 0x16)
+    }
+
+    /// Rasterises the save/load screen's rows for every page the list holds.
+    ///
+    /// Rebuilt on entering the screen and on each step of the page slide
+    /// settling, which is when the shipped `FUN_10011ec0` and `FUN_10018fd0`
+    /// run. One bank on School Days HQ, whose list shows a page at a time, and
+    /// [`saveload::Strip::banks`] on Shiny Days, whose list slides.
     pub fn load_rows(&mut self) {
         self.rows = None;
         let list = match self.showing {
@@ -1318,14 +1433,7 @@ impl Menu {
             self.dirty = true;
             return;
         }
-        // The selection is what opens the expanded comment, so this is rebuilt
-        // on every hover — which is what the shipped screen does: its
-        // `FUN_10012900` re-runs the whole row rasterising before laying the
-        // tooltip out.
-        let hovered = self
-            .selection
-            .filter(|w| (0x16..0x20).contains(w))
-            .map(|w| w - 0x16);
+        let hovered = self.hovered_row();
         self.rows = Some(saveload::Rows::render(
             self.list_layout,
             font,
@@ -1335,6 +1443,7 @@ impl Menu {
             &self.screen.atlas().widgets,
             self.session.text_input,
             hovered,
+            self.list_slide.as_ref(),
         ));
         self.dirty = true;
     }
@@ -1629,6 +1738,104 @@ impl Menu {
         self.rows.as_ref()
     }
 
+    /// The save/load list's page slide, for a tool that wants to report it.
+    pub fn list_slide(&self) -> Option<&saveload::Slide> {
+        self.list_slide.as_ref()
+    }
+
+    /// Whether the save/load list's strip is mid-travel, which is the module's
+    /// `+0x624`.
+    ///
+    /// `FUN_10017e70` tests it twice: the row under the pointer is not
+    /// highlighted and the expanded comment is not drawn while the strip moves.
+    /// Everything else on the screen is — the page buttons keep their hover art
+    /// and their clicks, which is how a click part-way through a slide redirects
+    /// it.
+    fn list_moving(&self) -> bool {
+        self.list_slide
+            .as_ref()
+            .is_some_and(saveload::Slide::moving)
+    }
+
+    /// Everything the save/load list draws, in `FUN_10017e70`'s order.
+    ///
+    /// The strip's six panels, then the row under the pointer, then every
+    /// bank's rows, then — on the module that slides — the two black bands
+    /// that mask what has run past the 800x450 layout. Each bank's quads say
+    /// where its rows sit *in the bank*, and the strip's offset goes on here,
+    /// because `FUN_1001e1f0` re-places all sixty row sprites against the live
+    /// scroll every frame.
+    ///
+    /// The list goes **under the base art** on the module that slides and over
+    /// it on the module that does not — see [`Menu::layers`]. The rows are not
+    /// widget sprites either way: their source is twice the size of their
+    /// destination, so they are averaged down rather than point-sampled.
+    fn list_layers(&self) -> Vec<Layer<'_>> {
+        let Some(rows) = &self.rows else {
+            return Vec::new();
+        };
+        let mut layers = Vec::new();
+        if let (Some(art), Some(slide)) = (&self.list_strip, &self.list_slide) {
+            for bank in 0..rows.banks.len() {
+                layers.push(self.screen.plate(art, slide.panel(bank)));
+            }
+        }
+        if let Some(record) = self
+            .row_highlight()
+            .and_then(|widget| self.screen.atlas().widgets.get(widget))
+        {
+            layers.push(self.screen.widget_layer(record));
+        }
+        for (bank, rows) in rows.banks.iter().enumerate() {
+            let dy = self
+                .list_slide
+                .as_ref()
+                .map_or(0.0, |slide| slide.offset(bank));
+            for quad in &rows.quads {
+                let (x, y, w, h) = quad.dst;
+                layers.push(
+                    self.screen
+                        .averaged(&rows.surface, quad.src, (x, y + dy, w, h)),
+                );
+            }
+        }
+        // `FUN_1001abb0` builds two `DX9Sprite2D`s coloured `0xff000000`, the
+        // width of the display and the height of the letterbox plus one, at
+        // `y = -0.5` and `y = (height - letterbox) - 0.5`, and `FUN_10017e70`
+        // draws them here — after the rows and before the base art. They are
+        // the letterbox bands painted black again, because the strip runs past
+        // the layout at both ends and the base art only covers the layout. The
+        // module builds them only when host `+0xcc`, the display setting, says
+        // 4:3, which is the only display with a letterbox to spill into; here
+        // they are drawn whatever it says, and are empty when it is zero.
+        if self.list_slide.is_some() {
+            let bar = self.screen.out_letterbox().round() as i64;
+            if bar > 0 {
+                let (width, height) = self.screen.size();
+                let size = (width, bar as u32);
+                layers.push(self.screen.band(&self.black, (0, 0), size));
+                layers.push(
+                    self.screen
+                        .band(&self.black, (0, i64::from(height) - bar), size),
+                );
+            }
+        }
+        layers
+    }
+
+    /// Which widget's sprite the row under the pointer lights, when the list
+    /// draws it itself.
+    ///
+    /// `FUN_10017e70` draws the row highlight between the strip's panels and
+    /// the rows, so on the module that slides it goes under the base art with
+    /// them rather than over it with the rest of the hover art. It is also the
+    /// one hover sprite the slide takes away: the draw is gated on `+0x624`
+    /// and `+0x62c` both being clear.
+    fn row_highlight(&self) -> Option<usize> {
+        self.list_slide.as_ref()?;
+        self.lit().filter(|widget| *widget < saveload::PER_PAGE)
+    }
+
     /// Composites at `width` x `height` from here on. See [`Screen::fit_to`].
     ///
     /// What is remembered is the *factor*, not the size: every screen carries
@@ -1804,9 +2011,21 @@ impl Menu {
             art,
             sprites: &page_sprites,
         });
+        // The save/load list, and which side of the base art it goes on.
+        // Shiny Days' `FUN_10017e70` draws the strip, the row highlight and
+        // the rows and *then* the base art, as a full-screen sprite of its own
+        // (`FUN_1001ad60`, `+0xd4`): `Load.png` is opaque everywhere but the
+        // list's own window, so the art is what confines the strip and nothing
+        // scissors it. School Days HQ's list cannot run past that window —
+        // it shows one page and does not scroll — so it keeps the order every
+        // other screen has and is drawn over the base art, and the two orders
+        // give the same picture there.
+        let list = self.list_layers();
+        let late_base = self.list_slide.is_some();
         let mut layers = self.screen.layers(&Composite {
             backdrop: self.dress_art.as_ref().or(backdrop),
             base: self.base_art(),
+            under_base: if late_base { &list } else { &[] },
             page,
             under: &under,
             states: &self.states,
@@ -1850,18 +2069,15 @@ impl Menu {
         if let Some(buffer) = &self.backlog_art {
             layers.push(backlog::layer(&self.screen, buffer));
         }
-        // The save/load rows are not widget sprites: their source is twice the
-        // size of their destination, so they are averaged down rather than
-        // point-sampled.
+        if !late_base {
+            layers.extend_from_slice(&list);
+        }
         if let Some(rows) = &self.rows {
-            for quad in &rows.quads {
-                layers.push(self.screen.averaged(&rows.surface, quad.src, quad.dst));
-            }
             // The expanded comment goes over the list, panel first. The panel
             // is cut from the chip sheet at the record's full height however
             // short it is drawn, so a one- or two-line panel is that art
             // squashed — the shipped sprite's own source rectangle.
-            if let Some(tip) = &rows.tooltip {
+            if let Some(tip) = rows.tooltip.as_ref().filter(|_| !self.list_moving()) {
                 // The panel is cut from the sheet the list's own sprites come
                 // from: the view's chip sheet on the module that draws its
                 // views from a record run, and the screen's own otherwise.
@@ -1871,7 +2087,11 @@ impl Menu {
                 };
                 let panel = &tip.panel;
                 layers.push(self.screen.averaged(chip, panel.src, panel.dst));
-                let from = rows.tip_surface.as_ref().unwrap_or(&rows.surface);
+                let shown = self.list_slide.as_ref().map_or(0, saveload::Slide::shown);
+                let Some(page) = rows.banks.get(shown) else {
+                    return layers;
+                };
+                let from = rows.tip_surface.as_ref().unwrap_or(&page.surface);
                 for line in &tip.lines {
                     layers.push(self.screen.averaged(from, line.src, line.dst));
                 }
@@ -2372,7 +2592,12 @@ impl Menu {
     fn lit(&self) -> Option<usize> {
         let selection = self.selection?;
         match self.mode() {
-            Some(Mode::SAVELOAD) => saveload::highlight(self.kind, selection),
+            Some(Mode::SAVELOAD) => saveload::highlight(self.kind, selection)
+                // `FUN_10017e70` draws the row highlight only while `+0x624`
+                // and `+0x62c` are both clear, so a row under the pointer goes
+                // dark for the length of the slide. The page buttons' own hover
+                // art is drawn either way.
+                .filter(|widget| *widget >= saveload::PER_PAGE || !self.list_moving()),
             Some(Mode::REPLAY) if self.view == replay::View::PlayData => {
                 playdata::highlight(selection)
             }
@@ -2388,8 +2613,12 @@ impl Menu {
     /// table belongs to this screen anyway; the run after it is the next
     /// screen's table, which the atlas cannot see the end of.
     fn refresh(&mut self) {
-        self.load_rows();
-        let lit = self.lit();
+        self.refresh_rows();
+        // The row the pointer is on is not in here on the module that slides
+        // its list: `FUN_10017e70` draws that one sprite under the base art
+        // with the rows, so [`Menu::list_layers`] carries it instead.
+        let highlight = self.row_highlight();
+        let lit = self.lit().filter(|widget| Some(*widget) != highlight);
         let states: Vec<WidgetState> = (0..self.states.len())
             .map(|i| match self.extra_for(i) {
                 Some(extra) => WidgetState::Extra(extra),
@@ -2820,6 +3049,16 @@ impl Menu {
     /// original does — see [`dress::SLIDE_FRAMES`] for why a tick is one
     /// presented frame.
     pub fn tick(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<(), Error> {
+        if self.showing.is(Mode::SAVELOAD) {
+            self.dirty |= self.list_moving();
+            // `FUN_1001ef80` re-seats the scroll and calls `FUN_10018fd0` on
+            // every settle, whether or not the page it decided on is a new one.
+            if let Some(page) = self.list_slide.as_mut().and_then(saveload::Slide::tick) {
+                self.page = page;
+                self.refresh();
+            }
+            return Ok(());
+        }
         if !self.showing.is(Mode::DRESS_SELECT) {
             return Ok(());
         }
@@ -2847,7 +3086,8 @@ impl Menu {
     /// then pumps [`Menu::tick`] until this is false, where the player's
     /// machine would have drawn thirty frames.
     pub fn moving(&self) -> bool {
-        self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving()
+        (self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving())
+            || (self.showing.is(Mode::SAVELOAD) && self.list_moving())
     }
 
     /// The screen the two dresses' records and sheet come from.
@@ -2922,11 +3162,23 @@ impl Menu {
                 })
             }
             saveload::Act::Page(page) => {
-                if page == self.page {
-                    return Ok(Action::Stay);
+                // On the list that slides, the page button does not set the
+                // page: `FUN_1001cb00` starts a step or a run of them and
+                // `FUN_1001ef80` moves `+0x5c4` as each one settles. Nothing
+                // else in the module writes it.
+                match &mut self.list_slide {
+                    Some(slide) => {
+                        slide.go(page);
+                        self.dirty |= slide.moving();
+                    }
+                    None => {
+                        if page == self.page {
+                            return Ok(Action::Stay);
+                        }
+                        self.page = page;
+                        self.refresh();
+                    }
                 }
-                self.page = page;
-                self.refresh();
                 Ok(Action::Stay)
             }
             saveload::Act::Leave => self.leave(vfs, dll),

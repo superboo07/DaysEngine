@@ -28,6 +28,72 @@
 //! screen does not grey out an empty slot, it just does nothing when the row
 //! it names has no file.
 //!
+//! # The list slides — on one of the two modules
+//!
+//! `SysMenuSDHQ.dll` changes the page on the spot: `FUN_10011ec0` refills its
+//! one surface and the new ten rows are simply there. `SysMenuSD.dll` does not.
+//! Its list is a strip of six page-panels stacked down the screen, and a page
+//! button **slides** the strip a page at a time — twenty frames of linear
+//! travel each, so page 0 to page 9 really is nine of them, 180 frames.
+//! [`Strip`] is the strip and [`Slide`] is everything that moves it, with the
+//! provenance for each rule in its own doc comment.
+//!
+//! The strip runs from y 122 to y 1627 while the screen is 450 tall, so most of
+//! it is outside the list at any moment, and **nothing scissors it**: not the
+//! DLL, which sets only blend and texture-stage states before each draw, and
+//! not `DX9Sprite2D`, whose draw writes four vertices and calls
+//! `DrawPrimitive`. What confines it is the screen's own base art.
+//! `FUN_1001ad60` loads `Load.png` or `Save.png` into a full-screen sprite of
+//! the module's own at `+0xd4`, and `FUN_10017e70` draws that sprite **after**
+//! the list:
+//!
+//! ```text
+//! +0x5e0   the strip's six panels                  FUN_1001a710
+//! +0x80    the row under the pointer, one sprite   gated on +0x624, +0x62c
+//!          the six banks' rows, ten each           FUN_1001b240
+//! +0x5e4   two black bands over the letterbox      FUN_1001abb0
+//! +0x5ec   the base art, full screen               FUN_1001ad60
+//! +0x80    the page indicator and the rest of the hover art
+//!          the expanded comment                    gated on +0x624, +0x62c
+//! ```
+//!
+//! `Load.png` is opaque everywhere but the list — its only fully transparent
+//! pixels are the window x 26..773, y 122..426 — so drawing it over the strip
+//! is the clip. That is the second, non-decompiler check on `_DAT_1004bd60`:
+//! the constant the panels are stacked from, 122.0, is exactly the first
+//! transparent row of the player's own art, and the strip's own ink (y 3..299
+//! of a 301 pitch) fits the window to the pixel at rest.
+//!
+//! The two black bands are the other half of the same idea. The base art is
+//! only the 800x450 layout, so in 4:3 the strip runs into the letterbox
+//! instead; `FUN_1001abb0` builds two `DX9Sprite2D`s coloured `0xff000000`,
+//! the width of the display and the height of the letterbox plus one, at
+//! `y = -0.5` and `y = height - letterbox - 0.5`, and the draw puts them
+//! between the rows and the base art. It builds them only when host `+0xcc`,
+//! the display setting, says 4:3 — the one display with a letterbox to spill
+//! into.
+//!
+//! **The row highlight and the expanded comment are the two things the slide
+//! takes away.** Both draws are gated on `+0x624` and `+0x62c` being clear.
+//! Nothing else is: `FUN_1001ca60` gates every widget on the confirm popup and
+//! on nothing else, so a page button clicked mid-slide is answered and the new
+//! step starts from wherever the strip has got to. Only the keyboard waits —
+//! `FUN_1001ce60` wraps its whole arrow block in the same two flags.
+//!
+//! ## The drag-scroll is recovered and not implemented
+//!
+//! The same members carry a second interaction. `FUN_1001e1f0`'s `+0x58` arm
+//! drags the strip with the pointer and its `+0x62c` arm settles the drag:
+//! clamped at 0 and at `pitch * 5`, it divides the scroll by a tenth of a page
+//! to find the **row** it has come to rest on, keeps that row in `+0x5d0` and
+//! slides to `(pitch / 10) * row`. `+0x5d0` is why [`Strip::rest`] has a
+//! row-granular term and why `FUN_10018fd0` offsets the ten live rows by it.
+//! That settle has a page decision of its own, `FUN_1001f130`, which is not
+//! `FUN_1001f8c0` — see [`Settled::Same`].
+//!
+//! None of it is implemented here: it is a different interaction from the page
+//! slide, and this engine always leaves `+0x5d0` at zero.
+//!
 //! # The display line
 //!
 //! A slot's file says nothing about itself. The line the screen shows lives in
@@ -449,6 +515,411 @@ pub struct Layout {
     pub centre_from: f32,
     /// The expanded comment.
     pub tip: Tip,
+    /// The strip the list scrolls on, or `None` for a list that is one page at
+    /// a time and changes page instantly.
+    pub strip: Option<Strip>,
+}
+
+/// The strip of page-panels Shiny Days' list scrolls through, from
+/// `FUN_1001a710`, `FUN_1001ed40` and `FUN_1001e1f0`.
+///
+/// The list is not redrawn when the page changes: the module keeps [`banks`]
+/// pages' worth of rows stacked down a strip and **slides** the strip, one page
+/// at a time. `FUN_1001a710` gives each bank a sprite of the same art, stacked
+/// [`Strip::pitch`] apart, and `FUN_1001e1f0` re-places all six of them and all
+/// sixty rows every frame against one scroll offset. [`Slide`] is that offset
+/// and everything that moves it.
+///
+/// [`banks`]: Strip::banks
+#[derive(Debug, Clone, Copy)]
+pub struct Strip {
+    /// The art behind one page of rows, loaded by `FUN_1001a710` and drawn once
+    /// per bank. The engine reads its size at runtime rather than carrying
+    /// numbers, because the module does: `+0x5d4` and `+0x5d8` are the image's
+    /// own width and height plus one.
+    pub art: &'static str,
+    /// How many pages of rows the strip holds at once, from the six
+    /// `FrameBuffer`s `FUN_1001b240` builds and the `local_28 < 6` loops that
+    /// fill, place and draw them.
+    pub banks: usize,
+    /// How many pages the window keeps above the page being shown, once it has
+    /// any to keep.
+    ///
+    /// The module's own ladder, not a formula: `FUN_10018fd0` fills bank 0 from
+    /// page `0` for pages 0 and 1, from `page - 2` for pages 2 to 6, and from
+    /// `page - 3`, `- 4`, `- 5` for pages 7, 8 and 9 — which is `page - 2`
+    /// clamped to `0 ..= PAGES - banks`. See [`Strip::window_top`].
+    pub lead: usize,
+    /// Where the first panel's top edge sits down the screen, `_DAT_1004bd60` —
+    /// an `faddl`, so the double 122.0.
+    pub top: f32,
+    /// How much of a step's travel one frame covers, `_DAT_10049738` — an
+    /// `fdivl`, so the double 20.0.
+    pub frames: f32,
+    /// What the step's own counter climbs by each frame, `_DAT_1004a020` — an
+    /// `faddl`, so the double nearest the float 0.05.
+    ///
+    /// The counter is what *ends* the step, at `_DAT_100497b0` (1.0), and
+    /// [`Strip::frames`] is what moves it; the two agree on twenty, which is
+    /// the cross-check. Both are kept because both are shipped: twenty
+    /// accumulations of this constant reach 1.0000001, so the step ends on the
+    /// twentieth frame and not the twenty-first.
+    pub step: f32,
+}
+
+impl Strip {
+    /// How far apart the panels are stacked: the art's own height plus one, the
+    /// same `+ 1.0` `FUN_1001a710` adds to both of the image's dimensions.
+    pub fn pitch(height: u32) -> f32 {
+        height as f32 + 1.0
+    }
+
+    /// Which page bank 0 holds while `page` is the one being shown.
+    ///
+    /// Three independent ladders agree on this, which is what confirms it:
+    /// `FUN_10018fd0` fills bank `b` from page `window_top + b`,
+    /// `FUN_1001f6f0` re-seats the scroll at `pitch * (page - window_top)`, and
+    /// `FUN_1001f8c0` decides the new page from the scroll measured against the
+    /// same difference. See [`Strip::lead`] for the arms themselves.
+    pub fn window_top(&self, page: usize) -> usize {
+        window_top(page, self.lead, self.banks, PAGES)
+    }
+
+    /// Where the scroll comes to rest with `page` showing, from `FUN_1001f6f0`.
+    ///
+    /// The shipped function adds a row-granular term, `(pitch / 10) * +0x5d0`,
+    /// which only the drag-scroll ever makes non-zero — see the module docs for
+    /// why that interaction is not implemented here. Page 9's arm leaves the
+    /// term out altogether.
+    pub fn rest(&self, page: usize, pitch: f32) -> f32 {
+        pitch * (page - self.window_top(page)) as f32
+    }
+
+    /// Where a step to `next` is heading, from `FUN_1001ed40`.
+    ///
+    /// The shipped code is a seven-arm switch on the page being left, the page
+    /// being entered and which way the step runs, and it is transcribed here
+    /// arm for arm rather than reduced. It is **identical** to
+    /// `pitch * (next - window_top(page))` for all eighteen reachable
+    /// transitions, which `the_step_switch_is_the_window` asserts — two ways of
+    /// arriving at the same number, which is the standard a recovered rule is
+    /// held to here.
+    pub fn target(&self, page: usize, next: usize, forward: bool, pitch: f32) -> f32 {
+        let banks = |k: usize| pitch * k as f32;
+        if (next == 2 && forward) || (next == 6 && !forward) {
+            banks(2)
+        } else if next == 0 && !forward {
+            0.0
+        } else if next == 9 && forward {
+            banks(5)
+        } else if next == 8 {
+            banks(4)
+        } else if next == 7 && !forward {
+            banks(3)
+        } else if (next == 1 && forward) || page == next + 1 {
+            banks(1)
+        } else {
+            banks(3)
+        }
+    }
+
+    /// Which page the scroll now shows, from `FUN_1001f8c0`.
+    ///
+    /// Measured against `k = page - window_top(page)`, the bank the shown page
+    /// occupies:
+    ///
+    /// ```text
+    /// if (k - 1) * pitch <  scroll {
+    ///     if (k + 1) * pitch <= scroll { the next page } else { neither }
+    /// } else { the previous page }
+    /// ```
+    ///
+    /// **The second compare is `<=`, not `<`.** Ghidra prints both as
+    /// `a < b != (a == b)`; the instructions are `FCOMPP; FNSTSW AX` followed
+    /// by `TEST AH,0x41; JP` for the `<=` at `0x1001f94f` and `TEST AH,0x1;
+    /// JNZ` for the `<` at `0x1001f8fc`. Read as `<`, a step that lands exactly
+    /// on `(k + 1) * pitch` — which is every step from a page button — never
+    /// advances the page, and the screen looks like it ships a bug it does not.
+    ///
+    /// `FUN_1001ef80`'s arms for pages 0 and 9 are this function inlined with
+    /// the half that cannot be reached from there dropped, and the general form
+    /// gives the same answer on both, which is the second check on it.
+    pub fn settled(&self, page: usize, scroll: f32, pitch: f32) -> Settled {
+        let k = (page - self.window_top(page)) as f32;
+        if (k - 1.0) * pitch < scroll {
+            if (k + 1.0) * pitch <= scroll {
+                Settled::Next
+            } else {
+                Settled::Same
+            }
+        } else {
+            Settled::Previous
+        }
+    }
+}
+
+/// Which page a strip of `panels` over `pages` starts at, keeping `lead` pages
+/// above the page showing wherever there is room for them.
+///
+/// Both of this module's slot lists window their strip the same way, from two
+/// different functions, and each is written out one page at a time rather than
+/// as arithmetic: `FUN_10018fd0` for the save/load screen's and
+/// `FUN_100267c0` for the replay play-data list's — see
+/// [`Strip::window_top`] and [`crate::ui::replay_pages::window_top`] for the
+/// two ladders. This is the half they share.
+pub fn window_top(page: usize, lead: usize, panels: usize, pages: usize) -> usize {
+    page.saturating_sub(lead).min(pages - panels)
+}
+
+/// Which page a settling step has brought the strip to. See [`Strip::settled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// The next page down the list.
+    Next,
+    /// The previous one.
+    Previous,
+    /// Neither: the scroll stopped inside the page that was already showing.
+    ///
+    /// `FUN_1001f8c0` leaves the direction it reports **uninitialised** on this
+    /// arm, and nothing in the retail build reaches it. `FUN_1001f8c0` has
+    /// four callers and they are all in `FUN_1001ef80`; `FUN_1001ef80` runs
+    /// only for a step `FUN_1001ed40` started, because `+0x630` and `+0x628`
+    /// are written nowhere else; and every target `FUN_1001ed40` sets is
+    /// `pitch * k`, so the scroll `FUN_1001ef80` measures is always exactly on
+    /// a page. The drag-release settle, which is the one thing that can leave
+    /// the scroll inside a page, has its own page decision in `FUN_1001f130`
+    /// and never calls this. Both caller sets were taken from Ghidra's
+    /// reference index and from a raw scan of `.text` for the call
+    /// displacement, which agree.
+    ///
+    /// So there is no direction to carry a multi-page jump on, and
+    /// [`Slide::tick`] stops the jump and says so rather than choosing one.
+    Same,
+}
+
+/// The slide the list makes when the page changes, from `FUN_1001e1f0`.
+///
+/// Every field is one of the module's own members and the arithmetic is the
+/// shipped arithmetic. A step covers a page of travel in
+/// [`Strip::frames`] frames, linearly, and then **snaps** onto its target
+/// rather than keeping the twentieth accumulation — the same shape as
+/// [`crate::ui::dress::Slide`]. A jump across more than one page is a run of
+/// one-page steps back to back, so page 0 to page 9 really is nine of them.
+///
+/// # Output pixels against layout pixels
+///
+/// The module keeps the scroll at `+0xb4` in **output** pixels: every target it
+/// is compared with is `pitch * k * +0x98`, the display scale already in it.
+/// This engine keeps the same quantity in the 800x450 layout space the rest of
+/// the screen is written in, which is the shipped value divided by that scale
+/// and so the same picture — a step's travel divides by twenty either way.
+/// Keeping it in layout space is also what lets the window be resized
+/// mid-slide, where the shipped members would leave the strip a scale out.
+#[derive(Debug, Clone)]
+pub struct Slide {
+    strip: Strip,
+    /// The art's own size, for the panels' `+ 1`.
+    art: (u32, u32),
+    /// `+0x5d8`: the distance between banks, the art's height plus one.
+    pitch: f32,
+    /// `+0x5c4`: the page showing. Nothing outside a settling step writes it —
+    /// a page button starts a slide and the page follows.
+    page: usize,
+    /// `+0xb4`: how far down the strip has been pulled.
+    scroll: f32,
+    /// `+0x620`: the scroll this step is heading for.
+    target: f32,
+    /// `+0x618`: the distance it has to cover.
+    travel: f32,
+    /// `+0x61c`: the counter the step runs on, climbing to 1.0.
+    counter: f32,
+    /// `+0x624`: a step is running.
+    running: bool,
+    /// `+0x628`, `+0x634`, `+0x638` and `+0x63c` together.
+    run: Option<Run>,
+}
+
+/// A jump across more than one page, from `FUN_1001eee0`.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    /// `+0x634`: how many one-page steps the jump is.
+    steps: usize,
+    /// `+0x638`: how many have settled.
+    done: usize,
+    /// `+0x63c`: which way they run, 1 forward.
+    forward: bool,
+}
+
+impl Slide {
+    /// Seats the strip under `page`, the way `FUN_1001b240` leaves it: the
+    /// banks filled from [`Strip::window_top`] and the scroll at
+    /// [`Strip::rest`].
+    pub fn new(strip: Strip, art: (u32, u32), page: usize) -> Slide {
+        let pitch = Strip::pitch(art.1);
+        Slide {
+            strip,
+            art,
+            pitch,
+            page,
+            scroll: strip.rest(page, pitch),
+            target: 0.0,
+            travel: 0.0,
+            counter: 0.0,
+            running: false,
+            run: None,
+        }
+    }
+
+    /// The page showing, which is the page the ten live rows belong to.
+    pub fn page(&self) -> usize {
+        self.page
+    }
+
+    /// Which page bank 0 holds.
+    pub fn window_top(&self) -> usize {
+        self.strip.window_top(self.page)
+    }
+
+    /// The pages the banks hold, in bank order: `FUN_10018fd0`'s own loop.
+    pub fn window(&self) -> std::ops::Range<usize> {
+        let top = self.window_top();
+        top..top + self.strip.banks
+    }
+
+    /// Which bank the page showing occupies, and so which one's rows the ten
+    /// live records and the expanded comment belong to.
+    pub fn shown(&self) -> usize {
+        self.page - self.window_top()
+    }
+
+    /// Whether the next tick moves the strip.
+    pub fn moving(&self) -> bool {
+        self.running
+    }
+
+    /// How far down one bank's rows are drawn from where their records put
+    /// them, in layout pixels.
+    ///
+    /// `FUN_1001e1f0` adds `pitch * bank - scroll` to every one of the sixty
+    /// row sprites' destinations every frame, which is why a row's quad carries
+    /// where it sits **in its bank** and this is added at compose time.
+    pub fn offset(&self, bank: usize) -> f32 {
+        self.pitch * bank as f32 - self.scroll
+    }
+
+    /// Where one bank's panel of the strip art lands, in layout space, as
+    /// `(x, y, width, height)`.
+    ///
+    /// `FUN_1001a710` and `FUN_1001e1f0` place it at `x = -0.5`,
+    /// `y = (bank * pitch + letterbox + top) * scale - 0.5 - scroll`, sized
+    /// `scale * (width + 1, height + 1)` — so the panels are `pitch` apart and
+    /// `pitch` tall and tile with no seam, the art stretched by the one pixel.
+    /// The half-pixel outset is the same one every sprite in this module has;
+    /// the module takes it off after the display scale and this engine takes it
+    /// off before, as it does everywhere else, which is less than an output
+    /// pixel on a flat white panel.
+    pub fn panel(&self, bank: usize) -> (f32, f32, f32, f32) {
+        (
+            -0.5,
+            self.strip.top + self.offset(bank) - 0.5,
+            self.art.0 as f32 + 1.0,
+            self.art.1 as f32 + 1.0,
+        )
+    }
+
+    /// Asks for a page, the way `FUN_1001cb00`'s page-button arm does.
+    ///
+    /// The page next to the one showing is one step; anything further is a run
+    /// of them. The page already showing is nothing at all — and a click
+    /// arriving mid-slide is **not** refused: `FUN_1001ca60` gates the widgets
+    /// on the confirm popup and on nothing else, so the new step simply starts
+    /// from wherever the strip has got to. Only the keyboard is inert while the
+    /// strip moves; `FUN_1001ce60` wraps its whole arrow block in
+    /// `+0x624 == 0 && +0x62c == 0`.
+    pub fn go(&mut self, to: usize) {
+        if to == self.page {
+            return;
+        }
+        if to + 1 == self.page || to == self.page + 1 {
+            self.step(to, to == self.page + 1);
+            return;
+        }
+        // `FUN_1001eee0`: record the direction and the distance, then run that
+        // many one-page steps.
+        let forward = to > self.page;
+        self.run = Some(Run {
+            steps: to.abs_diff(self.page),
+            done: 0,
+            forward,
+        });
+        let next = if forward {
+            self.page + 1
+        } else {
+            self.page - 1
+        };
+        self.step(next, forward);
+    }
+
+    /// Starts one step, from `FUN_1001ed40`.
+    fn step(&mut self, next: usize, forward: bool) {
+        self.target = self.strip.target(self.page, next, forward, self.pitch);
+        self.travel = self.target - self.scroll;
+        self.counter = 0.0;
+        self.running = true;
+    }
+
+    /// One host tick of the slide, from `FUN_1001e1f0`'s `+0x624` arm.
+    ///
+    /// Answers the page the banks should now be filled from, on the tick a step
+    /// settles. `FUN_1001ef80` calls `FUN_10018fd0` whether or not the page
+    /// changed, so this answers on every settle.
+    pub fn tick(&mut self) -> Option<usize> {
+        if !self.running {
+            return None;
+        }
+        self.counter += self.strip.step;
+        self.scroll += self.travel / self.strip.frames;
+        if self.counter < 1.0 {
+            return None;
+        }
+        self.scroll = self.target;
+        self.counter = 0.0;
+        self.running = false;
+
+        // The run's bookkeeping happens before the settle, so that the settle
+        // sees whether there is another step to start.
+        if let Some(run) = &mut self.run {
+            run.done += 1;
+            if run.done == run.steps {
+                self.run = None;
+            }
+        }
+        // `FUN_1001ef80`: which page the scroll shows, then re-seat it, then
+        // the banks, then the next step of the run.
+        match self.strip.settled(self.page, self.scroll, self.pitch) {
+            Settled::Next => self.page += 1,
+            Settled::Previous => self.page -= 1,
+            Settled::Same => {
+                if self.run.take().is_some() {
+                    log::warn!(
+                        "the save/load list settled inside page {} with a jump still running, \
+                         which the shipped code has no direction for",
+                        self.page
+                    );
+                }
+            }
+        }
+        self.scroll = self.strip.rest(self.page, self.pitch);
+        if let Some(run) = self.run {
+            let next = if run.forward {
+                self.page + 1
+            } else {
+                self.page - 1
+            };
+            self.step(next, run.forward);
+        }
+        Some(self.page)
+    }
 }
 
 /// One column's place on the surface and on the screen.
@@ -542,6 +1013,9 @@ impl Layout {
             deep_step: 0.0,
             deep_text: [64.0, 32.0],
         },
+        // `FUN_100135c0` builds one surface and `FUN_10011ec0` refills it when
+        // the page changes. Nothing on this screen scrolls.
+        strip: None,
     };
 
     /// Shiny Days', from `SysMenuSD.dll`.
@@ -613,6 +1087,14 @@ impl Layout {
             deep_step: 3.0,
             deep_text: [58.0, 29.0],
         },
+        strip: Some(Strip {
+            art: "System/SaveLoad/SaveLoadList.png",
+            banks: 6,
+            lead: 2,
+            top: 122.0,
+            frames: 20.0,
+            step: 0.05,
+        }),
     };
 
     /// Which module's save/load screen this is.
@@ -740,7 +1222,7 @@ const SURFACE_COMMENT_Y: f32 = 514.0;
 /// font's own cell and comes down to size in the blit.
 pub const DEST_HEIGHT: f32 = 24.0;
 
-/// The rectangle of [`SURFACE`] this column of this row occupies, as
+/// The rectangle of [`Layout::surface`] this column of this row occupies, as
 /// `(x, y, width, height)`.
 ///
 /// From `FUN_100135c0`'s `DX9Sprite2D` slot `+0x1c` calls, whose two `/ width`
@@ -867,11 +1349,11 @@ pub fn wrap_comment(text: &str, english: bool) -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct Tooltip {
     /// The panel behind the lines. Its `src` is in the screen's `_CHIP` sheet,
-    /// not in [`Rows::surface`], and it is the record's **full** height however
+    /// not in [`Bank::surface`], and it is the record's **full** height however
     /// short the panel is drawn — so a one-line panel is the same art squashed,
     /// which is what the shipped sprite does.
     pub panel: Quad,
-    /// The lines, cut from [`Rows::surface`].
+    /// The lines, cut from [`Bank::surface`].
     pub lines: Vec<Quad>,
 }
 
@@ -984,19 +1466,34 @@ impl Tooltip {
     }
 }
 
-/// The ten rows of a page, rasterised into one surface with the rectangles that
-/// put each column on the screen.
+/// One page of rows, rasterised into a surface of its own with the rectangles
+/// that put each column on the screen.
 ///
 /// This is `FUN_10011ec0` and the sprite set-up in `FUN_100135c0` together —
 /// `FUN_10018fd0` and `FUN_1001b240` on the other module: one
 /// [`Layout::surface`]-sized buffer holding up to thirty columns of text, and a
 /// quad per column cutting it out and placing it.
-pub struct Rows {
+pub struct Bank {
     /// The glyph surface, RGB carrying the font's luminance plane and alpha its
     /// outline plane — the same two planes the shipped blitter writes.
     pub surface: days_ui::Image,
-    /// One per drawn column, in row order.
+    /// One per drawn column, in row order. The destination is where the column
+    /// sits **in this bank**; a scrolling list adds [`Slide::offset`] to it.
     pub quads: Vec<Quad>,
+}
+
+/// What the save/load list draws: one [`Bank`] per page it holds at once, and
+/// the expanded comment over them.
+///
+/// School Days HQ holds one — `FUN_100135c0` builds a single surface and
+/// `FUN_10011ec0` refills it when the page changes. Shiny Days holds
+/// [`Strip::banks`] of them, because the page change is a slide and six pages
+/// of rows are on screen while it runs; `FUN_1001b240` builds six
+/// `FrameBuffer`s and `FUN_10018fd0` fills bank `b` from page
+/// `window_top + b`.
+pub struct Rows {
+    /// In bank order, so bank 0 is the top of the strip.
+    pub banks: Vec<Bank>,
     /// The expanded comment, when the pointer is in the second band and the
     /// row it names has one.
     pub tooltip: Option<Tooltip>,
@@ -1005,24 +1502,32 @@ pub struct Rows {
     ///
     /// School Days HQ does not: `FUN_10012900` rasterises the tooltip into the
     /// same buffer as the rows, clear of all three columns, so this is `None`
-    /// and the lines come out of [`Rows::surface`]. Shiny Days keeps a buffer
-    /// of its own for it on both of its slot lists — `FUN_10019a40` here and
-    /// `FUN_100271f0` in [`crate::ui::replay_pages`] — which is
-    /// [`Tip::surface`].
+    /// and the lines come out of the shown page's [`Bank::surface`]. Shiny Days
+    /// keeps a buffer of its own for it on both of its slot lists —
+    /// `FUN_10019a40` here and `FUN_100271f0` in
+    /// [`crate::ui::replay_pages`] — which is [`Tip::surface`].
     pub tip_surface: Option<days_ui::Image>,
 }
 
 /// One column's sprite: what it cuts out of the surface and where it lands.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quad {
-    /// The rectangle of [`Rows::surface`] this column occupies, in pixels.
+    /// The rectangle of [`Bank::surface`] this column occupies, in pixels.
     pub src: (u32, u32, u32, u32),
     /// Where it is drawn, in the 800x450 layout space the widget records use.
     pub dst: (f32, f32, f32, f32),
 }
 
 impl Rows {
-    /// Rasterises a page's rows.
+    /// Rasterises every page the list holds at once.
+    ///
+    /// One bank for a screen that shows a page at a time, and
+    /// [`Strip::banks`] of them for one that slides — bank `b` filled from page
+    /// `window_top(page) + b`, which is `FUN_10018fd0`'s own loop. `slide` is
+    /// what says which, so a list whose strip art would not load is rasterised
+    /// as the single page it can draw rather than as a window nothing places.
+    /// `page` is the page showing either way, and it is the page the tooltip
+    /// reads.
     ///
     /// A row whose slot has no file is skipped entirely, which is what the
     /// shipped loop does: it only draws when the host's slot query answers 1.
@@ -1040,7 +1545,95 @@ impl Rows {
         records: &[days_ui::atlas::Widget],
         comments: bool,
         hovered: Option<usize>,
+        slide: Option<&Slide>,
     ) -> Rows {
+        let window = match slide {
+            Some(slide) => slide.window(),
+            None => page..page + 1,
+        };
+        let shown = page - window.start;
+        let mut banks: Vec<Bank> = window
+            .map(|page| Rows::bank(layout, font, slots, page, english, records, comments))
+            .collect();
+
+        // Shiny Days rasterises the expanded comment into a buffer of its own;
+        // School Days HQ puts it in the corner of the rows', clear of all three
+        // columns. `tip` is whichever the module says, and the tooltip's quads
+        // cut whichever they were drawn into.
+        let mut tip = layout
+            .tip
+            .surface
+            .map(|(width, height)| days_ui::Image::empty(width, height));
+        let tooltip = Rows::expand_into(
+            tip.as_mut(),
+            banks.get_mut(shown),
+            layout,
+            font,
+            slots,
+            page,
+            english,
+            records,
+            comments,
+            hovered,
+        );
+        Rows {
+            banks,
+            tooltip,
+            tip_surface: tip,
+        }
+    }
+
+    /// Re-lays the expanded comment without rasterising the rows again.
+    ///
+    /// Only the screen whose tooltip has a buffer of its own can do this, and
+    /// that is the point of it: Shiny Days keeps six 1024x1024 banks, and
+    /// pointing at a row must not cost six of those. `FUN_10017e70` calls
+    /// `FUN_10019a40` from the draw and leaves `FUN_10018fd0` alone, so this is
+    /// also what the shipped screen does. School Days HQ's `FUN_10012900`
+    /// rasterises into the rows' own surface and its screen does go back
+    /// through the whole row loop on every hover, so this answers `false` there
+    /// and the caller rebuilds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehover(
+        &mut self,
+        layout: &Layout,
+        font: &days_font::Font,
+        slots: &Slots,
+        page: usize,
+        english: bool,
+        records: &[days_ui::atlas::Widget],
+        comments: bool,
+        hovered: Option<usize>,
+    ) -> bool {
+        let Some(tip) = &mut self.tip_surface else {
+            return false;
+        };
+        tip.rgba.fill(0);
+        self.tooltip = Rows::expand_into(
+            Some(tip),
+            None,
+            layout,
+            font,
+            slots,
+            page,
+            english,
+            records,
+            comments,
+            hovered,
+        );
+        true
+    }
+
+    /// Rasterises one page of rows into a surface of its own.
+    fn bank(
+        layout: &Layout,
+        font: &days_font::Font,
+        slots: &Slots,
+        page: usize,
+        english: bool,
+        records: &[days_ui::atlas::Widget],
+        comments: bool,
+    ) -> Bank {
         let (width, height) = layout.surface;
         let mut surface = days_ui::Image::empty(width, height);
         let mut quads = Vec::new();
@@ -1086,33 +1679,32 @@ impl Rows {
                 });
             }
         }
+        Bank { surface, quads }
+    }
 
-        // Shiny Days rasterises the expanded comment into a buffer of its own;
-        // School Days HQ puts it in the corner of this one, clear of all three
-        // columns. `tip` is whichever the module says, and the tooltip's quads
-        // cut whichever they were drawn into.
-        let mut tip = layout
-            .tip
-            .surface
-            .map(|(width, height)| days_ui::Image::empty(width, height));
-        let tooltip = hovered.filter(|_| comments).and_then(|row| {
-            Rows::expand(
-                layout,
-                tip.as_mut().unwrap_or(&mut surface),
-                font,
-                slots,
-                page,
-                row,
-                english,
-                records,
-            )
-        });
-        Rows {
-            surface,
-            quads,
-            tooltip,
-            tip_surface: tip,
-        }
+    /// Lays the expanded comment out into whichever surface holds it.
+    ///
+    /// `tip` is the screen's own tooltip buffer and `shown` the bank of the
+    /// page being pointed at; exactly one of them is where the lines go.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_into(
+        tip: Option<&mut days_ui::Image>,
+        shown: Option<&mut Bank>,
+        layout: &Layout,
+        font: &days_font::Font,
+        slots: &Slots,
+        page: usize,
+        english: bool,
+        records: &[days_ui::atlas::Widget],
+        comments: bool,
+        hovered: Option<usize>,
+    ) -> Option<Tooltip> {
+        let row = hovered.filter(|_| comments)?;
+        let surface = match tip {
+            Some(tip) => tip,
+            None => &mut shown?.surface,
+        };
+        Rows::expand(layout, surface, font, slots, page, row, english, records)
     }
 
     /// Rasterises the expanded comment and lays it out, from `FUN_10012900`.
@@ -1695,19 +2287,37 @@ mod tests {
     #[test]
     fn the_tooltip_opens_only_on_a_hovered_row() {
         let slots = filled(3);
-        let open = Rows::render(HQ, &font(), &slots, 0, false, &records(), true, Some(3));
+        let open = Rows::render(
+            HQ,
+            &font(),
+            &slots,
+            0,
+            false,
+            &records(),
+            true,
+            Some(3),
+            None,
+        );
         assert!(open.tooltip.is_some());
         assert!(
-            Rows::render(HQ, &font(), &slots, 0, false, &records(), true, None)
+            Rows::render(HQ, &font(), &slots, 0, false, &records(), true, None, None)
                 .tooltip
                 .is_none()
         );
         // A row with no file has nothing to expand.
-        assert!(
-            Rows::render(HQ, &font(), &slots, 0, false, &records(), true, Some(4))
-                .tooltip
-                .is_none()
-        );
+        assert!(Rows::render(
+            HQ,
+            &font(),
+            &slots,
+            0,
+            false,
+            &records(),
+            true,
+            Some(4),
+            None
+        )
+        .tooltip
+        .is_none());
     }
 
     /// `[TextInput]` off takes the comment column and the tooltip together,
@@ -1723,9 +2333,10 @@ mod tests {
             &records(),
             false,
             Some(3),
+            None,
         );
         assert!(rows.tooltip.is_none());
-        assert_eq!(rows.quads.len(), 2);
+        assert_eq!(only(&rows).quads.len(), 2);
     }
 
     fn rect(x: u32, y: u32) -> days_ui::cmap::Rect {
@@ -2006,19 +2617,35 @@ mod tests {
     #[test]
     fn only_the_slots_with_a_file_get_quads() {
         let rows = saveload_rows(&filled(3), 0);
-        assert_eq!(rows.quads.len(), 3);
-        assert!(saveload_rows(&Slots::default(), 0).quads.is_empty());
+        assert_eq!(only(&rows).quads.len(), 3);
+        assert!(only(&saveload_rows(&Slots::default(), 0)).quads.is_empty());
     }
 
     /// The page a row stands for moves it a whole page of slots, not a row.
     #[test]
     fn a_page_shows_its_own_ten_slots() {
-        assert!(saveload_rows(&filled(3), 1).quads.is_empty());
-        assert_eq!(saveload_rows(&filled(13), 1).quads.len(), 3);
+        assert!(only(&saveload_rows(&filled(3), 1)).quads.is_empty());
+        assert_eq!(only(&saveload_rows(&filled(13), 1)).quads.len(), 3);
     }
 
     fn saveload_rows(slots: &Slots, page: usize) -> Rows {
-        Rows::render(HQ, &font(), slots, page, false, &records(), true, None)
+        Rows::render(
+            HQ,
+            &font(),
+            slots,
+            page,
+            false,
+            &records(),
+            true,
+            None,
+            None,
+        )
+    }
+
+    /// The one bank of a list that does not slide.
+    fn only(rows: &Rows) -> &Bank {
+        assert_eq!(rows.banks.len(), 1, "School Days HQ's list has no strip");
+        &rows.banks[0]
     }
 
     /// The surface is the size the `FrameBuffer` is created at, and every quad
@@ -2026,11 +2653,12 @@ mod tests {
     #[test]
     fn the_rendered_quads_cut_the_surface_they_were_drawn_into() {
         let rows = saveload_rows(&filled(7), 0);
-        assert_eq!((rows.surface.width, rows.surface.height), HQ.surface);
-        for quad in &rows.quads {
+        let bank = only(&rows);
+        assert_eq!((bank.surface.width, bank.surface.height), HQ.surface);
+        for quad in &bank.quads {
             let (x, y, w, h) = quad.src;
-            assert!(x + w <= rows.surface.width);
-            assert!(y + h <= rows.surface.height);
+            assert!(x + w <= bank.surface.width);
+            assert!(y + h <= bank.surface.height);
         }
     }
 
@@ -2039,10 +2667,199 @@ mod tests {
     #[test]
     fn a_row_with_no_record_is_left_undrawn() {
         let short: Vec<days_ui::atlas::Widget> = records().into_iter().take(10).collect();
-        let rows = Rows::render(HQ, &font(), &filled(0), 0, false, &short, true, None);
+        let rows = Rows::render(HQ, &font(), &filled(0), 0, false, &short, true, None, None);
         // The comment's record is in the second band, which this table stops
         // short of, so only the stored line's two columns are placed.
-        assert_eq!(rows.quads.len(), 2);
+        assert_eq!(only(&rows).quads.len(), 2);
+    }
+
+    /// The strip's constants, against Shiny Days' own art: `SaveLoadList.png`
+    /// is 800x300, so the banks are 301 apart and a panel is 801x301.
+    const ART: (u32, u32) = (800, 300);
+    const PITCH: f32 = 301.0;
+
+    fn strip() -> Strip {
+        Layout::SHINY_DAYS.strip.expect("Shiny Days' list slides")
+    }
+
+    /// The window bank 0 holds, against `FUN_10018fd0`'s own ladder: page 0 and
+    /// 1 from page 0, pages 2 to 6 from `page - 2`, and pages 7, 8 and 9 all
+    /// from page 4.
+    #[test]
+    fn the_window_is_the_modules_ladder() {
+        let tops: Vec<usize> = (0..PAGES).map(|page| strip().window_top(page)).collect();
+        assert_eq!(tops, [0, 0, 0, 1, 2, 3, 4, 4, 4, 4]);
+    }
+
+    /// `FUN_1001ed40`'s seven-arm switch is `pitch * (next - window_top(page))`
+    /// for every transition a page button can ask for — the two methods that
+    /// have to agree before either is believed. See [`Strip::target`].
+    #[test]
+    fn the_step_switch_is_the_window() {
+        let strip = strip();
+        for page in 0..PAGES {
+            for (next, forward) in [(page.wrapping_sub(1), false), (page + 1, true)] {
+                if next >= PAGES {
+                    continue;
+                }
+                let want = PITCH * (next - strip.window_top(page)) as f32;
+                assert_eq!(
+                    strip.target(page, next, forward, PITCH),
+                    want,
+                    "page {page} to {next}"
+                );
+            }
+        }
+    }
+
+    /// A step from a page button lands exactly on `(k ± 1) * pitch`, and the
+    /// settle then reads the page back off the scroll. The `<=` in
+    /// `FUN_1001f8c0`'s second compare is what makes the forward half of this
+    /// work at all; with a `<` every forward step would leave the page alone.
+    #[test]
+    fn a_settled_step_reads_its_page_back_off_the_scroll() {
+        let strip = strip();
+        for page in 0..PAGES {
+            for (next, want) in [
+                (page.wrapping_sub(1), Settled::Previous),
+                (page + 1, Settled::Next),
+            ] {
+                if next >= PAGES {
+                    continue;
+                }
+                let scroll = strip.target(page, next, next > page, PITCH);
+                assert_eq!(strip.settled(page, scroll, PITCH), want, "{page} to {next}");
+            }
+        }
+    }
+
+    /// Every one-page step, run to its end, reaches the page it was aimed at
+    /// and leaves that page's rows exactly where their records put them.
+    ///
+    /// The re-seat is the part this pins down. A step's target is measured
+    /// against the window the page it *left* had, so when the window itself
+    /// shifts — page 2 to page 3, where bank 0 goes from page 0 to page 1 —
+    /// the strip overshoots by a pitch and `FUN_1001f6f0` takes it back while
+    /// `FUN_10018fd0` refills the banks one page along. The two cancel, and
+    /// that is why the settle re-seats rather than just stopping.
+    #[test]
+    fn every_step_lands_on_the_page_it_was_aimed_at() {
+        for page in 0..PAGES {
+            for next in [page.wrapping_sub(1), page + 1] {
+                if next >= PAGES {
+                    continue;
+                }
+                let mut slide = Slide::new(strip(), ART, page);
+                slide.go(next);
+                let mut ticks = 0;
+                while slide.tick().is_none() {
+                    ticks += 1;
+                    assert!(ticks < 100, "page {page} to {next} never settled");
+                }
+                assert_eq!(slide.page(), next, "page {page} to {next}");
+                assert_eq!(slide.offset(next - slide.window_top()), 0.0);
+            }
+        }
+    }
+
+    /// A one-page step is twenty frames, linear, and the twentieth snaps onto
+    /// the target rather than keeping the twentieth accumulation.
+    #[test]
+    fn a_step_takes_twenty_frames() {
+        let mut slide = Slide::new(strip(), ART, 0);
+        slide.go(1);
+        for frame in 1..20 {
+            assert_eq!(slide.tick(), None, "frame {frame}");
+            assert!(slide.moving());
+            assert_eq!(slide.page(), 0);
+        }
+        assert_eq!(slide.tick(), Some(1));
+        assert!(!slide.moving());
+        assert_eq!(slide.offset(0), -PITCH);
+    }
+
+    /// A jump across pages is a run of one-page steps, so page 0 to page 9 is
+    /// nine of them and the page climbs one at a time.
+    #[test]
+    fn a_jump_is_one_step_per_page() {
+        let mut slide = Slide::new(strip(), ART, 0);
+        slide.go(9);
+        let mut settled = Vec::new();
+        for _ in 0..9 * 20 {
+            if let Some(page) = slide.tick() {
+                settled.push(page);
+            }
+        }
+        assert_eq!(settled, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(!slide.moving());
+        assert_eq!(slide.page(), 9);
+    }
+
+    /// The page showing rests where its own bank does, so the strip's offset
+    /// puts that bank's rows exactly where their records say.
+    #[test]
+    fn the_shown_page_rests_on_its_own_bank() {
+        let strip = strip();
+        for page in 0..PAGES {
+            let slide = Slide::new(strip, ART, page);
+            assert_eq!(slide.offset(page - strip.window_top(page)), 0.0);
+        }
+    }
+
+    /// The panels tile with no seam: each is `pitch` tall and `pitch` below the
+    /// one before it, the art stretched by the one pixel `FUN_1001a710` adds.
+    #[test]
+    fn the_panels_abut() {
+        let slide = Slide::new(strip(), ART, 0);
+        let (_, first, width, height) = slide.panel(0);
+        assert_eq!((width, height), (801.0, PITCH));
+        assert_eq!(first, 122.0 - 0.5);
+        for bank in 1..strip().banks {
+            assert_eq!(slide.panel(bank).1, first + bank as f32 * height);
+        }
+    }
+
+    /// A page click part-way through a slide is answered: `FUN_1001ca60` gates
+    /// the widgets on the confirm popup and on nothing else, so the new step
+    /// starts from wherever the strip has got to.
+    #[test]
+    fn a_click_mid_slide_redirects_the_strip() {
+        let mut slide = Slide::new(strip(), ART, 0);
+        slide.go(1);
+        for _ in 0..10 {
+            slide.tick();
+        }
+        let part_way = slide.offset(0);
+        assert!(part_way < 0.0 && part_way > -PITCH);
+        slide.go(3);
+        while slide.tick() != Some(3) {}
+        assert_eq!(slide.page(), 3);
+        assert_eq!(slide.offset(slide.page() - slide.window_top()), 0.0);
+    }
+
+    /// Both banks of a list that slides are filled from the window, not from
+    /// the page: six pages of rows are on screen while a step runs.
+    #[test]
+    fn a_sliding_list_rasterises_its_whole_window() {
+        let rows = Rows::render(
+            &Layout::SHINY_DAYS,
+            &font(),
+            &filled(35),
+            3,
+            false,
+            &records(),
+            true,
+            None,
+            Some(&Slide::new(strip(), ART, 3)),
+        );
+        assert_eq!(rows.banks.len(), 6);
+        // Page 3's window starts at page 1, so slot 35 is row 5 of bank 2.
+        let drawn: Vec<usize> = rows
+            .banks
+            .iter()
+            .map(|bank| bank.quads.len())
+            .collect::<Vec<_>>();
+        assert_eq!(drawn, [0, 0, 3, 0, 0, 0]);
     }
 
     #[test]

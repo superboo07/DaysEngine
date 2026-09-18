@@ -80,8 +80,8 @@
 use crate::ui::options::Dir;
 use crate::ui::replay::View;
 use crate::ui::saveload::{
-    self, Column, Layout, Line, Quad, Rows, Slots, Tooltip, DEST_HEIGHT, LAST_ROW_OPENING_DOWN,
-    PER_PAGE, SURFACE_ROW_HEIGHT, SURFACE_ROW_PITCH,
+    self, Bank, Column, Layout, Line, Quad, Rows, Slots, Tooltip, DEST_HEIGHT,
+    LAST_ROW_OPENING_DOWN, PER_PAGE, SURFACE_ROW_HEIGHT, SURFACE_ROW_PITCH,
 };
 use days_ui::atlas::{self, Atlas, Widget};
 use days_ui::cmap::Rect;
@@ -456,9 +456,11 @@ pub fn render(
     let tooltip = hovered
         .filter(|_| comments)
         .and_then(|row| expand(&mut surface, font, slots, page, row, records));
+    // One bank: this list shows a page at a time and `FUN_10024ee0` refills
+    // its single surface when the page changes. Only the save/load screen's
+    // Shiny Days list slides — see [`saveload::Strip`].
     Rows {
-        surface,
-        quads,
+        banks: vec![Bank { surface, quads }],
         tooltip,
         tip_surface: None,
     }

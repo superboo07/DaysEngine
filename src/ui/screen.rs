@@ -207,6 +207,7 @@ pub struct Page<'a, 'b> {
 ///
 /// The original draws its menus this way too: `FUN_1000c740` and the rest hand
 /// Direct3D one quad per sprite and never touch a pixel themselves.
+#[derive(Clone, Copy)]
 pub struct Layer<'a> {
     pub art: Art<'a>,
     /// Where it lands, in the screen's output space.
@@ -216,6 +217,7 @@ pub struct Layer<'a> {
 }
 
 /// What a [`Layer`] draws, and how its pixels are arrived at.
+#[derive(Clone, Copy)]
 pub enum Art<'a> {
     /// An image that is already in display space and already the right size.
     /// The base art, a backdrop, a page's art, a buffer drawn elsewhere.
@@ -229,6 +231,7 @@ pub enum Art<'a> {
 /// The three ways are not interchangeable: they are the three kinds of source
 /// the screens actually have, and each is the sampling that kind needs. See
 /// [`resampled`], [`sampled`] and [`Image::downscaled`].
+#[derive(Clone, Copy)]
 pub enum Source {
     /// Whole source pixels, scaled to the destination by the cubic every piece
     /// of this game's art goes through. A widget's chip sprite.
@@ -316,6 +319,17 @@ pub struct Composite<'a, 'b> {
     /// Whether the screen's own base art is drawn. A layer over playback
     /// leaves it out.
     pub base: bool,
+    /// Layers of the caller's own, drawn over the backdrop and **under the
+    /// base art**.
+    ///
+    /// For a screen that draws its base art over its own content. Shiny Days'
+    /// save/load list is the one: `FUN_10017e70` draws the six panels of the
+    /// sliding strip, the row highlight and the sixty rows, and **only then**
+    /// the base art, as a full-screen sprite of its own that `FUN_1001ad60`
+    /// builds from `Load.png` at `+0xd4`. So the transparent window
+    /// `Load.png` carries is what confines the strip, and nothing scissors it.
+    /// See [`crate::ui::saveload::Slide`].
+    pub under_base: &'b [Layer<'a>],
     pub page: Option<Page<'a, 'b>>,
     /// Sprites a screen's own module works out and draws **before** it looks at
     /// the pointer, so the hover art of whatever the pointer is on lands on
@@ -811,6 +825,55 @@ impl Screen {
         }
     }
 
+    /// A whole image brought to the size a layout-space rectangle gives it.
+    ///
+    /// For art a screen draws itself that is not a cut of a sheet and not in
+    /// display space: each panel of the save/load list's strip is one of these,
+    /// the same 800x300 image at six places down the screen.
+    pub fn plate<'a>(&self, art: &'a Image, dst: (f32, f32, f32, f32)) -> Layer<'a> {
+        let (x, y, w, h) = self.place_layout(dst);
+        Layer {
+            art: Art::Cut {
+                sheet: art,
+                src: Source::Sprite((0, 0, art.width, art.height)),
+            },
+            at: (x, y),
+            size: (w, h),
+        }
+    }
+
+    /// One widget's chip sprite as a layer, for a caller assembling its own
+    /// list.
+    ///
+    /// For a sprite a screen draws out of order: the save/load list's row
+    /// highlight goes under the base art with the rows rather than over it
+    /// with the rest of the hover art, because `FUN_10017e70` draws it there.
+    pub fn widget_layer(&self, widget: &Widget) -> Layer<'_> {
+        self.sprite(&self.chip, widget)
+    }
+
+    /// A black band, for masking what a screen draws outside its own layout.
+    ///
+    /// `at` and `size` are in output pixels. The image is scaled by the blit
+    /// rather than resampled — one black pixel is black at every size — so the
+    /// caller can keep a single one. `FUN_1001abb0` is why this exists: the
+    /// save/load list's strip runs past the 800x450 layout at both ends, and
+    /// the module paints the two letterbox bands black again after the rows
+    /// and before the base art.
+    pub fn band<'a>(&self, black: &'a Image, at: (i64, i64), size: (u32, u32)) -> Layer<'a> {
+        Layer {
+            art: Art::Whole(black),
+            at,
+            size,
+        }
+    }
+
+    /// The letterbox in output pixels, which is what [`Screen::place_layout`]
+    /// adds and how tall [`Screen::band`]'s two bands are.
+    pub fn out_letterbox(&self) -> f64 {
+        self.out_letterbox
+    }
+
     /// An image in display space as a layer, for a caller assembling its own
     /// list — the menu's backlog buffer and dress caption are these.
     pub fn whole_layer<'a>(&self, img: &'a Image) -> Layer<'a> {
@@ -977,6 +1040,7 @@ impl Screen {
         if let Some(under) = what.backdrop {
             layers.push(self.whole(under));
         }
+        layers.extend_from_slice(what.under_base);
         if what.base {
             layers.push(self.whole(&self.base));
         }

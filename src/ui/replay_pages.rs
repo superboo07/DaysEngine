@@ -210,7 +210,7 @@
 
 use crate::ui::options::Dir;
 use crate::ui::replay::View;
-use crate::ui::saveload::{self, Column, Layout, Line, Quad, Rows, Slots, Tooltip};
+use crate::ui::saveload::{self, Bank, Column, Layout, Line, Quad, Rows, Slots, Tooltip};
 use days_ui::atlas::{self, Widget};
 
 /// The first widget of a view. Widgets 0 to 2 are the frame's, and
@@ -305,9 +305,17 @@ pub const PLAYDATA_PANELS: usize = 6;
 /// `0 ..= PLAYDATA_PAGES - PLAYDATA_PANELS`. So the page showing sits third of
 /// the six wherever there is room either side, and at the end the strip stops
 /// rather than running past the last page.
+///
+/// The save/load screen's list windows its own strip by the same rule from
+/// `FUN_10018fd0`, so the arithmetic is [`saveload::window_top`] and the
+/// constants are this screen's.
 pub fn window_top(page: usize) -> usize {
-    page.saturating_sub(2).min(PLAYDATA_PAGES - PLAYDATA_PANELS)
+    saveload::window_top(page, PLAYDATA_LEAD, PLAYDATA_PANELS, PLAYDATA_PAGES)
 }
+
+/// How many pages the list's strip keeps above the page showing, from the same
+/// ladder — `page - 2` where there is room for two.
+const PLAYDATA_LEAD: usize = 2;
 
 /// The panel art for one page, or `None` for a page the view has not got.
 ///
@@ -1191,9 +1199,13 @@ pub fn render(
         Some((tip, surface)) => (Some(tip), Some(surface)),
         None => (None, None),
     };
+    // One bank. `FUN_100293e0` does load `System/Replay/PlayData/ReplayList.png`
+    // for this list, which is the same art the save/load screen slides as a
+    // strip of six panels; whether this screen slides it too is **not
+    // recovered**. Its grid comes out of `Replay_PlayData.png`, so the list
+    // draws right without it.
     Rows {
-        surface,
-        quads,
+        banks: vec![Bank { surface, quads }],
         tooltip,
         tip_surface,
     }
