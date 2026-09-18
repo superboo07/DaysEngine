@@ -1916,19 +1916,66 @@ engine's own constructor `FUN_004217e0` builds at exactly those offsets plus
 `[SeClick]` `0x608`, `[SeUp]` `0x624`, `[SeDown]` `0x640`, `[SeView]` `0x65c`,
 `[SeOpen]` `0x678`.
 
-**DaysEngine keeps the screen underneath loaded and draws it under the popup**,
-with the title's backdrop beneath it when the title is what raised it — see
-`ui::menu::Under`. Two divergences, both deliberate:
+#### How it arrives and how it goes
 
-- **One dim, not two.** Nothing in `FUN_0041dfa0` removes the `[SystemBase]`
-  sprite while the popup module is up, so a literal reading has the module's
-  own copy of those same pixels drawn over it. Two passes of alpha 221 leave
-  the screen at about 2% of its brightness, which is not a screen anything
-  shows through; which of the two the retail build actually presents is **not
-  recovered**, and this engine draws the screen underneath and the popup's art
-  over it.
-- **The two 500 ms fades are not implemented.** The popup appears and goes at
-  once.
+The dim is a sprite of its own, at engine `+0x274`, and its transition is the
+only animation the popup has. `FUN_0042f2f0` draws it as one quad whose corners
+come from the object's own members — `x` is the constant -0.5, `y` is `+0x3c`,
+`width` is `+0x4c` and `height` is `+0x48` — and `FUN_0042ed00` seats those
+when it is built:
+
+| | |
+|---|---|
+| `+0x3c` | 0 when the display is widescreen, 75 otherwise: the letterbox the 800x450 layout sits in |
+| `+0x4c` | 801, or the back buffer's width when the game is widescreen and full screen |
+| `+0x50` | 451, or the back buffer's height on the same terms |
+| `+0x48` | the height actually drawn, seated at `+0x50` |
+
+**The two ends are not the same animation.** `FUN_0042f6a0` is the way in: it
+ramps `+0x48` from 0 to `+0x50` — so the dim arrives as a shade pulled down
+from the top of the layout — while ramping the sprite's diffuse alpha from 0 to
+255 underneath it. `FUN_0042f5b0` alone is the way out, at full height, 255
+down to 0; case 5 rebuilds the sprite before case 6 fades it, which is what
+puts `+0x48` back to `+0x50` first. Both ramps are linear in elapsed
+milliseconds off `timeGetTime`, not in host ticks the way the dress-select
+slide is, and the alpha is computed in integers — `(t * 0xff) / dur`, and
+`0xff -` that for the way out — so half way through, the way in is at 127 and
+the way out at 128.
+
+**The shade squashes rather than wipes.** `FUN_0042eda0` sets the sprite's UV
+rectangle once, from the texture's own dimensions, through `DX9Sprite2D` slot
+`+0x1c`; the ramp only ever touches the quad, slot `+0x0c`, which
+`FUN_00411b80` turns into the corners `(x, y)` and `(x + w, y + h)`. Nothing
+rewrites the UVs, so a quad that is `+0x48` tall shows the whole texture
+squashed into it. It reads as a wipe on School Days HQ, whose `SysBase.png` is
+a flat alpha with only a fine noise in it, and not on Shiny Days', which is
+graded.
+
+**The popup module has no animation at all.** `FUN_1000a490` draws the base art
+and whichever of the two buttons the pointer is on, and `FUN_1000a9c0` only
+moves the selection. So the dialog is there the instant the shade finishes and
+gone the instant it is answered — and because case 2 opens the module only
+after case 1 has finished, and case 5 drops it before case 6 starts, nothing of
+the dialog is on screen during either ramp and nothing of it can be clicked.
+
+#### What DaysEngine does
+
+**It keeps the screen underneath loaded and draws it under the popup**, with
+the title's backdrop beneath it when the title is what raised it, and it runs
+both ramps — see `ui::menu::Under` and `ui::menu::Dim`. Answering the popup
+starts the way out and the answer lands when it finishes, which is case 7.
+
+One divergence: **one dim is drawn, not two.** Nothing in `FUN_0041dfa0`
+removes the `[SystemBase]` sprite while the popup module is up, so a literal
+reading has the module's own copy of those same pixels drawn over it. Two
+passes of alpha 221 leave the screen at about 2% of its brightness, which is
+not a screen anything shows through; which of the two the retail build actually
+presents is **not recovered**, and this engine draws the screen underneath, the
+shade while it is ramping, and the popup's art once it is up.
+
+An install whose `[SystemBase]` will not read gets no transition and nothing
+else: the dialog arrives and goes at once, the way any missing asset costs its
+own effect and no more.
 
 ### Title
 

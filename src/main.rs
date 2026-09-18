@@ -1825,7 +1825,16 @@ fn run_menu(
         // The pointer first, so a confirm in the same pass acts on what it is
         // over — which is what a click is: the original acts on whatever the
         // cursor is on, not on whatever the selection last was.
-        let mut actions: Vec<Action> = Vec::new();
+        // One tick of whatever the screen animates itself: the dress-select
+        // slide and the confirm popup's dim. This is the module update the
+        // exe's message loop makes once per presented frame, and this loop is
+        // paced the same way — see `daysengine::ui::dress::SLIDE_FRAMES`. The
+        // dim is timed in milliseconds rather than in ticks, which is why the
+        // frame's own length goes with it; see `daysengine::ui::menu::Dim`.
+        // Its answer lands in the same pass as the player's own input, because
+        // it is one: the popup's YES is what started it.
+        let mut actions: Vec<Action> =
+            vec![menu.tick(player.vfs, &player.dll, cadence.interval())?];
         if let Some((x, y)) = pointed {
             actions.push(match to_screen(canvas, &menu, whole, x as f32, y as f32) {
                 Some((sx, sy)) => menu.point_at(sx, sy),
@@ -2095,12 +2104,6 @@ fn run_menu(
             };
             menu.finish_save(slot, line.unwrap_or_default());
         }
-
-        // One tick of whatever the screen animates itself, which is the
-        // dress-select slide and nothing else. This is the module update the
-        // exe's message loop makes once per presented frame, and this loop is
-        // paced the same way — see `daysengine::ui::dress::SLIDE_FRAMES`.
-        menu.tick(player.vfs, &player.dll)?;
 
         // Where the screen lands, and then the screen composited at exactly
         // that size — one pass from the 800x450 art to the pixels the player
@@ -2784,6 +2787,11 @@ impl<'r> Layers<'r> {
                 continue;
             }
             let held = self.hold(screen, layer, whole)?;
+            // The fade is one alpha on the texture rather than a new one every
+            // frame, which is how the original does it — an ARGB on the sprite
+            // — and what keeps a ramping layer at one cache entry. The control
+            // bar's strip is faded the same way.
+            held.texture.set_alpha_mod(layer.alpha);
             canvas
                 .copy(
                     &held.texture,

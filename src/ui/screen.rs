@@ -214,6 +214,14 @@ pub struct Layer<'a> {
     pub at: (i64, i64),
     /// How big it is drawn, which is the size [`Layer::realize`] produces.
     pub size: (u32, u32),
+    /// One alpha over the whole layer, multiplied through its own.
+    ///
+    /// 255 for everything the screens draw at rest. A layer that is being
+    /// faded carries the ramp here rather than in its pixels, so that the
+    /// pixels stay one cache entry and one texture for the length of the fade
+    /// — which is also how the original does it, as an ARGB on the sprite
+    /// rather than a new surface. See [`crate::ui::menu::Dim`].
+    pub alpha: u8,
 }
 
 /// What a [`Layer`] draws, and how its pixels are arrived at.
@@ -758,6 +766,7 @@ impl Screen {
             art: Art::Whole(img),
             at: (0, self.out_letterbox.round() as i64),
             size: (img.width, img.height),
+            alpha: 255,
         }
     }
 
@@ -776,6 +785,7 @@ impl Screen {
             },
             at: (dst.0, dst.1),
             size: (dst.2, dst.3),
+            alpha: 255,
         }
     }
 
@@ -800,6 +810,7 @@ impl Screen {
             },
             at: (dst.0, dst.1),
             size: (dst.2, dst.3),
+            alpha: 255,
         }
     }
 
@@ -822,6 +833,7 @@ impl Screen {
             },
             at: (dst.0, dst.1),
             size: (dst.2, dst.3),
+            alpha: 255,
         }
     }
 
@@ -839,6 +851,7 @@ impl Screen {
             },
             at: (x, y),
             size: (w, h),
+            alpha: 255,
         }
     }
 
@@ -865,6 +878,7 @@ impl Screen {
             art: Art::Whole(black),
             at,
             size,
+            alpha: 255,
         }
     }
 
@@ -881,6 +895,7 @@ impl Screen {
             art: Art::Whole(img),
             at: (0, self.letterbox.round() as i64),
             size: (img.width, img.height),
+            alpha: 255,
         }
     }
 
@@ -1158,7 +1173,15 @@ impl Screen {
     /// copying the base art into a cache to read it back is work for nothing.
     pub fn draw(&self, out: &mut Image, layer: &Layer) {
         if let Art::Whole(art) = &layer.art {
-            out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect());
+            // A faded layer is a copy with the ramp multiplied through, which
+            // is what [`Image::modulate`] is for. The SDL backend sets one
+            // alpha on the texture instead and keeps the pixels; here there is
+            // no texture to set it on. Nothing is faded at rest, so the copy
+            // is only ever paid for while something is ramping.
+            match faded(art, layer.alpha) {
+                Some(art) => out.blit_scaled(&art, (0, 0, art.width, art.height), layer.rect()),
+                None => out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect()),
+            }
             return;
         }
         let mut realized = self.realized.borrow_mut();
@@ -1168,8 +1191,22 @@ impl Screen {
         let art = realized
             .entry(layer.key())
             .or_insert_with(|| layer.realize().into_owned());
-        out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect());
+        match faded(art, layer.alpha) {
+            Some(art) => out.blit_scaled(&art, (0, 0, art.width, art.height), layer.rect()),
+            None => out.blit_scaled(art, (0, 0, art.width, art.height), layer.rect()),
+        }
     }
+}
+
+/// `art` with `alpha` multiplied through, or `None` when there is nothing to
+/// multiply. See [`Layer::alpha`].
+fn faded(art: &Image, alpha: u8) -> Option<Image> {
+    if alpha == 255 {
+        return None;
+    }
+    let mut copy = art.clone();
+    copy.modulate(alpha);
+    Some(copy)
 }
 
 /// A widget's source rectangle brought to the size it is drawn at.

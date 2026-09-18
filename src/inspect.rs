@@ -1262,6 +1262,17 @@ fn no_module(game: &Path, exports: &[&str]) -> String {
     )
 }
 
+/// How long one `tick` of `daysengine menu` stands for.
+///
+/// The menus animate two ways. The dress-select slide counts host ticks, so a
+/// `tick` is one of those whatever this says. The confirm popup's dim counts
+/// milliseconds off `timeGetTime`, so it needs a length for the frame — and
+/// this tool has no display to take one from. One presented frame at 60 Hz is
+/// what the player's machine gives both of them. **It is this tool's
+/// stand-in, not a recovered value**: the original is paced by whatever panel
+/// is in front of it.
+const TICK: std::time::Duration = std::time::Duration::from_micros(16_667);
+
 /// Reads `FILMENGINE.INI` out of the packs, or an empty one with a warning.
 fn film_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
     match vfs.read_path("Ini/FILMENGINE.INI") {
@@ -3088,7 +3099,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                     // thirty ticks later. `daysengine` gets those ticks from
                     // its frame loop, so here they are pumped by hand.
                     while menu.moving() {
-                        menu.tick(&vfs, &dll)?;
+                        menu.tick(&vfs, &dll, TICK)?;
                     }
                     Ok(action)
                 });
@@ -3218,11 +3229,15 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         let tick_event = event.starts_with("tick");
         if menu.moving() && !stepping && !tick_event {
             let mut ticks = 0;
+            let mut settled = Action::Stay;
             while menu.moving() {
-                menu.tick(&vfs, &dll)?;
+                let action = menu.tick(&vfs, &dll, TICK)?;
+                if !matches!(action, Action::Stay) {
+                    settled = action;
+                }
                 ticks += 1;
             }
-            println!("  {:<12} -> {ticks} frames of the slide", "(settling)");
+            println!("  {:<12} -> {ticks} frames, {settled:?}", "(settling)");
         }
         stepping |= tick_event;
         let (action, label) = match event {
@@ -3235,20 +3250,23 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             "yes" => (menu.confirm_popup(&vfs, &dll)?, "yes".to_string()),
             "release" => (menu.release(), "release".to_string()),
             // One frame of whatever the screen animates itself, for looking at
-            // the dress-select slide part-way through: `tick` is one, `tick:N`
-            // is N. See `daysengine::ui::dress::SLIDE_FRAMES`.
-            "tick" => {
-                menu.tick(&vfs, &dll)?;
-                (Action::Stay, "tick".to_string())
-            }
+            // the dress-select slide or the confirm popup's dim part-way
+            // through: `tick` is one, `tick:N` is N. See
+            // `daysengine::ui::dress::SLIDE_FRAMES` and
+            // `daysengine::ui::menu::Dim`.
+            "tick" => (menu.tick(&vfs, &dll, TICK)?, "tick".to_string()),
             other if other.starts_with("tick:") => {
                 let count: usize = other["tick:".len()..]
                     .parse()
                     .with_context(|| format!("{other:?} needs a frame count, as tick:N"))?;
+                let mut acted = Action::Stay;
                 for _ in 0..count {
-                    menu.tick(&vfs, &dll)?;
+                    let action = menu.tick(&vfs, &dll, TICK)?;
+                    if !matches!(action, Action::Stay) {
+                        acted = action;
+                    }
                 }
-                (Action::Stay, format!("tick {count}"))
+                (acted, format!("tick {count}"))
             }
             other => {
                 // Points are written `at:X:Y` rather than `at:X,Y` so the comma
@@ -3368,11 +3386,15 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // them, so a slide stopped part-way stays stopped.
     if menu.moving() && !stepping {
         let mut ticks = 0;
+        let mut settled = Action::Stay;
         while menu.moving() {
-            menu.tick(&vfs, &dll)?;
+            let action = menu.tick(&vfs, &dll, TICK)?;
+            if !matches!(action, Action::Stay) {
+                settled = action;
+            }
             ticks += 1;
         }
-        println!("  {:<12} -> {ticks} frames of the slide", "(settling)");
+        println!("  {:<12} -> {ticks} frames, {settled:?}", "(settling)");
     }
 
     // The save/load screen's rows carry text the composite draws itself rather

@@ -66,6 +66,7 @@ use crate::ui::routemap;
 use crate::ui::saveload::{self, Kind, Slots};
 use crate::ui::screen::{Art, Composite, Error, Layer, Resolution, Screen, WidgetState};
 use days_save::FlagStore;
+use std::time::Duration;
 
 /// A menu screen id, as the game itself numbers them.
 ///
@@ -762,6 +763,12 @@ pub struct Menu {
     /// The screen the confirm popup was raised over, kept loaded and drawn
     /// under it. Absent on every other screen. See [`Under`].
     under: Option<Under>,
+    /// The `[SystemBase]` dim the confirm popup arrives and leaves behind.
+    /// Absent on every other screen, and when the install has no readable
+    /// `SysBase.png` — which costs the popup its transition and nothing else.
+    dim: Option<Dim>,
+    /// Which end of that transition is running, if either. See [`Fade`].
+    fade: Option<Fade>,
 }
 
 /// The screen the confirm popup is drawn over.
@@ -802,9 +809,8 @@ pub struct Menu {
 /// retail build leaves it under the module's own copy of the same pixels is
 /// not recovered. Drawing both would put the screen at about 2% of its
 /// brightness, which is not a screen anything shows through, so what is drawn
-/// here is the screen underneath and the popup's art over it. The 500 ms fades
-/// at each end are recovered and **not implemented**: the popup appears and
-/// goes at once.
+/// here is the screen underneath, the shade while it is ramping, and the
+/// popup's art once it is up. See [`Dim`] for the ramps.
 struct Under {
     /// Still loaded, so that its layers cost a texture each and not a
     /// composite a frame.
@@ -814,6 +820,104 @@ struct Under {
     /// gated off while the popup is up, and the pointer is over the popup, so
     /// nothing moves them.
     states: Vec<WidgetState>,
+}
+
+/// How long the confirm popup's dim takes to arrive and to go.
+///
+/// `FUN_0041dfa0` passes 500 to `FUN_00427ea0` at both ends, and the unit is
+/// milliseconds: the object at engine `+0x274` measures with `timeGetTime`,
+/// not in host ticks the way the dress-select slide does.
+const FADE: Duration = Duration::from_millis(500);
+
+/// The `[SystemBase]` dim, and how it is drawn while it comes and goes.
+///
+/// `FUN_0042f2f0` draws it as one rectangle whose corners are the object's own
+/// members: `x` is a constant -0.5, `y` is `+0x3c` — the letterbox, 0 when the
+/// display is widescreen and 75 when it is not — `width` is `+0x4c` and
+/// `height` is `+0x48`. `FUN_0042ed00` seats those when it is built: 801 x 451
+/// in the 800x450 layout, and the back buffer's own size when the game is
+/// widescreen and full screen.
+///
+/// **The two ends are not the same animation.** `FUN_0042f6a0`, the way in,
+/// ramps `+0x48` from 0 to `+0x50` — so the dim *unrolls* downward from the
+/// top of the layout — while `FUN_0042f5b0` ramps the sprite's diffuse alpha
+/// from 0 to 255 underneath it. `FUN_0042f5b0` alone is the way out, at full
+/// height, 255 down to 0. Both are linear in elapsed milliseconds.
+///
+/// The popup module itself has no animation at all: `FUN_1000a490` draws the
+/// base art and whichever of the two buttons the pointer is on, and
+/// `FUN_1000a9c0` only moves the selection. So the dialog arrives the instant
+/// the dim finishes and goes the instant it is answered.
+struct Dim {
+    /// `[SystemBase]` in native layout space — `System/System/SysBase.png` in
+    /// both shipped installs.
+    art: days_ui::Image,
+    /// The same at the size the screen composites at, and that size.
+    scaled: days_ui::Image,
+    at: (u32, u32),
+}
+
+/// Which end of the popup's transition is running, and what to do at the end
+/// of it. See [`Dim`].
+#[derive(Clone, Copy)]
+struct Fade {
+    elapsed: Duration,
+    going: Going,
+}
+
+#[derive(Clone, Copy)]
+enum Going {
+    /// Wiping down and fading in. The popup module is not open yet — case 2 of
+    /// `FUN_0041dfa0` comes after case 1 — so nothing of the dialog is drawn
+    /// and nothing of it can be clicked.
+    In,
+    /// Fading out at full height, the popup module already dropped by case 5.
+    /// The answer is acted on when the fade finishes, which is case 7.
+    Out(Answer),
+}
+
+/// What answering the confirm popup does, once its dim has faded out.
+///
+/// `FUN_1000a8f0` records the answer and hands the host a code; the mode it
+/// lands on is `_getNextMode@8(-1)`, the popup's remembered `+0xa4`. Quitting
+/// is the affirmative answer to the popup raised from the title.
+#[derive(Clone, Copy)]
+enum Answer {
+    Quit,
+    To(Mode),
+}
+
+impl Fade {
+    /// How far through, 0.0 at the start and 1.0 at the end.
+    fn through(self) -> f64 {
+        (self.elapsed.as_secs_f64() / FADE.as_secs_f64()).clamp(0.0, 1.0)
+    }
+
+    /// The alpha the sprite's diffuse carries: up on the way in, down on the
+    /// way out.
+    ///
+    /// `FUN_0042f5b0` does it in integers — `(t * 0xff) / dur`, truncated, and
+    /// `0xff - that` for the way out — so the two ends are not mirror images
+    /// of each other. Half way through, the way in is at 127 and the way out
+    /// at 128.
+    fn alpha(self) -> u8 {
+        let t = self.elapsed.min(FADE).as_millis();
+        let up = (t * 255 / FADE.as_millis()) as u8;
+        match self.going {
+            Going::In => up,
+            Going::Out(_) => 255 - up,
+        }
+    }
+
+    /// How many of the dim's rows are drawn, of `height`. `FUN_0042f6a0`'s
+    /// `+0x48`; the way out is at full height, because case 5 rebuilds the
+    /// sprite before case 6 fades it.
+    fn rows(self, height: u32) -> u32 {
+        match self.going {
+            Going::In => (f64::from(height) * self.through()).round() as u32,
+            Going::Out(_) => height,
+        }
+    }
 }
 
 impl Menu {
@@ -922,6 +1026,8 @@ impl Menu {
             backlog_art: None,
             dress_art: None,
             under: None,
+            dim: None,
+            fade: None,
             showing,
             paths,
             variant,
@@ -1040,6 +1146,7 @@ impl Menu {
         self.load_replay_page(vfs, dll);
         self.load_dress(vfs, dll);
         self.load_strip(vfs);
+        self.load_dim(vfs);
         self.refresh();
         Ok(())
     }
@@ -1110,6 +1217,57 @@ impl Menu {
     /// that is a visible stall at each end of it. Nothing about the screen's
     /// behaviour changes — the maps swap on the same frames — only when the
     /// files are read.
+    /// Loads the `[SystemBase]` dim for the confirm popup, and drops it for
+    /// every other screen.
+    ///
+    /// The path is read out of the player's own `FILMENGINE.INI` rather than
+    /// spelled here, because that is where the executable gets it:
+    /// `FUN_00422170` parses the key into the config subobject at engine
+    /// `+0x30` and `FUN_00427e30` opens exactly that string. Both shipped
+    /// installs name `System/System/SysBase.png`.
+    ///
+    /// A missing or unreadable file costs the popup its transition and nothing
+    /// else: with no dim there is nothing to fade, so the dialog arrives and
+    /// goes at once. See [`Dim`].
+    fn load_dim(&mut self, vfs: &Vfs) {
+        if !self.showing.is(Mode::CONFIRM) {
+            self.dim = None;
+            self.fade = None;
+            return;
+        }
+        if self.dim.is_some() {
+            return;
+        }
+        let film = match vfs.read_path("Ini/FILMENGINE.INI") {
+            Ok(bytes) => Ini::parse_bytes(&bytes),
+            Err(err) => {
+                log::warn!("reading Ini/FILMENGINE.INI: {err}");
+                return;
+            }
+        };
+        let Some(path) = film.get("SystemBase") else {
+            log::info!("FILMENGINE.INI names no [SystemBase]; the popup will not fade");
+            return;
+        };
+        let art = match vfs
+            .read_path(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| days_ui::Image::decode_png(&bytes).map_err(|e| e.to_string()))
+        {
+            Ok(art) => art,
+            Err(err) => {
+                log::warn!("no [SystemBase] dim ({path}): {err}");
+                return;
+            }
+        };
+        let scaled = self.screen.to_display(&art);
+        self.dim = Some(Dim {
+            art,
+            scaled,
+            at: self.screen.size(),
+        });
+    }
+
     fn load_dress(&mut self, vfs: &Vfs, dll: &[u8]) {
         self.dress = None;
         self.dress_map = self.dress_phase;
@@ -2117,6 +2275,30 @@ impl Menu {
         }
     }
 
+    /// The dim as this frame of the transition draws it, or `None` when
+    /// nothing is fading.
+    ///
+    /// **The wipe squashes rather than crops.** `FUN_0042eda0` sets the
+    /// sprite's UV rectangle once, from the texture's own dimensions, through
+    /// `DX9Sprite2D` slot `+0x1c`; the ramp only ever touches the quad, slot
+    /// `+0x0c`, which `FUN_00411b80` turns into the corners `(x, y)` and
+    /// `(x + w, y + h)`. Nothing rewrites the UVs, so a quad that is `+0x48`
+    /// tall shows the whole texture squashed into it. See [`Dim`].
+    fn fade_layer(&self) -> Option<Layer<'_>> {
+        let (dim, fade) = (self.dim.as_ref()?, self.fade?);
+        let art = &dim.scaled;
+        let rows = fade.rows(art.height);
+        if rows == 0 {
+            return None;
+        }
+        Some(Layer {
+            art: Art::Whole(art),
+            at: (0, self.screen.out_letterbox().round() as i64),
+            size: (art.width, rows),
+            alpha: fade.alpha(),
+        })
+    }
+
     /// Everything this frame draws, in the order it is drawn.
     ///
     /// [`Menu::prepare`] first: the layers borrow the art it builds.
@@ -2151,6 +2333,15 @@ impl Menu {
             }),
             None => Vec::new(),
         };
+        // While either end of the popup's transition is running, the popup
+        // module is not open — case 2 of `FUN_0041dfa0` opens it after case 1
+        // has faded the dim in, and case 5 drops it before case 6 fades the
+        // dim out. So this frame is the screen underneath and the dim over it,
+        // and none of the dialog. See [`Dim`].
+        if self.fade.is_some() {
+            layers.extend(self.fade_layer());
+            return layers;
+        }
         // A backdrop belongs to whichever screen is the bottom one, and with
         // the popup up that is the screen underneath.
         let backdrop = backdrop.filter(|_| self.under.is_none());
@@ -2193,6 +2384,7 @@ impl Menu {
                 art: Art::Whole(caption),
                 at: (0, self.screen.letterbox().round() as i64),
                 size: (caption.width, caption.height),
+                alpha: 255,
             });
         }
         // The backlog's lines are shown by one sprite over the whole screen,
@@ -2258,6 +2450,12 @@ impl Menu {
                     .as_ref()
                     .map(|art| self.screen.to_display(art));
                 dress.at = size;
+            }
+        }
+        if let Some(dim) = &mut self.dim {
+            if dim.at != size {
+                dim.scaled = self.screen.to_display(&dim.art);
+                dim.at = size;
             }
         }
     }
@@ -2784,6 +2982,13 @@ impl Menu {
 
     /// Moves the pointer. Coordinates are in the screen's own pixel space.
     pub fn point_at(&mut self, x: u32, y: u32) -> Action {
+        // Nothing on the screen can be touched while the popup's dim is
+        // running: at the way in the module is not open yet and at the way out
+        // it is already gone, so there is nothing under the pointer either
+        // end. See [`Dim`].
+        if self.fade.is_some() {
+            return Action::Stay;
+        }
         // A drag owns the pointer while it lasts: `FUN_1000b3d0` goes straight
         // to `FUN_1000bd20` and never reaches the hit test, so the selection
         // stays on the slider however far the pointer wanders off the track.
@@ -2832,6 +3037,13 @@ impl Menu {
     /// selection, the way `FUN_10009430` is handed one, and `FUN_1000c280`
     /// tests `x` alone.
     pub fn press(&mut self, x: u32, y: u32) -> Action {
+        // Nothing on the screen can be touched while the popup's dim is
+        // running: at the way in the module is not open yet and at the way out
+        // it is already gone, so there is nothing under the pointer either
+        // end. See [`Dim`].
+        if self.fade.is_some() {
+            return Action::Stay;
+        }
         // The save/load list is the other thing a press starts, and it is
         // gated on nothing: `FUN_1001e1f0`'s drag arm tests `+0x58`, the
         // base's held flag, and never asks where the pointer is. The screen
@@ -2862,6 +3074,13 @@ impl Menu {
     /// up it clears `+0x24c` and does nothing else, so the last value written
     /// is the one that stands.
     pub fn release(&mut self) -> Action {
+        // Nothing on the screen can be touched while the popup's dim is
+        // running: at the way in the module is not open yet and at the way out
+        // it is already gone, so there is nothing under the pointer either
+        // end. See [`Dim`].
+        if self.fade.is_some() {
+            return Action::Stay;
+        }
         if let Some(page) = &mut self.option_page {
             page.drag = None;
         }
@@ -3009,6 +3228,13 @@ impl Menu {
     /// The page module's are `FUN_1002abc0` and `FUN_1002b040`, dispatched on
     /// `+0x618` by `FUN_1002a9a0` — see [`replay_pages::navigate`].
     pub fn navigate(&mut self, vfs: &Vfs, dll: &[u8], dir: Dir) -> Result<Action, Error> {
+        // Nothing on the screen can be touched while the popup's dim is
+        // running: at the way in the module is not open yet and at the way out
+        // it is already gone, so there is nothing under the pointer either
+        // end. See [`Dim`].
+        if self.fade.is_some() {
+            return Ok(Action::Stay);
+        }
         let next = match self.mode() {
             Some(Mode::OPTION) if self.option_page.is_some() => Some(option_pages::navigate(
                 self.tab,
@@ -3114,6 +3340,13 @@ impl Menu {
     /// (`FUN_1001de10`) and the replay popup's in [`replay::popup_action`]
     /// (`FUN_10019610`).
     pub fn confirm(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
+        // Nothing on the screen can be touched while the popup's dim is
+        // running: at the way in the module is not open yet and at the way out
+        // it is already gone, so there is nothing under the pointer either
+        // end. See [`Dim`].
+        if self.fade.is_some() {
+            return Ok(Action::Stay);
+        }
         let Some(widget) = self.selection else {
             return Ok(Action::Stay);
         };
@@ -3155,7 +3388,7 @@ impl Menu {
                 0 => self.confirm_popup(vfs, dll),
                 1 => {
                     let back = self.return_to;
-                    self.advance(vfs, dll, back)
+                    self.answer_popup(vfs, dll, Answer::To(back))
                 }
                 _ => Ok(Action::Stay),
             },
@@ -3211,7 +3444,12 @@ impl Menu {
     /// that draws every frame calls this every frame, which is what the
     /// original does — see [`dress::SLIDE_FRAMES`] for why a tick is one
     /// presented frame.
-    pub fn tick(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<(), Error> {
+    pub fn tick(&mut self, vfs: &Vfs, dll: &[u8], elapsed: Duration) -> Result<Action, Error> {
+        // The popup's dim owns the frame while it is running: nothing else on
+        // that screen moves, and the answer it is carrying lands here.
+        if self.fade.is_some() {
+            return self.tick_fade(vfs, dll, elapsed);
+        }
         if self.showing.is(Mode::SAVELOAD) {
             self.dirty |= self.list_moving();
             // Both settles end in `FUN_10018fd0`, whether or not the page they
@@ -3223,26 +3461,80 @@ impl Menu {
                 self.load_rows();
                 self.refresh();
             }
-            return Ok(());
+            return Ok(Action::Stay);
         }
         if !self.showing.is(Mode::DRESS_SELECT) {
-            return Ok(());
+            return Ok(Action::Stay);
         }
         self.dirty |= self.dress_slide.moving();
         match self.dress_slide.tick() {
-            None => Ok(()),
+            None => Ok(Action::Stay),
             // Arm 1: the popup's art and hit map, and `+0x140` raised.
             Some(dress::Slid::Popup) => {
                 let chosen = self.dress_slide.chosen();
                 self.set_dress_phase(vfs, dll, dress::Phase::Confirming { chosen })?;
-                Ok(())
+                Ok(Action::Stay)
             }
             // The tail of arm 3: `FUN_1000d7f0`, the main hit map again. The
             // phase went back to [`dress::Phase::Choosing`] at the click.
             Some(dress::Slid::Dresses) => {
                 self.set_dress_phase(vfs, dll, dress::Phase::Choosing)?;
-                Ok(())
+                Ok(Action::Stay)
             }
+        }
+    }
+
+    /// One tick of the confirm popup's dim, and the answer it lands on.
+    ///
+    /// `FUN_0041dfa0` advances only when `FUN_00427ea0` reports the ramp
+    /// finished, so the dialog arrives on the tick after the wipe completes
+    /// and the answer is acted on on the tick after the fade out does. See
+    /// [`Dim`].
+    fn tick_fade(&mut self, vfs: &Vfs, dll: &[u8], elapsed: Duration) -> Result<Action, Error> {
+        let Some(mut fade) = self.fade else {
+            return Ok(Action::Stay);
+        };
+        self.dirty = true;
+        fade.elapsed = fade.elapsed.saturating_add(elapsed);
+        if fade.elapsed < FADE {
+            self.fade = Some(fade);
+            return Ok(Action::Stay);
+        }
+        self.fade = None;
+        match fade.going {
+            Going::In => Ok(Action::Stay),
+            Going::Out(answer) => self.apply_answer(vfs, dll, answer),
+        }
+    }
+
+    /// Answers the confirm popup, which starts its dim fading back out.
+    ///
+    /// The answer is not acted on here: `FUN_1000a8f0` records it and the
+    /// popup module goes at case 5, but the mode only changes at case 7, after
+    /// the 500 ms of case 6. With no dim to fade — an install whose
+    /// `[SystemBase]` will not read — there is nothing to wait for and the
+    /// answer lands at once, the way any missing asset costs its own effect
+    /// and nothing more.
+    fn answer_popup(&mut self, vfs: &Vfs, dll: &[u8], answer: Answer) -> Result<Action, Error> {
+        if !self.showing.is(Mode::CONFIRM) || self.fade.is_some() {
+            return Ok(Action::Stay);
+        }
+        if self.dim.is_none() {
+            return self.apply_answer(vfs, dll, answer);
+        }
+        self.fade = Some(Fade {
+            elapsed: Duration::ZERO,
+            going: Going::Out(answer),
+        });
+        self.dirty = true;
+        Ok(Action::Stay)
+    }
+
+    /// Where an answered popup goes, once its dim has gone.
+    fn apply_answer(&mut self, vfs: &Vfs, dll: &[u8], answer: Answer) -> Result<Action, Error> {
+        match answer {
+            Answer::Quit => Ok(Action::Quit),
+            Answer::To(mode) => self.advance(vfs, dll, mode),
         }
     }
 
@@ -3252,7 +3544,8 @@ impl Menu {
     /// then pumps [`Menu::tick`] until this is false, where the player's
     /// machine would have drawn thirty frames.
     pub fn moving(&self) -> bool {
-        (self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving())
+        self.fade.is_some()
+            || (self.showing.is(Mode::DRESS_SELECT) && self.dress_slide.moving())
             || (self.showing.is(Mode::SAVELOAD) && self.list_moving())
     }
 
@@ -3876,6 +4169,15 @@ impl Menu {
     /// route map's own back button sets is not recovered**, and this engine
     /// does not depend on it.)
     pub fn cancel(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
+        if self.fade.is_some() {
+            return Ok(Action::Stay);
+        }
+        // Backing out of the popup is its NO, and it leaves the same way the
+        // widget does — through the dim, not around it.
+        if self.showing.is(Mode::CONFIRM) {
+            let back = self.return_to;
+            return self.answer_popup(vfs, dll, Answer::To(back));
+        }
         match backing_out(self.entry, self.showing, self.return_to) {
             Leaving::Resume => Ok(Action::Play),
             Leaving::To(mode) => self.advance(vfs, dll, mode),
@@ -3896,14 +4198,12 @@ impl Menu {
 
     /// Answers the confirm popup with "yes".
     pub fn confirm_popup(&mut self, vfs: &Vfs, dll: &[u8]) -> Result<Action, Error> {
-        if !self.showing.is(Mode::CONFIRM) {
-            return Ok(Action::Stay);
-        }
-        if self.return_to == Mode::TITLE {
-            Ok(Action::Quit)
+        let answer = if self.return_to == Mode::TITLE {
+            Answer::Quit
         } else {
-            self.reopen(vfs, dll, Mode::TITLE)
-        }
+            Answer::To(Mode::TITLE)
+        };
+        self.answer_popup(vfs, dll, answer)
     }
 
     /// Reloads the screen that is showing at a different art set.
@@ -3979,7 +4279,21 @@ impl Menu {
         };
         let was = (self.showing, self.variant.clone());
         match self.enter(vfs, dll, Showing::Mode(next), return_to) {
-            Ok(()) => Ok(Action::Opened(next)),
+            Ok(()) => {
+                // The dim wipes down over the screen underneath before the
+                // popup module is opened at all: `FUN_0041dfa0` case 1 runs to
+                // completion before its case 2. An install with no readable
+                // `[SystemBase]` has nothing to wipe, and the dialog is simply
+                // there. See [`Dim`].
+                if next == Mode::CONFIRM && self.dim.is_some() {
+                    self.fade = Some(Fade {
+                        elapsed: Duration::ZERO,
+                        going: Going::In,
+                    });
+                    self.dirty = true;
+                }
+                Ok(Action::Opened(next))
+            }
             // A screen whose art, hit map or widget table will not read
             // cannot be drawn. Staying put is the right answer: a screen this
             // engine cannot build should leave the player on a working menu,
@@ -4636,6 +4950,33 @@ mod tests {
             ),
             "2"
         );
+    }
+
+    /// The dim wipes down while it fades in, and fades out at full height.
+    /// `FUN_0042f6a0` ramps the height with the alpha; `FUN_0042f5b0` alone is
+    /// the way out, and case 5 has already put the height back to full.
+    #[test]
+    fn the_popups_dim_wipes_in_and_only_fades_out() {
+        let at = |going, ms| Fade {
+            elapsed: Duration::from_millis(ms),
+            going,
+        };
+        assert_eq!(at(Going::In, 0).alpha(), 0);
+        assert_eq!(at(Going::In, 0).rows(450), 0);
+        assert_eq!(at(Going::In, 250).alpha(), 127);
+        assert_eq!(at(Going::In, 250).rows(450), 225);
+        assert_eq!(at(Going::In, 500).alpha(), 255);
+        assert_eq!(at(Going::In, 500).rows(450), 450);
+
+        let out = Going::Out(Answer::Quit);
+        assert_eq!(at(out, 0).alpha(), 255);
+        assert_eq!(at(out, 250).alpha(), 128);
+        assert_eq!(at(out, 500).alpha(), 0);
+        // Full height at every point of it, which is what the rebuild at case
+        // 5 is for.
+        for ms in [0, 250, 500] {
+            assert_eq!(at(out, ms).rows(450), 450);
+        }
     }
 
     /// The popup is drawn over the screen it was raised from, so a popup
