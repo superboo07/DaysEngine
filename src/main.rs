@@ -3188,6 +3188,9 @@ fn run_script(
     player.mixer.set_rate(bar_state.rate);
     // The bar's own fade, and the frame the auto flag was last set on.
     let mut auto_since = Instant::now();
+    // The elapsed value widget 0's animation was last placed from. A pause
+    // stops the placing, not the clock — see `bar::placement_clock`.
+    let mut auto_placed_ms = 0u32;
     let mut hovered: Option<usize> = None;
     // Cached on the record list, so the strip is only recomposited when it
     // actually changes — which is on a hover, a state change or an auto frame.
@@ -3582,6 +3585,7 @@ fn run_script(
                         bar::Act::ToggleAuto => {
                             bar_state.auto = !bar_state.auto;
                             auto_since = Instant::now();
+                            auto_placed_ms = 0;
                         }
                         // Host `+0xf4` is `FUN_00424f40`, the same
                         // `FUN_00424e20` / `FUN_00424eb0` pair every other
@@ -4308,7 +4312,9 @@ fn run_script(
             .as_ref()
             .filter(|c| c.fade().drawn() || c.pinned(bar_state))
         {
-            let elapsed = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            let running = auto_since.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            let elapsed = bar::placement_clock(bar_state.paused, running, auto_placed_ms);
+            auto_placed_ms = elapsed;
             // The cache key carries the gauge's leads as well as the record
             // list: the gauge's three pieces are sized from those and not from
             // any record, so a layer keyed on records alone would hold one

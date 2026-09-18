@@ -457,6 +457,28 @@ impl Auto {
 /// `0x004a1b3c`, and that table holds the same five rates.
 pub const SPEEDS: [f32; 5] = [1.0, 2.0, 4.0, 12.0, 24.0];
 
+/// The elapsed value widget 0's animation is placed from.
+///
+/// `FUN_10024ca0` computes the frame and re-places the sprite **only while
+/// host `+0x108` — playback is paused — answers zero**, and draws it either
+/// way. So a paused bar keeps the frame it was left on.
+///
+/// The clock it is measured against does not stop: the original re-reads
+/// `timeGetTime` against the start stamped when the flag went up, so unpausing
+/// picks the animation up where the clock has got to rather than where it left
+/// off. That is why this takes the running value and the last placed one and
+/// chooses between them, instead of holding a paused clock back.
+///
+/// Shiny Days has no animation to place ([`Auto::Lit`]), so this changes
+/// nothing there.
+pub fn placement_clock(paused: bool, now_ms: u32, last_ms: u32) -> u32 {
+    if paused {
+        last_ms
+    } else {
+        now_ms
+    }
+}
+
 /// How long the bar takes to fade in and out, in milliseconds.
 ///
 /// `FUN_10024100` calls the fade helper `FUN_100255c0(this, 1, 300)` while the
@@ -542,32 +564,11 @@ impl Fade {
         self.up
     }
 
-    /// The alpha every one of the bar's sprites is modulated by, bar the
-    /// gauge's — see [`Fade::gauge_alpha`].
+    /// The alpha every one of the bar's sprites is modulated by, bar the ones
+    /// `FUN_10025690` skips — see [`Bar::compose_faded`], which draws those as
+    /// they stand.
     pub fn alpha(&self) -> u8 {
         self.alpha
-    }
-
-    /// The alpha the gauge bed and the gauge's three pieces are modulated by,
-    /// which is opaque whenever the gauge is raised and the bar's own alpha
-    /// otherwise.
-    ///
-    /// Two halves of the original meet here. `FUN_10025690` sets one ARGB on
-    /// every sprite the bar owns **except** `this+0x80` and `this+0x98..0xa0`,
-    /// which it skips whenever host `+0x154` answers non-zero — so while the
-    /// gauge is up those four keep whatever they last held. What they last held
-    /// is `0xffffffff`, because [`gauge::Anim`]'s first step sets exactly those
-    /// four opaque and every raise begins with it.
-    ///
-    /// So there is nothing to store: a raised gauge is solid, whatever the bar
-    /// was doing when the delta landed, and it rejoins the bar's own alpha the
-    /// moment it comes down.
-    pub fn gauge_alpha(&self, gauge_raised: bool) -> u8 {
-        if gauge_raised {
-            255
-        } else {
-            self.alpha
-        }
     }
 
     /// Puts the bar straight into its hidden state, for a fresh script.
@@ -714,7 +715,45 @@ pub struct State {
     /// draws from the alternate run and animates, and the choice box stops
     /// following the pointer (`FUN_0044dcc0`).
     pub auto: bool,
+    /// `_GetAutoDraw@0`: the `AutoDraw` setting, which decides whether widget
+    /// 0's lit sprite is part of the bar at all or a sign that sits over the
+    /// picture on its own.
+    ///
+    /// The export is not a question about drawing state. `FUN_00422170`, the
+    /// `FILMENGINE.INI` parse, hands the settings store at `DAT_0050b160` to
+    /// `_SystemMenuInit@4`, which calls `FUN_10006ce0` on the module's
+    /// singleton; that fills `+0x1b0` with the store's
+    /// `+0x10(L"AutoDraw", 1)` — the bool getter with a default of 1 — beside
+    /// `TextView`, `MenVoice`, `Mute`, `Skip`, `SuperSkip` and `UseSOM`.
+    /// `_GetAutoDraw@0` returns that member and nothing else writes it: exactly
+    /// one instruction in the module stores at that displacement, checked with
+    /// Ghidra's instruction listing and again with a raw scan of `.text`.
+    /// The store's identity is forced by shape — its `+0x10` and `+0x14` are
+    /// `(key, default)` getters (`FUN_0046ca70`, `FUN_0046cae0`), while the
+    /// *host* interface's `+0x14` is a `void` setter, so the object the module
+    /// is handed cannot be the host.
+    ///
+    /// So this is [`Config`]'s own `AutoDraw`, and both modules gate the same
+    /// sprite on it twice over — School Days HQ's `this+0x84` in
+    /// `FUN_10024ca0` and `FUN_10025690`, Shiny Days' `this+0x6c` in
+    /// `FUN_10034230` and `FUN_10034a40`:
+    ///
+    /// ```text
+    /// if (auto flag) {
+    ///     if (_GetAutoDraw@0() == 0) { if (this+0xbc) draw(lit) }   // with the bar
+    ///     else                         draw(lit)                    // whatever the bar does
+    /// }
+    /// ```
+    ///
+    /// and the walker that modulates every sprite at once skips that one while
+    /// the export answers non-zero. Set — its default, and what both retail
+    /// installs ship — the lit sprite is drawn with the bar gone and never
+    /// takes the fade's alpha. Clear, it is an ordinary sprite of the strip.
+    pub auto_draw: bool,
     /// Host `+0x108`: playback is paused. Swaps widget 1's sprite.
+    ///
+    /// Also freezes widget 0's animation: `FUN_10024ca0` re-places that sprite
+    /// only while this answers zero — see [`placement_clock`].
     pub paused: bool,
     /// Host `+0x104`: the replay menu started this playback. Disables widgets
     /// 4 and 10..12.
@@ -851,6 +890,7 @@ impl State {
         State {
             skippable: true,
             super_skip: config.flag(Flag::SuperSkip),
+            auto_draw: config.flag(Flag::AutoDraw),
             rate: SPEEDS[0],
             ..State::default()
         }
@@ -1384,7 +1424,12 @@ impl Bar {
     /// showing the strip cannot be drawn by modulating one texture — the fade
     /// has to be composited in, which is what [`Bar::compose_faded`] does.
     pub fn pinned(&self, state: State) -> bool {
-        state.gauge_raised || self.rate_readout(state).is_some()
+        state.gauge_raised
+            || self.rate_readout(state).is_some()
+            // Widget 0's lit sprite under `AutoDraw`, which the draw puts on
+            // the picture whether or not the bar is down — so it is also a
+            // reason to composite the strip at all with the bar gone.
+            || (self.layout.is_some() && state.auto && state.auto_draw)
     }
 
     /// Drops widget 2's latch once the clock is past
@@ -1575,6 +1620,18 @@ impl Bar {
                     pinned.push(live);
                 }
             }
+            // Widget 0's lit sprite is what `AutoDraw` takes out of the fade:
+            // `FUN_10025690` modulates `this+0x84` only while
+            // `_GetAutoDraw@0` answers zero, and `FUN_10034a40` does the same
+            // for Shiny Days' `this+0x6c`. With the setting on it keeps the
+            // opaque colour it was given. The hover sprite widget 0 shows
+            // under the pointer is a different record and stays in the walker's
+            // list, so it fades.
+            if state.auto && state.auto_draw {
+                let lit = layout.auto_lit.frame(elapsed_ms, state.speed);
+                faded.retain(|r| *r != lit);
+                pinned.push(lit);
+            }
         }
         if let Some(readout) = self.rate_readout(state) {
             // Only the one `records` pushed for the readout: the same number
@@ -1668,10 +1725,13 @@ impl Bar {
     /// as one modulation over the whole layer, which is what `FUN_10025690`
     /// does — it walks every sprite the bar owns and sets the same ARGB on each.
     ///
-    /// One sprite escapes it in the original: `FUN_10025690` skips widget 0's
-    /// animation while `_GetAutoDraw@0` is non-zero, so that one stays at full
-    /// alpha. **What that export returns is not recovered**, so the exception is
-    /// not reproduced and the whole strip fades together.
+    /// One sprite escapes it: `FUN_10025690` skips widget 0's animation while
+    /// `_GetAutoDraw@0` is non-zero, so that one stays at full alpha, and
+    /// `FUN_10024ca0` draws it past the `this+0xbc` test as well. That export
+    /// is the `AutoDraw` setting — see [`State::auto_draw`] for the chain — and
+    /// it defaults to set, so in an ordinary install the auto sign sits on the
+    /// picture whether or not the bar is down. Reproduced: [`Bar::split`] pins
+    /// it and [`Bar::pinned`] keeps the strip composited for it alone.
     ///
     /// Two more are absent from `FUN_10025690`'s list altogether — the rate
     /// readout at `this+0x88` and the `REPLAYMODE` indicator at `this+0x94` —
@@ -1808,14 +1868,21 @@ impl Bar {
             .compose_layer_cuts(&self.states_of(&records), &faded_cuts);
         layer.modulate(self.fade.alpha());
         if !pinned.is_empty() || !pinned_cuts.is_empty() {
-            let mut over = self
+            let over = self
                 .screen
                 .compose_sprites(&self.states_of(&pinned), &pinned_cuts);
-            // Everything in the pinned layer is opaque: a raised gauge by
-            // `FUN_10026b40`'s first step, and the rate readout because it is
-            // never in `FUN_10025690`'s list at all, so it keeps the opaque
-            // colour `FUN_10022650` gave it.
-            over.modulate(self.fade.gauge_alpha(state.gauge_raised));
+            // Everything in the pinned layer is opaque, whatever the fade is
+            // doing, because nothing in it is a sprite `FUN_10025690` reaches:
+            // a raised gauge and its bed are the four the walker skips under
+            // host `+0x154`, and they were set opaque by `FUN_10026b40`'s first
+            // step, which every raise begins with; the rate readout and the
+            // `REPLAYMODE` sign are not in its list at all, so they keep the
+            // opaque colour `FUN_10022650` gave them; and widget 0's lit sprite
+            // is the one the walker skips under `_GetAutoDraw@0`.
+            //
+            // So the layer is blitted as it stands. Modulating it by the bar's
+            // own alpha whenever the gauge happened to be down faded three of
+            // those four, which is what the original never does to any of them.
             let (w, h) = (over.width, over.height);
             layer.blit_scaled(&over, (0, 0, w, h), (0, 0, w, h));
         }
@@ -1957,25 +2024,53 @@ mod tests {
         assert_eq!(fade.alpha(), 255);
     }
 
-    /// `FUN_10025690` skips the gauge while it is raised, and the ramp's first
-    /// step makes it opaque — so a gauge raised over a bar that has already
-    /// faded away is on screen at full strength, and only rejoins the bar's own
-    /// alpha once it comes down.
+    /// A gauge raised over a bar that has already faded away is on screen at
+    /// full strength: `FUN_10025690` skips those four sprites under host
+    /// `+0x154`, and `FUN_10026b40`'s first step — which every raise begins
+    /// with — set them opaque. The bar's own alpha is at nothing meanwhile,
+    /// which is what makes the two separable at all.
     #[test]
-    fn a_raised_gauge_is_opaque_whatever_the_bar_is_doing() {
+    fn the_bar_is_at_nothing_while_a_raised_gauge_is_on_screen() {
         let mut fade = Fade::default();
-        // The bar has never been up, so everything on it is at nothing.
         fade.update(0, false);
-        assert_eq!(fade.gauge_alpha(false), 0);
+        assert_eq!(fade.alpha(), 0);
 
-        // A delta lands with the bar away, and the gauge is on screen anyway.
+        // A delta lands with the bar away, and the strip stays gone.
         fade.update(1_000, false);
         fade.update(1_000 + FADE_OUT_MS, false);
         assert_eq!(fade.alpha(), 0);
-        assert_eq!(fade.gauge_alpha(true), 255);
+        assert!(!fade.drawn(), "the strip itself is not up");
+    }
 
-        // Lowered, it follows the bar again.
-        assert_eq!(fade.gauge_alpha(false), 0);
+    /// `FUN_10024ca0` re-places widget 0's animation only while host `+0x108`
+    /// is clear, and the clock it measures against never stops — so a pause
+    /// holds the frame and unpausing jumps to where the clock got to.
+    #[test]
+    fn a_paused_bar_holds_widget_0_s_frame_and_then_catches_up() {
+        assert_eq!(placement_clock(false, 500, 0), 500, "running: place at now");
+        assert_eq!(
+            placement_clock(true, 900, 500),
+            500,
+            "paused: hold the frame"
+        );
+        assert_eq!(
+            placement_clock(false, 4_000, 500),
+            4_000,
+            "unpaused: the clock ran on while the sprite did not"
+        );
+    }
+
+    /// `AutoDraw` defaults to 1 and both retail installs ship it set, so widget
+    /// 0's lit sprite is normally the one thing on the strip that outlives the
+    /// fade.
+    #[test]
+    fn auto_draw_comes_from_the_setting_and_defaults_to_set() {
+        assert!(
+            State::from_config(&Config::parse_text("")).auto_draw,
+            "an empty file leaves AutoDraw at its default of 1"
+        );
+        assert!(!State::from_config(&Config::parse_text("[AutoDraw]=\"0\"\n")).auto_draw);
+        assert!(State::from_config(&Config::parse_text("[AutoDraw]=\"-1\"\n")).auto_draw);
     }
 
     #[test]

@@ -1331,6 +1331,10 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         // in the player's own `Config.DAT` means a dead skip button, so it
         // comes from there unless `--super-skip` overrides it.
         super_skip: args.super_skip || State::from_config(&config).super_skip,
+        // `_GetAutoDraw@0`, which is the `AutoDraw` setting and decides whether
+        // widget 0's lit sprite fades with the strip or sits on the picture.
+        // From the player's own file, like the setting above it.
+        auto_draw: State::from_config(&config).auto_draw,
         following_record: args.following_record,
         ..State::default()
     };

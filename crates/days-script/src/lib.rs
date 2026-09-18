@@ -375,12 +375,59 @@ fn statements(text: &str) -> Vec<(usize, &str)> {
         line += stmt.matches('\n').count();
         let trimmed = stmt.trim_start_matches(['\r', '\n', ' ', '\t', '\u{feff}']);
         if !trimmed.is_empty() {
+            if let Some(at) = absorbed_at(trimmed) {
+                log::warn!(
+                    "line {line}: the statement at offset {at} was absorbed into this one, \
+                     so its line is lost and this one's end timecode came from its tail"
+                );
+            }
             out.push((line, trimmed));
         }
         rest = tail;
         search_from = 0;
     }
     out
+}
+
+/// Where a statement swallowed the start of another one, if it did.
+///
+/// [`statements`] only ends a statement at a `;` whose next non-whitespace
+/// character is `[`, because dialogue contains bare semicolons and the format
+/// has no escaping. Five shipped statements put something else there — a
+/// scripter's `TOO LONG `, a stray `t` or `\`, a `# ` commenting a line out —
+/// and those are absorbed by the statement before them. The cost is not only
+/// the absorbed line: fields are read by position, so the swallowing statement
+/// takes its **end timecode** from the absorbed tail as well.
+///
+/// What the retail parser does with these is **not recovered** — its
+/// tokenisation happens at script load, before the field vector
+/// `FUN_0042d8c0` counts ever exists — so the reading here is not changed on a
+/// guess. It is only reported, because a line that disappears without a word
+/// is the failure worth refusing.
+///
+/// The signature is a `;` inside the statement followed by a `[Name]=`. The
+/// `]=` is what keeps ordinary dialogue out: Shiny Days' Cellphone lines carry
+/// a sender in brackets — `[Noan Murayama]`, `[Compose]` — and no `=` follows
+/// the bracket.
+fn absorbed_at(stmt: &str) -> Option<usize> {
+    let bytes = stmt.as_bytes();
+    let mut semicolon = false;
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b';' => semicolon = true,
+            b'[' if semicolon => {
+                let name = bytes[at + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+                if name > 0 && bytes.get(at + 1 + name..at + 3 + name) == Some(b"]=") {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Splits a statement body into fields.
@@ -797,6 +844,48 @@ mod tests {
         let after = Frame::parse("00:30:13").unwrap();
         assert_eq!(s.events_between(before, after).count(), 2); // text + voice
         assert_eq!(s.events_between(after, after).count(), 0);
+    }
+
+    /// The five shipped statements with junk between the `;` and the next
+    /// `[` are absorbed by the statement before them, and the absorbed tail
+    /// supplies the end timecode. Both halves are reported rather than
+    /// reinterpreted.
+    #[test]
+    fn a_statement_behind_junk_is_absorbed_and_said_so() {
+        // `00-00-A03`: a `[PrintText]` the scripter commented out with `# `.
+        let stmt = "[PlayVoice]=00:22:01\tVoice00/x\t1\tham\t00:30:07;\n\n\
+                    # [PrintText]=00:22:21\tMakoto\t- ...Aww, sheesh.\t00:24:10";
+        assert!(absorbed_at(stmt).is_some(), "the `# ` hides a statement");
+
+        let s = Script::parse_str("00-00-A03", &format!("{stmt};\n")).unwrap();
+        let voice = s
+            .events
+            .iter()
+            .find(|e| matches!(e.command, Command::PlayVoice { .. }))
+            .expect("the swallowing statement still parses");
+        assert_eq!(
+            voice.end,
+            Frame::parse("00:24:10").unwrap(),
+            "its end comes from the absorbed tail, not its own 00:30:07"
+        );
+        assert!(
+            !s.events
+                .iter()
+                .any(|e| matches!(e.command, Command::PrintText { .. })),
+            "the absorbed line is lost"
+        );
+    }
+
+    /// Shiny Days' Cellphone lines carry a sender in brackets, which is
+    /// dialogue and not a swallowed statement.
+    #[test]
+    fn a_bracketed_sender_in_dialogue_is_not_an_absorbed_statement() {
+        for text in [
+            "[PrintText]=00:00:00\tCellphone\t[Noan Murayama]\\nYour boyfriend?\t00:09:01",
+            "[PrintText]=00:17:18\tCellphone\t[Compose]\\nI like you\t00:24:11",
+        ] {
+            assert_eq!(absorbed_at(text), None, "no `]=` follows the bracket");
+        }
     }
 
     /// `05-KC-F00` line 241: a semicolon inside dialogue must not end the

@@ -115,7 +115,7 @@ pub const MAX_LINES: usize = 8;
 /// draws the ruby `FUN_10002eb0` laid out. **That drawing is not implemented
 /// here.** Both retail installs ship `[AgateUsing]="0"` and `UseAgate` `0`, and
 /// no `[PrintText]` in either title carries a ruby mark — 0 of 30,485 in School
-/// Days HQ and 0 of 45,015 in Shiny Days — so there is nothing shipped to draw.
+/// Days HQ and 0 of 45,012 in Shiny Days — so there is nothing shipped to draw.
 /// The marks are still recognised by [`wrap`], because they change where the
 /// line breaks whether or not the ruby is drawn.
 pub const RUBY_SETTING: &str = "UseAgate";
@@ -247,7 +247,7 @@ pub struct Entry {
 /// **One divergence, written down rather than reproduced.** `FUN_10002a90`
 /// does not advance its index for a `\` that is not followed by `n`, so such a
 /// line spins forever. No shipped `[PrintText]` in either title contains one —
-/// 0 of 30,485 in School Days HQ and 0 of 45,015 in Shiny Days, and none
+/// 0 of 30,485 in School Days HQ and 0 of 45,012 in Shiny Days, and none
 /// carries a ruby mark either — so nothing in the retail data reaches it. Here
 /// the backslash is consumed, which is what the dialogue box's `FUN_0043f600`
 /// does with the same input.

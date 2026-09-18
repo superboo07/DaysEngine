@@ -742,8 +742,8 @@ handing the mode to `_SystemInit@8` through `FUN_004167e0`.
 
 A whole-module disassembly of `SysMenuSD.dll` finds **eight** writes to a
 `+0xe0` displacement and no more: the five arms above, two that park the member
-on 2 when the screen is built and when it is activated, and `FUN_10030043`,
-which computes -1 or 2 from its argument. Only one of the eight writes 9. The
+on 2 when the screen is built and when it is activated, and the store at
+`0x10030043` inside `FUN_10030020`, which computes -1 or 2 from its argument. Only one of the eight writes 9. The
 anchor is confirmed from both sides — `_SystemInit@8` case 2 hands out the same
 object `0x1005b7b0` whose `+0xe0` `getNextMode` case 2 reads — and the whole
 chain was read with `objdump` rather than the decompiler, so it is a second
@@ -1493,9 +1493,9 @@ runs from the script open, the state is written in `FUN_0041cb60`,
 then has not been traced. Until it is, the command's meaning is incomplete and
 the engine does not act on it.
 
-(The host vtable anchor: `0x0048e50c` is stored into `[reg+0x2c]` by
-`FUN_0041d6c0`, is preceded in `.rdata` by an RTTI pointer, and runs 93 code
-pointers. The abstract base's vtable at `0x0048e234` is installed the same way
+(The host vtable anchor: `0x0048e50c` is stored into `[reg+0x2c]` at
+`0x0041d6c0`, inside `FUN_0041d660`, is preceded in `.rdata` by an RTTI
+pointer, and runs 93 code pointers. The abstract base's vtable at `0x0048e234` is installed the same way
 at `0x0041d69c` and its slot `+0x130` is `purecall`, which is what tells the
 two apart.)
 
@@ -1509,7 +1509,8 @@ parser over the real packs, not by reading the format spec:
 | `05-KC-F00` line 241 | A **semicolon inside dialogue** (`I know; I am, too.`). Statements have no escaping, so a `;` only terminates when the next non-whitespace character is `[` or the file ends. |
 | `05-KI-OP1` | Written with **`, ` separators instead of tabs**, plus a stray whitespace-only ` ;` statement. Fall back to comma splitting only when a statement contains no tab, so commas in ordinary dialogue stay literal. |
 | Shiny Days `03-32-A29`, `Z2-21-A18`, `03-3K-G34`, `04-K2-A00` | One `[PrintText]` each with **too few fields** — speaker and text typed into one field with a comma between them, an end timecode stuck to the text with no tab, and one statement written with spaces throughout. `FUN_0042d8c0` compares each `[PrintText]`'s field count to four before reading any field and skips the statement when it differs, so these cost their own line and nothing else. Refusing the script would make four scenes unplayable over four typos. |
-| `03-KB-D10` line 29 | A `PrintText` with a **trailing empty field**. |
+| `03-KB-D10` line 29 | A `PrintText` with an **empty field before the end timecode**, so five rather than four. The comparison above is `!= 4`, so the retail parser skips this line *if* its tokenisation keeps the empty field — and **whether it does is not recovered**, because the fields are split at script load, before the vector `FUN_0042d8c0` counts exists. `days-script` therefore drops a `[PrintText]` on `< 4` rather than `!= 4`: under that reading the two cannot disagree on anything in either install, since every statement they would judge differently has more than four fields and every malformed one has fewer. This line is the only one in either install where the readings differ, and DaysEngine shows it. |
+| `00-00-A03` line 41, and Shiny Days `02-I2-A03`, `02-I3-E00`, `04-K9-C01`, `Z4-Y3-A00` | Junk between a `;` and the next `[`: a `# ` commenting a duplicate line out, a scripter's `TOO LONG `, a stray `t`, a stray `\`. The `;` rule above cannot tell any of it from dialogue, so each of these statements is **absorbed by the one before it** — the absorbed line never plays, and because fields are read by position the swallowing statement takes its **end timecode from the absorbed tail** (`00-00-A03`'s voice window becomes `00:24:10` instead of `00:30:07`; `02-I2-A03`'s background `00:50:00` instead of `00:51:22`). What the retail parser makes of them is not recovered, so DaysEngine does not reinterpret them — it logs each one, because a line that disappears silently is the part worth refusing. Five in 4,444 scripts. |
 | `05-SE-C08` line 81, and 129 others | `PlayVoice` with **empty male-voice and tag fields** but the tabs still written. Fields must be read by position with defaults, not matched against an exact arity. |
 | `01-00-E01` | Two timecodes with a **frame field of 26** in a 24 fps script. Fold the overflow in rather than rejecting. |
 
@@ -2532,6 +2533,10 @@ bracket the 25 into the same twelve groups:
 | 3 | `+0xfc(2)` | always |
 | 4 | `+0x12c(1)` then `+0xfc(5)` | `!+0x104 && !+0x110 && SuperSkip` |
 | 5..9 | `+0x8c(0..4)`, the playback rate | `!+0x110 && +0x88` |
+| 10..12 | `+0xf8(4)`, `+0xf8(5)`, `+0xf8(3)` | `!+0x104` |
+| 13 | `+0xf8(2)` | always |
+| 14 | `+0x100(1)` | always |
+| 15..24 | `FUN_10026ed0`, the replay indicator's transparency | `+0x98` |
 
 `+0x110` is `FUN_00428210`: the draw-message flag at `engine + 0x5c8` **and** a
 script name at `engine + 0x188` that is empty or does not resolve in the packs
@@ -2539,10 +2544,6 @@ script name at `engine + 0x188` that is empty or does not resolve in the packs
 host `+0x10c` (`FUN_004281a0`), which tests the same name and drops the rate to
 1x when it fails; widget 2 calls that with 0 before either of its presses. What
 *raises* the flag is not recovered, so DaysEngine never sets it.
-| 10..12 | `+0xf8(4)`, `+0xf8(5)`, `+0xf8(3)` | `!+0x104` |
-| 13 | `+0xf8(2)` | always |
-| 14 | `+0x100(1)` | always |
-| 15..24 | `FUN_10026ed0`, the replay indicator's transparency | `+0x98` |
 
 A press on a widget that is not live is swallowed *and silent*: the dispatch
 asks the enabled test before playing SE index 2. The enabled test is also what
@@ -3461,8 +3462,45 @@ an ARGB modulation, so the whole strip fades as one; `FUN_100255c0` ramps it,
 and clears its start tick **only when a ramp completes**, so a pointer leaving
 mid-fade-in does not restart the clock — the direction flips against the old
 start and the alpha jumps. One sprite escapes the modulation: `FUN_10025690`
-skips widget 0's animation while `_GetAutoDraw@0` is non-zero. **What that
-export returns is not recovered.**
+skips widget 0's animation while `_GetAutoDraw@0` is non-zero.
+
+**`_GetAutoDraw@0` is the `AutoDraw` setting.** It is not a question about
+drawing state, and the chain to the value has no guess in it:
+
+```text
+FUN_00422170          the FILMENGINE.INI parse
+  _SystemMenuInit@4(&DAT_0050b160)          the settings store, not the host
+    FUN_10006ce0(&DAT_1004fb00, store)
+      [0x1004fb00 + 0x1b0] = store->+0x10(L"AutoDraw", 1)
+_GetAutoDraw@0 -> FUN_10001a90(0x1004fb00) -> return [+0x1b0]
+```
+
+`+0x10` is the store's bool getter with a default (`FUN_0046ca70`, through
+`FUN_0046e080`) and `+0x14` its int one, which is how the same function reads
+`TextView`, `MenVoice`, `Mute`, `Skip`, `SuperSkip` and `UseSOM` beside it and
+the three volumes through `+0x14`. The object cannot be the host interface,
+whose own `+0x14` is a `void` setter — the argument shape settles it. Exactly
+one instruction in the module stores at `+0x1b0`, confirmed from Ghidra's
+instruction listing and again from a raw scan of `.text` for a store at that
+displacement.
+
+So the default is **1**, and both retail installs ship it set. The setting
+gates the same sprite twice, and Shiny Days' module does the same thing to
+`this+0x6c` in `FUN_10034230` and `FUN_10034a40`:
+
+```text
+if (auto flag) {                                  // host +0x134, Shiny's +0x150
+    if (_GetAutoDraw@0() == 0) { if (this+0xbc) draw(lit) }
+    else                         draw(lit)
+}
+```
+
+With it set, widget 0's lit sprite is drawn whatever the bar is doing and never
+takes the fade's alpha; with it clear it is an ordinary sprite of the strip.
+`DaysEngine` reproduces both, and the placement has a rule of its own: the
+frame is only recomputed while host `+0x108` — paused — is clear, so a pause
+holds the frame and unpausing picks it up where the clock has got to, since the
+clock is measured from the stamp the flag went up on and never stops.
 
 `MENUBAR.PNG` is **RGBA**, not opaque: the strip's panels are semi-transparent
 and the frame underneath shows through them, which is why the bar is composited
@@ -3864,7 +3902,7 @@ stack slot holding `0` or `0x24`, never a space, so the test simply fails.
 **One divergence.** `FUN_10002a90` does not advance its index for a `\` that is
 not followed by `n`, so such a line spins forever. Nothing shipped reaches it:
 0 of School Days HQ's 30,485 `[PrintText]` statements and 0 of Shiny Days'
-45,015 carry a lone backslash, and none carries a ruby mark either. DaysEngine
+45,012 carry a lone backslash, and none carries a ruby mark either. DaysEngine
 consumes the backslash, which is what `FUN_0043f600` does with the same input.
 
 ### The widgets
@@ -4094,7 +4132,7 @@ getter (`FUN_10006ce0`) and writes back (`FUN_10006e40`):
 | `MenVoice` | bool | true | Sound tab — plays male voice lines; see the `.ORS` male-voice flag |
 | `Mute` | bool | false | Sound tab |
 | `Skip` | bool | false | Def tab |
-| `AutoDraw` | bool | true | *(no widget recovered)* |
+| `AutoDraw` | bool | true | *(no widget recovered)* — but `_GetAutoDraw@0` answers it, and it takes widget 0's lit sprite out of the control bar's fade and out of its visibility test; see *The bar is a drop-down, and translucent* |
 | `SuperSkip` | bool | false | Def tab |
 | `UseSOM` | bool | false | SOMCON tab |
 

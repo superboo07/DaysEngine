@@ -456,7 +456,7 @@ pub fn render(
     let tooltip = hovered
         .filter(|_| comments)
         .and_then(|row| expand(&mut surface, font, slots, page, row, records));
-    // One bank: this list shows a page at a time and `FUN_10024ee0` refills
+    // One bank: this list shows a page at a time and `FUN_10024e30` refills
     // its single surface when the page changes. Only the save/load screen's
     // Shiny Days list slides — see [`saveload::Strip`].
     Rows {
