@@ -96,14 +96,49 @@ member of the same number does on the other module. So the value is the
 `this+0x224` is the host subobject's numbering, so it is the engine's own
 `+0x250`: `DAT_004b31bc` is the engine and `DAT_004b31bc + 0x2c` is the
 subobject the DLL holds, which is the `0x2c` every other offset here is shifted
-by. Two functions write it — `FUN_00414ed0`, which takes it from an object's
-`+0x2f8` beside a `L"FLAG_LOGO"` set through host `+0x1c`, and `FUN_0041ee60`,
-which clears it. **What that member means is not recovered.**
+by.
 
-So this engine picks the cleared title from the `EndClear` flag, which is what
-the slot answers whenever `+0x250` is set, and what School Days HQ's
-`FUN_0042baf0` answers outright. The one case it does not reproduce is a clear
-`+0x250`, where the original shows the plain title however the flag reads.
+**`+0x250` is `STARTSCRIPT.INI [EndBGView]`.** One function writes it:
+`FUN_00414ed0`, the startup-config loader, which parses the key into its config
+object's `+0x2f8` and then stores that straight into `DAT_004b31bc + 0x250`,
+calling `FUN_00414bb0` to load `[EndingList]` in the same breath when it is set.
+
+```c
+iVar7 = FUN_0044c860(text, L"[EndBGView]=\"", 1);   /* default 1 */
+*(undefined4 *)(param_1 + 0x2f8) = (iVar7 != 0);
+...
+*(undefined4 *)(DAT_004b31bc + 0x250) = *(undefined4 *)(param_1 + 0x2f8);
+if (*(int *)(param_1 + 0x2f8) != 0) {
+  FUN_00414bb0();                                   /* [EndingList] */
+}
+```
+
+That is the same key, doing the same two jobs, that School Days HQ reads in
+`FUN_0041f600` — see [Which endings have been seen](#which-endings-have-been-seen-and-the-title-backdrop).
+The two titles differ only in where the member sits and how the DLL asks for it:
+
+| | INI reader | Config member | Engine member | Subobject | Slot reader |
+|---|---|---|---|---|---|
+| School Days HQ | `FUN_0041f600` | `+0x26c` | `+0x21c` (`FUN_00420150`) | `+0x1f0` | `FUN_0042baf0` |
+| Shiny Days | `FUN_00414ed0` | `+0x2f8` | `+0x250` (written inline) | `+0x224` | `FUN_004173c0` |
+
+The other seventeen `+0x250` displacements in `SHINYDAYS.exe` are not this
+member. `FUN_0041ee60`'s is the trap: it looks like a second writer, and is not.
+Its `this` is a `FILMEngine` **secondary** subobject — the vtable holding it, at
+`0x0048e684`, has an RTTI complete-object locator whose `offset_to_top` is `4`
+and whose type descriptor reads `.?AVFILMEngine@@` — so its store lands on
+engine `+0x254`. Eleven more belong to `FILMOBJ::Telop`, named by the vftable
+its own constructor `FUN_0043a790` installs; `FUN_00422200`'s is an indexed
+`[ESI + EAX*1 + 0x250]`; and the rest are `LEA`s in the `0x465xxx` range. Two
+methods agree on the count: Ghidra's instruction scan finds eighteen, and a raw
+scan of `.text` for the little-endian word finds nineteen, the extra being the
+`JLE` at `0x00439c3c` whose rel32 happens to be `0x250`.
+
+So this engine picks the cleared title from the `EndClear` flag **and**
+`[EndBGView]`, which is what the slot answers, and what School Days HQ's
+`FUN_0042baf0` answers through its own `+0x21c`. Nothing about the chain is now
+unreproduced. `src/ui/menu.rs`'s `end_bg_view` is the one reader both titles go
+through.
 
 **The Shiny Days Option screen is a carousel, not three screens.** Its four
 regions are the three tab headers and the close button — the same first four
@@ -4577,7 +4612,24 @@ if (*(int *)(param_1 + 0x26c) != 0) {
 
 One key therefore does two things: it is the extra condition on route 0, and it
 gates loading the ending list at all. Clearing it leaves the plain `Title` and
-no ending backdrops however far the player has got. The shipped value is `"1"`.
+no ending backdrops however far the player has got. The shipped value is `"1"`
+in both installs, and Shiny Days does the same through its own `+0x250` — see
+[Other titles on this engine](#other-titles-on-this-engine).
+
+**An absent key reads as set, not clear.** `FUN_0046e080` takes a default as
+its third argument and `FUN_0041f600` hands it `1`; the reader `wcsstr`s for the
+key and returns that default untouched when it is not there. Shiny Days'
+`FUN_0044c860` is the same function with the same `1`. The member's
+zero-initialiser never decides anything, because the branch that reads the INI
+at all writes the member on both arms.
+
+The value is not compared against the string `"1"` either. Both readers hand it
+to `oleaut32`'s `VariantChangeType` with `vt = 0xb`, `VT_BOOL` — `FUN_0046de00`
+on School Days HQ, `FUN_0044c530` on Shiny Days — and test the result against
+zero. That is `VarBoolFromStr`: a numeric string is false only when it converts
+to zero, and `True`/`False` are spellings too. A value it cannot convert raises
+`_com_error`, and what the original does with that is **not recovered**; this
+engine gives it the absent key's answer.
 
 ### Which endings have been seen, and the title backdrop
 

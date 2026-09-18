@@ -222,7 +222,8 @@ pub struct SaveState {
     /// The host's trial answer. Always false in the retail executable.
     pub trial: bool,
     /// Route 0 cleared: switches the title to `Title_Clear`. Needs both the
-    /// `EndClear` flag and `STARTSCRIPT.INI [EndBGView]`.
+    /// `EndClear` flag and `STARTSCRIPT.INI [EndBGView]` — in both titles, and
+    /// each asks that key through a member of its own. See [`end_bg_view`].
     pub cleared_first: bool,
     /// Route 1 cleared: unlocks `REPLAY`. The `EndClear` flag alone.
     pub cleared_replay: bool,
@@ -263,6 +264,22 @@ impl SaveState {
     /// unlocks `REPLAY`. Route 0 carries one further condition, object
     /// `+0x21c`, which `FUN_0041f600` sets from `STARTSCRIPT.INI
     /// [EndBGView]` — the same key that gates loading the ending list at all.
+    ///
+    /// Shiny Days spells the same two questions as one slot taking the route
+    /// number. `FUN_004173c0` is host `+0x108`, and it answers
+    ///
+    /// ```text
+    /// route != 0  ->  flag(L"EndClear")
+    /// route == 0  ->  engine+0x250 != 0 ? flag(L"EndClear") : 0
+    /// ```
+    ///
+    /// so route 0 carries the `[EndBGView]` condition and route 1 does not —
+    /// the same split, with the member now `+0x250` instead of `+0x21c`.
+    /// `SysMenuSD.dll` asks `+0x108(0)` in `FUN_1002f550` and `FUN_10030070`,
+    /// for the title art, and `+0x108(1)` in `FUN_1002fbd0` — its enablement
+    /// switch, whose case 2 is `!trial && +0x108(1)`, the same pair
+    /// `SysMenuSDHQ.dll`'s `FUN_100206e0` uses — and in `FUN_1002fd80`, which
+    /// steps the keyboard selection over a locked `REPLAY`.
     pub fn from_flags(flags: &FlagStore, start: &Ini) -> Self {
         let cleared = flags.flag("EndClear");
         SaveState {
@@ -328,14 +345,39 @@ fn load_font(vfs: &Vfs) -> Option<days_font::Font> {
 
 /// `STARTSCRIPT.INI [EndBGView]`, the ending-backdrop switch.
 ///
-/// `FUN_0041f600` reads this key into the startup config and does two things
-/// with it: it hands it to the host as the extra condition on route 0, and it
-/// skips loading the ending list entirely when the key is clear. So one key
-/// turns off both the ending backdrops and the cleared title art. The shipped
-/// value is `"1"`; a key that is absent altogether reads as off, which is what
-/// the executable's zero-initialised member does.
+/// Both titles read this key into their startup config and do two things with
+/// it: they hand it to the host as the extra condition on the cleared title,
+/// and they skip loading the ending list entirely when it is clear. So one key
+/// turns off both the ending backdrops and the cleared title art.
+///
+/// Each title keeps the same member under its own two numbers — the engine
+/// object's, and the `0x2c`-lower one the host subobject the DLL holds sees:
+///
+/// | | INI reader | Config member | Engine member | Subobject | Slot reader |
+/// |---|---|---|---|---|---|
+/// | School Days HQ | `FUN_0041f600` | `+0x26c` | `+0x21c` (`FUN_00420150`) | `+0x1f0` | `FUN_0042baf0` |
+/// | Shiny Days | `FUN_00414ed0` | `+0x2f8` | `+0x250` (written inline) | `+0x224` | `FUN_004173c0` |
+///
+/// **An absent key reads as set, not clear.** Both readers take a default and
+/// both are handed `1`: HQ's `FUN_0046e080` and Shiny's `FUN_0044c860` each
+/// `wcsstr` for the key and return that default untouched when it is not
+/// there. The member's zero-initialiser never decides anything, because the
+/// load path that reads the INI at all writes the member on both arms.
+///
+/// The test is not a string compare against `"1"`. Both readers hand the value
+/// to `oleaut32`'s `VariantChangeType` with `vt = 0xb`, `VT_BOOL` — HQ through
+/// `FUN_0046de00`, Shiny through `FUN_0044c530` — and compare the result
+/// against zero. That is `VarBoolFromStr`, so a numeric string is false only
+/// when it converts to zero, and `True`/`False` are spellings too. A value it
+/// cannot convert raises `_com_error`, and what the original does with **that**
+/// is **not recovered**; this engine gives it the absent key's answer. The
+/// shipped value is `"1"` in both installs.
 pub fn end_bg_view(start: &Ini) -> bool {
-    start.get_bool("EndBGView").unwrap_or(false)
+    match start.get("EndBGView").map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        Some(value) => value.parse::<i64>() != Ok(0),
+        None => true,
+    }
 }
 
 /// What the engine should do after handing the menu an event.
@@ -4757,8 +4799,14 @@ mod tests {
         assert_eq!(save.title_variant(), "Title");
         assert!(save.replay_unlocked());
 
-        // An absent key reads as clear, matching the zeroed member.
+        // An absent key reads as *set*: both readers default to 1.
         let save = SaveState::from_flags(&cleared_save(), &Ini::parse(""));
+        assert_eq!(save.title_variant(), "Title_Clear");
+
+        // And the test is `VarBoolFromStr`, not a compare against "1".
+        let save = SaveState::from_flags(&cleared_save(), &started("2"));
+        assert_eq!(save.title_variant(), "Title_Clear");
+        let save = SaveState::from_flags(&cleared_save(), &started("False"));
         assert_eq!(save.title_variant(), "Title");
     }
 

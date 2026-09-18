@@ -73,9 +73,11 @@ const CANDIDATES: &[(i32, &str)] = &[
 /// Which art it picks is host slot `+0x108(0)`, and that asks the same named
 /// flag this engine asks: `FUN_004173c0` hands the literal at `0x0048df50` —
 /// `L"EndClear"` — to slot `+0x18`, a lookup by name in the store, and reaches
-/// it when the engine's `+0x250` is set. **What `+0x250` means is not
-/// recovered**, so the one thing this does not reproduce is a clear `+0x250`,
-/// where the original shows the plain title however `EndClear` reads.
+/// it when the engine's `+0x250` is set. That member is
+/// `STARTSCRIPT.INI [EndBGView]`: `FUN_00414ed0` parses the key into its
+/// config object's `+0x2f8` and stores it straight into `DAT_004b31bc + 0x250`.
+/// So the gate is the one [`crate::ui::menu::end_bg_view`] already applies, and
+/// [`crate::ui::menu::SaveState::cleared_first`] is what selects this art.
 /// `docs/FORMATS.md` has the chain.
 const TITLE_CLEAR: (&str, &str) = (
     "System/Title/Clear/Title_Clear.png",
