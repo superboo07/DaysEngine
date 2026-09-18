@@ -759,6 +759,61 @@ pub struct Menu {
     /// What the dress-select popup is composited over; see
     /// [`Menu::dress_under`]. Held for the same reason as `backlog_art`.
     dress_art: Option<days_ui::Image>,
+    /// The screen the confirm popup was raised over, kept loaded and drawn
+    /// under it. Absent on every other screen. See [`Under`].
+    under: Option<Under>,
+}
+
+/// The screen the confirm popup is drawn over.
+///
+/// **The popup's art has no opaque pixel in it.** `Popup_Exit.png` and
+/// `Popup_Title.png` are 800x450 and translucent from edge to edge: outside
+/// the dialog panel every pixel is near-black at alpha 221 in School Days HQ,
+/// and outside it the two files are *byte-identical to `System/System/SysBase.png`*
+/// — the `[SystemBase]` dim the executable itself lays over the screen.
+/// Shiny Days ships the same pair the same way, its own `SysBase.png` under
+/// its own dialog. So the popup is a checkered screen-door over whatever was
+/// already there, not a background of its own, and compositing it over black
+/// is what turned it into a flat dark panel.
+///
+/// `FUN_0041dfa0` is the popup driver and it never closes the screen
+/// underneath: case 0 builds the `[SystemBase]` sprite at engine `+0x274` out
+/// of the path at engine `+0x5ac` (`FUN_00427e30`), case 1 fades it in over
+/// 500 ms (`FUN_0042f6a0`), and only then does case 2 open the popup module —
+/// into `engine + 0x270`, a slot of its own, while the module that raised it
+/// keeps its own. Case 5 drops the popup module, case 6 fades the dim back out
+/// over 500 ms and case 7 releases it. The screen underneath is live the whole
+/// time, which is also why `FUN_10014910` has to gate the save/load screen's
+/// widgets on the popup being up rather than relying on it being gone.
+///
+/// The anchor for `+0x5ac`: `FUN_00422170` is slot 8 of the vtable at
+/// `0x004d2864` and stores every `FILMENGINE.INI` string at `this + 0x57c`
+/// upwards, and `FUN_00422e10` — slot 9 of that same vtable — reaches the
+/// engine as `param_1 - 0x30`, so that subobject sits at engine `+0x30` and
+/// `[SystemBase]` lands at engine `+0x5ac`. Confirmed a second way by the
+/// whole run: `[SeCancel]` `+0x5a0`, `[SeSelect]` `+0x5bc`, `[SeClick]`
+/// `+0x5d8`, `[SeUp]`, `[SeDown]`, `[SeView]` and `[SeOpen]` are all
+/// constructed by the engine's own constructor `FUN_004217e0` at exactly those
+/// offsets plus `0x30`.
+///
+/// **This engine draws one dim, not two.** The shipped code fades
+/// `SysBase.png` in before the popup module opens and out after it closes, and
+/// nothing in `FUN_0041dfa0` removes it while the module is up; whether the
+/// retail build leaves it under the module's own copy of the same pixels is
+/// not recovered. Drawing both would put the screen at about 2% of its
+/// brightness, which is not a screen anything shows through, so what is drawn
+/// here is the screen underneath and the popup's art over it. The 500 ms fades
+/// at each end are recovered and **not implemented**: the popup appears and
+/// goes at once.
+struct Under {
+    /// Still loaded, so that its layers cost a texture each and not a
+    /// composite a frame.
+    screen: Screen,
+    /// Its widget states as the popup was raised, frozen. The module
+    /// underneath goes on running in the original but every widget of it is
+    /// gated off while the popup is up, and the pointer is over the popup, so
+    /// nothing moves them.
+    states: Vec<WidgetState>,
 }
 
 impl Menu {
@@ -866,6 +921,7 @@ impl Menu {
         let mut menu = Menu {
             backlog_art: None,
             dress_art: None,
+            under: None,
             showing,
             paths,
             variant,
@@ -956,8 +1012,24 @@ impl Menu {
             self.dress_phase,
             self.resolution,
         )?;
-        self.states = vec![WidgetState::Resting; screen.widget_count()];
-        self.screen = screen;
+        let states = vec![WidgetState::Resting; screen.widget_count()];
+        let was = (
+            std::mem::replace(&mut self.screen, screen),
+            std::mem::replace(&mut self.states, states),
+        );
+        // The confirm popup is drawn over the screen it was raised from, which
+        // stays loaded for as long as it is up. See [`Under`]. Arriving at the
+        // popup keeps what was showing; re-entering it — which is what a
+        // display-mode change is — keeps what it already had; leaving it drops
+        // the screen underneath.
+        self.under = match (showing.is(Mode::CONFIRM), self.under.take()) {
+            (true, Some(kept)) => Some(kept),
+            (true, None) => Some(Under {
+                screen: was.0,
+                states: was.1,
+            }),
+            (false, _) => None,
+        };
         self.refit();
         self.showing = showing;
         self.variant = variant;
@@ -1890,6 +1962,9 @@ impl Menu {
         if let Some(other) = self.dress.as_mut().and_then(|dress| dress.other.as_mut()) {
             fit(other, scale);
         }
+        if let Some(under) = self.under.as_mut() {
+            fit(&mut under.screen, scale);
+        }
         self.dirty |= self.screen.size() != was;
     }
 
@@ -1904,6 +1979,11 @@ impl Menu {
         }
         let scale = self.out_scale;
         fit(&mut self.screen, scale);
+        // The screen under the confirm popup is drawn at the same size as the
+        // popup, so it follows the same factor.
+        if let Some(under) = self.under.as_mut() {
+            fit(&mut under.screen, scale);
+        }
         // The dress-select screen's other map is fitted with it rather than
         // when it is swapped in: resampling a screen's base art is the
         // expensive half of loading one, and the swap happens on the frame the
@@ -1915,6 +1995,16 @@ impl Menu {
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// Whether the title's backdrop belongs under what is showing.
+    ///
+    /// The title is the one screen that does not own its background, and the
+    /// confirm popup is drawn over the screen it was raised from — so a popup
+    /// raised from the title wants that same backdrop, at the bottom of the
+    /// stack. See [`Under`] and [`crate::ui::ending::title_backdrop`].
+    pub fn wants_title_backdrop(&self) -> bool {
+        wants_title_backdrop(self.showing, self.return_to)
     }
 
     pub fn selection(&self) -> Option<usize> {
@@ -2049,7 +2139,22 @@ impl Menu {
         // give the same picture there.
         let list = self.list_layers();
         let late_base = self.list_slide.is_some();
-        let mut layers = self.screen.layers(&Composite {
+        // The screen the confirm popup was raised over goes under it, whole:
+        // its own backdrop, its own base art and its widgets as they were.
+        // See [`Under`].
+        let mut layers: Vec<Layer<'a>> = match &self.under {
+            Some(under) => under.screen.layers(&Composite {
+                backdrop,
+                base: true,
+                states: &under.states,
+                ..Default::default()
+            }),
+            None => Vec::new(),
+        };
+        // A backdrop belongs to whichever screen is the bottom one, and with
+        // the popup up that is the screen underneath.
+        let backdrop = backdrop.filter(|_| self.under.is_none());
+        layers.extend(self.screen.layers(&Composite {
             backdrop: self.dress_art.as_ref().or(backdrop),
             base: self.base_art(),
             under_base: if late_base { &list } else { &[] },
@@ -2058,7 +2163,7 @@ impl Menu {
             states: &self.states,
             sprites: &sprites,
             ..Default::default()
-        });
+        }));
         // The two dresses while they are moving. They are cuts and not widget
         // sprites because a thirtieth of 194.5 pixels leaves them on a
         // fraction, and they come from whichever sheet holds the six records —
@@ -4025,6 +4130,17 @@ fn step(
     None
 }
 
+/// Whether the title's backdrop belongs under `showing`.
+///
+/// See [`Menu::wants_title_backdrop`].
+fn wants_title_backdrop(showing: Showing, return_to: Mode) -> bool {
+    match showing {
+        Showing::Mode(Mode::TITLE) => true,
+        Showing::Mode(Mode::CONFIRM) => return_to == Mode::TITLE,
+        _ => false,
+    }
+}
+
 /// Background art for screens that do not name theirs after the stem.
 ///
 /// The confirm popup shares one chip sheet and hit map between two questions
@@ -4520,6 +4636,29 @@ mod tests {
             ),
             "2"
         );
+    }
+
+    /// The popup is drawn over the screen it was raised from, so a popup
+    /// raised from the title needs what the title is drawn over as well.
+    #[test]
+    fn the_popup_takes_the_title_backdrop_with_it() {
+        assert!(wants_title_backdrop(
+            Showing::Mode(Mode::TITLE),
+            Mode::TITLE
+        ));
+        assert!(wants_title_backdrop(
+            Showing::Mode(Mode::CONFIRM),
+            Mode::TITLE
+        ));
+        assert!(!wants_title_backdrop(
+            Showing::Mode(Mode::CONFIRM),
+            Mode::OPTION
+        ));
+        assert!(!wants_title_backdrop(
+            Showing::Mode(Mode::OPTION),
+            Mode::TITLE
+        ));
+        assert!(!wants_title_backdrop(Showing::BackLog, Mode::TITLE));
     }
 
     #[test]

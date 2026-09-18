@@ -2130,8 +2130,11 @@ fn run_menu(
             under = backdrop.as_ref().map(|b| menu.screen().to_display(b));
         }
         // The backdrop is only the title's; every other screen draws its own
-        // background or sits over black.
-        let under = (menu.showing().is(Mode::TITLE))
+        // background or sits over black. The confirm popup is the one that is
+        // drawn over another screen, so raised from the title it wants the
+        // title's backdrop at the bottom of its stack.
+        let under = menu
+            .wants_title_backdrop()
             .then_some(under.as_ref())
             .flatten();
         // Rasterises whatever the menu draws for itself, and only when

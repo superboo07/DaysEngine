@@ -3487,7 +3487,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         let dress_back = dress_back.as_ref().map(|b| b.path());
         let under = match &args.backdrop {
             Some(path) => Some(path.as_str()),
-            None if menu.showing().is(Mode::TITLE) => Some(chosen.path.as_str()),
+            None if menu.wants_title_backdrop() => Some(chosen.path.as_str()),
             None if menu.showing().is(Mode::DRESS_SELECT) => dress_back,
             None => None,
         };

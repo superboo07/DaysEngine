@@ -1872,6 +1872,64 @@ The popup's own dispatch (`FUN_1000a8f0`) settles which of its two regions is
 which: **widget 0 is YES**, which records the affirmative answer at `+0xa0`,
 and **widget 1 is NO**, which returns the player to the remembered mode.
 
+#### The popup is drawn over the screen that raised it
+
+**Neither `Popup_Exit.png` nor `Popup_Title.png` has an opaque pixel in it.**
+Both are 800x450 and translucent from edge to edge — in School Days HQ the
+dialog panel is alpha 238 and everything around it is near-black at alpha 221 —
+and outside the panel both files are **byte-identical to
+`System/System/SysBase.png`**, all 222,588 pixels of it. `SysBase.png` is
+`FILMENGINE.INI`'s `[SystemBase]`, the full-screen dim the *executable* lays
+over the screen. Shiny Days ships the same pair the same way: its `SysBase.png`
+carries a graded alpha rather than a flat one, and 331,625 of its
+`Popup_Exit.png`'s 360,000 pixels are that file unchanged.
+
+So the popup is a checkered screen-door over whatever was already on screen,
+and the art Overflow authored for it is that dim with the dialog painted on.
+
+`FUN_0041dfa0` is the popup's driver — `FUN_0041d410` case 5 enters it from the
+title and `FUN_0041d9c0` case 8 from any other screen — and **it never closes
+the screen underneath**. Its states, in order:
+
+    0  FUN_00427e30: build the [SystemBase] sprite at engine +0x274
+    1  FUN_0042f6a0: fade it in over 500 ms
+    2  FUN_00427d20: _SystemInit@8(-1) into engine +0x270, a slot of its own
+    3  FUN_00427da0: tick the popup module until it answers
+    4  advance
+    5  FUN_00427dd0: drop the popup module; rebuild the dim
+    6  FUN_0042f5b0: fade the dim out over 500 ms
+    7  FUN_00427e70: release it, and return _getNextMode@8
+
+The module that raised the popup keeps its own slot and goes on running the
+whole time, which is also why `FUN_10014910` has to gate the save/load screen's
+widgets on the popup being up rather than on the screen being gone.
+
+The anchor for engine `+0x5ac` is worth writing down, because it is a second
+vtable of the same class. `FUN_00422170` is slot 8 of the vtable at
+`0x004d2864` — the one preceded by the RTTI pointer at `0x004d2860`, four slots
+before the host vtable at `0x004d2894` — and it parses `FILMENGINE.INI` into
+`this + 0x57c` upwards. That subobject sits at engine `+0x30`: `FUN_00422e10`,
+slot 9 of the same vtable, reaches the engine as `param_1 - 0x30`. `0x57c +
+0x30` is `0x5ac`. Confirmed a second way by the whole run of strings, which the
+engine's own constructor `FUN_004217e0` builds at exactly those offsets plus
+`0x30` — `[SystemBase]` `0x5ac`, `[SeCancel]` `0x5d0`, `[SeSelect]` `0x5ec`,
+`[SeClick]` `0x608`, `[SeUp]` `0x624`, `[SeDown]` `0x640`, `[SeView]` `0x65c`,
+`[SeOpen]` `0x678`.
+
+**DaysEngine keeps the screen underneath loaded and draws it under the popup**,
+with the title's backdrop beneath it when the title is what raised it — see
+`ui::menu::Under`. Two divergences, both deliberate:
+
+- **One dim, not two.** Nothing in `FUN_0041dfa0` removes the `[SystemBase]`
+  sprite while the popup module is up, so a literal reading has the module's
+  own copy of those same pixels drawn over it. Two passes of alpha 221 leave
+  the screen at about 2% of its brightness, which is not a screen anything
+  shows through; which of the two the retail build actually presents is **not
+  recovered**, and this engine draws the screen underneath and the popup's art
+  over it.
+- **The two 500 ms fades are not implemented.** The popup appears and goes at
+  once.
+
 ### Title
 
 `FUN_10020140` picks the variant and the widget count together, and the count
