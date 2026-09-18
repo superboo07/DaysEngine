@@ -74,9 +74,36 @@ slot `+0x34` non-zero gives `Title.png`, otherwise slot `+0x108(0)` picks
 widget tables at `0x10058580` and `0x10058628`. Those two tables differ only by
 half a pixel of `y` on five records, so the box search cannot tell them apart
 and reaches the first; that is a half-pixel, and it is noted here rather than
-worked around. **What sets slot `+0x108` in `SHINYDAYS.exe` is not recovered**,
-so this engine still picks the cleared title from the `EndClear` flag, the way
-School Days HQ's `FUN_0042baf0` answers.
+worked around.
+
+Slot `+0x108` is `FUN_004173c0`, and it asks the **same named flag School Days
+HQ does**:
+
+```text
+if (arg != 0)              return this->+0x18(L"EndClear")
+if (this+0x224 != 0)       return this->+0x18(L"EndClear")
+return 0
+```
+
+Both branches overwrite the argument with the literal at `0x0048df50`, which is
+`L"EndClear"`, and tail-jump through the same slot. That slot is `FUN_00417df0`
+— a lookup **by name** in the store at `this+0x10`, releasing the entry it gets
+back through its `+0x4` and returning an int — not the pack-path lookup the
+member of the same number does on the other module. So the value is the
+`EndClear` flag, and the menu DLL's `+0x108(0)` reaches it through the
+`this+0x224` test.
+
+`this+0x224` is the host subobject's numbering, so it is the engine's own
+`+0x250`: `DAT_004b31bc` is the engine and `DAT_004b31bc + 0x2c` is the
+subobject the DLL holds, which is the `0x2c` every other offset here is shifted
+by. Two functions write it — `FUN_00414ed0`, which takes it from an object's
+`+0x2f8` beside a `L"FLAG_LOGO"` set through host `+0x1c`, and `FUN_0041ee60`,
+which clears it. **What that member means is not recovered.**
+
+So this engine picks the cleared title from the `EndClear` flag, which is what
+the slot answers whenever `+0x250` is set, and what School Days HQ's
+`FUN_0042baf0` answers outright. The one case it does not reproduce is a clear
+`+0x250`, where the original shows the plain title however the flag reads.
 
 **The Shiny Days Option screen is a carousel, not three screens.** Its four
 regions are the three tab headers and the close button — the same first four

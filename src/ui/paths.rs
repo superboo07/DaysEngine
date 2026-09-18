@@ -69,6 +69,14 @@ const CANDIDATES: &[(i32, &str)] = &[
 /// `FUN_1002f3f0` fills the `%s` of `System/Title/%s.cmap` from a literal that
 /// is `L"Title"` either way — so the cleared title is the same hit map under
 /// different art. The pair is the base and the chip sheet, in that order.
+///
+/// Which art it picks is host slot `+0x108(0)`, and that asks the same named
+/// flag this engine asks: `FUN_004173c0` hands the literal at `0x0048df50` —
+/// `L"EndClear"` — to slot `+0x18`, a lookup by name in the store, and reaches
+/// it when the engine's `+0x250` is set. **What `+0x250` means is not
+/// recovered**, so the one thing this does not reproduce is a clear `+0x250`,
+/// where the original shows the plain title however `EndClear` reads.
+/// `docs/FORMATS.md` has the chain.
 const TITLE_CLEAR: (&str, &str) = (
     "System/Title/Clear/Title_Clear.png",
     "System/Title/Clear/Title_Clear_Chip.png",
