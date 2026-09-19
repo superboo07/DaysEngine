@@ -41,12 +41,12 @@ pub enum VideoScaler {
     /// What the original's Direct3D path gives (`FUN_0044a3d0` sets
     /// `D3DTEXF_LINEAR`), for a player who wants that rather than better.
     Bilinear,
-    /// The default: sharper than bilinear, cheap enough for 4K.
-    #[default]
+    /// Sharper than bilinear, cheap enough for 4K.
     Bicubic,
     /// Sharper still, and rings a little.
     Lanczos,
-    /// Natural bicubic spline.
+    /// The default: a natural bicubic spline, sharp without lanczos' ringing.
+    #[default]
     Spline,
     /// Softer than bicubic, with no ringing at all.
     Gaussian,
@@ -774,7 +774,7 @@ impl ScaleBackend {
 /// where it is converted. The original leaves scaling to Direct3D's bilinear
 /// filter — `FUN_0044a3d0` sets `D3DTEXF_LINEAR` on every sampler stage — and
 /// this engine's deliberate departure is to do better than a driver's bilinear,
-/// so the default is [`VideoScaler::Bicubic`] and `DaysEngine.ini` can say
+/// so the default is [`VideoScaler::Spline`] and `DaysEngine.ini` can say
 /// otherwise. At 1:1 it costs nothing either way: swscale takes its unscaled
 /// path whatever the flag says.
 ///

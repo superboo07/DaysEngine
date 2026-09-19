@@ -38,7 +38,7 @@
 //! ```text
 //! ; DaysEngine.ini
 //! [Video]
-//! Scaler = bicubic
+//! Scaler = spline
 //!
 //! [UI]
 //! Scaler = bspline
@@ -620,8 +620,8 @@ pub fn template() -> String {
          [Video]\n\
          ; How a movie frame is scaled to the window. libswscale's filters:\n\
          ;   {}\n\
-         ; The original left this to Direct3D's bilinear; bicubic is sharper.\n\
-         Scaler = bicubic\n\
+         ; The original left this to Direct3D's bilinear; spline is sharper.\n\
+         Scaler = spline\n\
          \n\
          ; libavfilter chains, `ffmpeg -vf` syntax, run over every movie frame.\n\
          ; Empty means no filtering at all, which is what the original did.\n\
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn no_file_means_the_engine_defaults() {
         let settings = Settings::parse("");
-        assert_eq!(settings.video_scaler, VideoScaler::Bicubic);
+        assert_eq!(settings.video_scaler, VideoScaler::Spline);
         assert_eq!(settings.ui_scaler, UiScaler::Pixel);
         assert!(!settings.pixel_perfect());
     }
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn a_value_that_makes_no_sense_keeps_the_default() {
         let settings = Settings::parse("[Video]\nScaler = magic\n[UI]\nScaler = \n");
-        assert_eq!(settings.video_scaler, VideoScaler::Bicubic);
+        assert_eq!(settings.video_scaler, VideoScaler::Spline);
         assert_eq!(settings.ui_scaler, UiScaler::Pixel);
     }
 
