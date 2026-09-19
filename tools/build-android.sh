@@ -159,13 +159,53 @@ if [ "$libs_only" = 1 ]; then
     exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# The debug key, and why it is kept
+#
+# A debug APK has to be signed with the *same* key every time or `adb install`
+# on top of the last one fails with "signatures do not match", and the only
+# way out is uninstalling -- which throws away the folder grant with it.
+#
+# Android's own debug keystore lives in $HOME/.android, and $HOME inside the
+# --rm build container is thrown away when the container exits, so the plugin
+# generated a fresh one on every build and every APK was signed by a different
+# key. Measured: two consecutive builds of the same commit signed by
+# 73c433bb... and 120e8390.... So the keystore lives under target/ with every
+# other build output, and android/app/build.gradle names it outright rather
+# than leaving the plugin to find one.
+#
+# **These credentials are not a secret and are not meant to be.** They are
+# exactly what every Android SDK generates for a debug key, they are in every
+# copy of this file, and a debug key is not what a published build is signed
+# with -- `--release` produces an unsigned APK precisely so that signing it is
+# a deliberate act with a key this repository never sees.
+#
+# By default it is per-checkout, under target/ with every other build output:
+# a fresh clone builds a new one, and installing over an APK from a different
+# checkout needs one uninstall. DAYS_ANDROID_KEYSTORE moves it somewhere that
+# outlives target/ -- the devcontainer sets it to a volume it owns, so
+# `cargo clean` and a container rebuild both leave the key alone. See
+# .devcontainer/docker-compose.yml and tools/in-container.sh, which carries
+# the path into the build container.
+# ---------------------------------------------------------------------------
+keystore=${DAYS_ANDROID_KEYSTORE:-$root/target/android/debug.keystore}
+mkdir -p "$(dirname "$keystore")"
+if [ ! -f "$keystore" ]; then
+    echo "== generating a debug key in $(dirname "$keystore")"
+    keytool -genkeypair -noprompt \
+        -keystore "$keystore" -storepass android -keypass android \
+        -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10950 \
+        -dname 'C=US, O=Android, CN=Android Debug'
+fi
+
 task=assemble$([ "$mode" = release ] && echo Release || echo Debug)
 # --project-cache-dir is not optional. Gradle keeps per-project state in a
 # `.gradle` directory beside the build file unless told otherwise, and that is
 # generated output in the source tree -- which this repository does not have.
 # Everything gradle writes belongs under target/ with every other build output.
 gradle -p "$root/android" --no-daemon \
-    --project-cache-dir "$root/target/android/gradle-cache" "$task"
+    --project-cache-dir "$root/target/android/gradle-cache" \
+    -Pdaysengine.keystore="$keystore" "$task"
 
 # **Found rather than spelled out.** A debug build leaves `app-debug.apk` and
 # an unsigned release leaves `app-release-unsigned.apk` -- the name carries

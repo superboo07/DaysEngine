@@ -48,9 +48,35 @@ android {
         }
     }
 
+    // Named outright rather than left to the plugin, which would generate a
+    // throwaway one in $HOME on every build -- see the long note in
+    // tools/build-android.sh, which is what creates this. The credentials are
+    // the standard Android debug ones and are not a secret; the keystore is
+    // never committed.
+    //
+    // The property is how tools/build-android.sh says where it put it, which
+    // is under target/ unless DAYS_ANDROID_KEYSTORE moved it. The default
+    // keeps a bare `gradle assembleDebug` working.
+    signingConfigs {
+        debug {
+            storeFile file(project.findProperty('daysengine.keystore')
+                ?: "${rootDir}/../target/android/debug.keystore")
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
         release {
             minifyEnabled false
+            // Deliberately unsigned. There is no signing key in this
+            // repository and there should not be one; signing a release is a
+            // deliberate act with a key of the publisher's own.
+            signingConfig null
         }
     }
 

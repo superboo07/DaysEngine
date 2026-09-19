@@ -188,6 +188,32 @@ build directory, its caches, and the project cache it would otherwise keep in
 a `.gradle` beside the build file (`--project-cache-dir`). Nothing generated
 lands in `android/`.
 
+## The debug key
+
+A debug APK has to be signed with the **same key every time**, or `adb install`
+over the previous one fails with `signatures do not match` and the only way
+forward is uninstalling — which on this app throws the player's folder grant
+away with it.
+
+Android's own debug keystore lives in `$HOME/.android`, and `$HOME` inside the
+`--rm` build container is discarded when it exits, so the plugin generated a
+fresh key on every build and no APK could be installed over the last. Measured:
+two consecutive builds of the same commit signed by `73c433bb…` and
+`120e8390…`. So `tools/build-android.sh` creates the keystore itself and
+`android/app/build.gradle` names it outright.
+
+By default it is `target/android/debug.keystore`, per-checkout. Set
+`DAYS_ANDROID_KEYSTORE` to put it somewhere that outlives `target/` — the
+devcontainer points it at `/root/.android` on a volume it owns, beside the ssh
+and git credentials, because a key a `cargo clean` can delete is a key that
+will be deleted. `tools/in-container.sh` mounts that directory into the build
+container at the same path, so the value means one thing on both sides.
+
+The credentials are `androiddebugkey` / `android`, which is exactly what every
+Android SDK generates and is **not a secret**. A debug key is not what a
+published build is signed with: `--release` produces an unsigned APK precisely
+so that signing it is a deliberate act, with a key this repository never sees.
+
 ## Known gaps
 
 - **Not run against a real install on a device.** The build is verified end to

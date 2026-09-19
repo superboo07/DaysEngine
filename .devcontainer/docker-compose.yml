@@ -96,6 +96,22 @@ services:
       #     git config --global user.email "..."
       - daysengine-ssh:/root/.ssh
       - daysengine-gitconfig:/root/.config/git
+      # **The Android debug signing key**, which is a credential and so follows
+      # the rule above: a volume the container owns, generated once from
+      # inside, never bound in from the host.
+      #
+      # It is on a volume rather than under target/ for a reason the other
+      # build outputs do not have. A debug APK must be signed with the same key
+      # every time or `adb install` over the last one fails with "signatures do
+      # not match", and the only way forward is uninstalling -- which on this
+      # app throws away the player's folder grant with it. A key that a
+      # `cargo clean` can delete is a key that will be deleted.
+      #
+      # /root/.android is where Android's own tooling keeps this, so anything
+      # else that writes there lands on the volume too. devcontainer.json's
+      # DAYS_ANDROID_KEYSTORE points tools/build-android.sh at it, and
+      # tools/in-container.sh carries it into the build container.
+      - daysengine-android:/root/.android
       # Claude Code's credentials, settings and per-project history, so a
       # rebuild does not ask you to log in again.
       - daysengine-claude:/root/.claude
@@ -143,3 +159,4 @@ volumes:
   daysengine-gitconfig:
   daysengine-claude:
   daysengine-ghidra:
+  daysengine-android:

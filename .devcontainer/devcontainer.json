@@ -46,7 +46,15 @@
     // in one directory, which is the volume above. Without this, .claude.json
     // sits at /root/.claude.json instead, outside the volume: the credentials
     // persist and the login does not, so every rebuild asks again.
-    "CLAUDE_CONFIG_DIR": "/root/.claude"
+    "CLAUDE_CONFIG_DIR": "/root/.claude",
+
+    // The Android debug signing key, on the volume docker-compose.yml mounts
+    // at /root/.android. Without this, tools/build-android.sh keeps it under
+    // target/, where a `cargo clean` takes it with everything else -- and a
+    // debug APK signed with a new key cannot be installed over the old one,
+    // so losing it costs an uninstall and, on the phone, re-granting the game
+    // folder. tools/in-container.sh carries the path into the build container.
+    "DAYS_ANDROID_KEYSTORE": "/root/.android/debug.keystore"
   },
 
   "customizations": {

@@ -1,6 +1,7 @@
-# Sourced by the three scripts that build what ships -- tools/build-sdl.sh,
-# tools/build-ffmpeg.sh and tools/dist.sh. It answers one question, and acts on
-# it before the script it was sourced from does anything:
+# Sourced by the four scripts that build what ships -- tools/build-sdl.sh,
+# tools/build-ffmpeg.sh, tools/build-android.sh and tools/dist.sh. It answers
+# one question, and acts on it before the script it was sourced from does
+# anything:
 #
 #   "am I already in the image a release is built in?"
 #
@@ -21,7 +22,8 @@
 # accident. And SDL3 and ffmpeg have build dependencies of their own, dozens of
 # -dev packages between them, which live in exactly one place rather than being
 # installed twice. tools/dist/Dockerfile is both: a toolchain, the MinGW
-# cross-compiler, the assembler, those build dependencies, and nothing else.
+# cross-compiler, the Android NDK and SDK, gradle, the assembler, those build
+# dependencies, and nothing else.
 #
 # A developer build is NOT untouched by this, and has not been since the
 # libraries stopped being the host's: `just deps` builds the same pinned SDL3 and
@@ -160,6 +162,24 @@ days_run+=(
     -e GIT_CONFIG_KEY_0=safe.directory
     -e GIT_CONFIG_VALUE_0="$days_root"
 )
+
+# **The Android debug key, when it has been moved out of the tree.** A debug
+# APK must be signed with the same key every time or `adb install` over the
+# last one fails and the only way forward is an uninstall -- which on this app
+# throws away the player's folder grant with it. tools/build-android.sh keeps
+# that key under target/ by default; DAYS_ANDROID_KEYSTORE puts it somewhere
+# that outlives target/, and the devcontainer points it at a volume.
+#
+# The directory is mounted at its own path, the same way the tree and the game
+# installs are, so the value means one thing on both sides of this line.
+if [ -n "${DAYS_ANDROID_KEYSTORE:-}" ]; then
+    days_keydir=$(dirname "$DAYS_ANDROID_KEYSTORE")
+    mkdir -p "$days_keydir"
+    days_run+=(
+        -v "$days_keydir:$days_keydir"
+        -e "DAYS_ANDROID_KEYSTORE=$DAYS_ANDROID_KEYSTORE"
+    )
+fi
 
 # **Who the build runs as, and why the answer is not always the same.** What
 # matters is only that the archive comes out owned by the person who asked for
