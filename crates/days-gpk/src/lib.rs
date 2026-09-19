@@ -130,7 +130,17 @@ impl Key {
     /// user's own `SCHOOLDAYS HQ.exe`, not in this repository.
     pub fn from_executable(exe: &Path) -> Result<Self, Error> {
         let bytes = std::fs::read(exe).map_err(io(exe))?;
-        let res = pe::find_resource(&bytes, "CODE", "CIPHERCODE")?;
+        Self::from_image(&bytes)
+    }
+
+    /// Reads the key out of an executable already in memory.
+    ///
+    /// The same test as [`Key::from_executable`], for a caller that has the
+    /// bytes rather than a path it can hand to `std::fs`. The engine reaches
+    /// for this on Android, where the install is a Storage Access Framework
+    /// tree and a game file has no path the C library can open.
+    pub fn from_image(bytes: &[u8]) -> Result<Self, Error> {
+        let res = pe::find_resource(bytes, "CODE", "CIPHERCODE")?;
         Self::from_resource(&res)
     }
 
@@ -212,7 +222,20 @@ impl Archive {
     /// Opens an archive and parses its index.
     pub fn open(path: impl AsRef<Path>, key: &Key) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
-        let mut file = File::open(&path).map_err(io(&path))?;
+        let file = File::open(&path).map_err(io(&path))?;
+        Self::from_file(path, file, key)
+    }
+
+    /// Parses the index of an archive that is already open.
+    ///
+    /// `path` names it for errors and for [`Archive::path`]; it is never
+    /// opened. This is the door for a caller whose files do not come from
+    /// `std::fs` — on Android the install is a Storage Access Framework tree,
+    /// and what a document resolves to is a file descriptor and not a path.
+    /// The descriptor is still seekable, which is the whole reason a pack can
+    /// be read a piece at a time there as it is everywhere else.
+    pub fn from_file(path: PathBuf, file: File, key: &Key) -> Result<Self, Error> {
+        let mut file = file;
         let total = file.seek(SeekFrom::End(0)).map_err(io(&path))?;
         if total < FOOTER_LEN {
             return Err(Error::NotGpk(path));

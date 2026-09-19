@@ -88,7 +88,7 @@ pub fn slot_keys(film: &Ini, slot: u32) -> (String, String) {
 /// the session.
 pub fn load_slot(game: &Path, film: &Ini, slot: u32) -> Option<Slot> {
     let path = slot_path(game, film, slot);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::storage::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
@@ -122,11 +122,11 @@ pub fn write_flags(game: &Path, film: &Ini, flags: &FlagStore) -> std::io::Resul
 
 fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        super::storage::create_dir_all(dir)?;
     }
     let temp = path.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(&temp, path)?;
+    super::storage::write(&temp, bytes)?;
+    super::storage::rename(&temp, path)?;
     log::info!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())
 }
@@ -151,7 +151,7 @@ pub fn flag_path(game: &Path, film: &Ini) -> PathBuf {
 /// asset costs the player a feature and never the session.
 pub fn load_flags(game: &Path, film: &Ini) -> FlagStore {
     let path = flag_path(game, film);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::storage::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             log::info!("no save data at {}: starting fresh", path.display());

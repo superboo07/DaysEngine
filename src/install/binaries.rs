@@ -30,6 +30,7 @@
 //! `RouteProcSD.dll` adds `_ChangeSubtitle@4`, `_CheckEndRollSelect@8`,
 //! `_CheckEndRollView@4` and `_CheckUniformBlock@4` and drops nothing.
 
+use super::storage;
 use days_gpk::Key;
 use days_route::pe::Image;
 use std::path::{Path, PathBuf};
@@ -88,7 +89,7 @@ impl Binaries {
         let mut menu = None;
         let mut route = None;
         for path in dlls(root) {
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(bytes) = storage::read(&path) else {
                 continue;
             };
             let Ok(image) = Image::parse(&bytes) else {
@@ -145,7 +146,7 @@ fn read_or_warn(path: Option<&Path>, why: &str) -> Vec<u8> {
     let Some(path) = path else {
         return Vec::new();
     };
-    match std::fs::read(path) {
+    match storage::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
             log::warn!("reading {} — {why}: {err}", path.display());
@@ -159,12 +160,12 @@ fn read_or_warn(path: Option<&Path>, why: &str) -> Vec<u8> {
 /// Sorted so that two installs holding the same files classify the same way
 /// whatever order the filesystem hands them back in.
 fn dlls(root: &Path) -> Vec<PathBuf> {
-    let Ok(read) = std::fs::read_dir(root) else {
+    let Ok(read) = storage::read_dir(root) else {
         return Vec::new();
     };
     let mut out: Vec<PathBuf> = read
-        .flatten()
-        .map(|e| e.path())
+        .into_iter()
+        .map(|e| e.path)
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")))
         .collect();
     out.sort();
@@ -177,16 +178,16 @@ fn dlls(root: &Path) -> Vec<PathBuf> {
 /// repackaged install, and on the other titles on this engine, so the test is
 /// the resource rather than the name.
 pub fn find_executable(root: &Path) -> Result<PathBuf, Error> {
-    let Ok(read) = std::fs::read_dir(root) else {
+    let Ok(read) = storage::read_dir(root) else {
         return Err(Error::NoExecutable(root.to_path_buf()));
     };
     let mut exes: Vec<PathBuf> = read
-        .flatten()
-        .map(|e| e.path())
+        .into_iter()
+        .map(|e| e.path)
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
         .collect();
     exes.sort();
     exes.into_iter()
-        .find(|p| Key::from_executable(p).is_ok())
+        .find(|p| storage::read(p).is_ok_and(|bytes| Key::from_image(&bytes).is_ok()))
         .ok_or_else(|| Error::NoExecutable(root.to_path_buf()))
 }

@@ -44,6 +44,7 @@
 //! Neither retail install ships an overlay, so nothing in either one changes;
 //! a patched or translated install is what this is for.
 
+use super::storage;
 use days_gpk::{Archive, Entry, Key};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,7 +108,14 @@ impl Vfs {
     pub fn mount(root: impl AsRef<Path>) -> Result<Self, Error> {
         let root = root.as_ref().to_path_buf();
         let executable = super::binaries::find_executable(&root)?;
-        let key = Key::from_executable(&executable)?;
+        // Read once and parse from memory rather than handing the path to
+        // `Key::from_executable`: on Android the install is a SAF tree and the
+        // executable has no name `std::fs` can open.
+        let exe_bytes = storage::read(&executable).map_err(|source| Error::Io {
+            path: executable.clone(),
+            source,
+        })?;
+        let key = Key::from_image(&exe_bytes)?;
         let binaries = super::binaries::Binaries::find(&root, &executable);
         let patches = patch_max(&binaries);
 
@@ -124,7 +132,13 @@ impl Vfs {
             // Base first, then overlay 0 upward, so the highest-numbered
             // overlay holding a path is the one left in the index.
             for layer in std::iter::once(base.clone()).chain(overlay_paths(base, patches)) {
-                let archive = match Archive::open(&layer, &key) {
+                let archive = match storage::open(&layer)
+                    .map_err(|source| days_gpk::Error::Io {
+                        path: layer.clone(),
+                        source,
+                    })
+                    .and_then(|file| Archive::from_file(layer.clone(), file, &key))
+                {
                     Ok(archive) => archive,
                     // A base pack that will not open is the install being
                     // broken; an overlay that will not open costs only itself.
@@ -363,7 +377,7 @@ fn overlay_paths(base: &Path, patches: u32) -> impl Iterator<Item = PathBuf> {
     let base = base.to_path_buf();
     (0..patches)
         .map(move |i| overlay_path(&base, i))
-        .filter(|p| p.is_file())
+        .filter(|p| storage::is_file(p))
 }
 
 /// Where overlay `i` of `base` would live, whether or not it is there.
@@ -388,7 +402,7 @@ pub fn pack_display_name(path: &Path) -> String {
 
 fn pack_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
     let dir = root.join("Packs");
-    let read = std::fs::read_dir(&dir).map_err(|source| {
+    let read = storage::read_dir(&dir).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             Error::NoPacksDir(root.to_path_buf())
         } else {
@@ -400,17 +414,12 @@ fn pack_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
     })?;
     let mut out = Vec::new();
     for entry in read {
-        let path = entry
-            .map_err(|source| Error::Io {
-                path: dir.clone(),
-                source,
-            })?
-            .path();
-        if path
+        if entry
+            .path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("gpk"))
         {
-            out.push(path);
+            out.push(entry.path);
         }
     }
     if out.is_empty() {

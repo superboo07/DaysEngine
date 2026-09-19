@@ -88,8 +88,12 @@ miniz_oxide = { version = "=0.9.1", features = ["std"] }
 # derive(Error) boilerplate only. Compile-time only, no runtime surface.
 thiserror = "=2.0.20"
 
-# Error propagation in the binaries only. Libraries use typed `thiserror` enums
-# so callers can match on failure modes; `anyhow` never appears in a lib crate.
+# Error propagation in the application layer only: `game` and `inspect`, which
+# live in this crate's library rather than in `src/main.rs` because Android
+# loads a shared object instead of running a `main`. The format readers under
+# crates/ -- the parts another project could use -- carry typed `thiserror`
+# enums so callers can match on failure modes, and none of them depends on
+# this.
 anyhow = "=1.0.104"
 
 # Logging facade + the only backend we link. env_logger is binary-only.
@@ -100,7 +104,9 @@ env_logger = "=0.11.11"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 
-# CLI for the offline asset/route tools. Binary-only.
+# CLI for the `daysengine <subcommand>` inspection tools. Reached only from
+# `inspect`, which is in the library for the linkage reason above; nothing in
+# `install`, `media`, `playback` or `ui` touches it.
 clap = { version = "=4.6.6", features = ["derive", "env"] }
 
 # Window, input, GPU present and audio output. Links the system libSDL3.

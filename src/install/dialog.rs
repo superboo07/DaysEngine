@@ -145,7 +145,8 @@ impl Template {
     pub fn from_game(game: &Path, id: u16) -> Result<Template, Error> {
         let path = crate::install::binaries::find_executable(game)
             .map_err(|_| Error::NotPe("no game executable in the install"))?;
-        let bytes = std::fs::read(&path).map_err(|_| Error::NotPe("cannot read the executable"))?;
+        let bytes = crate::install::storage::read(&path)
+            .map_err(|_| Error::NotPe("cannot read the executable"))?;
         Template::find(&bytes, id)
     }
 

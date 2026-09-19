@@ -13,11 +13,11 @@
 //! argument to be spelled differently. [`run`] is the whole entry point, and
 //! `main` hands over to it when the first argument names a subcommand.
 
+use crate::install::binaries::{self, Binaries};
+use crate::ui::ending;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use days_gpk::{Archive, Key};
-use daysengine::install::binaries::{self, Binaries};
-use daysengine::ui::ending;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -517,7 +517,7 @@ pub struct MenuArgs {
     /// how the original reaches the mode. `--mode 9`, the dress-select screen,
     /// is reachable the way the original reaches it — the title screen's
     /// `START` — so this is a shortcut to it rather than the only way in; see
-    /// [`daysengine::ui::dress`].
+    /// [`crate::ui::dress`].
     #[arg(long, value_name = "N", conflicts_with = "from_bar")]
     mode: Option<i32>,
     /// Stand in a playthrough loaded from this slot, so the screens that ask
@@ -558,11 +558,7 @@ pub fn run() -> Result<()> {
 
     // These tools are the verification path for what the engine draws, so they
     // have to draw it the same way: same UI kernel, out of the same file.
-    daysengine::playback::scale::set_kernel(
-        daysengine::install::engine::Settings::load()
-            .ui_scaler
-            .kernel(),
-    );
+    crate::playback::scale::set_kernel(crate::install::engine::Settings::load().ui_scaler.kernel());
 
     let game = match cli.game {
         Some(dir) => dir,
@@ -581,7 +577,7 @@ pub fn run() -> Result<()> {
             // Through the VFS rather than straight off the pack files, so what
             // this lists is what the game can see: one row per logical path,
             // from whichever patch overlay won it.
-            let vfs = daysengine::install::vfs::Vfs::mount(&game)?;
+            let vfs = crate::install::vfs::Vfs::mount(&game)?;
             let prefix = pack.map(|p| format!("{}/", p.to_ascii_lowercase()));
             let mut rows: Vec<_> = vfs
                 .entries()
@@ -718,7 +714,7 @@ pub fn run() -> Result<()> {
 /// Pack paths look like `english/00/00-00-A00.ENG.ORS`; the route layer knows
 /// the script as `00-00-A00`, so strip the language directory and the `.ENG`
 /// infix.
-fn script_paths(vfs: &daysengine::install::vfs::Vfs) -> Vec<(String, String)> {
+fn script_paths(vfs: &crate::install::vfs::Vfs) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vfs
         .paths()
         .filter(|p| p.starts_with("script/") && p.ends_with(".ors"))
@@ -737,7 +733,7 @@ fn script_paths(vfs: &daysengine::install::vfs::Vfs) -> Vec<(String, String)> {
 }
 
 fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let mut histogram: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let (mut ok, mut failed) = (0usize, 0usize);
 
@@ -772,7 +768,7 @@ fn cmd_scripts(game: &Path, stats: bool) -> Result<()> {
 }
 
 fn cmd_script(game: &Path, name: &str) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, path) = script_paths(&vfs)
         .into_iter()
@@ -800,7 +796,7 @@ fn cmd_script(game: &Path, name: &str) -> Result<()> {
 }
 
 fn cmd_assets(game: &Path) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let mut missing: std::collections::BTreeMap<String, usize> = Default::default();
     let mut checked = 0usize;
 
@@ -847,7 +843,7 @@ fn cmd_assets(game: &Path) -> Result<()> {
 
 /// Reports the engine's own settings, or prints a file to start from.
 fn cmd_settings(template: bool) {
-    use daysengine::install::engine::{self, Settings};
+    use crate::install::engine::{self, Settings};
     if template {
         print!("{}", engine::template());
         return;
@@ -868,7 +864,7 @@ fn cmd_settings(template: bool) {
     }
     println!("  [Rumble] Strength   = {}%", settings.rumble_strength);
     println!("  [Input] every control, with what it is bound to:");
-    let width = daysengine::install::binding::Action::ALL
+    let width = crate::install::binding::Action::ALL
         .into_iter()
         .map(|action| action.key().len())
         .max()
@@ -900,8 +896,8 @@ fn cmd_media(
     dump_frame: Option<&Path>,
     at_size: Option<&str>,
 ) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
-    println!("ffmpeg {}", daysengine::media::ffmpeg_version());
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
+    println!("ffmpeg {}", crate::media::ffmpeg_version());
 
     let handle = vfs
         .resolve(path)
@@ -912,14 +908,14 @@ fn cmd_media(
     println!("{} ({} bytes)", name, bytes.len());
 
     if name.to_ascii_lowercase().ends_with(".wmv") {
-        let mut decoder = daysengine::media::VideoDecoder::open(bytes)?;
+        let mut decoder = crate::media::VideoDecoder::open(bytes)?;
         println!("video {}x{}", decoder.width(), decoder.height());
         if let Some(size) = at_size {
             // The engine's own settings, so this measures what the player gets
             // rather than what the defaults would give — the filter chains and
             // the grain included, since they are most of what a frame costs
             // now and this is where that is measured.
-            let settings = daysengine::install::engine::Settings::load();
+            let settings = crate::install::engine::Settings::load();
             decoder.set_scaler(settings.video_scaler)?;
             decoder.set_filters(&settings.video_filters);
             decoder.set_post_filters(&settings.video_filters_after);
@@ -936,7 +932,7 @@ fn cmd_media(
         }
         let mut frames = 0usize;
         let mut last = 0.0;
-        let mut first: Option<daysengine::media::VideoFrame> = None;
+        let mut first: Option<crate::media::VideoFrame> = None;
         let started = std::time::Instant::now();
         while let Some(frame) = decoder.next_frame()? {
             last = frame.timestamp;
@@ -967,7 +963,7 @@ fn cmd_media(
             println!("wrote first frame to {}", path.display());
         }
     } else {
-        let audio = daysengine::media::decode_audio(bytes)?;
+        let audio = crate::media::decode_audio(bytes)?;
         println!(
             "audio {} frames, {:.3}s, peak {:.3}",
             audio.frames(),
@@ -988,7 +984,7 @@ fn parse_size(text: &str) -> Result<(u32, u32)> {
 
 /// Writes an RGBA frame as a binary PPM, dropping alpha. Enough to eyeball a
 /// decode without pulling in an image encoder.
-fn write_ppm(path: &Path, frame: &daysengine::media::VideoFrame) -> Result<()> {
+fn write_ppm(path: &Path, frame: &crate::media::VideoFrame) -> Result<()> {
     let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
     out.extend(
         frame
@@ -1008,7 +1004,7 @@ fn write_ppm(path: &Path, frame: &daysengine::media::VideoFrame) -> Result<()> {
 /// expected to cut a movie short, and we would rather find out here than by
 /// watching playback drift.
 fn cmd_timing(game: &Path, name: &str) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -1029,7 +1025,7 @@ fn cmd_timing(game: &Path, name: &str) -> Result<()> {
             println!("{path:<46} MISSING");
             continue;
         };
-        let mut decoder = daysengine::media::VideoDecoder::open(vfs.read(handle)?)?;
+        let mut decoder = crate::media::VideoDecoder::open(vfs.read(handle)?)?;
         let mut frames = 0usize;
         while decoder.next_frame()?.is_some() {
             frames += 1;
@@ -1111,7 +1107,7 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
     } = args;
     let (bar, following_record, ending_card, rate) = (*bar, *following_record, *ending_card, *rate);
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let wanted = name.to_uppercase();
     let (_, script_path) = script_paths(&vfs)
         .into_iter()
@@ -1131,12 +1127,12 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
         .collect::<Result<_>>()?;
     targets.sort();
 
-    let mixer = daysengine::Mixer::new();
-    let mut stage = daysengine::Stage::new(script);
+    let mixer = crate::Mixer::new();
+    let mut stage = crate::Stage::new(script);
     // The player's `MenVoice`, because a refused male line drives no mouth:
     // the option moves the picture as well as the sound.
     {
-        use daysengine::install::config::{Config, Flag};
+        use crate::install::config::{Config, Flag};
         stage.set_men_voice(Config::load(game).flag(Flag::MenVoice));
     }
     stage.set_ending_card(ending_card);
@@ -1146,8 +1142,7 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
     // Two answers only the install can give: the choice box's axis, and
     // whether dialogue wraps and at what pitch.
     let film = film_ini(&vfs);
-    let stacked =
-        daysengine::ui::select::Layout::from_ini(&film) == daysengine::ui::select::Layout::Stacked;
+    let stacked = crate::ui::select::Layout::from_ini(&film) == crate::ui::select::Layout::Stacked;
     let english = film.get_bool("UseEnglish").unwrap_or(false);
     let left_arrangement = film.get_bool("LeftArrangement").unwrap_or(false);
 
@@ -1155,10 +1150,10 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
     // settled, so `--bar` shows the dropped-down state.
     let control = if bar {
         let dll = system_menu_dll(game)?;
-        match daysengine::ui::bar::Bar::load(&vfs, &dll, daysengine::ui::screen::Resolution::Wide) {
+        match crate::ui::bar::Bar::load(&vfs, &dll, crate::ui::screen::Resolution::Wide) {
             Ok(mut strip) => {
                 strip.point_at(Some((0, 0)), 0);
-                strip.point_at(Some((0, 0)), daysengine::ui::bar::FADE_IN_MS + 1);
+                strip.point_at(Some((0, 0)), crate::ui::bar::FADE_IN_MS + 1);
                 Some(strip)
             }
             Err(err) => {
@@ -1171,11 +1166,10 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
     };
     // The gauge reads the player's own save, as playback does: a bar drawn with
     // no counters has nothing to put in the channel.
-    let bar_state = daysengine::ui::bar::State {
+    let bar_state = crate::ui::bar::State {
         following_record,
-        gauge: slot_feeling(game)
-            .map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store)),
-        ..daysengine::ui::bar::State::from_config(&daysengine::install::config::Config::load(game))
+        gauge: slot_feeling(game).map(|(_, _, _, store)| crate::install::feeling::gauge(&store)),
+        ..crate::ui::bar::State::from_config(&crate::install::config::Config::load(game))
     };
 
     const W: usize = 800;
@@ -1197,7 +1191,7 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
                 .select
                 .map(|w| format!("{:?}/{:?} {}..{}", w.a, w.b, w.start, w.end)),
         );
-        let mut rgba = daysengine::playback::compose::frame_rgba_with(
+        let mut rgba = crate::playback::compose::frame_rgba_with(
             &visual,
             &font,
             W,
@@ -1274,21 +1268,21 @@ fn no_module(game: &Path, exports: &[&str]) -> String {
 const TICK: std::time::Duration = std::time::Duration::from_micros(16_667);
 
 /// Reads `FILMENGINE.INI` out of the packs, or an empty one with a warning.
-fn film_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
+fn film_ini(vfs: &crate::install::vfs::Vfs) -> crate::Ini {
     match vfs.read_path("Ini/FILMENGINE.INI") {
-        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
+        Ok(bytes) => crate::Ini::parse_bytes(&bytes),
         Err(err) => {
             log::warn!("reading Ini/FILMENGINE.INI: {err}");
-            daysengine::Ini::parse("")
+            crate::Ini::parse("")
         }
     }
 }
 
 fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
-    use daysengine::ui::bar::{self, Act, Bar, State};
-    use daysengine::ui::screen::Resolution;
+    use crate::ui::bar::{self, Act, Bar, State};
+    use crate::ui::screen::Resolution;
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -1301,7 +1295,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
         println!("compositing the strip at {w}x{h}");
     }
 
-    let config = daysengine::install::config::Config::load(game);
+    let config = crate::install::config::Config::load(game);
     let counters = |pair: &str, flag: &str| -> anyhow::Result<(i32, i32)> {
         let (a, b) = pair
             .split_once(',')
@@ -1310,9 +1304,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     };
     let feeling = match &args.feeling {
         Some(pair) => Some(counters(pair, "--feeling")?),
-        None => {
-            slot_feeling(game).map(|(_, _, _, store)| daysengine::install::feeling::gauge(&store))
-        }
+        None => slot_feeling(game).map(|(_, _, _, store)| crate::install::feeling::gauge(&store)),
     };
     let was = match &args.feeling_was {
         Some(pair) => Some(counters(pair, "--feeling-was")?),
@@ -1443,7 +1435,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
     println!(
         "audio: resampled x{} and {}",
         bar::SPEEDS[state.speed],
-        if bar::SPEEDS[state.speed] > daysengine::playback::mixer::MUTE_ABOVE {
+        if bar::SPEEDS[state.speed] > crate::playback::mixer::MUTE_ABOVE {
             "muted, above the 4.0 threshold"
         } else {
             "heard"
@@ -1494,12 +1486,12 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
             let level = matches!(bar.layout().map(|l| l.gauge), Some(bar::Gauge::Fill { .. }));
             println!(
                 "gauge: {} {first}, {} {second} — {}, {}",
-                daysengine::install::feeling::FIRST,
-                daysengine::install::feeling::SECOND,
+                crate::install::feeling::FIRST,
+                crate::install::feeling::SECOND,
                 if level {
                     format!(
                         "{} alone, at {}",
-                        daysengine::install::feeling::FIRST,
+                        crate::install::feeling::FIRST,
                         state.gauge_fill
                     )
                 } else {
@@ -1540,7 +1532,7 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
                 println!(
                     "  bar    {} wide, from {} alone",
                     state.gauge_fill.max(0.0).round(),
-                    daysengine::install::feeling::FIRST,
+                    crate::install::feeling::FIRST,
                 );
                 bar::gauge::Pieces::default()
             } else {
@@ -1683,11 +1675,11 @@ fn cmd_bar(game: &Path, args: &BarArgs) -> Result<()> {
 }
 
 fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
+    use crate::ui::screen::Resolution;
+    use crate::ui::select::{Choice, Metrics, Select};
     use days_script::Frame;
-    use daysengine::ui::screen::Resolution;
-    use daysengine::ui::select::{Choice, Metrics, Select};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let film = film_ini(&vfs);
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -1724,27 +1716,20 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
     // Where each line lands, which is the whole of what the box looks like:
     // `System/Select` ships no art, so a label that is placed wrong is a label
     // nobody can see. The picture is 800x450 here, the space
-    // `daysengine::playback::text::Geometry::native` works in.
-    let geometry = daysengine::playback::text::Geometry::native(
-        film.get_bool("LeftArrangement").unwrap_or(false),
-    );
+    // `crate::playback::text::Geometry::native` works in.
+    let geometry =
+        crate::playback::text::Geometry::native(film.get_bool("LeftArrangement").unwrap_or(false));
     let english = film.get_bool("UseEnglish").unwrap_or(false);
     println!(
         "placed in {}x{}, strip {:.1} wide",
         geometry.screen.0,
         geometry.screen.1,
-        daysengine::ui::select::strip_width(choice.count(), select.layout, english, geometry),
+        crate::ui::select::strip_width(choice.count(), select.layout, english, geometry),
     );
     for (i, label) in choice.labels.iter().enumerate() {
         let lines = metrics.lines(label);
-        let places = daysengine::ui::select::place(
-            &lines,
-            i,
-            choice.count(),
-            select.layout,
-            english,
-            geometry,
-        );
+        let places =
+            crate::ui::select::place(&lines, i, choice.count(), select.layout, english, geometry);
         for (line, at) in lines.iter().zip(places) {
             println!(
                 "  label {i}: at ({:7.2},{:7.2}) x{:.3}/{:.3}  {line:?}",
@@ -1777,12 +1762,12 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
             None => (0.5, 0.5),
         };
         let mut rng = |_: usize| 0;
-        let hover = daysengine::ui::select::Input {
+        let hover = crate::ui::select::Input {
             pointer,
             ..Default::default()
         };
         choice.tick(Frame(0), &select, hover, false, &mut rng);
-        let answering = daysengine::ui::select::Input {
+        let answering = crate::ui::select::Input {
             pick: pick >= 0,
             dismiss: pick < 0,
             ..hover
@@ -1838,8 +1823,8 @@ fn ui_pages(dll: &[u8], screen: &str, frame: usize) {
 
 /// The Option screen's three tab pages.
 fn option_tables(dll: &[u8], frame: usize) {
-    use daysengine::ui::option_pages::{self, Pages};
-    use daysengine::ui::options::Tab;
+    use crate::ui::option_pages::{self, Pages};
+    use crate::ui::options::Tab;
 
     let Some(pages) = Pages::locate(dll, frame) else {
         println!("no Option page tables in this module");
@@ -1898,8 +1883,8 @@ fn option_tables(dll: &[u8], frame: usize) {
 
 /// The Replay screen's two views.
 fn replay_tables(dll: &[u8], frame: usize) {
-    use daysengine::ui::replay::View;
-    use daysengine::ui::replay_pages::{self, Pages};
+    use crate::ui::replay::View;
+    use crate::ui::replay_pages::{self, Pages};
 
     let Some(pages) = Pages::locate(dll, frame) else {
         println!("no Replay view tables in this module");
@@ -1975,9 +1960,9 @@ fn replay_tables(dll: &[u8], frame: usize) {
 }
 
 fn cmd_ui(game: &Path, args: &UiArgs) -> Result<()> {
-    use daysengine::ui::screen::{Resolution, Screen, WidgetState};
+    use crate::ui::screen::{Resolution, Screen, WidgetState};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -2101,7 +2086,7 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
 }
 
 fn cmd_font(game: &Path, text: Option<&str>, alpha: bool, verify: bool) -> Result<()> {
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     // The English build ships both; FONTDATA_ENG is the one the localised
     // executable selects.
     let bytes = vfs
@@ -2230,7 +2215,7 @@ fn matches(name: &str, filter: Option<&str>) -> bool {
 
 /// A pack file's name without the `[FileExtend]`: `System`, `System.000`.
 fn pack_name(p: &Path) -> String {
-    daysengine::install::vfs::pack_display_name(p)
+    crate::install::vfs::pack_display_name(p)
 }
 
 /// Every pack file in `Packs`: the base packs and their patch overlays.
@@ -2287,18 +2272,15 @@ fn select_packs(dir: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
 ///
 /// Shared by `menu` and `save` so both see the install the same way. A missing
 /// or unreadable file reads as a fresh install, which is what it means.
-fn load_flags(
-    game: &Path,
-    vfs: &daysengine::install::vfs::Vfs,
-) -> daysengine::install::save::FlagStore {
+fn load_flags(game: &Path, vfs: &crate::install::vfs::Vfs) -> crate::install::save::FlagStore {
     let film = match vfs.read_path("Ini/FILMENGINE.INI") {
-        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
+        Ok(bytes) => crate::Ini::parse_bytes(&bytes),
         Err(err) => {
             log::warn!("reading Ini/FILMENGINE.INI: {err}");
-            daysengine::Ini::parse("")
+            crate::Ini::parse("")
         }
     };
-    daysengine::install::save::load_flags(game, &film)
+    crate::install::save::load_flags(game, &film)
 }
 
 /// The backdrop the title screen would be drawn over.
@@ -2306,21 +2288,21 @@ fn load_flags(
 /// Shared by `menu` and `save`, and the reason `[BaseFile]` is read here rather
 /// than passed in: the fresh-install picture is one of the four answers.
 fn chosen_backdrop(
-    vfs: &daysengine::install::vfs::Vfs,
+    vfs: &crate::install::vfs::Vfs,
     list: &ending::EndingList,
-    flags: &daysengine::install::save::FlagStore,
+    flags: &crate::install::save::FlagStore,
 ) -> ending::Backdrop {
     let start = start_script_ini(vfs);
     ending::title_backdrop(list, flags, start.get("BaseFile").unwrap_or_default())
 }
 
 /// `STARTSCRIPT.INI`, which both the title art and the backdrop are read from.
-fn start_script_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
+fn start_script_ini(vfs: &crate::install::vfs::Vfs) -> crate::Ini {
     match vfs.read_path("Ini/STARTSCRIPT.INI") {
-        Ok(bytes) => daysengine::Ini::parse_bytes(&bytes),
+        Ok(bytes) => crate::Ini::parse_bytes(&bytes),
         Err(err) => {
             log::warn!("reading Ini/STARTSCRIPT.INI: {err}");
-            daysengine::Ini::parse("")
+            crate::Ini::parse("")
         }
     }
 }
@@ -2334,9 +2316,9 @@ fn start_script_ini(vfs: &daysengine::install::vfs::Vfs) -> daysengine::Ini {
 /// cipher index and every record order — not just on what the reader happens
 /// to accept.
 fn cmd_save_roundtrip(game: &Path) -> Result<()> {
-    use daysengine::install::save::{flag_path, slot_path, FlagStore, Slot};
+    use crate::install::save::{flag_path, slot_path, FlagStore, Slot};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let film = film_ini(&vfs);
     let mut checked = 0;
     let mut differed = 0;
@@ -2407,8 +2389,7 @@ fn cmd_save_roundtrip(game: &Path) -> Result<()> {
     let mut lost = 0;
     if let Ok(dll) = route_dll(game) {
         let global = load_flags(game, &vfs);
-        if let Ok(mut progress) = daysengine::install::progress::Progress::load(&vfs, &dll, global)
-        {
+        if let Ok(mut progress) = crate::install::progress::Progress::load(&vfs, &dll, global) {
             for n in 0..100 {
                 let Ok(bytes) = std::fs::read(slot_path(game, &film, n)) else {
                     continue;
@@ -2447,9 +2428,9 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
 /// `Progress::from_story` — so what this reports is where the jump would put
 /// the player, and what it left of the run's history.
 fn cmd_save_story(game: &Path, slot: u32, story: u32) -> Result<()> {
-    use daysengine::install::progress::Progress;
+    use crate::install::progress::Progress;
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let film = film_ini(&vfs);
     let flags = load_flags(game, &vfs);
     let mut progress = Progress::load(&vfs, &route_dll(game)?, flags)?;
@@ -2486,9 +2467,9 @@ fn cmd_save_story(game: &Path, slot: u32, story: u32) -> Result<()> {
 /// is what says whether a name is in the store at all — a distinction the
 /// getters hide, since a name that is not there reads as zero.
 fn cmd_save_slot(game: &Path, n: u32, all: bool) -> Result<()> {
-    use daysengine::install::save::{load_slot, slot_keys, slot_path, Value};
+    use crate::install::save::{load_slot, slot_keys, slot_path, Value};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let film = film_ini(&vfs);
     let flags = load_flags(game, &vfs);
     let path = slot_path(game, &film, n);
@@ -2552,10 +2533,10 @@ fn cmd_save_slot(game: &Path, n: u32, all: bool) -> Result<()> {
 }
 
 fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
-    use daysengine::install::save::Value;
-    use daysengine::SaveState;
+    use crate::install::save::Value;
+    use crate::SaveState;
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let flags = load_flags(game, &vfs);
     let start = start_script_ini(&vfs);
     let save = SaveState::from_flags(&flags, &start);
@@ -2610,7 +2591,7 @@ fn cmd_save(game: &Path, all: bool, grep: Option<&str>) -> Result<()> {
 
 /// Prints the player's settings the way the Option screen reads them.
 fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
-    use daysengine::install::config::{Channel, Config, Flag, Sound};
+    use crate::install::config::{Channel, Config, Flag, Sound};
 
     let path = Config::path(game);
     let config = Config::load(game);
@@ -2621,7 +2602,7 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
     // Which units the three volumes are in is the menu module's answer, and a
     // module this tool cannot read leaves the settings unreadable too rather
     // than read in the wrong units.
-    let sound = daysengine::ui::paths::Paths::from_module(&system_menu_dll(game)?).sound();
+    let sound = crate::ui::paths::Paths::from_module(&system_menu_dll(game)?).sound();
     println!();
     match sound {
         Sound::Levels => println!("volumes (level, then what reaches the sound layer):"),
@@ -2667,7 +2648,7 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
         println!();
         println!("the ladder, level by level:");
         print!("  ");
-        for level in 0..=daysengine::install::config::MAX_VOLUME {
+        for level in 0..=crate::install::config::MAX_VOLUME {
             print!("{level:>2}:{:<6} ", config.centibels(level));
         }
         println!();
@@ -2718,8 +2699,8 @@ fn cmd_config(game: &Path, roundtrip: bool) -> Result<()> {
 /// tail of the old one behind and a longer one eats the next line's `[`. Those
 /// fragments are unreachable for a reader that looks for `[Key]="`, and this
 /// engine drops them instead of carrying them forward.
-fn config_roundtrip(path: &Path, config: &daysengine::install::config::Config) -> Result<()> {
-    use daysengine::install::config::{Config, MAGIC};
+fn config_roundtrip(path: &Path, config: &crate::install::config::Config) -> Result<()> {
+    use crate::install::config::{Config, MAGIC};
 
     /// Both of the retail reader's stack buffers.
     const BUFFER: usize = 1024;
@@ -2825,7 +2806,7 @@ fn config_roundtrip(path: &Path, config: &daysengine::install::config::Config) -
 
 /// The container, decoded the way `FUN_0046c520` decodes it.
 fn inflate_config(bytes: &[u8]) -> Result<String> {
-    use daysengine::install::config::MAGIC;
+    use crate::install::config::MAGIC;
 
     let body = bytes
         .strip_prefix(&MAGIC)
@@ -2845,9 +2826,9 @@ fn find_key<'t>(text: &'t str, key: &str) -> Option<&'t str> {
 
 /// Prints the replay scene table recovered from the user's own menu DLL.
 fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
-    use daysengine::ui::replay::{Scenes, HSCENE_PER_PAGE};
+    use crate::ui::replay::{Scenes, HSCENE_PER_PAGE};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let flags = load_flags(game, &vfs);
     let scenes = Scenes::recover(&dll)?;
@@ -2876,7 +2857,7 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
             scene.first_script().unwrap_or("(no script recovered)"),
         );
         // The steps after the first, which is what a scene chains through when
-        // it is played. See `daysengine::ui::replay` for the walk.
+        // it is played. See `crate::ui::replay` for the walk.
         if scene.scripts.len() > 1 {
             println!(
                 "        then {}",
@@ -2926,7 +2907,7 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
 /// A row is the three next steps a step can lead to — the first for a player
 /// who has answered no choice box, the other two for the two answers — and a
 /// step past the end of the list is where the scene stops.
-fn print_branch(indent: &str, branch: Option<&daysengine::ui::replay::Branch>, scripts: &[String]) {
+fn print_branch(indent: &str, branch: Option<&crate::ui::replay::Branch>, scripts: &[String]) {
     let Some(table) = branch else {
         return;
     };
@@ -2952,15 +2933,15 @@ fn print_branch(indent: &str, branch: Option<&daysengine::ui::replay::Branch>, s
 
 /// Drives the menu state machine and reports where each event lands.
 fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
-    use daysengine::install::config::Config;
-    use daysengine::ui::menu::{Action, Menu, Mode, SaveState, Session};
-    use daysengine::ui::options::{Dir, Display, Som};
-    use daysengine::ui::paths::Paths;
-    use daysengine::ui::replay::Scenes;
-    use daysengine::ui::saveload::Kind;
-    use daysengine::ui::screen::Resolution;
+    use crate::install::config::Config;
+    use crate::ui::menu::{Action, Menu, Mode, SaveState, Session};
+    use crate::ui::options::{Dir, Display, Som};
+    use crate::ui::paths::Paths;
+    use crate::ui::replay::Scenes;
+    use crate::ui::saveload::Kind;
+    use crate::ui::screen::Resolution;
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let resolution = Resolution::from_name(&args.resolution)
         .with_context(|| format!("unknown resolution {}", args.resolution))?;
@@ -2969,7 +2950,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // A forced-fresh run reads an empty store, so the backdrop below follows
     // the same pretence the widget tables do.
     let flags = if args.fresh {
-        daysengine::install::save::FlagStore::default()
+        crate::install::save::FlagStore::default()
     } else {
         load_flags(game, &vfs)
     };
@@ -2991,7 +2972,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 .iter()
                 .filter_map(|e| match &e.command {
                     days_script::Command::PrintText { speaker, text } => {
-                        Some(daysengine::ui::backlog::Entry {
+                        Some(crate::ui::backlog::Entry {
                             speaker: speaker.clone(),
                             text: text.clone(),
                         })
@@ -3028,16 +3009,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         // port is held is the engine's answer, and `--som-port` is what
         // stands in for one here.
         som: Som {
-            enabled: Config::load(game).flag(daysengine::install::config::Flag::UseSom),
+            enabled: Config::load(game).flag(crate::install::config::Flag::UseSom),
             attached: args.som_port.is_some(),
             port: args.som_port.and_then(|n| n.checked_sub(1)).unwrap_or(0),
             testing: false,
         },
-        slots: daysengine::ui::saveload::Slots::read(game, &film, &flags, english),
+        slots: crate::ui::saveload::Slots::read(game, &film, &flags, english),
         english,
         text_input: film.get_bool("TextInput").unwrap_or(false),
         run: args.run_from_slot.and_then(|n| {
-            let slot = daysengine::install::save::load_slot(game, &film, n);
+            let slot = crate::install::save::load_slot(game, &film, n);
             if slot.is_none() {
                 log::warn!("slot {n} is empty, so there is no run to stand in");
             }
@@ -3046,11 +3027,11 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         // The backlog's two answers. There is no run here to have logged any
         // lines, so the screen opens empty — which is what it does in the
         // original before the first `[PrintText]` too.
-        flow: daysengine::ui::backlog::Flow::from_setting(
+        flow: crate::ui::backlog::Flow::from_setting(
             film.get_u32("BackLogType").unwrap_or(0).into(),
         ),
         ruby: Config::load(game).int_or(
-            daysengine::ui::backlog::RUBY_SETTING,
+            crate::ui::backlog::RUBY_SETTING,
             film.get_u32("AgateUsing").unwrap_or(0) as i32,
         ) != 0,
         lines: lines.clone(),
@@ -3090,7 +3071,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         }
         // The dress-select popup is not a mode, so it cannot be opened like
         // one: it is the second hit map inside mode 9, and the only way to it
-        // is to commit to a dress. See `daysengine::ui::dress`.
+        // is to commit to a dress. See `crate::ui::dress`.
         match Menu::open(&vfs, &dll, Mode::DRESS_SELECT, session(), resolution) {
             Ok(mut menu) => {
                 // Point at the first dress the way a player would, then
@@ -3146,7 +3127,7 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
         // The backlog is the fourth, and the one with no mode integer:
         // `setSystemInit` code 3 selects `DAT_1004ffc8`, whose constructor
         // installs `MENU::BackLogView::vftable`, and `SystemInit`'s switch has
-        // no case that reaches it. See `daysengine::ui::backlog`.
+        // no case that reaches it. See `crate::ui::backlog`.
         match Menu::open_backlog(&vfs, &dll, session(), resolution) {
             Ok(mut menu) => {
                 let leaving = menu.leave(&vfs, &dll);
@@ -3256,8 +3237,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             // One frame of whatever the screen animates itself, for looking at
             // the dress-select slide or the confirm popup's dim part-way
             // through: `tick` is one, `tick:N` is N. See
-            // `daysengine::ui::dress::SLIDE_FRAMES` and
-            // `daysengine::ui::menu::Dim`.
+            // `crate::ui::dress::SLIDE_FRAMES` and
+            // `crate::ui::menu::Dim`.
             "tick" => (menu.tick(&vfs, &dll, TICK)?, "tick".to_string()),
             other if other.starts_with("tick:") => {
                 let count: usize = other["tick:".len()..]
@@ -3343,24 +3324,22 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
                 som.enabled = menu
                     .session()
                     .config
-                    .flag(daysengine::install::config::Flag::UseSom);
+                    .flag(crate::install::config::Flag::UseSom);
                 let stand_in = args.som_port.and_then(|n| n.checked_sub(1));
                 match request {
-                    daysengine::ui::options::SomRequest::Detect => {
+                    crate::ui::options::SomRequest::Detect => {
                         som.attached = stand_in.is_some();
                         som.port = stand_in.unwrap_or(0);
                     }
-                    daysengine::ui::options::SomRequest::Release => {
+                    crate::ui::options::SomRequest::Release => {
                         som.attached = false;
                         som.testing = false;
                     }
-                    daysengine::ui::options::SomRequest::Port(port) => {
+                    crate::ui::options::SomRequest::Port(port) => {
                         som.attached = stand_in.is_some();
                         som.port = port;
                     }
-                    daysengine::ui::options::SomRequest::Test(on) => {
-                        som.testing = on && som.attached
-                    }
+                    crate::ui::options::SomRequest::Test(on) => som.testing = on && som.attached,
                 }
                 if !som.enabled {
                     som.attached = false;
@@ -3410,16 +3389,16 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             "  {:?} screen, page {} of {}, {} slots filled",
             menu.kind(),
             menu.page() + 1,
-            daysengine::ui::saveload::PAGES,
+            crate::ui::saveload::PAGES,
             slots.len()
         );
         // The ten rows the records have under them, which a drag can leave
         // starting part-way into a page — see `saveload::slot_at`.
         let rest = menu
             .list_slide()
-            .map_or(0, daysengine::ui::saveload::Slide::rest_row);
-        let live = (0..daysengine::ui::saveload::PER_PAGE).map(|row| {
-            let slot = daysengine::ui::saveload::slot_at(menu.page(), rest, row);
+            .map_or(0, crate::ui::saveload::Slide::rest_row);
+        let live = (0..crate::ui::saveload::PER_PAGE).map(|row| {
+            let slot = crate::ui::saveload::slot_at(menu.page(), rest, row);
             (slot, slots.get(slot))
         });
         for (slot, line) in live {
@@ -3476,10 +3455,10 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             chart.cells
         );
         for cell in 0..chart.cells {
-            let story = daysengine::ui::routemap::story(episode, chart.base, cell);
+            let story = crate::ui::routemap::story(episode, chart.base, cell);
             println!(
                 "    {:<6} {:<10} {:<14} {}",
-                daysengine::ui::routemap::story_flag(story),
+                crate::ui::routemap::story_flag(story),
                 if charted[cell] { "charted" } else { "blank" },
                 if pickable[cell] {
                     "can be picked"
@@ -3498,8 +3477,8 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
     // The dress-select screen's own base art is the transparent plate, so what
     // it is drawn over is `[DressBG]`. It is a clip in the shipped install,
     // which the game plays and a PNG can only hold the first frame of; see
-    // `daysengine::ui::dress::BACKGROUND_FPS`.
-    let dress_back = daysengine::ui::dress::background(&start_script_ini(&vfs));
+    // `crate::ui::dress::BACKGROUND_FPS`.
+    let dress_back = crate::ui::dress::background(&start_script_ini(&vfs));
     if menu.showing().is(Mode::DRESS_SELECT) {
         match &dress_back {
             Some(background) => println!("dress background {background:?}"),
@@ -3537,9 +3516,9 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
 
 /// Prints a dialog template out of the player's executable.
 fn cmd_dialog(game: &Path, id: Option<&str>, out: Option<&Path>, text: &str) -> Result<()> {
-    use daysengine::install::dialog::{comment_dialog, Class, Template};
+    use crate::install::dialog::{comment_dialog, Class, Template};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let english = film_ini(&vfs).get_bool("UseEnglish").unwrap_or(false);
     let id = match id {
         Some(text) => {
@@ -3572,7 +3551,7 @@ fn cmd_dialog(game: &Path, id: Option<&str>, out: Option<&Path>, text: &str) -> 
     }
 
     if let Some(out) = out {
-        use daysengine::ui::comment::{base_units, Comment};
+        use crate::ui::comment::{base_units, Comment};
         let exe = std::fs::read(Binaries::discover(game)?.executable)?;
         let bytes = vfs
             .read_path("System/System/FONTDATA_ENG.DAT")
@@ -3618,9 +3597,9 @@ fn cmd_route_play(
     rewind: usize,
     dress: u32,
 ) -> Result<()> {
-    use daysengine::install::progress::Progress;
+    use crate::install::progress::Progress;
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let flags = load_flags(game, &vfs);
     let mut progress = Progress::load(&vfs, &route_dll(game)?, flags)?;
     let answers: Vec<i32> = choices
@@ -3699,7 +3678,7 @@ fn cmd_route_play(
 /// beside each step because they are the half that is easy to get wrong — a
 /// rewind that moved but did not un-credit would read the same here and play
 /// differently three branches later.
-fn rewind_from(progress: &mut daysengine::install::progress::Progress, steps: usize) {
+fn rewind_from(progress: &mut crate::install::progress::Progress, steps: usize) {
     if steps == 0 {
         return;
     }
@@ -3724,7 +3703,7 @@ fn rewind_from(progress: &mut daysengine::install::progress::Progress, steps: us
 /// over ground the player has covered separates the two: if the whole walk
 /// comes back unknown, the spelling is wrong.
 fn read_record(
-    progress: &daysengine::install::progress::Progress,
+    progress: &crate::install::progress::Progress,
     was_read: &std::collections::BTreeSet<String>,
     walked: &[String],
 ) {
@@ -3751,10 +3730,10 @@ fn read_record(
 
 /// Prints the branch graph and the affection tables that drive it.
 fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) -> Result<()> {
+    use crate::install::feeling::{self, Deltas, Thresholds, FIRST, SECOND};
     use days_route::{Machine, Routes};
-    use daysengine::install::feeling::{self, Deltas, Thresholds, FIRST, SECOND};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = route_dll(game)?;
     let routes = Routes::recover(&dll)?;
     let machine = Machine::recover(&dll)?;
@@ -4371,14 +4350,14 @@ fn slot_feeling(game: &Path) -> Option<(String, i32, i32, days_save::FlagStore)>
 /// session's — enough to check the wrap, the stacking and the placement against
 /// the player's own art and font.
 fn cmd_backlog(game: &Path, args: &BacklogArgs) -> Result<()> {
-    use daysengine::ui::backlog::{self, Entry, Flow};
-    use daysengine::ui::paths::Paths;
-    use daysengine::ui::screen::{Resolution, Screen, WidgetState};
+    use crate::ui::backlog::{self, Entry, Flow};
+    use crate::ui::paths::Paths;
+    use crate::ui::screen::{Resolution, Screen, WidgetState};
 
-    let vfs = daysengine::install::vfs::Vfs::mount(game)?;
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
     let dll = system_menu_dll(game)?;
     let film = film_ini(&vfs);
-    let config = daysengine::install::config::Config::load(game);
+    let config = crate::install::config::Config::load(game);
     let english = film.get_bool("UseEnglish").unwrap_or(false);
     let flow = Flow::from_setting(film.get_u32("BackLogType").unwrap_or(0).into());
     // `[AgateUsing]` is the shipped default and `Config.DAT`'s `UseAgate` is
@@ -4476,7 +4455,7 @@ fn cmd_backlog(game: &Path, args: &BacklogArgs) -> Result<()> {
 }
 
 /// The glyph store, whichever of the two an install ships.
-fn load_font(vfs: &daysengine::install::vfs::Vfs) -> Result<days_font::Font> {
+fn load_font(vfs: &crate::install::vfs::Vfs) -> Result<days_font::Font> {
     let bytes = vfs
         .read_path("System/System/FONTDATA_ENG.DAT")
         .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?;

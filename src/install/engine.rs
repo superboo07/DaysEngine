@@ -266,6 +266,25 @@ impl Settings {
 /// The file's name, looked for beside the running binary.
 pub const FILE: &str = "DaysEngine.ini";
 
+/// Where to look for [`FILE`] when "beside the running binary" means nothing.
+///
+/// On Android the running binary is Android's own `app_process`, in a system
+/// directory no app may write, so `current_exe` gives a place the settings can
+/// be neither read from nor written to. The activity calls
+/// [`set_directory`] with the app's private files directory before the engine
+/// starts, and everything below then behaves exactly as it does on a desktop:
+/// the file is read if it is there, and written with the defaults if it is not.
+///
+/// This is the engine's own file and not the player's game, so it is a real
+/// path rather than anything in [`storage`](super::storage) — the SAF tree
+/// holds the install, and this does not live in the install.
+static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets the directory [`Settings::path`] reads from. Once, before loading.
+pub fn set_directory(dir: PathBuf) -> Result<(), PathBuf> {
+    DIRECTORY.set(dir)
+}
+
 impl Settings {
     /// Loads the settings from beside the running executable, writing the
     /// defaults out when there is no file there yet.
@@ -363,6 +382,9 @@ impl Settings {
 
     /// Where [`Settings::load`] looks.
     pub fn path() -> Option<PathBuf> {
+        if let Some(dir) = DIRECTORY.get() {
+            return Some(dir.join(FILE));
+        }
         let exe = std::env::current_exe().ok()?;
         Some(exe.parent()?.join(FILE))
     }

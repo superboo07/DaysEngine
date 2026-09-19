@@ -12,6 +12,11 @@
 //! [`engine`] reads `DaysEngine.ini`, which holds the choices the original
 //! never had to make, and [`binding`] is the part of it that says which key or
 //! which controller button does what.
+//!
+//! Every read and write of a file in the install goes through [`storage`]
+//! rather than through `std::fs` directly. On a desktop the two are the same
+//! thing; on Android the player grants a folder and not a path, and that is
+//! the seam where the difference lives.
 
 pub mod binaries;
 pub mod binding;
@@ -23,4 +28,5 @@ pub mod feeling;
 pub mod ini;
 pub mod progress;
 pub mod save;
+pub mod storage;
 pub mod vfs;

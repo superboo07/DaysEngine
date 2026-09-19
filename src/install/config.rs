@@ -349,7 +349,7 @@ impl Config {
 
     /// Reads one settings file, reporting why it could not be read.
     pub fn read(path: &Path) -> Result<Config, Error> {
-        let bytes = std::fs::read(path).map_err(|source| Error::Io {
+        let bytes = super::storage::read(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -722,8 +722,8 @@ impl Config {
             path: path.clone(),
             source,
         };
-        std::fs::write(&temp, self.encode()).map_err(io)?;
-        std::fs::rename(&temp, &path).map_err(io)?;
+        super::storage::write(&temp, self.encode()).map_err(io)?;
+        super::storage::rename(&temp, &path).map_err(io)?;
         self.dirty = false;
         log::info!("wrote {}", path.display());
         Ok(())

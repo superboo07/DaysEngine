@@ -2188,7 +2188,7 @@ impl Slots {
     pub fn read(game: &Path, film: &Ini, flags: &FlagStore, english: bool) -> Slots {
         let mut rows = BTreeMap::new();
         for slot in 0..(PAGES * PER_PAGE) as u32 {
-            if !save::slot_path(game, film, slot).is_file() {
+            if !crate::install::storage::is_file(save::slot_path(game, film, slot)) {
                 continue;
             }
             rows.insert(slot, Line::read(film, flags, slot, english));
