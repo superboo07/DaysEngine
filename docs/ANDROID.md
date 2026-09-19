@@ -175,6 +175,13 @@ The libraries have unversioned sonames — `libavcodec.so`, not
 | `DaysEngineActivity` | `SDLActivity` with the library list and no arguments. Also brings the grant back when Android has restored it straight from the task stack, which resets every static in the app |
 | `Saf` | The other side of `install::saf` |
 
+Both activities are `android:screenOrientation="sensorLandscape"`. The stage
+is whichever back buffer `DisplayType` selects in the player's `Config.DAT`,
+800x600 or 800x450, and both are landscape, so a portrait window would letterbox
+the same picture into a fraction of the screen. `sensorLandscape` rather than
+`landscape` leaves the device free to be held either way round, and the picker
+carries the same lock as the game so launching into it is not a rotation.
+
 SDL's own Java classes are compiled from `third_party/sdl`, not copied in:
 `SDLActivity` is the other side of `libSDL3.so`'s native methods and the two
 have to come from the same SDL.
