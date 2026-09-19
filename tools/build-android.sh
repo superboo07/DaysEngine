@@ -130,6 +130,21 @@ if [ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]; then
     version="$version-dirty"
 fi
 
+# The versionCode, which is the only thing Android itself compares: an install
+# over a lower one is an upgrade, over a higher one it refuses, and versionName
+# does not enter into it. So it cannot be the commit -- a hash has no order --
+# and it is the number of commits reachable from HEAD, which goes up by exactly
+# one per commit and is derived rather than remembered.
+#
+# It is not the count *of this branch* in any meaningful sense: rewriting
+# history can leave it flat or move it backwards, and an APK built from a
+# rewritten history may then need one uninstall. That is the cost of not
+# keeping a counter file, and it is the right trade here, where history is
+# linear on master and nothing is published to a store.
+#
+# 1 when there is no git, which is the floor Android accepts.
+code=$(git -C "$root" rev-list --count HEAD 2>/dev/null || echo 1)
+
 # ---------------------------------------------------------------------------
 # What an APK owes, and where it carries it
 #
@@ -208,7 +223,8 @@ task=assemble$([ "$mode" = release ] && echo Release || echo Debug)
 # Everything gradle writes belongs under target/ with every other build output.
 gradle -p "$root/android" --no-daemon \
     --project-cache-dir "$root/target/android/gradle-cache" \
-    -Pdaysengine.keystore="$keystore" -Pdaysengine.version="$version" "$task"
+    -Pdaysengine.keystore="$keystore" -Pdaysengine.version="$version" \
+    -Pdaysengine.versionCode="$code" "$task"
 
 # **Found rather than spelled out.** A debug build leaves `app-debug.apk` and
 # an unsigned release leaves `app-release-unsigned.apk` -- the name carries

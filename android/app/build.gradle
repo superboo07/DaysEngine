@@ -38,6 +38,13 @@ def engineVersion = (versionLine =~ /"(.*)"/)[0][1]
 // a checkout with no git: `unknown`.
 def buildId = project.findProperty('daysengine.version') ?: 'unknown'
 
+// And the number Android itself compares when deciding whether an install is
+// an upgrade -- versionName is only ever shown to a person. The same script
+// derives it from the commit count, for the reasons written down beside it
+// there; 1 is the floor Android accepts and what a checkout with no git gets.
+def buildCode = Integer.parseInt(
+    (project.findProperty('daysengine.versionCode') ?: '1').toString())
+
 android {
     namespace 'org.daysengine'
     compileSdk 35
@@ -53,7 +60,7 @@ android {
         applicationId 'org.daysengine'
         minSdk androidApi
         targetSdk 35
-        versionCode 1
+        versionCode buildCode
         versionName "${engineVersion}-${buildId}"
     }
 
