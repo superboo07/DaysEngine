@@ -163,15 +163,18 @@ days_run+=(
     -e GIT_CONFIG_VALUE_0="$days_root"
 )
 
-# **The Android debug key, when it has been moved out of the tree.** A debug
-# APK must be signed with the same key every time or `adb install` over the
-# last one fails and the only way forward is an uninstall -- which on this app
-# throws away the player's folder grant with it. tools/build-android.sh keeps
-# that key under target/ by default; DAYS_ANDROID_KEYSTORE puts it somewhere
-# that outlives target/, and the devcontainer points it at a volume.
+# **The Android signing key, when it has been moved out of the tree.** Every
+# APK this project builds is signed -- Android installs no unsigned one -- and
+# it must be the same key every time or `adb install` over the last one fails
+# and the only way forward is an uninstall, which on this app throws away the
+# player's folder grant with it. tools/build-android.sh keeps that key under
+# target/ by default; DAYS_ANDROID_KEYSTORE puts it somewhere that outlives
+# target/, and the devcontainer points it at a volume.
 #
 # The directory is mounted at its own path, the same way the tree and the game
-# installs are, so the value means one thing on both sides of this line.
+# installs are, so the value means one thing on both sides of this line. The
+# three credentials travel with it, for the case where it is a real key rather
+# than the public debug one.
 if [ -n "${DAYS_ANDROID_KEYSTORE:-}" ]; then
     days_keydir=$(dirname "$DAYS_ANDROID_KEYSTORE")
     mkdir -p "$days_keydir"
@@ -179,6 +182,15 @@ if [ -n "${DAYS_ANDROID_KEYSTORE:-}" ]; then
         -v "$days_keydir:$days_keydir"
         -e "DAYS_ANDROID_KEYSTORE=$DAYS_ANDROID_KEYSTORE"
     )
+    for days_cred in DAYS_ANDROID_KEYSTORE_PASS DAYS_ANDROID_KEY_ALIAS \
+        DAYS_ANDROID_KEY_PASS; do
+        # An `if` rather than `[ ... ] && ...`: under `set -e` the latter
+        # leaves the loop with a nonzero status when the last variable is
+        # unset, which is the common case, and takes the script down with it.
+        if [ -n "${!days_cred:-}" ]; then
+            days_run+=(-e "$days_cred=${!days_cred}")
+        fi
+    done
 fi
 
 # **Who the build runs as, and why the answer is not always the same.** What

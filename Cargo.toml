@@ -19,12 +19,12 @@ repository.workspace = true
 # resolve a path crate whose own version does not satisfy the requirement, so
 # these six lines move with `workspace.package.version` below and a bump that
 # forgets them fails loudly instead of drifting.
-days-gpk = { path = "crates/days-gpk", version = "=0.2.1" }
-days-script = { path = "crates/days-script", version = "=0.2.1" }
-days-font = { path = "crates/days-font", version = "=0.2.1" }
-days-ui = { path = "crates/days-ui", version = "=0.2.1" }
-days-save = { path = "crates/days-save", version = "=0.2.1" }
-days-route = { path = "crates/days-route", version = "=0.2.1" }
+days-gpk = { path = "crates/days-gpk", version = "=0.2.2" }
+days-script = { path = "crates/days-script", version = "=0.2.2" }
+days-font = { path = "crates/days-font", version = "=0.2.2" }
+days-ui = { path = "crates/days-ui", version = "=0.2.2" }
+days-save = { path = "crates/days-save", version = "=0.2.2" }
+days-route = { path = "crates/days-route", version = "=0.2.2" }
 miniz_oxide.workspace = true
 rusty_ffmpeg = { workspace = true, features = ["link_system_ffmpeg"] }
 sdl3.workspace = true
@@ -71,7 +71,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 rust-version = "1.82"

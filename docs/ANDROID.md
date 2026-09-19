@@ -8,7 +8,7 @@ picker, and everything after that is the game's own art.
 ```bash
 just android-deps    # SDL3 + ffmpeg for both ABIs. Slow; once per checkout.
 just android         # a debug-signed APK, ready for `adb install`
-just dist-android    # an unsigned release APK in target/dist/
+just dist-android    # a release APK in target/dist/
 ```
 
 `tools/build-android.sh` is where the build actually lives, so the `just`
@@ -195,12 +195,16 @@ build directory, its caches, and the project cache it would otherwise keep in
 a `.gradle` beside the build file (`--project-cache-dir`). Nothing generated
 lands in `android/`.
 
-## The debug key
+## The signing key
 
-A debug APK has to be signed with the **same key every time**, or `adb install`
-over the previous one fails with `signatures do not match` and the only way
-forward is uninstalling — which on this app throws the player's folder grant
-away with it.
+**Both modes are signed.** Android installs no unsigned APK — it rejects one
+with *"the package appears to be invalid"* before it looks at anything else —
+so an unsigned release is not a build anybody can run, only one they have to
+repair with `apksigner` first.
+
+It has to be the **same key every time**, too, or `adb install` over the
+previous one fails with `signatures do not match` and the only way forward is
+uninstalling — which on this app throws the player's folder grant away with it.
 
 Android's own debug keystore lives in `$HOME/.android`, and `$HOME` inside the
 `--rm` build container is discarded when it exits, so the plugin generated a
@@ -216,10 +220,25 @@ and git credentials, because a key a `cargo clean` can delete is a key that
 will be deleted. `tools/in-container.sh` mounts that directory into the build
 container at the same path, so the value means one thing on both sides.
 
-The credentials are `androiddebugkey` / `android`, which is exactly what every
-Android SDK generates and is **not a secret**. A debug key is not what a
-published build is signed with: `--release` produces an unsigned APK precisely
-so that signing it is a deliberate act, with a key this repository never sees.
+The default credentials are `androiddebugkey` / `android`, which is exactly
+what every Android SDK generates and is **not a secret**. What they are not is
+a *publishing* key. To use your own, point `DAYS_ANDROID_KEYSTORE` at it and
+set the three that go with it:
+
+```bash
+export DAYS_ANDROID_KEYSTORE=/path/to/your.keystore
+export DAYS_ANDROID_KEYSTORE_PASS=...
+export DAYS_ANDROID_KEY_ALIAS=...
+export DAYS_ANDROID_KEY_PASS=...
+```
+
+The repository still never sees that key; `tools/in-container.sh` carries the
+four into the build container alongside the keystore's directory. They reach
+gradle as command-line properties, which are visible in `ps` to anyone else on
+the machine — irrelevant for the public debug credential, worth knowing for a
+real one. `tools/build-android.sh` will generate a keystore for you only when
+the credentials are the debug ones; with your own set and the file missing it
+stops rather than inventing a key under your alias.
 
 ## Known gaps
 
@@ -232,9 +251,6 @@ so that signing it is a deliberate act, with a key this repository never sees.
   behaviour and it compiles, and that is not the same as working. This is the
   same state `docs/WINDOWS.md` records for Windows, and it is the first thing
   to check on a device.
-- **The release APK is unsigned.** There is no signing key in this repository
-  and there should not be. `apksigner sign --ks <your.keystore>` is the step
-  after `just dist-android`.
 - **The Option screen's windowed/full-screen toggle does nothing here.** An
   Android window is the display. The widget is still drawn, because it is the
   game's own screen and the tables come from the player's module.

@@ -4,7 +4,7 @@
 # APK.
 #
 #   tools/build-android.sh              debug APK, every configured ABI
-#   tools/build-android.sh --release    release APK (unsigned)
+#   tools/build-android.sh --release    release APK
 #   tools/build-android.sh --libs-only  just the .so files, no gradle
 #
 # What comes out is target/dist/daysengine-android-<commit>.apk, and what goes
@@ -178,25 +178,24 @@ if [ "$libs_only" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The debug key, and why it is kept
+# The signing key, and why it is kept
 #
-# A debug APK has to be signed with the *same* key every time or `adb install`
-# on top of the last one fails with "signatures do not match", and the only
-# way out is uninstalling -- which throws away the folder grant with it.
+# **Both modes are signed.** Android installs no unsigned APK -- it rejects one
+# with "the package appears to be invalid" before it looks at anything else --
+# so a release that came out unsigned is not a build anyone can run, only one
+# they have to repair with apksigner first.
+#
+# It has to be the *same* key every time, too, or `adb install` on top of the
+# last one fails with "signatures do not match" and the only way out is
+# uninstalling -- which throws away the player's folder grant with it.
 #
 # Android's own debug keystore lives in $HOME/.android, and $HOME inside the
 # --rm build container is thrown away when the container exits, so the plugin
 # generated a fresh one on every build and every APK was signed by a different
 # key. Measured: two consecutive builds of the same commit signed by
-# 73c433bb... and 120e8390.... So the keystore lives under target/ with every
-# other build output, and android/app/build.gradle names it outright rather
-# than leaving the plugin to find one.
-#
-# **These credentials are not a secret and are not meant to be.** They are
-# exactly what every Android SDK generates for a debug key, they are in every
-# copy of this file, and a debug key is not what a published build is signed
-# with -- `--release` produces an unsigned APK precisely so that signing it is
-# a deliberate act with a key this repository never sees.
+# 73c433bb... and 120e8390.... So this script creates the keystore itself and
+# android/app/build.gradle names it outright rather than leaving the plugin to
+# find one.
 #
 # By default it is per-checkout, under target/ with every other build output:
 # a fresh clone builds a new one, and installing over an APK from a different
@@ -205,10 +204,30 @@ fi
 # `cargo clean` and a container rebuild both leave the key alone. See
 # .devcontainer/docker-compose.yml and tools/in-container.sh, which carries
 # the path into the build container.
+#
+# **The default credentials are not a secret and are not meant to be.** They
+# are exactly what every Android SDK generates for a debug key and they are in
+# every copy of this file. What they are not is a *publishing* key: point
+# DAYS_ANDROID_KEYSTORE at your own and give its three credentials below, and
+# this repository still never sees it. Note that those three reach gradle as
+# command-line properties, which are visible in `ps` to anyone else on the
+# machine -- fine for the public debug credential, worth knowing for a real
+# one.
 # ---------------------------------------------------------------------------
 keystore=${DAYS_ANDROID_KEYSTORE:-$root/target/android/debug.keystore}
+storepass=${DAYS_ANDROID_KEYSTORE_PASS:-android}
+keyalias=${DAYS_ANDROID_KEY_ALIAS:-androiddebugkey}
+keypass=${DAYS_ANDROID_KEY_PASS:-android}
 mkdir -p "$(dirname "$keystore")"
 if [ ! -f "$keystore" ]; then
+    # Only ever the debug credential: a key this script invented is not one
+    # anybody should publish with, so it is generated with the credential that
+    # says so rather than with whatever the three variables above hold.
+    if [ "$storepass$keyalias$keypass" != "androidandroiddebugkeyandroid" ]; then
+        echo "no keystore at $keystore, and the credentials given are not the" >&2
+        echo "debug ones -- create that keystore yourself, or unset them." >&2
+        exit 1
+    fi
     echo "== generating a debug key in $(dirname "$keystore")"
     keytool -genkeypair -noprompt \
         -keystore "$keystore" -storepass android -keypass android \
@@ -223,13 +242,15 @@ task=assemble$([ "$mode" = release ] && echo Release || echo Debug)
 # Everything gradle writes belongs under target/ with every other build output.
 gradle -p "$root/android" --no-daemon \
     --project-cache-dir "$root/target/android/gradle-cache" \
-    -Pdaysengine.keystore="$keystore" -Pdaysengine.version="$version" \
-    -Pdaysengine.versionCode="$code" "$task"
+    -Pdaysengine.keystore="$keystore" -Pdaysengine.storepass="$storepass" \
+    -Pdaysengine.keyalias="$keyalias" -Pdaysengine.keypass="$keypass" \
+    -Pdaysengine.version="$version" -Pdaysengine.versionCode="$code" "$task"
 
-# **Found rather than spelled out.** A debug build leaves `app-debug.apk` and
-# an unsigned release leaves `app-release-unsigned.apk` -- the name carries
-# the signing state, so guessing it works for one mode and not the other.
-# There is exactly one APK in that directory; take it.
+# **Found rather than spelled out.** The name AGP gives the file carries the
+# build type and, when there is no signing config, the word `unsigned` -- so a
+# spelled-out name works for one mode and not the other, and would go stale
+# again the moment the signing setup changed. There is exactly one APK in that
+# directory; take it.
 built=$(find "$root/target/android/gradle/app/outputs/apk/$mode" \
     -maxdepth 1 -name '*.apk' -print -quit 2>/dev/null)
 if [ -z "$built" ]; then
@@ -243,10 +264,10 @@ cp "$built" "$apk"
 echo
 echo "$apk"
 echo
-if [ "$mode" = release ]; then
-    echo "Unsigned. Sign it before installing:"
-    echo "  apksigner sign --ks <your.keystore> $apk"
-else
+if [ "$keystore" = "$root/target/android/debug.keystore" ] ||
+    [ "$storepass$keyalias$keypass" = "androidandroiddebugkeyandroid" ]; then
     echo "Signed with the debug key. Install it with:"
-    echo "  adb install -r $apk"
+else
+    echo "Signed with $keystore. Install it with:"
 fi
+echo "  adb install -r $apk"

@@ -139,6 +139,6 @@ android-deps:
 android:
     ./tools/build-android.sh
 
-# An unsigned release APK in target/dist/, named after the commit.
+# A release APK in target/dist/, named after the commit.
 dist-android:
     ./tools/build-android.sh --release
