@@ -13,12 +13,12 @@ rust-version = "1.88"
 repository.workspace = true
 
 [dependencies]
-days-gpk = { path = "crates/days-gpk", version = "=0.1.0" }
-days-script = { path = "crates/days-script", version = "=0.1.0" }
-days-font = { path = "crates/days-font", version = "=0.1.0" }
-days-ui = { path = "crates/days-ui", version = "=0.1.0" }
-days-save = { path = "crates/days-save", version = "=0.1.0" }
-days-route = { path = "crates/days-route", version = "=0.1.0" }
+days-gpk = { path = "crates/days-gpk"}
+days-script = { path = "crates/days-script"}
+days-font = { path = "crates/days-font"}
+days-ui = { path = "crates/days-ui"}
+days-save = { path = "crates/days-save"}
+days-route = { path = "crates/days-route" }
 miniz_oxide.workspace = true
 rusty_ffmpeg = { workspace = true, features = ["link_system_ffmpeg"] }
 sdl3.workspace = true
@@ -65,8 +65,8 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2026"
 license = "MIT"
 rust-version = "1.82"
 repository = "https://github.com/superboo07/DaysEngine"
