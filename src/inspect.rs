@@ -882,10 +882,10 @@ fn cmd_settings(template: bool) {
         );
     }
     println!(
-        "\nA file of the defaults is written beside the binary on its first run, \
+        "\nA file of the defaults is written at the path above on its first run, \
          and anything a later version adds is written into it — additively, \
          never over what you wrote. Print a fresh one with: \
-         days settings --template > {}",
+         daysengine settings --template > {}",
         engine::FILE
     );
 }

@@ -269,15 +269,17 @@ pub const FILE: &str = "DaysEngine.ini";
 /// Where to look for [`FILE`] when "beside the running binary" means nothing.
 ///
 /// On Android the running binary is Android's own `app_process`, in a system
-/// directory no app may write, so `current_exe` gives a place the settings can
-/// be neither read from nor written to. The activity calls
-/// [`set_directory`] with the app's private files directory before the engine
-/// starts, and everything below then behaves exactly as it does on a desktop:
-/// the file is read if it is there, and written with the defaults if it is not.
+/// directory no app may write, so `current_exe` names a place the settings
+/// could be neither read from nor written to. There the engine sets this to
+/// **the folder the player chose**, so `DaysEngine.ini` sits beside their
+/// `Packs` where they can find it, edit it from a file manager and keep it
+/// with the install it belongs to — which is as close as that platform gets
+/// to what "beside the binary" means everywhere else.
 ///
-/// This is the engine's own file and not the player's game, so it is a real
-/// path rather than anything in [`storage`](super::storage) — the SAF tree
-/// holds the install, and this does not live in the install.
+/// Everything below then behaves exactly as it does on a desktop: the file is
+/// read if it is there, and written with the defaults if it is not. It reaches
+/// it through [`storage`](super::storage) rather than `std::fs`, which is
+/// what makes a path inside a Storage Access Framework tree openable at all.
 static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Sets the directory [`Settings::path`] reads from. Once, before loading.
@@ -300,7 +302,7 @@ impl Settings {
             log::info!("cannot find this binary's own directory; using default settings");
             return Settings::default();
         };
-        match std::fs::read_to_string(&path) {
+        match super::storage::read_to_string(&path) {
             Ok(text) => {
                 let settings = Settings::parse(&text);
                 log::info!("{} : {settings:?}", path.display());
@@ -335,7 +337,7 @@ impl Settings {
     /// game installed under `Program Files`, an install on a mounted image —
     /// is not a reason to refuse to start.
     fn write_template(path: &std::path::Path) {
-        match std::fs::write(path, template()) {
+        match super::storage::write(path, template()) {
             Ok(()) => log::info!("no {}; wrote the defaults there", path.display()),
             Err(err) => log::info!(
                 "no {} and it cannot be created ({err}); using default settings",
@@ -368,7 +370,7 @@ impl Settings {
         let Some(filled) = top_up(text) else {
             return;
         };
-        match std::fs::write(path, filled) {
+        match super::storage::write(path, filled) {
             Ok(()) => log::info!(
                 "{} did not mention every setting; wrote the missing ones in",
                 path.display()

@@ -156,17 +156,6 @@ public final class Saf {
     }
 
     /**
-     * Where {@code DaysEngine.ini} goes.
-     *
-     * <p>Not in the install: that is the player's game, and this is the
-     * engine's own settings file. "Beside the running binary", which is where
-     * a desktop keeps it, is a system directory here.
-     */
-    public static String filesDirectory() {
-        return context == null ? null : context.getFilesDir().getAbsolutePath();
-    }
-
-    /**
      * Every child of a directory, three strings each: name, document id, and
      * {@code "d"} or {@code "f"}.
      *

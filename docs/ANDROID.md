@@ -103,12 +103,22 @@ to read the folder, and it is persisted, so the picker appears once. Asking for
 storage permission on top of it would be asking for every file on the device in
 order to read the one folder the player already chose.
 
-### `DaysEngine.ini` is not in the install
+### `DaysEngine.ini` goes in the folder the player chose
 
-It is the engine's own settings file and not the player's game, and "beside the
-running binary" here is a system directory no app may write. It goes in the
-app's private files directory, which `install::engine::set_directory` is told
-about at boot.
+Beside their `Packs`, as `install::engine::set_directory` is told at boot.
+
+"Beside the running binary", which is where every other platform keeps it, is
+`/system/bin` here — a system directory no app may write. The granted folder is
+the closest thing this platform has to the same idea: it is writable, it is
+somewhere a file manager can open, and it stays with the install it belongs to.
+That last part is what makes the setting editable at all. An app's private
+directory would also have worked and is what this did first, and it is
+`/data/data/org.daysengine/files` — which no file manager will show and no
+player can reach without `adb run-as` or root, so the one file here a player is
+*meant* to edit would have been the one file they could not.
+
+It is read and written through `install::storage` like everything else in the
+install, which is what makes a path inside the tree openable at all.
 
 ## Touch
 

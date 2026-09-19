@@ -18,9 +18,14 @@
 //!   directory holds the game and no path names it. The player granted a
 //!   folder, and [`install::saf`] is the backend that makes that folder look
 //!   like one. Installing it is also how `discover_game_dir` learns the root.
-//! * **`DaysEngine.ini` has to live somewhere writable.** "Beside the running
-//!   binary" is `/system/bin` here. The activity's own files directory is what
-//!   [`install::engine::set_directory`] is given.
+//! * **`DaysEngine.ini` has to live somewhere the player can reach.** "Beside
+//!   the running binary" is `/system/bin` here, which no app may write. It
+//!   goes in **the folder they chose**, beside their `Packs`, which is both
+//!   writable and somewhere a file manager can open — so the settings are
+//!   editable on this platform the same way they are on every other.
+//!   [`install::engine::set_directory`] is what is told, and the read and the
+//!   write go through [`install::storage`] like every other file in the
+//!   install.
 //!
 //! # Touch
 //!
@@ -147,15 +152,10 @@ fn boot() -> anyhow::Result<()> {
     storage::install(Box::new(saf::Saf::new(root)))
         .map_err(|_| anyhow::anyhow!("the storage backend was already installed"))?;
 
-    match saf::files_directory() {
-        Ok(dir) => {
-            let _ = engine::set_directory(PathBuf::from(dir));
-        }
-        // The settings are all defaults anyway if there is no file, so this
-        // costs the player their `DaysEngine.ini` and not the session — the
-        // rule a missing asset follows everywhere else here.
-        Err(err) => log::warn!("no private directory for {}: {err}", engine::FILE),
-    }
+    // Beside their `Packs`, not in an app-private directory the player has no
+    // way to open. This is set *after* the backend is installed, because the
+    // path it produces is one only that backend can resolve.
+    let _ = engine::set_directory(PathBuf::from(saf::ROOT));
 
     game::run_with(Vec::new())
 }

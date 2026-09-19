@@ -41,7 +41,8 @@
 //! behaviour is Android's: the naming rule `createFile` relies on is
 //! `FileUtils.buildUniqueFile`, which keeps a display name whose extension
 //! maps to no known MIME type — every name the engine writes (`.DAT`, `.tmp`,
-//! `.new`) is one of those, so a file is created under the name it asked for.
+//! `.new`, and `DaysEngine.ini`) is one of those, so a file is created under
+//! the name it asked for.
 
 #![allow(unsafe_code)]
 
@@ -587,11 +588,6 @@ mod bridge {
     pub fn root_document() -> io::Result<String> {
         no_argument("rootDocument")
     }
-
-    /// The app's own private directory, which is where `DaysEngine.ini` goes.
-    pub fn files_directory() -> io::Result<String> {
-        no_argument("filesDirectory")
-    }
 }
 
-pub use bridge::{files_directory, present, root_document};
+pub use bridge::{present, root_document};
