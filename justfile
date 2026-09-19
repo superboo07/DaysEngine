@@ -113,3 +113,32 @@ dist-linux: deps
 
 dist-windows: windows-deps
     ./tools/dist.sh windows
+
+# ---------------------------------------------------------------------------
+# Android
+#
+# The engine is a shared object here rather than a program -- an Android app
+# has no main, SDLActivity loads libdaysengine.so and calls its SDL_main -- and
+# the app around it is android/, a gradle project whose only screen asks which
+# folder the player's install is in. Everything else on screen is the game's
+# own art, as everywhere else.
+#
+# Built in the same image as every other release: the NDK, the Android SDK's
+# build tools and gradle are pinned in tools/dist/Dockerfile beside the MinGW
+# cross-compiler. See docs/ANDROID.md.
+# ---------------------------------------------------------------------------
+
+# SDL3 and ffmpeg for both packaged ABIs. Slow, and once per checkout.
+android-deps:
+    ./tools/build-sdl.sh android-arm64
+    ./tools/build-sdl.sh android-x86_64
+    ./tools/build-ffmpeg.sh android-arm64
+    ./tools/build-ffmpeg.sh android-x86_64
+
+# A debug-signed APK, ready for `adb install`.
+android:
+    ./tools/build-android.sh
+
+# An unsigned release APK in target/dist/, named after the commit.
+dist-android:
+    ./tools/build-android.sh --release

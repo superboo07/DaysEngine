@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The launcher icon, and the one piece of drawn artwork in this project.
+    Deliberately abstract: nothing here may carry the game's own art or its
+    branding, so it is a film frame's four perforations and the timeline the
+    engine plays one along.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#e8e6df"
+        android:pathData="M34,38h8v7h-8zM34,52h8v7h-8zM34,66h8v7h-8zM66,38h8v7h-8zM66,52h8v7h-8zM66,66h8v7h-8z" />
+    <path
+        android:fillColor="#c8452f"
+        android:pathData="M48,36h12v40h-12z" />
+</vector>

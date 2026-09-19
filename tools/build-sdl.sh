@@ -2,8 +2,10 @@
 #
 # Builds the vendored SDL3 in third_party/sdl for a distribution build.
 #
-#   tools/build-sdl.sh linux     -> target/sdl/linux
-#   tools/build-sdl.sh windows   -> target/sdl/windows   (MinGW-w64 cross)
+#   tools/build-sdl.sh linux            -> target/sdl/linux
+#   tools/build-sdl.sh windows          -> target/sdl/windows   (MinGW-w64 cross)
+#   tools/build-sdl.sh android-arm64    -> target/sdl/android-arm64
+#   tools/build-sdl.sh android-x86_64   -> target/sdl/android-x86_64
 #
 # Like tools/build-ffmpeg.sh, this is the release path and not the developer
 # one: `cargo build` and `just check` link whatever libSDL3 the machine has.
@@ -19,19 +21,28 @@
 # and one more file leaves the archive. ffmpeg cannot follow: LGPL v2.1 permits
 # static linking only against an obligation to let the player relink, and
 # shipping it shared is how section 6 is satisfied without one.
+#
+# **Android is the exception, and not for a licensing reason.** There SDL3 is
+# built SHARED, because on Android SDL is half Java: SDLActivity, SDLSurface
+# and SDLAudioManager are classes in the APK whose native methods are resolved
+# against libSDL3.so by name, and System.loadLibrary("SDL3") is what binds
+# them. A static SDL3 inside libdaysengine.so has no library for that call to
+# find. zlib still attaches no condition either way, so what changes is one
+# file in the APK and nothing about what may be distributed.
 set -euo pipefail
 
 # Builds what ships, so it builds in the image that decides what that links --
 # on a bare host, in the devcontainer, or already inside it, this is the line
-# that works out which and re-execs there when it has to.
+# that works out which and re-execs there when it has to. The Android NDK is
+# in that image too, pinned beside the rest.
 # shellcheck source=tools/in-container.sh
 . "$(dirname "${BASH_SOURCE[0]}")/in-container.sh"
 
 target=${1:-}
 case "$target" in
-linux | windows) ;;
+linux | windows | android-arm64 | android-x86_64) ;;
 *)
-    echo "usage: $0 {linux|windows}" >&2
+    echo "usage: $0 {linux|windows|android-arm64|android-x86_64}" >&2
     exit 2
     ;;
 esac
@@ -61,6 +72,13 @@ cmake_args=(
     -DSDL_INSTALL_TESTS=OFF
 )
 
+# The oldest Android this runs on. Android 7.0, which is where the linker
+# gained the namespace behaviour SDL's Java-to-native binding wants and where
+# `posix_spawn` and a complete `<locale.h>` arrived for ffmpeg. Written down in
+# one place: the gradle project reads it back out of this file rather than
+# spelling a second number that could disagree.
+ANDROID_API=24
+
 if [ "$target" = windows ]; then
     cmake_args+=(
         -DCMAKE_SYSTEM_NAME=Windows
@@ -75,6 +93,28 @@ if [ "$target" = windows ]; then
     )
 fi
 
+if [ "${target#android-}" != "$target" ]; then
+    ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
+    if [ -z "$ndk" ] || [ ! -f "$ndk/build/cmake/android.toolchain.cmake" ]; then
+        echo "set ANDROID_NDK_HOME to an Android NDK (r27 or newer)" >&2
+        exit 1
+    fi
+    case "$target" in
+    android-arm64) abi=arm64-v8a ;;
+    android-x86_64) abi=x86_64 ;;
+    esac
+    cmake_args+=(
+        -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake"
+        -DANDROID_ABI="$abi"
+        -DANDROID_PLATFORM="android-$ANDROID_API"
+        # Shared, for the Java-to-native binding described at the top of this
+        # file. The static half is switched off so nothing links the wrong one
+        # by accident.
+        -DSDL_SHARED=ON
+        -DSDL_STATIC=OFF
+    )
+fi
+
 emit_source_note() {
     {
         echo "SDL3, as shipped with DaysEngine"
@@ -86,13 +126,34 @@ emit_source_note() {
         echo "Licence:   zlib. The full text is in SDL-LICENSE.txt, distributed"
         echo "           beside this file."
         echo
-        echo "This is unmodified SDL3, statically linked into daysengine and"
-        echo "days. To build against your own copy instead, point"
-        echo "tools/build-sdl.sh at it, or drop the static-sdl feature and link"
-        echo "the SDL3 your system provides."
+        echo "This is unmodified SDL3. On desktop it is linked into the"
+        echo "daysengine binary; on Android it is libSDL3.so in the APK, for"
+        echo "the Java-to-native reason in tools/build-sdl.sh. To build against"
+        echo "your own copy instead, point tools/build-sdl.sh at it, or drop the"
+        echo "static-sdl feature and link the SDL3 your system provides."
     } >"$prefix/SDL-SOURCE.txt"
     cp "$src/LICENSE.txt" "$prefix/SDL-LICENSE.txt"
 }
+
+# **A configure that cannot be reused is worse than no configure.** CMake
+# caches the absolute path of the compiler it found, and for a cross build the
+# absolute path of the toolchain file too. Those move: a bumped NDK pin in
+# tools/dist/Dockerfile, or a tree built once on a host and once in the build
+# image, leaves a cache naming a compiler that is not there -- and cmake's
+# answer to that is to fail rather than to look again. Nothing in the cache is
+# worth that, so a cache whose paths have gone is dropped and the configure is
+# done afresh.
+cache=$build/CMakeCache.txt
+if [ -f "$cache" ]; then
+    stale=0
+    while IFS= read -r path; do
+        [ -n "$path" ] && [ ! -e "$path" ] && stale=1
+    done < <(sed -n 's/^CMAKE_\(TOOLCHAIN_FILE\|C_COMPILER\):[A-Z]*=\(.*\)$/\2/p' "$cache")
+    if [ "$stale" = 1 ]; then
+        echo "== $build was configured against a toolchain that has moved; reconfiguring"
+        rm -rf "$build"
+    fi
+fi
 
 cmake "${cmake_args[@]}"
 cmake --build "$build" --parallel "$(nproc)"

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The engine's window is the game's own art from the first frame, so the
+         app's theme only ever shows behind the one screen that asks which
+         install to play. Black, because that is what the game letterboxes
+         against. -->
+    <style name="Theme.DaysEngine" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

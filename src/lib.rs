@@ -21,6 +21,10 @@
 // on the module.
 #![deny(unsafe_code)]
 
+/// The Android entry point. `SDL_main` and the boot this platform needs
+/// before the shared loop can start.
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod game;
 pub mod inspect;
 pub mod install;

@@ -1,0 +1,21 @@
+// The Android app around the engine. `tools/build-android.sh` drives this;
+// see docs/ANDROID.md.
+//
+// Everything this build produces goes under target/, the same as every other
+// build here, so nothing generated lands in the tree.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'DaysEngine'
+include ':app'

@@ -113,6 +113,30 @@
       "problemMatcher": [],
       "presentation": { "panel": "dedicated" }
     },
+    {
+      "label": "android: deps",
+      "detail": "Build the vendored SDL3 and ffmpeg for arm64-v8a and x86_64. Slow; once per checkout.",
+      "type": "shell",
+      "command": "./tools/build-sdl.sh android-arm64 && ./tools/build-sdl.sh android-x86_64 && ./tools/build-ffmpeg.sh android-arm64 && ./tools/build-ffmpeg.sh android-x86_64",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
+      "label": "android: build",
+      "detail": "A debug-signed APK in target/dist/, ready for `adb install`. The player picks their own install in the app.",
+      "type": "shell",
+      "command": "./tools/build-android.sh",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
+    {
+      "label": "dist: android",
+      "detail": "An unsigned release APK in target/dist/, named after the commit. Sign it before installing.",
+      "type": "shell",
+      "command": "./tools/build-android.sh --release",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated" }
+    },
 
     {
       "// The inspection subcommands": "These are the verification path. They run headless against a real install and print what they found; the game itself is not a test harness. The same binary with no subcommand opens a window instead.",

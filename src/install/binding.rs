@@ -310,6 +310,12 @@ impl Default for Bindings {
     /// button under your thumb confirms, the one right of it goes back, the
     /// d-pad and the left stick navigate, the shoulders seek and the triggers
     /// change speed.
+    ///
+    /// `ac back` beside Escape is Android's hardware Back, which SDL reports
+    /// as a key like any other. It backs out rather than quitting, which is
+    /// the difference between it and Escape during playback: a gesture that
+    /// easy to make by accident should not be the one that closes the game.
+    /// It costs a desktop nothing, because no keyboard produces that key.
     fn default() -> Bindings {
         let of = |action: Action| -> Vec<Trigger> {
             let names: &[&str] = match action {
@@ -318,7 +324,7 @@ impl Default for Bindings {
                 Action::Left => &["left", "pad:dpleft", "pad:-leftx"],
                 Action::Right => &["right", "pad:dpright", "pad:+leftx"],
                 Action::Confirm => &["return", "keypad enter", "space", "pad:a"],
-                Action::Cancel => &["escape", "pad:b"],
+                Action::Cancel => &["escape", "ac back", "pad:b"],
                 Action::Quit => &["escape"],
                 Action::Pause => &["pad:start"],
                 Action::SeekBack => &["pad:leftshoulder"],

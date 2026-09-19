@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DaysEngine</string>
+    <string name="prompt">Choose the folder your game is installed in — the one holding <b>Packs</b>.</string>
+    <string name="choose">Choose folder</string>
+    <string name="no_packs">That folder has no <b>Packs</b> in it, so it is not a game install. Try the folder the game\'s .exe is in.</string>
+    <string name="not_a_folder">Android would not grant that folder. Try another one.</string>
+</resources>

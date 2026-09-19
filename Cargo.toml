@@ -29,6 +29,12 @@ clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
+# Android only. The engine calls up into the app for everything the Storage
+# Access Framework does, and this is the JNI that makes those calls; see
+# src/install/saf.rs. Nothing on a desktop links it.
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+
 [features]
 # **On by default**, because every build here links the pinned SDL3 in
 # third_party/, built by tools/build-sdl.sh into target/sdl/linux -- a developer
@@ -119,6 +125,14 @@ rusty_ffmpeg = "=0.17.0"
 
 # Pure-Rust PNG decode for backgrounds and UI art.
 png = "=0.18.1"
+
+# JNI, on Android and nowhere else. The engine has to call up into the app to
+# reach a folder the player granted: a Storage Access Framework tree is read
+# through ContentResolver, and there is no path std::fs could be pointed at.
+# Preferred over hand-writing the calls because the JNI function table is an
+# ABI to get exactly right, and a wrong offset there is the kind of bug that
+# looks like a working program.
+jni = "=0.21.1"
 
 [profile.release]
 opt-level = 3

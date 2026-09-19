@@ -16,12 +16,20 @@ rows below describe; Shiny Days is being brought up on the same code.
 | Linux x86_64 | **Works.** The platform the engine is developed and verified on. Every build links the pinned SDL3 and ffmpeg from `third_party/`, static and shared respectively |
 | Windows x86_64 | **Builds.** Cross-compiled from Linux for `x86_64-pc-windows-gnu` against vendored SDL3 and ffmpeg; `just dist-windows` packages the `.exe` files with their DLLs. **Not yet run against a real install on Windows** — the build is verified, the game is not |
 | macOS | Not worked on, and not planned |
-| Android | Not started |
+| Android | **Builds.** `arm64-v8a` and `x86_64`, as an APK; the engine is `libdaysengine.so` and SDL calls its `SDL_main`. The player picks their install in Android's own folder picker, and it is read through the Storage Access Framework. Touch is a mouse, and Back is Cancel. **Not yet run against a real install on a device** — the build is verified, the game is not. `docs/ANDROID.md` |
 
-The only place the engine ever needed a platform branch was the local UTC
-offset for a save slot's timestamp line, and it does not need one now either:
-`install::clock` asks SDL, which asks the platform. Everything else is portable
-Rust over SDL3 and libav. `docs/WINDOWS.md` has the cross-build.
+Two things in the engine are platform-specific, and both are about the
+machine rather than the game. `install::clock` asks SDL for the local UTC
+offset a save slot's timestamp line needs. And **Android has no directory an
+app may open by name** — what the player grants is a Storage Access Framework
+tree, reached by document id through `ContentResolver` — so every read and
+write of a file in the install goes through `install::storage`, which is
+`std::fs` on a desktop and `install::saf` there. Nothing above that seam knows
+which. Everything else is portable Rust over SDL3 and libav.
+
+`docs/WINDOWS.md` and `docs/ANDROID.md` have the cross-builds. Both, and the
+Linux archive, are built in one pinned image; `tools/in-container.sh` says
+why.
 
 **The file formats transfer for free.** Both titles are FILMEngine, so the
 archives, the scripts, the glyph store, the hit maps, the atlases and the save

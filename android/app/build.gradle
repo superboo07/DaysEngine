@@ -1,0 +1,74 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The minimum Android, read out of the file that decides it rather than
+// spelled a second time: tools/build-sdl.sh sets ANDROID_API and both C
+// libraries are compiled against it, so a number typed here that disagreed
+// would be an app that installs on a device its own libraries cannot run on.
+def androidApi = Integer.parseInt(
+    file("${rootDir}/../tools/build-sdl.sh").readLines()
+        .find { it.startsWith('ANDROID_API=') }
+        .substring('ANDROID_API='.length()).trim())
+
+android {
+    namespace 'org.daysengine'
+    compileSdk 35
+
+    // Pinned rather than left to the plugin's default. Without this, AGP
+    // reaches for a version of its own choosing and **downloads it mid-build**
+    // -- which is the one thing tools/dist/Dockerfile exists to prevent, and
+    // which the --rm build container would then repeat on every single build.
+    // The version here is the one the image installs.
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'org.daysengine'
+        minSdk androidApi
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    sourceSets {
+        main {
+            // SDL's Java half, compiled from the pinned submodule rather than
+            // copied in. SDLActivity, SDLSurface and SDLAudioManager are the
+            // other side of libSDL3.so's native methods, and the two have to
+            // come from the same SDL.
+            java.srcDirs += '../../third_party/sdl/android-project/app/src/main/java'
+            // Built by tools/build-android.sh, under target/ with every other
+            // build output. Gradle packages whatever it finds here.
+            jniLibs.srcDirs = ['../../target/android/jniLibs']
+            // ffmpeg's licence and upstream commit, SDL3's notice, this
+            // engine's licence, and the source this APK was built from. An APK
+            // is one file, so a compliance artifact that did not travel inside
+            // it would not travel at all.
+            assets.srcDirs = ['../../target/android/assets']
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            // The libraries are opened by the dynamic linker from the APK
+            // itself rather than unpacked first, which is what modern Android
+            // wants and what keeps the install half the size.
+            useLegacyPackaging false
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}

@@ -42,11 +42,12 @@ deliberately small and deliberately boring.
 | `miniz_oxide` | 0.9.1 | GPK index and entry inflate | Pure Rust, no C. Same inflate backend `flate2` uses by default; depending on it directly avoids `flate2`'s optional zlib-sys C backends. |
 | `thiserror` | 2.0.20 | `derive(Error)` | Proc macro, compile-time only, zero runtime surface. dtolnay; among the most-reviewed crates in the ecosystem. |
 | `log` | 0.4.34 | Logging facade | rust-lang owned. |
-| `env_logger` | 0.11.11 | Log backend | Binary crates only; never linked into the libraries. |
+| `env_logger` | 0.11.11 | Log backend on a desktop | Reached only from `game::run`, which is the desktop entry point; Android logs to logcat through `src/android.rs` instead, which needs no crate. |
 | `serde` + `serde_json` | 1.0.229 / 1.0.151 | Route graph and config (de)serialization | Proc macro in `derive`. Note `serde_derive` historically shipped a precompiled binary; that was reverted and the current release builds from source — re-check this on every bump. |
-| `clap` | 4.6.6 | CLI parsing for the offline tools | Binary crates only. |
+| `clap` | 4.6.6 | CLI parsing for the `daysengine` subcommands | Reached only from `inspect`, which is in the library because Android loads a shared object rather than running a `main`. Nothing in `install`, `media`, `playback` or `ui` touches it. |
 | `sdl3` | 0.20.0 | Window, input, GPU present, audio output | Thin bindings over the **system** libSDL3; has a `build.rs` that locates and links it. Reviewed: it probes pkg-config and does not download anything. Younger crate than the rest of this list — the riskiest entry here, revisit on each bump. |
 | `rusty_ffmpeg` | 0.17.0 | WMV3/VC-1 video and Vorbis audio decode | Generates bindgen bindings at build time against whichever ffmpeg it is pointed at, rather than carrying pre-written ones for a release it lags behind, as `ffmpeg-next` does. Has a `build.rs` running bindgen. `FFMPEG_PKG_CONFIG_PATH` is how it is aimed at the vendored prefix; see *Third-party native libraries*. |
+| `jni` | 0.21.1 | Calling up into the Android app for Storage Access Framework access | **Android only** — a `[target.'cfg(target_os = "android")']` dependency, linked on no other platform. The engine has to ask the app to open a document, because a folder the player granted has no path `std::fs` could be given; see `src/install/saf.rs`. Preferred over hand-writing the calls because the JNI function table is an ABI to get exactly right, and a wrong offset there is a bug that looks like a working program. |
 | `png` | 0.18.1 | PNG decode for backgrounds and UI art | image-rs owned, pure Rust. Used instead of routing PNGs through ffmpeg so the image path has no C in it. |
 
 ## Deliberately *not* depended on

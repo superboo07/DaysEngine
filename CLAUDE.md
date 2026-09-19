@@ -272,13 +272,16 @@ methods that agree is the standard the rules above ask for.
 ## The code
 
 ```text
-src/install/      the player's install: vfs, ini, config, save
+src/install/      the player's install: vfs, ini, config, save, storage
 src/media/        audio + video decode through ffmpeg (vendored; see below)
 src/playback/     stage, mixer, lipsync, text, compose
 src/ui/           menu, screen, options, replay, ending
-src/main.rs       `daysengine` — the game (SDL3), and the dispatch that
-                  decides whether this run plays or inspects
+src/game.rs       the game (SDL3), and the dispatch that decides whether this
+                  run plays or inspects
 src/inspect.rs    the `daysengine <subcommand>` inspection tools
+src/android.rs    `SDL_main`, and the three things Android needs before the
+                  loop in `game` can start
+src/main.rs       four lines: the desktop's `main`, calling `game::run`
 
 crates/days-gpk     GPK archives
 crates/days-script  .ORS timelines
@@ -288,6 +291,11 @@ crates/days-ui      CMAP hit maps + _CHIP atlas recovery
 ```
 
 **This is one ordinary crate, not a pile of them, and it builds one binary.**
+On Android it builds one *library* instead — an Android app has no `main`, so
+`SDLActivity` loads `libdaysengine.so` and calls its `SDL_main`. That is why
+the loop is `game::run` in the library and `src/main.rs` is four lines; it is
+the same program either way, and there is exactly one of it. `docs/ANDROID.md`.
+
 New engine functionality is a module in one of those four `src/` groups — find
 the group it belongs to rather than dropping another file at the top level. A
 new *command* is a variant of `inspect::Cmd`, not a second binary: two programs
@@ -340,6 +348,12 @@ Design decisions already made and not up for re-litigation:
   `sdl3` crate does not wrap). Anything else is a design error.
 - **All pack and CMAP lookups are case-insensitive.** INIs say
   `System/Title/TitleBase.png`; packs store `TITLE/TITLEBASE.PNG`.
+- **Every read or write of a file in the player's install goes through
+  `install::storage`**, never `std::fs` directly. On a desktop the two are the
+  same thing. On Android they are not: what the player grants is a Storage
+  Access Framework tree, reached by document id, and there is no path
+  `std::fs` could be given. Nothing above that seam knows which backend is
+  under it.
 
 ---
 

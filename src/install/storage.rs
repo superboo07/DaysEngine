@@ -70,6 +70,18 @@ pub trait Backend: Send + Sync {
     /// Whether the path is a file that can be opened.
     fn is_file(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
+
+    /// The one install this backend is, when it is only ever one.
+    ///
+    /// [`Local`] answers `None`: it is the whole filesystem, and which
+    /// directory in it holds the game is a question the command line, the
+    /// environment and the working directory answer. A backend that exists
+    /// *because* the player picked a folder already knows, and this is how it
+    /// tells `discover_game_dir` instead of that function growing a second
+    /// platform branch.
+    fn root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// The ordinary filesystem: every call is the `std::fs` one it replaced.
@@ -170,4 +182,85 @@ pub fn is_file(path: impl AsRef<Path>) -> bool {
 
 pub fn is_dir(path: impl AsRef<Path>) -> bool {
     backend().is_dir(path.as_ref())
+}
+
+/// The install the backend is, when it is only ever one. See [`Backend::root`].
+pub fn root() -> Option<&'static Path> {
+    backend().root()
+}
+
+/// A path under a backend's own root, as a `/`-separated relative path.
+///
+/// For a backend whose root is invented rather than real — Android's, where
+/// the path never reaches a filesystem and is only ever a way to name a
+/// document — this is the whole of turning what the engine spells into
+/// something that can be walked. `..` and `.` are dropped rather than
+/// followed: there is nothing above the granted folder, and a path that tried
+/// to climb out of it would be asking for something the player did not grant.
+pub fn under(root: &Path, path: &Path) -> io::Result<String> {
+    let rest = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not inside {}", path.display(), root.display()),
+        )
+    })?;
+    Ok(rest
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+/// Splits a relative path into its parent and its final component.
+///
+/// `"Packs/System.GPK"` -> `("Packs", "System.GPK")`, and `"Packs"` ->
+/// `("", "Packs")`, where the empty parent is the root itself.
+pub fn split(relative: &str) -> (&str, &str) {
+    match relative.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", relative),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The paths the engine actually builds, turned into what a document tree
+    /// can be walked with. `Vfs::mount` joins `Packs` onto the root and
+    /// `save::slot_path` joins whatever `FILMENGINE.INI` says, so both shapes
+    /// have to come out the same way.
+    #[test]
+    fn a_path_under_the_root_becomes_its_components() {
+        let root = Path::new("/saf");
+        assert_eq!(
+            under(root, Path::new("/saf/Packs/System.GPK")).unwrap(),
+            "Packs/System.GPK"
+        );
+        assert_eq!(under(root, Path::new("/saf/Save")).unwrap(), "Save");
+        assert_eq!(under(root, Path::new("/saf")).unwrap(), "");
+    }
+
+    /// Nothing is above the granted folder, so nothing may climb out of it.
+    #[test]
+    fn climbing_out_of_the_root_is_not_a_path() {
+        let root = Path::new("/saf");
+        assert_eq!(
+            under(root, Path::new("/saf/Packs/../Save")).unwrap(),
+            "Packs/Save"
+        );
+        assert!(under(root, Path::new("/elsewhere/Packs")).is_err());
+    }
+
+    /// The final component is the name a provider is asked to create or
+    /// rename, and the rest is the directory it goes in.
+    #[test]
+    fn a_relative_path_splits_at_its_last_separator() {
+        assert_eq!(split("Save/SaveFile000.DAT"), ("Save", "SaveFile000.DAT"));
+        assert_eq!(split("Config.DAT"), ("", "Config.DAT"));
+        assert_eq!(split(""), ("", ""));
+    }
 }

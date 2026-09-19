@@ -27,6 +27,9 @@ pub mod engine;
 pub mod feeling;
 pub mod ini;
 pub mod progress;
+/// The install as an Android Storage Access Framework tree.
+#[cfg(target_os = "android")]
+pub mod saf;
 pub mod save;
 pub mod storage;
 pub mod vfs;

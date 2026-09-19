@@ -145,53 +145,12 @@ cp "$sdl/SDL-SOURCE.txt" "$sdl/SDL-LICENSE.txt" "$out/"
 cp "$ffmpeg/FFMPEG-SOURCE.txt" "$ffmpeg/COPYING.LGPLv2.1" "$out/"
 cp "$root/LICENSE" "$out/"
 
-# The engine's own source, as it was when this binary was built.
-#
-# The commit in the archive's name says which source that is, but only while the
-# commit is reachable -- and says nothing at all for a `-dirty` build, which is
-# exactly the build whose source is hardest to reconstruct later. So the source
-# travels with the binary rather than being pointed at.
-#
-# Tracked files plus untracked ones git is not ignoring, taken from the working
-# tree rather than from HEAD: a dirty build then ships what actually built it.
-# `target/` is excluded because .gitignore excludes it.
-#
-# The third_party submodules are gitlinks, so their contents are not in here.
-# That is deliberate and not a compliance gap: FFMPEG-SOURCE.txt beside this
-# file names ffmpeg's exact upstream commit, which is what LGPL 2.1 asks for,
-# and .gitmodules in the zip names the repository it came from.
-emit_source_zip() {
-    local list
-    list=$(mktemp)
-    git -C "$root" ls-files --cached --others --exclude-standard |
-        grep -vx -e third_party/ffmpeg -e third_party/sdl >"$list"
-
-    {
-        echo "DaysEngine source, as built"
-        echo
-        echo "Commit:  $version"
-        echo "Built:   $(date -u '+%Y-%m-%d %H:%M:%S UTC') for $target"
-        echo
-        if [ "${version%-dirty}" != "$version" ]; then
-            echo "This build was made from a WORKING TREE, not from a commit. What"
-            echo "is in this zip is what went into the binary; the commit named"
-            echo "above is only where those changes started."
-            echo
-        fi
-        echo "The vendored SDL3 and ffmpeg sources are not in here -- they are"
-        echo "git submodules, and FFMPEG-SOURCE.txt and SDL-SOURCE.txt beside"
-        echo "this zip name the exact upstream commit of each. Restore them with"
-        echo "'git submodule update --init --depth 1'."
-        echo
-        echo "Build it with 'cargo build --locked --release'; see docs/WINDOWS.md"
-        echo "for a release archive."
-    } >"$root/target/dist/SOURCE.txt"
-
-    (cd "$root" && zip -q -X "$out/SOURCE.zip" -@ <"$list")
-    (cd "$root/target/dist" && zip -qj "$out/SOURCE.zip" SOURCE.txt)
-    rm -f "$list" "$root/target/dist/SOURCE.txt"
-}
-emit_source_zip
+# The engine's own source, as it was when this binary was built. What goes in
+# it, and why, is tools/source-zip.sh -- shared with the Android build, which
+# ships the same zip inside its APK.
+# shellcheck source=tools/source-zip.sh
+. "$root/tools/source-zip.sh"
+days_source_zip "$root" "$version" "$target" "$out/SOURCE.zip"
 
 cd "$root/target/dist"
 case "$target" in

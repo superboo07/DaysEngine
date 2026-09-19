@@ -898,14 +898,23 @@ fn is_subcommand(command: &clap::Command, name: &str) -> bool {
 
 pub fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    run_with(std::env::args().skip(1).collect())
+}
 
+/// The engine, given the arguments to run on and a logger already installed.
+///
+/// [`run`] is this with the process's own arguments and `env_logger`. Android
+/// is why they are separate: there the arguments belong to Android's
+/// `app_process` and mean nothing here, and the log has to reach logcat rather
+/// than a standard error nobody is reading. See [`crate::android`].
+pub fn run_with(arguments: Vec<String>) -> Result<()> {
     // Before anything is mounted or any window is opened: this may not be a run
     // of the game at all.
-    if wants_inspection(std::env::args().skip(1)) {
+    if wants_inspection(arguments.iter().cloned()) {
         return inspect::run();
     }
 
-    let mut args = std::env::args().skip(1);
+    let mut args = arguments.into_iter();
     let mut game: Option<PathBuf> = None;
     let mut script_name: Option<String> = None;
     while let Some(arg) = args.next() {
@@ -4434,6 +4443,12 @@ fn find_script(vfs: &Vfs, wanted: &str, english: bool) -> Result<(String, String
 /// the install two different ways, and only one of them honoured the `.env`
 /// this repository keeps the path in.
 fn discover_game_dir() -> Result<PathBuf> {
+    // A backend that exists because the player picked a folder already knows
+    // which install this is, and there is nowhere else on that platform to
+    // look: see `install::storage::Backend::root`.
+    if let Some(root) = crate::install::storage::root() {
+        return Ok(root.to_path_buf());
+    }
     if let Some(dir) = std::env::var_os("DAYS_GAME_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
     }

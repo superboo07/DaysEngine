@@ -1,0 +1,10 @@
+plugins {
+    // Pinned exactly, the same rule every dependency here follows. The gradle
+    // that drives it is pinned in tools/dist/Dockerfile.
+    id 'com.android.application' version '8.7.3' apply false
+}
+
+// Out of the source tree and into target/, beside every other build output.
+allprojects {
+    layout.buildDirectory = file("${rootDir}/../target/android/gradle/${project.name}")
+}
