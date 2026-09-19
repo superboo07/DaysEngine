@@ -13,12 +13,18 @@ rust-version = "1.88"
 repository.workspace = true
 
 [dependencies]
-days-gpk = { path = "crates/days-gpk"}
-days-script = { path = "crates/days-script"}
-days-font = { path = "crates/days-font"}
-days-ui = { path = "crates/days-ui"}
-days-save = { path = "crates/days-save"}
-days-route = { path = "crates/days-route" }
+# The `version` on each path dependency is what `cargo publish` would ship in
+# place of `path`, and it is pinned exactly for the same reason every other
+# direct dependency is. It also asserts the member versions: cargo refuses to
+# resolve a path crate whose own version does not satisfy the requirement, so
+# these six lines move with `workspace.package.version` below and a bump that
+# forgets them fails loudly instead of drifting.
+days-gpk = { path = "crates/days-gpk", version = "=0.2.1" }
+days-script = { path = "crates/days-script", version = "=0.2.1" }
+days-font = { path = "crates/days-font", version = "=0.2.1" }
+days-ui = { path = "crates/days-ui", version = "=0.2.1" }
+days-save = { path = "crates/days-save", version = "=0.2.1" }
+days-route = { path = "crates/days-route", version = "=0.2.1" }
 miniz_oxide.workspace = true
 rusty_ffmpeg = { workspace = true, features = ["link_system_ffmpeg"] }
 sdl3.workspace = true
@@ -65,7 +71,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.82"
