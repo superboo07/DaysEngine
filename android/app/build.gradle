@@ -11,6 +11,33 @@ def androidApi = Integer.parseInt(
         .find { it.startsWith('ANDROID_API=') }
         .substring('ANDROID_API='.length()).trim())
 
+// The engine's version, for the same reason and out of the same kind of file:
+// Cargo.toml's [workspace.package] is what every other artifact this project
+// builds is stamped with, and a number typed here would be a second place to
+// remember on a bump -- which is exactly how this line came to read 0.1.0 while
+// the engine inside the APK was 0.2.x. It throws rather than falling back to a
+// default, because an APK whose version silently disagrees with its own engine
+// is worse than a build that stops.
+def cargoToml = file("${rootDir}/../Cargo.toml").readLines()
+def workspaceStart = cargoToml.findIndexOf { it.trim() == '[workspace.package]' }
+if (workspaceStart < 0) {
+    throw new GradleException("no [workspace.package] in Cargo.toml")
+}
+def versionLine = cargoToml.subList(workspaceStart + 1, cargoToml.size())
+    .find { it ==~ /^version\s*=\s*".*"\s*$/ }
+if (versionLine == null) {
+    throw new GradleException("no version in Cargo.toml's [workspace.package]")
+}
+def engineVersion = (versionLine =~ /"(.*)"/)[0][1]
+
+// Which build of that version this is: the short commit, plus `-dirty` when the
+// working tree had changes git did not. tools/build-android.sh computes it --
+// it is the same string it names the APK file after, so the file and the
+// version the device shows cannot disagree -- and passes it in rather than this
+// file shelling out to git a second time. The fallback is the script's own for
+// a checkout with no git: `unknown`.
+def buildId = project.findProperty('daysengine.version') ?: 'unknown'
+
 android {
     namespace 'org.daysengine'
     compileSdk 35
@@ -27,7 +54,7 @@ android {
         minSdk androidApi
         targetSdk 35
         versionCode 1
-        versionName '0.1.0'
+        versionName "${engineVersion}-${buildId}"
     }
 
     sourceSets {

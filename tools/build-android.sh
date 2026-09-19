@@ -121,7 +121,10 @@ done
 
 # The build this APK is, named so two of them cannot be confused. `-dirty`
 # means the working tree had changes git did not, so the source shipped inside
-# is the only record of what actually went in.
+# is the only record of what actually went in. It names the file and -- passed
+# to gradle below -- is also the second half of the APK's own versionName,
+# after the engine version out of Cargo.toml, so what the device reports and
+# what the file is called are the same string.
 version=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)
 if [ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]; then
     version="$version-dirty"
@@ -205,7 +208,7 @@ task=assemble$([ "$mode" = release ] && echo Release || echo Debug)
 # Everything gradle writes belongs under target/ with every other build output.
 gradle -p "$root/android" --no-daemon \
     --project-cache-dir "$root/target/android/gradle-cache" \
-    -Pdaysengine.keystore="$keystore" "$task"
+    -Pdaysengine.keystore="$keystore" -Pdaysengine.version="$version" "$task"
 
 # **Found rather than spelled out.** A debug build leaves `app-debug.apk` and
 # an unsigned release leaves `app-release-unsigned.apk` -- the name carries
