@@ -86,6 +86,13 @@ fi
 # "everything libavfilter knows is available". Trimming the filter list would
 # turn that into a lie and break configs that already work against a system
 # ffmpeg.
+#
+# `wmav2` is the one decoder here that src/media does not yet ask for. School
+# Days (2005) -- the original gEngine release, not School Days HQ -- keeps each
+# scene's voice and sound effects premixed in a single per-scene `.WMA`
+# alongside its `.WMV` shots, so it is the format any support for that title
+# would decode first. It is enabled because the ASF demuxer is already built
+# and the decoder is small; nothing in the engine calls it today.
 # ---------------------------------------------------------------------------
 components=(
     --disable-encoders
@@ -93,7 +100,7 @@ components=(
     --disable-devices
     --disable-bsfs
     --disable-decoders
-    --enable-decoder=wmv3,vc1,vorbis
+    --enable-decoder=wmv3,vc1,vorbis,wmav2
     --disable-demuxers
     --enable-demuxer=asf,ogg
     --disable-protocols

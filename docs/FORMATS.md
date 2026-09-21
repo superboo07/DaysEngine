@@ -10,7 +10,9 @@ Where a second FILMEngine title differs, it is noted against the section it
 belongs to. The one examined so far is the English **Shiny Days** release
 (`SHINYDAYS.exe`, `SysMenuSD.dll` and `RouteProcSD.dll`, Dec 2015): 27 packs,
 2,587 scripts, 103 routes, 2,301 scenes. See *Other titles on this engine*
-below for what is shared and what is not.
+below for what is shared and what is not. The 2005 Overflow release of
+School Days is a generation earlier and shares the container rather than
+the script layer; it has a section of its own.
 
 ---
 
@@ -1327,6 +1329,136 @@ first like evidence against that, since it plays host sound `6` whenever the
 selection is `0xd ..= 0x16` and differs from `+0x620`; but `+0x620` is the
 previous frame's selection, which `FUN_1002a9a0` stores after the hit test has
 already written `+0x608`, so that block is the column's pointer-hover sound.
+
+---
+
+## School Days (2005) — the earlier gEngine release
+
+The original 2005 Overflow release is the same engine lineage one generation
+back: `SD.exe` loads `gEngine.gesl`, which loads `module/FILMEngine.gem` beside
+`ScriptEngine.gem`, `WM9Reader.gem` and a dozen others. Nothing in DaysEngine
+reads it and none of it is implemented; this is recorded because the container
+and asset layers turn out to be the ones already decoded here, so the cost of a
+third title is concentrated in a small number of places rather than spread
+across the whole format stack.
+
+**Shared without change.** The `.GPK` container, byte for byte — the same
+`STKFile0PIDX`/`STKFile0PACKFILE` footer, the same XOR-then-zlib index, the
+same inline-header trap — and the key is a 20-byte `CODE`/`CIPHERCODE` resource
+in `SD.exe`, which `Key::from_executable` already handles. Movies are WMV3 in
+ASF, at 640x348 against School Days HQ's 800x452. `.CMAP` hit maps,
+`*CHIP.PNG` atlases and `FONTDATA.DAT` are the same families, and the screen
+inventory in `ETC.GPK` is recognisable one for one: `TITLE`, `OPTION`,
+`SAVELOAD`, `LOG`, `FEEL`, `ENDSAVE`, `QUIT`, `MENU/SYSTEMMENU`.
+
+**Not shared.** Scripts are compiled XML ASTs for a stateful sprite VM, not
+`.ORS` timelines — see *The 2005 opcode table* below. Configuration is XML
+(`FILMENGINE.XML`, `DX9GRAPHIC.XML`, `CONFIGBASE.XML`) rather than `.INI`. The
+menu tables live in `MenuBase.gem`, not a `SysMenu*.dll`, and there is no
+`RouteProc*.dll` at all: the branch graph is in the scripts themselves, through
+the `GNScr` and `SSel` opcodes. Still art is `SFD2` (`.CGS`), a format not
+decoded here. Per-scene voice is `.WMA`, which the engine's ffmpeg gains a
+decoder for in `tools/build-ffmpeg.sh` and nothing yet calls.
+
+**The overlay series runs past `009`.** The retail disc ships `SCENE.GPK` with
+`SCENE.GPK.010` through `.061`, and the official 1.11 update adds `.101`
+through `.111`. School Days HQ's `_GetPatchMax@0` is 10 and neither retail
+FILMEngine install ships an overlay at all, so this is the only shipped example
+of the layering in *A pack is not one file* actually being used — and it needs
+a cap this engine's does not have.
+
+**The scripts carry no dialogue text.** Checked across all 1,756 of them two
+ways: a tag inventory of the whole corpus (`_L`, `STR`, `INT`, `FLT`, `FUNC`,
+`GOTO`, `IF`/`CASE`/`SET` and nothing text-bearing), and a scan of every
+non-ASCII byte — 18,378 of them across 1,155 files, every one of which is an
+asset name (`教室`, `電車内`, `COMMON/SE/電車入線～停止`) or an `SSel` choice
+label (`だったら？`, `違う`). The original shipped without subtitles. This is a
+property of the shipped scripts, not of the engine: the opcode table has `Txt`
+and `Txt2` and no script calls either.
+
+### The 2005 opcode table
+
+`FILMEngine.gem` holds 46 opcode names as UTF-16 literals, with a table of
+pointers to them in `.data` at `0x1007216c .. 0x10072220` (image base
+`0x10000000`). `ScriptEngine.gem` parses the XML — it is the module holding the
+`SCRIPT`, `FUNC` and `name` literals — and the dispatcher compares the
+*interned pointer* rather than the string, down an if-else chain, handing a
+numeric command id to a scheduler at `FUN_100176a0`. `LVo` is command `0x22`
+(`0x10003511`) and `LVc` is `0x26` (`0x100036df`).
+
+```text
+SysOff SysOn ChgBLay Frm ReFrm CSkip CLay CMn CCg CCgs CLCgs CMv CLMv CMMv
+CLMMv EObj EAObj MObj SPos SZom SPai SDif SBOp SAPos SAZom SAPai SADif SOCmd
+MErs MFd MGCg LBgm LVo LVo2 StBgm StVo LVc AOff STOut SSel SelT GNScr Txt Txt2
+FEDbgScrnClr FEDbgScrnDrawTxt
+```
+
+`Frm` moves a frame cursor and the rest act at that cursor, so the engine is
+still frame-scheduled the way `.ORS` is; what it adds is named sprite objects
+with position, zoom, tint and animated ramps of each. **What most of these do is
+not recovered** — only `LVo`, `LVc` and the `VoCD` path below were followed to
+their handlers.
+
+Counted across the corpus, the 2005 release is mostly still art: 7,114 `CCgs`
+(`.CGS`) and 4,311 `CCg` (`.PNG`/`.JPG`) shots against 1,370 movie shots. School
+Days HQ is the same shape — 13,024 `[CreateBG]` against 2,042 `[PlayMovie]` —
+with more of both.
+
+### `VoCD` — the lip-sync track
+
+Each scene ships a `.VC` beside its `.WMA` (`1/A00/SOUND/A00.VC`), loaded by the
+`LVc` opcode. It is the 2005 equivalent of School Days HQ's mouth overlays, and
+unlike them it is a data stream rather than a set of images: it says, per
+character, when a mouth should be moving.
+
+```text
+"VoCD"                       4 bytes
+repeat:
+    count   u16              0xFFFF ends the stream
+                             count == 0 is a second with nothing speaking
+    entry   [u16; count]     read one at a time
+        byte 0   id          character/object slot, 0..255
+        byte 1   mask        8 sub-slots of the second, MSB first
+```
+
+**One record is one second.** `FUN_1002a2d0` advances the stream clock by
+`*(DAT_10075ae4 + 0x80)` per record, and that global is a tick rate per second:
+`FUN_100217d0` computes `(*(DAT_10075ae4 + 0x80) * ms) / 1000` from it. Measured
+against the data as a second method, record count against the paired `.WMA`'s
+ASF duration comes to a ratio of 1.00 on 24 files spread across four packs.
+
+**The mask is MSB first.** `FUN_1002a3e0`, the per-frame lookup, computes
+`7 - ((t - t0) * 8) / rate`, clamps it to `0..7` and takes `1 << that`, so the
+first eighth of the second is bit 7 and the resolution is 125 ms.
+
+**Entries are read as `u16` and used as two bytes.** `FUN_1002a2d0` reads
+`count` 16-bit values; `FUN_1002a1b0` then indexes `data + i*2`, returns byte 0
+raw and returns byte 1 ANDed with the current sub-slot bit. An extractor that
+reads the record as pairs of bytes gets the same answer, but the parser's own
+unit is the `u16`.
+
+**Streams accumulate, and the mouth frame is random.** `FUN_10022430` walks
+every live `VoCD` object, ORs each entry's masked bit into a 256-entry table
+indexed by the id, and then for each id advances a mouth frame by
+`1 + (rand() >> 8 & 1)` while the accumulated bit is set, resetting to 0 when it
+clears. So the track drives *whether* a mouth moves; which frame it lands on is
+not reproducible, the way School Days HQ's `FUN_0041ba90` sample choice is not.
+The updater is throttled to every third tick.
+
+**Not recovered.** What writes `DAT_10075ae4 + 0x80` — it is set outside
+`FILMEngine.gem`, so the tick rate is a value this note names but does not have.
+What an id means: the mapping from id to character is established wherever the
+mouth slots are registered, which has not been followed. And **what the paired
+`.WMA` contains** — `LVo` was traced as far as command `0x22` and the path
+builder at `FUN_10012180` (`prefix + name + ".WMA"`), but not to its executor,
+so whether that track is voice alone or voice premixed with effects is open.
+The question matters: the scripts load ambience separately through `LBgm`
+(1,084 calls, names like `教室` and `電車内`, resolving to `BGM/*.OGG` in
+`ETC.GPK`) and long effects through `LVo2`, which argues for voice alone, while
+the track itself is only 1.1% below -60 dBFS with a longest silent run of 1.74s,
+which argues against it. Neither is evidence about the other, and an earlier
+claim here that the `.WMA` is premixed was withdrawn for resting on the first
+argument alone.
 
 ---
 
