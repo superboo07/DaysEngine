@@ -201,6 +201,16 @@ tool, not part of the build. `cargo build`, the tests and the
 Requires a Ghidra install and a copy of the game. Nothing below assumes where
 either lives — set these three to whatever is true for your machine.
 
+**In the devcontainer all three are already set**, and `/root/ghidra_projects`
+is a volume that survives a rebuild, so there is very likely a project there
+already — look before importing, because a fresh import pays the slow analysis
+below again for a project that was sitting next to you. `env |
+grep GHIDRA` and a listing of `$GHIDRA_PROJ` answer both questions; one
+directory per project is the convention there. `docs/DEVCONTAINER.md` has the
+rest. Writing this down because a session put its project in a session-scoped
+scratch directory instead, and then reported that location back to the user as
+though the choice had come from this file.
+
 ```bash
 export HEADLESS=/opt/ghidra/support/analyzeHeadless   # wherever Ghidra is
 export GHIDRA_PROJ=~/ghidra_projects/SDHQ             # any empty directory
@@ -262,6 +272,16 @@ style as whatever is already there.
   sweeps to an address range.
 - `pkill -f analyzeHeadless` **matches its own command line** and will kill
   your shell. Don't.
+- **Auto-analysis leaves holes, and a hole looks exactly like a null result.**
+  Importing `FILMEngine.gem` from the 2005 release left `1002abde`–`1002aeb0`,
+  722 bytes, with no disassembly and no function — and the whole `VoCD` parser
+  was inside it. `getFunctionContaining` returned null, so "there is no such
+  function" and "nothing calls this" were both available as conclusions and
+  both would have been false. Before believing either, check that the bytes
+  were disassembled at all: `getInstructionContaining` returning null while
+  `getDataContaining` returns `??` is the signature. `DisassembleCommand` over
+  the gap and `CreateFunctionCmd` at each start recovers it, and the repaired
+  program is saved back into the project for everyone after you.
 
 A plain Python scan over the raw file is often the faster and more reliable
 second opinion, especially for reading tables out of `.data` — and having two
