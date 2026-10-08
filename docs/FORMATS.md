@@ -2546,6 +2546,18 @@ selected slot draws, the last twelve what every live slot draws — and that
 doubled shape is what tells it apart from the chip sheet's run, which
 reproduces the same twelve boxes once and then carries on.
 
+Turning the page is `FUN_1001c1f0`, and everything it does hangs off `+0x2a4`:
+the page button's own sprite pair, records `page + 0xb` and `page + 0xf`; the
+twelve slot pictures, by way of `FUN_1001b3f0`, which releases the sheet it is
+holding, formats the new page's name and re-reads it; and the per-slot unlocked
+flags at `+0x240` and `+0x270`, re-asked for the twelve scenes the new page
+covers. Every arm that writes `+0x2a4` calls it — the page arm of
+`FUN_1001de10` for a click, and each of the four sideways arms of
+`FUN_1001e3a0` for the keyboard — so there is no path that moves the page
+without re-reading the sheet. In this engine the sprite pair and the flags are
+derived from the page as each frame is composed, so the call that has to be
+repeated is the sheet: `Menu::load_thumbnails`.
+
 ### The Replay screen's keyboard tables
 
 `FUN_1001e200` is the input pump. It writes the cursor `+0x2a0` from the hit

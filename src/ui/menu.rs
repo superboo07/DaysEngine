@@ -1736,6 +1736,18 @@ impl Menu {
     /// other module draws its grid from [`Self::load_replay_page`] instead, out
     /// of one sheet for every page, so the two are exclusive.
     ///
+    /// Every page has its own sheet, so this has to run again on every page
+    /// turn and not only on entry. `FUN_1001c1f0` is the shipped rebind, and
+    /// all three of the things it does hang off `+0x2a4`: the page button's
+    /// sprite pair at records `page + 0xb` and `page + 0xf`, the twelve slot
+    /// pictures by way of `FUN_1001b3f0`, which formats
+    /// `Replay_Thm%02d.png` from the page and re-reads it, and the per-slot
+    /// unlocked flags at `+0x240` and `+0x270`. The first and the last are
+    /// derived from [`Self::page`] as each frame is composed — see
+    /// [`replay::extra_for`] and [`replay::hscene_enabled`] — so this call is
+    /// the middle one, and every arm of `FUN_1001de10` and `FUN_1001e3a0` that
+    /// writes `+0x2a4` calls `FUN_1001c1f0` right after it.
+    ///
     /// A page whose art or table will not load leaves the frames empty and the
     /// grid still usable, which is the same rule every other missing asset
     /// follows.
@@ -3342,11 +3354,17 @@ impl Menu {
             if let Some(page) = opened.filter(|page| *page != self.page) {
                 self.page = page;
                 self.dirty = true;
-                // A page module draws the page as a layer of its own, so the
-                // art has to be rebuilt for the page turned to; the screen
-                // with its own hit maps redraws from the atlas it already has.
+                // Both modules hold per-page art that the atlas does not
+                // carry, so the page turned to has to be read in either way: a
+                // page module draws the whole page as a layer of its own, and
+                // the module with its own hit maps cuts the grid's twelve
+                // thumbnails from that page's `Replay_Thm%02d.png`. Every arm
+                // of `FUN_1001e3a0` that writes `+0x2a4` calls `FUN_1001c1f0`
+                // for the same reason.
                 if self.replay_page.is_some() {
                     self.load_replay_page(vfs, dll);
+                } else {
+                    self.load_thumbnails(vfs, dll);
                 }
             }
         }
@@ -4133,6 +4151,11 @@ impl Menu {
                 }
                 self.page = page;
                 self.selection = None;
+                // The grid's thumbnails come from the page's own sheet rather
+                // than from the atlas, so turning the page has to reload them:
+                // `FUN_1001de10`'s page arm calls `FUN_1001c1f0` after it
+                // writes `+0x2a4`. See [`Self::load_thumbnails`].
+                self.load_thumbnails(vfs, dll);
                 self.refresh();
                 Ok(Action::Sound(SystemSe::Click))
             }
