@@ -2480,7 +2480,7 @@ scene's list, ending the scene on -1 and on the list's NULL terminator.
 `FUN_1001ee20` is the branch:
 
 ```text
-column = host->+0x4()                      // the choice made in playback
+column = host->+0x4()                      // the choice this script settled
 column = (column == -2) ? 0 : column + 1
 switch (scene at +0x2a8) {
   case 1, 6, 7, 10, 11, 12, 16, 25, 28, 29, 36:
@@ -2492,19 +2492,65 @@ switch (scene at +0x2a8) {
 
 Eleven scenes have a table; scene 11 has four, one per version, picked by the
 version index at `+0x2b4`. A table is one row per script in the scene's list and
-a row is three `i32` step indices — column 0 for a player who has answered no
-choice box, columns 1 and 2 for the two answers.
+a row is three `i32` step indices — column 0 for a step whose box was never
+raised, declined or left to time out, columns 1 and 2 for the two answers.
 
-The column comes from the host's vtable slot `+0x4` (`FUN_0042c080`), which
-reads the film object's `+0x1f8` through `FUN_0042c0c0`. That member is written
-in exactly two places in the executable: `FUN_004388c0` sets it to -2 when the
-film object is constructed, and `FUN_0043f330` stores the index a choice box
-settled on — -1 when the box was dismissed or ran out of time (`FUN_00431740`
-resolves it). Nothing puts it back, so **the value outlives the script it was
-made in and the scene that reads it**: a replay's first step is walked by
-whatever the player last answered, possibly long before the replay started. Both
-writes were found by a byte scan of `.text` for stores at displacement `0x1f8`;
-the other hits belong to other classes.
+### The column is the step's own answer
+
+The column comes from the host's vtable slot `+0x4` (`FUN_0042c080`, at
+`0x004d2898`), which takes the holder at the host subobject's `+0x1b8` —
+`engine+0x1e4`, since the subobject sits at `engine+0x2c`, which
+`FUN_00424020` states outright by passing `param_1 + 0x2c` before every call
+into the module — resolves it through `FUN_00440730` and returns the film
+object's `+0x1f8` (`FUN_0042c0c0`). That member is written in exactly two
+places: `FUN_004388c0` sets it to -2 as the film object is constructed, and
+`FUN_0043f330` stores the index a choice box settled on — -1 when the box was
+dismissed or ran out of time (`FUN_00431740` resolves it, on the film object at
+that same `engine+0x1e4`, from `FUN_004252e0`).
+
+**A film object is constructed per script, so the value does not outlive the
+script that made it.** `FUN_00424020` is the chapter advance and does three
+things in this order: it asks the module for the next name
+(`_GetNextChapter@8`, at `0x004240f0`), it builds the film object for that name
+into the *second* holder at `engine+0x1f4` (`FUN_00430d20` at `0x00424500`,
+which allocates `0x418` bytes through `FUN_0047ad7d` and runs `FUN_004388c0`
+over them), and then `FUN_00423f40` (at `0x00424763`) moves that holder into
+`engine+0x1e4` through `FUN_00430e30`. So at the moment the module is asked for
+the next step, `engine+0x1e4` still holds the finished script's object and the
+column is that script's own answer; the script that follows starts at -2 again.
+
+Consequently a step whose script raises no `[SetSELECT]` is **always** read at
+column 0, and columns 1 and 2 of its row are cells nothing can reach.
+
+Four methods were used and they agree:
+
+- The decompiles above, end to end from `FUN_1001ee20` to the two stores.
+- A list of every instruction in the image at displacement `0x1f8`. It has two
+  more stores than the film object's: `FUN_0042a430` and `FUN_0042a4a0`, which
+  are host vtable slots `+0xf8` and `+0xfc` (`0x004d298c`, `0x004d2990`) and
+  write the *host subobject's* `+0x1f8` — `engine+0x224` — beside the mode
+  member they set to 3 and 4. A scan at a displacement alone cannot tell the
+  two members apart; `FUN_0042a430`'s own `SUB ECX,0x2c` is what does.
+- The module's other reader of the same tables. `FUN_1001f1e0`, behind the
+  `_SelectReadCheck@0` export, probes all three columns of **one** step through
+  `FUN_1001ee20(this, 0, column)` — the arm that takes the column as an
+  argument instead of asking the host — so the three columns are the three
+  outcomes of a single box. It also treats a cell of 0 as *no option*, skipping
+  the per-script check (`FUN_1001ed40`, host slot `+0x18`) that it runs on every
+  other value.
+- The shipped data, from two directions. Over all fourteen tables, 115 rows,
+  columns 1 and 2 hold 0 for exactly the rows whose script raises a
+  `[SetSELECT]` and a real step for exactly the rows whose script raises one —
+  no exceptions. And `RouteProcSDHQ.dll`'s route graph reproduces a table
+  target for target: for scene 16, route 27 gives `04-SB-G05` choice 0 →
+  `G06`, choice 1 → `G07`, neither → `G08`; `G06` → `I00`; `G07` → `I00`;
+  `G08` → `G09`, outside the scene; `I00` choice 0 → `I01`, choice 1 → `I02`,
+  neither → `I03`. The replay table's nine rows are that graph restricted to
+  the scene's nine scripts, with the out-of-scene edge becoming the end of the
+  chain.
+
+Walked this way, every script the replay listing names is reachable: **122 of
+122**, over 129 distinct walks. Nothing in the replay tables is dead.
 
 A branch table is a run of small integers and cannot be found by its contents
 the way the runs above are. It is found by the code that reads it: `FUN_1001ee20`
@@ -2527,6 +2573,16 @@ table is then read as one row per script and refused unless every entry is -1, a
 step its list has, or the one past the end that reads as the list's NULL
 terminator — all fourteen pass, and each one's length lands exactly on the next
 table or on the alignment padding before it.
+
+The anchor for all of that is one claim: the address in each arm of
+`FUN_1001ee20`'s switch is the base of that scene's table, read at
+`step * 0xc + column * 4`. It is confirmed a second way by a plain read of the
+raw file. Mapping each arm's address through the DLL's own section headers
+(image base `0x10000000`, `.data` va `0x43000` raw `0x40e00`) and taking
+`len(list)` rows of three `i32` at each gives, for all fourteen tables and 115
+rows, exactly what `Scenes::recover` yields from the image — and the row counts
+land so that scene 1's table at `0x1004bc58` runs up to scene 6's at
+`0x1004bcb8`, 8 rows of `0xc` later, with no slack.
 
 Scenes 11, 22 and 30 raise `Pop_Replay` instead (`FUN_10001830`, which sets
 `+0xc8` and `+0xc4` on the popup singleton). `+0xc8` picks `Pop_Replay_2` or

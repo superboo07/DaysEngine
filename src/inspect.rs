@@ -427,11 +427,13 @@ pub struct ExportArgs {
     /// Re-encode a scene whose file is already there instead of skipping it.
     #[arg(long)]
     force: bool,
-    /// Which column of a scene's branch table to walk.
+    /// How to answer every choice box the scene raises.
     ///
-    /// `none` is the answer a box records when it is dismissed or when its
-    /// window runs out, which the DLL maps to column 0 — so it is also what a
-    /// scene walks before any box has settled. The default.
+    /// The column a step is read at is the answer its own script settled, so
+    /// this answers each box in turn rather than picking a column once — see
+    /// [`one_column`]. `none` is what a box records when it is dismissed or
+    /// when its window runs out, which the DLL maps to column 0, and is also
+    /// where a step with no box of its own is read. The default.
     #[arg(long, value_parser = ["none", "first", "second"])]
     choice: Option<String>,
     /// Encode every distinct walk of a branching scene rather than one.
@@ -1666,7 +1668,7 @@ impl Wav {
     }
 }
 
-/// What one script can leave the player's last answer as, for
+/// What one script's choice box can settle on, for
 /// [`crate::ui::replay::Run::walks`].
 ///
 /// Only the **last** `[SetSELECT]` in a script matters: every box settles into
@@ -1675,11 +1677,11 @@ impl Wav {
 /// refused; a one-label box can be taken or refused. A refusal records -1, and
 /// `FUN_00431740` treats a refusal and a spent window alike — see
 /// [`crate::ui::select::Poll::Cancelled`]. `None` is a script with no box at
-/// all, which cannot change the column.
+/// all, which is read at [`crate::ui::replay::NO_CHOICE`].
 ///
 /// A script that will not parse answers `None`: it raises no box this can see,
-/// and the walk then reads the column it arrived on, which is what the
-/// original does with a script whose boxes never settle.
+/// and the walk then reads column 0, which is where a script whose box never
+/// settles leaves the original too.
 fn script_answers(vfs: &crate::install::vfs::Vfs, english: bool, name: &str) -> Option<Vec<i32>> {
     let stem = name.rsplit('/').next().unwrap_or(name);
     let (name, path) = crate::game::find_script(vfs, stem, english).ok()?;
@@ -1694,24 +1696,44 @@ fn script_answers(vfs: &crate::install::vfs::Vfs, english: bool, name: &str) -> 
     Some(if two { vec![0, 1, -1] } else { vec![0, -1] })
 }
 
+/// One walk, taken with every box answered the same way.
+///
+/// `choice` is the column the walk goes down where a box offers it; a box that
+/// does not — a one-label box asked for the second answer, or the declining
+/// [`crate::ui::replay::NO_CHOICE`], which no box can settle on — is refused
+/// instead, and a refusal and a spent window are the same -1 to
+/// `FUN_00431740`. A script with no box has nothing to answer and is read at
+/// [`crate::ui::replay::NO_CHOICE`], which is the same column 0.
+fn one_column(
+    answers: &dyn Fn(&str) -> Option<Vec<i32>>,
+    choice: i32,
+    name: &str,
+) -> Option<Vec<i32>> {
+    answers(name).map(|options| {
+        vec![if options.contains(&choice) {
+            choice
+        } else {
+            -1
+        }]
+    })
+}
+
 /// A set of walks covering every step a scene can reach.
 ///
 /// Greedy, and seeded with the walk a player who answers nothing takes so that
 /// walk keeps the unsuffixed file name — a scene already encoded without
 /// `--paths` is then not encoded again. Each further walk is the one that adds
-/// the most steps nothing chosen so far reaches, which for the retail tables
-/// lands on 49 files over the eleven branching scenes against 96 reachable
-/// scripts.
+/// the most steps nothing chosen so far reaches.
 fn cover(
     run: &crate::ui::replay::Run,
     answers: &dyn Fn(&str) -> Option<Vec<i32>>,
 ) -> Vec<Vec<usize>> {
     use crate::ui::replay::NO_CHOICE;
 
-    let walks = run.walks(answers, &[NO_CHOICE, 0, 1]);
+    let walks = run.walks(answers);
     let mut need: std::collections::HashSet<usize> = walks.iter().flatten().copied().collect();
     let mut chosen: Vec<Vec<usize>> = run
-        .walks(&|_| None, &[NO_CHOICE])
+        .walks(&|name| one_column(answers, NO_CHOICE, name))
         .into_iter()
         .take(1)
         .collect();
@@ -1845,7 +1867,7 @@ fn cmd_export(game: &Path, args: &ExportArgs) -> Result<()> {
                     })
                     .collect()
             } else {
-                run.walks(&|_| None, &[choice])
+                run.walks(&|name| one_column(&lookup, choice, name))
                     .into_iter()
                     .take(1)
                     .map(|walk| (tag.to_string(), walk))

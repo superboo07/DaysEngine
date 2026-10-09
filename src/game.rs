@@ -787,11 +787,13 @@ struct Player<'a> {
     pads: Pads,
     /// The binding table resolved against SDL, and what is held down.
     controls: Controls,
-    /// The index the last choice box settled on, which is what a replay's
-    /// branch table is read by. The film object's `+0x1f8`: `FUN_004388c0`
-    /// sets it to -2 once, when the object is constructed, and only a settling
-    /// choice box writes it after that — so it outlives the script it was made
-    /// in, and lives as long as the session does.
+    /// The index the choice box of the script now playing settled on, which is
+    /// what a replay's branch table is read by. The film object's `+0x1f8`:
+    /// `FUN_004388c0` sets it to [`replay::NO_CHOICE`] as the object is
+    /// constructed and `FUN_0043f330` stores a settled index. The engine
+    /// constructs one film object per script, so this is **per script** and is
+    /// put back at every load — see [`crate::ui::replay`]'s module doc for the
+    /// chain, and the load below for where it goes back.
     last_choice: i32,
     /// Every line the player has been shown this session, oldest first — the
     /// list the original keeps at `engine+0xac +0x08`.
@@ -1229,6 +1231,11 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
         chained = false;
         let (name, path) = find_script(&vfs, &next, english)?;
         log::info!("playing {name} from {path}");
+        // A script gets a fresh film object in the original — `FUN_00424020`
+        // builds one per chapter and `FUN_004388c0` writes `NO_CHOICE` into
+        // its `+0x1f8` — so the answer the last script settled does not reach
+        // this one. The replay walk above has already read it.
+        player.last_choice = replay::NO_CHOICE;
         let mut script = Script::parse(&name, &vfs.read_path(&path)?)?;
         // Whether this script's `[EndRoll]` plays, and which of a pair it is,
         // is the route module's answer for the position the engine is now at
@@ -1380,9 +1387,10 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
         if outcome == Outcome::Finished || outcome == Outcome::SkipToChoice {
             // A replay walks the scene's own list, by its branch table where it
             // has one and straight down the list where it does not —
-            // `FUN_1001ee20`'s `default` arm. The column is the choice the
-            // player last answered, which the original keeps for the life of
-            // the film object and so outlives the script it was made in.
+            // `FUN_1001ee20`'s `default` arm. The column is the answer the
+            // script that just ended settled, which is read here for the same
+            // reason `FUN_00424020` reads it before building the next film
+            // object: the holder still holds the finished script's.
             if let Some((run, step)) = &mut replaying {
                 if let Some(next_step) = run.next(*step, player.last_choice) {
                     *step = next_step;

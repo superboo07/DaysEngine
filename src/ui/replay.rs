@@ -55,7 +55,7 @@
 //! list is the steps after it — up to nine for a scene and sixteen for a
 //! version of one — and the engine asks the module for each in turn through
 //! `FUN_1001f0d0`, which walks the scene's branch table by the choice the
-//! player last made during playback.
+//! step's own script settled.
 //!
 //! # How a scene walks
 //!
@@ -81,6 +81,35 @@
 //! A row is three `i32` next-step indices, one per column. Scene 11 has four
 //! such tables, one per version, picked by `+0x2b4`. See [`Run::next`] for the
 //! walk and [`column`] for where the choice comes from.
+//!
+//! # The column is the step's own answer
+//!
+//! The choice the column is read from belongs to the script that just ended,
+//! not to the scene and not to the session: the engine builds a **fresh film
+//! object for every script**, and its constructor is what writes
+//! [`NO_CHOICE`]. `FUN_00424020` is the chapter advance and does the three
+//! things in this order — asks the module for the next name
+//! (`_GetNextChapter@8`, `0x004240f0`), builds the film object for it into the
+//! second holder at `engine+0x1f4` (`FUN_00430d20`, which allocates `0x418`
+//! bytes and runs `FUN_004388c0` over them, `0x00424500`), and then moves that
+//! holder into `engine+0x1e4` (`FUN_00423f40` at `0x00424763`, through
+//! `FUN_00430e30`). `engine+0x1e4` is the holder the host answers slot `+0x4`
+//! out of and the holder the per-frame `FUN_00431740` settles a box on, so at
+//! the moment the module is asked, it still holds the finished script's object
+//! and the column is that script's own answer. The next script starts at
+//! [`NO_CHOICE`] again.
+//!
+//! So a step whose script raises no `[SetSELECT]` is **always** read at column
+//! 0, and columns 1 and 2 of its row are cells nothing can reach. Two further
+//! things agree with that. The module's other reader of the same table,
+//! `FUN_1001f1e0` behind the `_SelectReadCheck@0` export, probes all three
+//! columns of **one** step — `FUN_1001ee20(this, 0, column)`, the arm that
+//! takes the column as an argument instead of asking the host — so the three
+//! columns are the three outcomes of a single box; and it treats a cell of 0 as
+//! *no option*, skipping the per-script check it runs on every other value.
+//! And the retail data: over all fourteen tables, 115 rows, columns 1 and 2
+//! hold 0 for exactly the rows whose script raises no box and hold a real step
+//! for exactly the rows whose script raises one.
 //!
 //! # Finding the branch tables
 //!
@@ -422,9 +451,11 @@ impl Scene {
 /// A scene's branch table: one row per step, three next-step indices a row.
 ///
 /// `FUN_1001ee20` indexes it `step * 0xc + column * 4` — twelve bytes a row and
-/// four a column — so a row is three `i32`s. The column is the choice the
-/// player last made and the value is the step to play next, where -1 or an
-/// index past the end of the scene's list ends the scene.
+/// four a column — so a row is three `i32`s. The column is the choice
+/// the step's own script settled and the value is the step to play next, where
+/// -1 or an index past the end of the scene's list ends the scene. Columns 1
+/// and 2 of a step whose script raises no box are cells nothing can reach, and
+/// the retail data fills them with 0.
 pub type Branch = Vec<[i32; 3]>;
 
 /// A replay scene in flight: the scripts it plays and how it walks them.
@@ -465,47 +496,35 @@ impl Run {
 
     /// Every distinct walk of this scene, as runs of step indices.
     ///
-    /// The column [`Run::next`] reads is the player's **last** answer, and that
-    /// value outlives the box that set it: `+0x1f8` is written in exactly two
-    /// places — `FUN_004388c0` sets it to [`NO_CHOICE`] as the film object is
-    /// built, and `FUN_0043f330` stores a settled index — so between those
-    /// stores it stands. A step whose script raises no `[SetSELECT]` therefore
-    /// cannot change the column and is walked at whatever answer arrived with
-    /// it. That is why a scene with a branch table is not three walks: its
-    /// choices are only where its scripts have boxes, and in the retail data
-    /// most of them do not.
+    /// The column [`Run::next`] reads is the answer settled by the step's
+    /// **own** script, because the engine builds a fresh film object for every
+    /// script and the constructor writes [`NO_CHOICE`] — see the module doc for
+    /// that chain. So a step whose script raises no `[SetSELECT]` is walked at
+    /// [`NO_CHOICE`] whatever came before it, and a scene branches only where
+    /// its scripts have boxes.
     ///
-    /// `answers` says what each script can leave the last answer as, `None`
-    /// for a script that raises no box. `entry` is the answers the scene can
-    /// be entered on — [`NO_CHOICE`] alone for a film object that has never
-    /// settled a box, and a carried-over index for one that has, since nothing
-    /// clears `+0x1f8` between scenes.
+    /// `answers` says what each script's box can settle on, `None` for a script
+    /// that raises none. A scene always starts at [`NO_CHOICE`], so there is
+    /// nothing to enter it on.
     ///
     /// Bounded by a seen-set per walk, so a table that leads back into itself
     /// ends the walk rather than the session.
-    pub fn walks(
-        &self,
-        answers: &dyn Fn(&str) -> Option<Vec<i32>>,
-        entry: &[i32],
-    ) -> Vec<Vec<usize>> {
+    pub fn walks(&self, answers: &dyn Fn(&str) -> Option<Vec<i32>>) -> Vec<Vec<usize>> {
         let mut out = Vec::new();
         if self.scripts.is_empty() {
             return out;
         }
-        for &first in entry {
-            self.walk_on(0, first, &mut Vec::new(), answers, &mut out);
-        }
+        self.walk_on(0, &mut Vec::new(), answers, &mut out);
         out.sort();
         out.dedup();
         out
     }
 
     /// One step of [`Run::walks`]: play `step`, then follow every answer its
-    /// script could leave behind.
+    /// own script can settle on.
     fn walk_on(
         &self,
         step: usize,
-        last: i32,
         seen: &mut Vec<usize>,
         answers: &dyn Fn(&str) -> Option<Vec<i32>>,
         out: &mut Vec<Vec<usize>>,
@@ -514,13 +533,13 @@ impl Run {
         let options = self
             .script(step)
             .and_then(answers)
-            .unwrap_or_else(|| vec![last]);
+            .unwrap_or_else(|| vec![NO_CHOICE]);
         let mut ended = true;
         for answer in options {
             match self.next(step, answer) {
                 Some(next) if !seen.contains(&next) => {
                     ended = false;
-                    self.walk_on(next, answer, seen, answers, out);
+                    self.walk_on(next, seen, answers, out);
                 }
                 _ => {}
             }
@@ -532,26 +551,35 @@ impl Run {
     }
 }
 
-/// What the last-choice value is before any choice box has settled.
+/// What the last-choice value is before a choice box has settled.
 ///
 /// `FUN_004388c0` writes it into the film object's `+0x1f8` when the object is
-/// constructed, and nothing puts it back.
+/// constructed, and a film object is constructed per script, so every script
+/// starts here.
 pub const NO_CHOICE: i32 = -2;
 
-/// The column of a branch row the player's last choice selects.
+/// The column of a branch row the step's own choice box selects.
 ///
 /// `FUN_1001ee20` asks the host for it through vtable slot `+0x4`
-/// (`FUN_0042c080`), which reads the film object's `+0x1f8`: `-2` until a
-/// choice box has ever settled, and after that the index it settled on, which
-/// is `-1` when the box was dismissed or ran out of time. The DLL maps `-2` to
-/// column 0 and everything else to `choice + 1`, so a dismissed box and one
-/// that was never raised share column 0.
+/// (`FUN_0042c080`), which reads the film object at the holder `engine+0x1e4`
+/// and returns its `+0x1f8`: `-2` until a choice box settles in that script,
+/// and after that the index it settled on, which is `-1` when the box was
+/// dismissed or ran out of time. The DLL maps `-2` to column 0 and everything
+/// else to `choice + 1`, so a dismissed box and one that was never raised share
+/// column 0.
 ///
-/// `+0x1f8` is written in exactly two places — `FUN_004388c0` sets it to `-2`
-/// once, when the film object is constructed, and `FUN_0043f330` stores the
-/// settled index — so the value outlives the script it was made in and the
-/// scene that reads it. A scene's first step is therefore walked by whatever
-/// the player last answered, which may have been several scripts ago.
+/// The film object's `+0x1f8` is written in exactly two places —
+/// `FUN_004388c0` sets it to `-2` as the object is constructed and
+/// `FUN_0043f330` stores a settled index — and the engine constructs one film
+/// object per script, so the value does not outlive the script it was made in.
+/// The column is the answer that script settled, and `-2` for a script that
+/// raised no box. The module doc has the chain that establishes it.
+///
+/// The two other stores at displacement `0x1f8` in the executable,
+/// `FUN_0042a430` and `FUN_0042a4a0`, are host vtable slots `+0xf8` and
+/// `+0xfc` writing the *host subobject's* own `+0x1f8` — `engine+0x224`, since
+/// the subobject sits at `engine+0x2c` — alongside the mode member they set to
+/// 3 and 4. They are a displacement coincidence and not this member.
 ///
 /// The choice box raises two options, so the column is one of the three the row
 /// has; a wider one would read off the end of the row and is refused rather
@@ -1805,11 +1833,11 @@ mod tests {
         assert_eq!(popup_action(&scene, 9), None);
     }
 
-    /// `FUN_1001ee20` + `FUN_1001f0d0`: the column is the last choice, the
-    /// `default` arm is `step + 1`, and both -1 and the index that lands on the
-    /// list's NULL terminator end the scene.
+    /// `FUN_1001ee20` + `FUN_1001f0d0`: the column is the answer the step's own
+    /// script settled, the `default` arm is `step + 1`, and both -1 and the
+    /// index that lands on the list's NULL terminator end the scene.
     #[test]
-    fn a_scene_walks_its_branch_table_by_the_last_choice() {
+    fn a_scene_walks_its_branch_table_by_its_own_answer() {
         let scripts: Vec<String> = (0..4).map(|i| format!("05/05-KC-D{i:02}")).collect();
         // Scene 36's shape: the first step fans out three ways and every other
         // step stops. The last row ends on -1 rather than on the terminator, so
@@ -1828,7 +1856,7 @@ mod tests {
         assert_eq!(run.next(0, 2), None);
 
         // No table is the `default` arm: straight down the list, whatever the
-        // player last answered, and it stops when the list runs out.
+        // script answered, and it stops when the list runs out.
         let plain = Run {
             branch: None,
             ..run
@@ -1836,6 +1864,53 @@ mod tests {
         assert_eq!(plain.next(0, 1), Some(1));
         assert_eq!(plain.next(2, 0), Some(3));
         assert_eq!(plain.next(3, 0), None);
+    }
+
+    /// Scene 16's own shape, which is the case the per-script column settles:
+    /// its last five scripts are reachable only because a step whose script
+    /// raises no box is read at column 0 rather than at the answer that got it
+    /// there. `04-SB-G05`, `I00` and `I02` are the three that raise a
+    /// `[SetSELECT]`; the rest hold 0 in columns 1 and 2.
+    #[test]
+    fn a_step_with_no_box_of_its_own_is_walked_down_column_zero() {
+        let names = [
+            "G05", "G06", "G07", "G08", "I00", "I01", "I02", "I03", "I04",
+        ];
+        let run = Run {
+            scripts: names.iter().map(|n| format!("04/04-SB-{n}")).collect(),
+            branch: Some(vec![
+                [3, 1, 2],
+                [4, 0, 0],
+                [4, 0, 0],
+                [-1, 0, 0],
+                [7, 5, 6],
+                [-1, 0, 0],
+                [7, 8, 0],
+                [-1, 0, 0],
+                [-1, 0, 0],
+            ]),
+        };
+        let boxes = |name: &str| {
+            ["G05", "I00", "I02"]
+                .iter()
+                .any(|n| name.ends_with(n))
+                .then(|| vec![0, 1, -1])
+        };
+        let walks = run.walks(&boxes);
+        let reached: std::collections::BTreeSet<usize> = walks.iter().flatten().copied().collect();
+        assert_eq!(reached, (0..9).collect(), "every step is reachable");
+        // G06 and G07 raise no box, so both are read at column 0 and both go
+        // to step 4 — which is the only way into the second half.
+        assert_eq!(run.next(1, NO_CHOICE), Some(4));
+        assert_eq!(run.next(2, NO_CHOICE), Some(4));
+        // Their columns 1 and 2 are the cells nothing reaches: the 0 there
+        // reads as step 0, and no walk above takes that edge.
+        assert_eq!(run.next(1, 0), Some(0));
+        assert_eq!(run.next(2, 1), Some(0));
+        assert!(
+            !walks.iter().any(|w| w.windows(2).any(|p| p == [1, 0])),
+            "nothing walks G06 back to the scene's first script"
+        );
     }
 
     #[test]
