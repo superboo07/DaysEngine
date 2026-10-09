@@ -99,6 +99,17 @@ pub enum Cmd {
     /// This is the regression check for playback: timing, fades and text layout
     /// all show up as an image rather than as "it looked wrong when I ran it".
     Render(RenderArgs),
+    /// Encode replay scenes to video files, without a display.
+    ///
+    /// Every frame is composited by the same software path [`Cmd::Render`]
+    /// uses, so what lands in the file is what the engine draws rather than a
+    /// capture of a window. Dialogue is **not** burned in: each
+    /// `[PrintText]` window becomes a cue on a subtitle stream the viewer can
+    /// turn on and off.
+    ///
+    /// This is an inspection tool like the rest of them — it reads the
+    /// player's own install and writes to a directory they name.
+    Export(ExportArgs),
     /// Composite a UI screen to PNG, without a display.
     ///
     /// The screen is drawn exactly as the game draws it: base art from the
@@ -396,6 +407,54 @@ pub struct RenderArgs {
 }
 
 #[derive(clap::Args)]
+pub struct ExportArgs {
+    /// Scene indices, as `daysengine replay` numbers them. Omit for every
+    /// scene, in the order the replay screen lists them.
+    scenes: Vec<usize>,
+    /// Directory to write the files into.
+    #[arg(long, short = 'o', default_value = ".")]
+    out: PathBuf,
+    /// Encode scenes the save data has not unlocked as well. By default only
+    /// what the screen would let the player open is encoded.
+    #[arg(long)]
+    locked: bool,
+    /// x264 quality: lower is better, 0 is lossless.
+    #[arg(long, default_value_t = 16)]
+    crf: u8,
+    /// x264 preset.
+    #[arg(long, default_value = "slow")]
+    preset: String,
+    /// Re-encode a scene whose file is already there instead of skipping it.
+    #[arg(long)]
+    force: bool,
+    /// Which column of a scene's branch table to walk.
+    ///
+    /// `none` is the answer a box records when it is dismissed or when its
+    /// window runs out, which the DLL maps to column 0 — so it is also what a
+    /// scene walks before any box has settled. The default.
+    #[arg(long, value_parser = ["none", "first", "second"])]
+    choice: Option<String>,
+    /// Encode every distinct walk of a branching scene rather than one.
+    ///
+    /// A scene's choices are only where its scripts raise a `[SetSELECT]`, so
+    /// one column is one path through it and the rest of the scene is not in
+    /// the file. This writes a set of files covering every script the scene can
+    /// reach — see [`cover`] and
+    /// [`crate::ui::replay::Run::walks`].
+    #[arg(long, conflicts_with = "choice")]
+    paths: bool,
+    /// Mix the sound at the levels `Config.DAT` holds, rather than at unity.
+    ///
+    /// The three sliders are a playback control and a viewer has its own, so a
+    /// file is written at full level by default: a slider at 5 of 10 is
+    /// -10.5 dB, and baking that into the file throws the headroom away for
+    /// good. This asks for the engine's own attenuation instead — see
+    /// [`crate::install::config::Config::centibels`].
+    #[arg(long)]
+    config_volume: bool,
+}
+
+#[derive(clap::Args)]
 pub struct UiArgs {
     /// Screen path stem as the DLL spells it, e.g. "System/Title/Title".
     screen: String,
@@ -645,6 +704,7 @@ pub fn run() -> Result<()> {
             verify,
         } => cmd_font(&game, text.as_deref(), alpha, verify)?,
         Cmd::Render(args) => cmd_render(&game, &args)?,
+        Cmd::Export(args) => cmd_export(&game, &args)?,
         Cmd::Ui(args) => cmd_ui(&game, &args)?,
         Cmd::Backlog(args) => cmd_backlog(&game, &args)?,
         Cmd::Menu(args) => cmd_menu(&game, &args)?,
@@ -1268,6 +1328,555 @@ fn no_module(game: &Path, exports: &[&str]) -> String {
 const TICK: std::time::Duration = std::time::Duration::from_micros(16_667);
 
 /// Reads `FILMENGINE.INI` out of the packs, or an empty one with a warning.
+/// The frame rate every `.ORS` window is in. See `days_script`.
+const EXPORT_FPS: u32 = 24;
+
+/// The output format `DX8SOUND.INI` declares, and what the mixer renders at.
+/// See [`crate::playback::mixer`].
+const EXPORT_SAMPLE_RATE: u32 = 44_100;
+
+/// One dialogue line, as a subtitle cue in frames.
+struct Cue {
+    start: u32,
+    end: u32,
+    speaker: String,
+    text: String,
+}
+
+/// Everything an export needs that does not change between scenes.
+struct Exporter<'a> {
+    vfs: &'a crate::install::vfs::Vfs,
+    font: &'a days_font::Font,
+    settings: &'a crate::install::engine::Settings,
+    /// `[UseEnglish]`, which picks the script language and the text pitch.
+    english: bool,
+    /// The choice box's axis, from `FILMENGINE.INI`.
+    stacked: bool,
+    left_arrangement: bool,
+    /// The player's `MenVoice`: a refused male line drives no mouth either.
+    men_voice: bool,
+    gains: crate::playback::mixer::Gains,
+    crf: u8,
+    preset: String,
+}
+
+impl Exporter<'_> {
+    /// Encodes one replay scene — its whole chain of scripts, end to end — to
+    /// `out`.
+    ///
+    /// One walk of the timeline produces both halves: the picture goes to
+    /// x264 down a pipe and the sound to a WAV beside it, and a second ffmpeg
+    /// muxes the two with the subtitle track. Muxing rather than re-encoding
+    /// is why the stage is only ever walked once.
+    ///
+    /// # What this does not reproduce
+    ///
+    /// Nothing here drives [`crate::ui::select::Choice::tick`], so a
+    /// `[SetSELECT]` is drawn for its whole window and never answered.
+    /// [`crate::playback::stage::Visual::select`] carries the labels and the
+    /// window and not the `Choice` state, so both labels are
+    /// `LABEL_PLAIN` for the window's length and the box cuts out at `end`.
+    /// The original answers it — `FUN_00431740` decides once the window is
+    /// spent — stamps the settle frame into every label and runs
+    /// [`crate::ui::select::Choice::label_colour`]'s ramp over them, and plays
+    /// `SystemSe::Cancel` through host `+0x50` as it settles. So an exported
+    /// box has no highlight, no fade and no sound, and the walk this took
+    /// agrees with it: a spent window records -1, which is the column
+    /// [`crate::ui::replay::NO_CHOICE`] maps to.
+    ///
+    /// Reproducing the ramp means handing `compose` a colour per label, which
+    /// is the live playback path's signature too, so it is not done here.
+    fn scene(&self, steps: &[String], out: &Path) -> Result<()> {
+        use days_script::{Command, Frame};
+        use std::io::Write as _;
+
+        // Resolved and parsed before anything is opened, so a name the
+        // install does not have fails with nothing half-written behind it.
+        // The scene table names a script by route and file — `03/03-SA-B07` —
+        // and the packs hold it under the file name alone.
+        let mut scripts = Vec::new();
+        let mut cues: Vec<Cue> = Vec::new();
+        let mut played = 0u32;
+        for step in steps {
+            let stem = step.rsplit('/').next().unwrap_or(step);
+            let (name, path) = crate::game::find_script(self.vfs, stem, self.english)?;
+            let script = days_script::Script::parse(&name, &self.vfs.read_path(&path)?)?;
+            for event in &script.events {
+                if let Command::PrintText { speaker, text } = &event.command {
+                    cues.push(Cue {
+                        start: played + event.start.0,
+                        end: played + event.end.0,
+                        speaker: speaker.clone(),
+                        text: text.clone(),
+                    });
+                }
+            }
+            played += script.length.0;
+            scripts.push(script);
+        }
+
+        let stem = out
+            .file_stem()
+            .map_or_else(|| "scene".to_string(), |s| s.to_string_lossy().into_owned());
+        let work = std::env::temp_dir().join(format!("daysengine-export-{stem}"));
+        std::fs::create_dir_all(&work)?;
+        let video_path = work.join("video.mkv");
+        let audio_path = work.join("audio.wav");
+        let subs_path = work.join("subs.srt");
+
+        let width = crate::game::STAGE_WIDTH;
+        let height = crate::game::STAGE_HEIGHT;
+
+        // The picture, straight into x264. Nothing but video goes in here, so
+        // the mux below can copy the stream rather than encode it twice.
+        let mut encoder = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "warning", "-y"])
+            .args(["-f", "rawvideo", "-pixel_format", "rgba"])
+            .args(["-video_size", &format!("{width}x{height}")])
+            .args(["-framerate", &EXPORT_FPS.to_string()])
+            .args(["-i", "-"])
+            .args(["-c:v", "libx264", "-preset", &self.preset])
+            .args(["-crf", &self.crf.to_string()])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&video_path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("running ffmpeg — it is what encodes the picture")?;
+        let mut sink = std::io::BufWriter::with_capacity(
+            width as usize * height as usize * 4,
+            encoder.stdin.take().expect("stdin was requested"),
+        );
+
+        let mut wav = Wav::create(&audio_path)?;
+        // Frames of scene played so far, which is what puts a later script's
+        // samples at the right place in the one file.
+        let mut played = 0u32;
+        // The sound carries across a script boundary in the original — the
+        // film object is not rebuilt — so one mixer serves the whole chain.
+        let mixer = crate::Mixer::new();
+        mixer.set_gains(self.gains);
+        let mut samples: Vec<f32> = Vec::new();
+
+        for script in scripts {
+            let length = script.length.0;
+            let mut stage = crate::Stage::new(script);
+            stage.set_men_voice(self.men_voice);
+            stage.set_video_size(width, height);
+            stage.set_video_scaler(self.settings.video_scaler);
+            stage.set_video_filters(
+                &self.settings.video_filters,
+                &self.settings.video_filters_after,
+                self.settings.video_grain,
+            );
+
+            for frame in 0..length {
+                stage.seek_to(Frame(frame), self.vfs, &mixer)?;
+                let mut visual = stage.visual_at(Frame(frame));
+                // The lines are a stream of their own, so they are kept off
+                // the picture. Everything else a frame carries — the fade, the
+                // episode card, the choice box and its labels — is the picture
+                // and stays in it.
+                visual.text = None;
+                visual.text_id = None;
+                let rgba = crate::playback::compose::frame_rgba_with(
+                    &visual,
+                    self.font,
+                    width as usize,
+                    height as usize,
+                    self.stacked,
+                    self.english,
+                    self.left_arrangement,
+                );
+                sink.write_all(&rgba)?;
+
+                // The sound for exactly this frame. Counted off the absolute
+                // frame because 44100 does not divide by 24: the window is
+                // 1837 samples or 1838 depending on where it falls, and
+                // deriving it from the running total is what keeps the two
+                // halves in step over a thirteen-minute scene.
+                let want = frame_samples(played + frame);
+                samples.clear();
+                samples.resize(want * 2, 0.0);
+                mixer.render(&mut samples);
+                wav.write(&samples)?;
+            }
+            played += length;
+        }
+
+        sink.flush()?;
+        drop(sink);
+        let status = encoder.wait()?;
+        if !status.success() {
+            bail!("ffmpeg failed to encode the picture: {status}");
+        }
+        wav.finish()?;
+        std::fs::write(&subs_path, srt(&mut cues))?;
+
+        // The mux: the encoded picture copied, the sound to AAC, and the lines
+        // as a stream the viewer can turn off. Default so they are on when the
+        // file is opened.
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "warning", "-y"])
+            .arg("-i")
+            .arg(&video_path)
+            .arg("-i")
+            .arg(&audio_path)
+            .arg("-i")
+            .arg(&subs_path)
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0"])
+            .args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-c:s", "srt"])
+            .args(["-disposition:s:0", "default"])
+            .args(["-metadata:s:s:0", "language=eng"])
+            .arg(out)
+            .status()
+            .context("running ffmpeg — it is what muxes the file")?;
+        if !status.success() {
+            bail!("ffmpeg failed to mux {}: {status}", out.display());
+        }
+        std::fs::remove_dir_all(&work).ok();
+
+        let seconds = f64::from(played) / f64::from(EXPORT_FPS);
+        println!(
+            "  {} — {played} frames ({:.0}:{:05.2}), {} lines",
+            out.display(),
+            (seconds / 60.0).floor(),
+            seconds % 60.0,
+            cues.len()
+        );
+        Ok(())
+    }
+}
+
+/// How many sample frames of sound belong to picture frame `frame`.
+///
+/// 44.1 kHz over 24 fps is 1837.5 samples a frame, so a fixed count drifts.
+/// Taking the difference of two running totals gives 1837 or 1838 as the
+/// remainder falls and keeps the sound exactly as long as the picture.
+fn frame_samples(frame: u32) -> usize {
+    let total = |f: u64| f * u64::from(EXPORT_SAMPLE_RATE) / u64::from(EXPORT_FPS);
+    (total(u64::from(frame) + 1) - total(u64::from(frame))) as usize
+}
+
+/// Renders the cues as SubRip.
+///
+/// Windows in a script overlap — the next line's starts a few frames before
+/// the last one's ends — because the original replaces the line on screen
+/// rather than waiting. One line is on screen at a time, so each cue is cut
+/// at the next one's start.
+fn srt(cues: &mut [Cue]) -> String {
+    use std::fmt::Write as _;
+
+    cues.sort_by_key(|c| (c.start, c.end));
+    let starts: Vec<u32> = cues.iter().map(|c| c.start).collect();
+    let mut out = String::new();
+    let mut n = 0usize;
+    for (index, cue) in cues.iter().enumerate() {
+        let end = starts[index + 1..]
+            .iter()
+            .copied()
+            .find(|s| *s > cue.start)
+            .map_or(cue.end, |next| cue.end.min(next));
+        if end <= cue.start || cue.text.trim().is_empty() {
+            continue;
+        }
+        n += 1;
+        let _ = writeln!(out, "{n}");
+        let _ = writeln!(out, "{} --> {}", timecode(cue.start), timecode(end));
+        if cue.speaker.trim().is_empty() {
+            let _ = writeln!(out, "{}", cue.text);
+        } else {
+            let _ = writeln!(out, "{}: {}", cue.speaker, cue.text);
+        }
+        let _ = writeln!(out);
+    }
+    out
+}
+
+/// A frame as SubRip spells a time: `HH:MM:SS,mmm`.
+fn timecode(frame: u32) -> String {
+    let ms = u64::from(frame) * 1000 / u64::from(EXPORT_FPS);
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+/// A 16-bit stereo WAV being written a frame at a time.
+///
+/// The sizes in the header are not known until the last sample is in, so they
+/// are left at zero and patched on [`Wav::finish`].
+struct Wav {
+    file: std::fs::File,
+    written: u32,
+}
+
+impl Wav {
+    const HEADER: usize = 44;
+
+    fn create(path: &Path) -> Result<Wav> {
+        use std::io::Write as _;
+        let mut file =
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let channels = 2u16;
+        let bits = 16u16;
+        let rate = EXPORT_SAMPLE_RATE;
+        let block = u32::from(channels * bits / 8);
+        file.write_all(b"RIFF")?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(b"WAVEfmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?; // PCM
+        file.write_all(&channels.to_le_bytes())?;
+        file.write_all(&rate.to_le_bytes())?;
+        file.write_all(&(rate * block).to_le_bytes())?;
+        file.write_all(&(block as u16).to_le_bytes())?;
+        file.write_all(&bits.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&0u32.to_le_bytes())?;
+        Ok(Wav { file, written: 0 })
+    }
+
+    /// Appends interleaved stereo samples, as [`crate::Mixer::render`] leaves
+    /// them.
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            let v = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        self.file.write_all(&bytes)?;
+        self.written += u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write as _};
+        self.file.flush()?;
+        let data = self.written;
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file
+            .write_all(&(data + Wav::HEADER as u32 - 8).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data.to_le_bytes())?;
+        Ok(())
+    }
+}
+
+/// What one script can leave the player's last answer as, for
+/// [`crate::ui::replay::Run::walks`].
+///
+/// Only the **last** `[SetSELECT]` in a script matters: every box settles into
+/// the same `+0x1f8`, so the one that settles last is what `FUN_1001ee20`
+/// reads when the script ends. A two-label box can be answered either way or
+/// refused; a one-label box can be taken or refused. A refusal records -1, and
+/// `FUN_00431740` treats a refusal and a spent window alike — see
+/// [`crate::ui::select::Poll::Cancelled`]. `None` is a script with no box at
+/// all, which cannot change the column.
+///
+/// A script that will not parse answers `None`: it raises no box this can see,
+/// and the walk then reads the column it arrived on, which is what the
+/// original does with a script whose boxes never settle.
+fn script_answers(vfs: &crate::install::vfs::Vfs, english: bool, name: &str) -> Option<Vec<i32>> {
+    let stem = name.rsplit('/').next().unwrap_or(name);
+    let (name, path) = crate::game::find_script(vfs, stem, english).ok()?;
+    let script = days_script::Script::parse(&name, &vfs.read_path(&path).ok()?).ok()?;
+    let b = script.events.iter().rev().find_map(|e| match &e.command {
+        days_script::Command::SetSelect { b, .. } => Some(b.clone()),
+        _ => None,
+    })?;
+    // `Choice::new` counts the labels it keeps, and the literal `null` in the
+    // second field is not one.
+    let two = b.is_some_and(|b| !b.eq_ignore_ascii_case("null"));
+    Some(if two { vec![0, 1, -1] } else { vec![0, -1] })
+}
+
+/// A set of walks covering every step a scene can reach.
+///
+/// Greedy, and seeded with the walk a player who answers nothing takes so that
+/// walk keeps the unsuffixed file name — a scene already encoded without
+/// `--paths` is then not encoded again. Each further walk is the one that adds
+/// the most steps nothing chosen so far reaches, which for the retail tables
+/// lands on 49 files over the eleven branching scenes against 96 reachable
+/// scripts.
+fn cover(
+    run: &crate::ui::replay::Run,
+    answers: &dyn Fn(&str) -> Option<Vec<i32>>,
+) -> Vec<Vec<usize>> {
+    use crate::ui::replay::NO_CHOICE;
+
+    let walks = run.walks(answers, &[NO_CHOICE, 0, 1]);
+    let mut need: std::collections::HashSet<usize> = walks.iter().flatten().copied().collect();
+    let mut chosen: Vec<Vec<usize>> = run
+        .walks(&|_| None, &[NO_CHOICE])
+        .into_iter()
+        .take(1)
+        .collect();
+    for step in chosen.iter().flatten() {
+        need.remove(step);
+    }
+    while !need.is_empty() {
+        let best = walks
+            .iter()
+            .filter(|w| !chosen.contains(w))
+            .max_by_key(|w| w.iter().filter(|s| need.contains(s)).count());
+        let Some(best) = best else { break };
+        if !best.iter().any(|s| need.contains(s)) {
+            break;
+        }
+        for step in best {
+            need.remove(step);
+        }
+        chosen.push(best.clone());
+    }
+    chosen
+}
+
+fn cmd_export(game: &Path, args: &ExportArgs) -> Result<()> {
+    use crate::ui::replay::{self, Scenes};
+
+    let vfs = crate::install::vfs::Vfs::mount(game)?;
+    let dll = system_menu_dll(game)?;
+    let flags = load_flags(game, &vfs);
+    let scenes = Scenes::recover(&dll)?;
+    let font = days_font::Font::parse(
+        vfs.read_path("System/System/FONTDATA_ENG.DAT")
+            .or_else(|_| vfs.read_path("System/System/FONTDATA.DAT"))?,
+    )?;
+    let film = film_ini(&vfs);
+    let settings = crate::install::engine::Settings::load();
+    let config = crate::install::config::Config::load(game);
+    let sound = crate::ui::paths::Paths::from_module(&dll).sound();
+    use crate::install::config::{Channel, Flag};
+
+    let exporter = Exporter {
+        vfs: &vfs,
+        font: &font,
+        settings: &settings,
+        english: film.get_bool("UseEnglish").unwrap_or(false),
+        stacked: crate::ui::select::Layout::from_ini(&film) == crate::ui::select::Layout::Stacked,
+        left_arrangement: film.get_bool("LeftArrangement").unwrap_or(false),
+        men_voice: config.flag(Flag::MenVoice),
+        gains: if args.config_volume {
+            crate::playback::mixer::Gains {
+                bgm: config.gain(Channel::Bgm, sound),
+                se: config.gain(Channel::Se, sound),
+                voice: config.gain(Channel::Voice, sound),
+                system: config.system_se_gain(sound),
+            }
+        } else {
+            crate::playback::mixer::Gains {
+                bgm: 1.0,
+                se: 1.0,
+                voice: 1.0,
+                system: 1.0,
+            }
+        },
+        crf: args.crf,
+        preset: args.preset.clone(),
+    };
+
+    // The column one walk is taken down, and what the file is called for it.
+    let (choice, tag) = match args.choice.as_deref() {
+        Some("first") => (0, "-first"),
+        Some("second") => (1, "-second"),
+        _ => (replay::NO_CHOICE, ""),
+    };
+
+    let wanted: Vec<usize> = if args.scenes.is_empty() {
+        (0..scenes.len()).collect()
+    } else {
+        args.scenes.clone()
+    };
+    std::fs::create_dir_all(&args.out)?;
+
+    for index in wanted {
+        let scene = scenes
+            .get(index)
+            .with_context(|| format!("there is no replay scene {index}"))?;
+        if !args.locked && !scenes.unlocked(index, &flags) {
+            println!("{index:>3} {} — locked, skipped", scene.flag);
+            continue;
+        }
+        // A scene that asks which version to play is two scenes as far as this
+        // is concerned: each answer is its own chain and its own file.
+        let runs: Vec<(String, replay::Run)> = if scene.asks() {
+            scene
+                .choices
+                .iter()
+                .enumerate()
+                .filter_map(|(n, choice)| {
+                    replay::popup_action(scene, n).map(|run| (choice.flag.clone(), run))
+                })
+                .collect()
+        } else {
+            vec![(scene.flag.clone(), scene.run())]
+        };
+
+        for (label, run) in runs {
+            // What each of the scene's scripts can leave the player's last
+            // answer as, worked out once: `walks` asks per visit and a step is
+            // visited by several walks.
+            let mut answers = std::collections::HashMap::new();
+            for script in &run.scripts {
+                answers.insert(
+                    script.clone(),
+                    script_answers(&vfs, exporter.english, script),
+                );
+            }
+            let lookup = |name: &str| answers.get(name).cloned().flatten();
+
+            // One file per walk. Without `--paths` that is one walk, down the
+            // column `--choice` names.
+            let plans: Vec<(String, Vec<usize>)> = if args.paths {
+                cover(&run, &lookup)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, walk)| {
+                        let tag = if n == 0 {
+                            String::new()
+                        } else {
+                            format!("-p{}", n + 1)
+                        };
+                        (tag, walk)
+                    })
+                    .collect()
+            } else {
+                run.walks(&|_| None, &[choice])
+                    .into_iter()
+                    .take(1)
+                    .map(|walk| (tag.to_string(), walk))
+                    .collect()
+            };
+
+            for (plan, walk) in plans {
+                let out = args.out.join(format!("{index:02}-{label}{plan}.mkv"));
+                if out.exists() && !args.force {
+                    println!(
+                        "{index:>3} {label}{plan} — {} is there already",
+                        out.display()
+                    );
+                    continue;
+                }
+                let steps: Vec<String> = walk
+                    .iter()
+                    .filter_map(|step| run.script(*step).map(str::to_string))
+                    .collect();
+                if steps.is_empty() {
+                    println!("{index:>3} {label}{plan} — no script recovered, skipped");
+                    continue;
+                }
+                println!("{index:>3} {label}{plan} — {}", steps.join(" -> "));
+                exporter.scene(&steps, &out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn film_ini(vfs: &crate::install::vfs::Vfs) -> crate::Ini {
     match vfs.read_path("Ini/FILMENGINE.INI") {
         Ok(bytes) => crate::Ini::parse_bytes(&bytes),

@@ -462,6 +462,74 @@ impl Run {
         let next = usize::try_from(next).ok()?;
         (next < self.scripts.len()).then_some(next)
     }
+
+    /// Every distinct walk of this scene, as runs of step indices.
+    ///
+    /// The column [`Run::next`] reads is the player's **last** answer, and that
+    /// value outlives the box that set it: `+0x1f8` is written in exactly two
+    /// places — `FUN_004388c0` sets it to [`NO_CHOICE`] as the film object is
+    /// built, and `FUN_0043f330` stores a settled index — so between those
+    /// stores it stands. A step whose script raises no `[SetSELECT]` therefore
+    /// cannot change the column and is walked at whatever answer arrived with
+    /// it. That is why a scene with a branch table is not three walks: its
+    /// choices are only where its scripts have boxes, and in the retail data
+    /// most of them do not.
+    ///
+    /// `answers` says what each script can leave the last answer as, `None`
+    /// for a script that raises no box. `entry` is the answers the scene can
+    /// be entered on — [`NO_CHOICE`] alone for a film object that has never
+    /// settled a box, and a carried-over index for one that has, since nothing
+    /// clears `+0x1f8` between scenes.
+    ///
+    /// Bounded by a seen-set per walk, so a table that leads back into itself
+    /// ends the walk rather than the session.
+    pub fn walks(
+        &self,
+        answers: &dyn Fn(&str) -> Option<Vec<i32>>,
+        entry: &[i32],
+    ) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        if self.scripts.is_empty() {
+            return out;
+        }
+        for &first in entry {
+            self.walk_on(0, first, &mut Vec::new(), answers, &mut out);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// One step of [`Run::walks`]: play `step`, then follow every answer its
+    /// script could leave behind.
+    fn walk_on(
+        &self,
+        step: usize,
+        last: i32,
+        seen: &mut Vec<usize>,
+        answers: &dyn Fn(&str) -> Option<Vec<i32>>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        seen.push(step);
+        let options = self
+            .script(step)
+            .and_then(answers)
+            .unwrap_or_else(|| vec![last]);
+        let mut ended = true;
+        for answer in options {
+            match self.next(step, answer) {
+                Some(next) if !seen.contains(&next) => {
+                    ended = false;
+                    self.walk_on(next, answer, seen, answers, out);
+                }
+                _ => {}
+            }
+        }
+        if ended {
+            out.push(seen.clone());
+        }
+        seen.pop();
+    }
 }
 
 /// What the last-choice value is before any choice box has settled.

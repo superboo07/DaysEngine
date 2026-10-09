@@ -74,8 +74,8 @@ use std::time::{Duration, Instant};
 /// Presentation size. Movies decode at 800x452 and still backgrounds are
 /// 800x450; everything is drawn into this box and the box is letterboxed into
 /// the window, so the two never disagree about aspect.
-const STAGE_WIDTH: u32 = 800;
-const STAGE_HEIGHT: u32 = 452;
+pub(crate) const STAGE_WIDTH: u32 = 800;
+pub(crate) const STAGE_HEIGHT: u32 = 452;
 
 /// Pulls mixed audio for SDL.
 struct MixerSource {
@@ -4407,7 +4407,7 @@ fn clock(origin: Instant, now: Instant, offset: Frame, rate: f32) -> Frame {
 }
 
 /// Resolves a script name to its pack path, preferring the configured language.
-fn find_script(vfs: &Vfs, wanted: &str, english: bool) -> Result<(String, String)> {
+pub(crate) fn find_script(vfs: &Vfs, wanted: &str, english: bool) -> Result<(String, String)> {
     let wanted_lower = wanted.to_ascii_lowercase();
     let mut candidates: Vec<&str> = vfs
         .paths()
