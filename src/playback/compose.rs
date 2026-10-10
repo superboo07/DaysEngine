@@ -12,27 +12,49 @@ use crate::playback::text;
 use crate::ui::select;
 use days_font::Font;
 
-/// Composites one frame to RGBA at `width` x `height`.
-pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize) -> Vec<u8> {
-    frame_rgba_with(visual, font, width, height, false, false, false)
-}
-
-/// As [`frame_rgba`], with the two answers only the install can give.
+/// What a frame needs that is not in the [`Visual`]: the install's answers,
+/// and the choice box's live state.
 ///
 /// `stacked` is the choice box's axis and `english` is `FILMENGINE.INI`'s
 /// `[UseEnglish]`, which decides both the character pitch and whether dialogue
 /// wraps at all — see [`crate::playback::text`] and
-/// [`crate::ui::select::Layout`]. `frame_rgba` cannot read either for itself
-/// because it is handed no INI.
+/// [`crate::ui::select::Layout`]. A compositor handed no INI cannot read
+/// either for itself.
+///
+/// `labels` is [`crate::ui::select::Choice::label_colour`] for each of the
+/// box's labels this frame: lit or plain while it is live, ramping to nothing
+/// once it has been answered, and `None` for one the ramp has finished with.
+/// It is the caller's because the [`Choice`](crate::ui::select::Choice) is —
+/// the box is driven by input, which a compositor has none of. Left empty,
+/// every label is drawn [`crate::ui::select::LABEL_PLAIN`], which is a live box
+/// with nothing pointing at it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Context<'a> {
+    pub stacked: bool,
+    pub english: bool,
+    pub left_arrangement: bool,
+    pub labels: &'a [Option<select::Rgba>],
+}
+
+/// Composites one frame to RGBA at `width` x `height`.
+pub fn frame_rgba(visual: &Visual<'_>, font: &Font, width: usize, height: usize) -> Vec<u8> {
+    frame_rgba_with(visual, font, width, height, Context::default())
+}
+
+/// As [`frame_rgba`], with the answers [`Context`] carries.
 pub fn frame_rgba_with(
     visual: &Visual<'_>,
     font: &Font,
     width: usize,
     height: usize,
-    stacked: bool,
-    english: bool,
-    left_arrangement: bool,
+    cx: Context<'_>,
 ) -> Vec<u8> {
+    let Context {
+        stacked,
+        english,
+        left_arrangement,
+        labels: colours,
+    } = cx;
     let mut out = vec![0u8; width * height * 4];
     for px in out.as_chunks_mut::<4>().0 {
         *px = [0, 0, 0, 255];
@@ -110,7 +132,7 @@ pub fn frame_rgba_with(
         let geometry = text::Geometry::native(left_arrangement);
         for (one, at) in lines.iter().zip(text::place(&lines, english, geometry)) {
             let image = text::render_line(font, one, [255, 255, 255], english);
-            blit_stretched(&mut out, width, height, &image, at);
+            blit_stretched(&mut out, width, height, &image, at, 0xff);
         }
     }
 
@@ -134,10 +156,19 @@ pub fn frame_rgba_with(
         let geometry = text::Geometry::native(left_arrangement);
         let metrics = select::Metrics::new(labels.len(), stacked, english);
         for (index, label) in labels.iter().enumerate() {
+            // A label the caller reports as gone is not drawn at all, which is
+            // `FUN_0044ced0` running out of ramp; one it says nothing about is
+            // live and unpointed-at.
+            let colour = match colours.get(index) {
+                Some(None) => continue,
+                Some(Some(colour)) => *colour,
+                None => select::LABEL_PLAIN,
+            };
             let lines = metrics.lines(label);
             let places = select::place(&lines, index, labels.len(), layout, english, geometry);
             for (line, at) in lines.iter().zip(places) {
-                let image = text::render_line(font, line, [255, 255, 255], english);
+                let image =
+                    text::render_line(font, line, [colour.red, colour.green, colour.blue], english);
                 blit_stretched(
                     &mut out,
                     width,
@@ -149,6 +180,7 @@ pub fn frame_rgba_with(
                         width: image.width as f32 * at.x_scale,
                         height: image.height as f32 * at.y_scale,
                     },
+                    colour.alpha,
                 );
             }
         }
@@ -163,12 +195,16 @@ pub fn frame_rgba_with(
 /// rectangle; the source row is 48 units tall and the destination 42 before the
 /// resolution scale, so a line is slightly squashed vertically, and that falls
 /// out of using the recovered rectangle rather than being applied separately.
+///
+/// `alpha` modulates the source's own, which is what the SDL path asks of the
+/// texture (`set_alpha_mod`) to fade an answered choice label out.
 fn blit_stretched(
     dst: &mut [u8],
     dst_w: usize,
     dst_h: usize,
     src: &text::TextImage,
     at: text::Placement,
+    alpha: u8,
 ) {
     let w = at.width.round().max(1.0) as usize;
     let h = at.height.round().max(1.0) as usize;
@@ -188,7 +224,7 @@ fn blit_stretched(
             let Some(px) = src.rgba.get(s..s + 4) else {
                 continue;
             };
-            let a = u32::from(px[3]);
+            let a = u32::from(px[3]) * u32::from(alpha) / 255;
             if a == 0 {
                 continue;
             }

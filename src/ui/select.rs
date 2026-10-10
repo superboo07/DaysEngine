@@ -547,8 +547,15 @@ fn rewrite(stem: &str, resolution: Resolution, layout: Layout) -> String {
 /// them, which is all the DLL-facing side of the engine knows about them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Input {
-    /// Pointer position, normalised.
-    pub pointer: (f64, f64),
+    /// Pointer position, normalised, or `None` where the caller has none to
+    /// report.
+    ///
+    /// `FUN_0044de50` keeps the last pair it hit-tested and only re-tests when
+    /// it moves, so "no pointer this frame" and "the pointer has not moved" are
+    /// the same thing to it: the highlight stands. A caller with no pointer at
+    /// all — the export, which has no player — therefore leaves the highlight
+    /// where it is, and at a box that has only just gone up that is nowhere.
+    pub pointer: Option<(f64, f64)>,
     /// Slot 0: picks whatever the pointer is already on.
     pub pick: bool,
     /// Slot 1: with slot 0 up, cancels.
@@ -724,6 +731,35 @@ impl Choice {
     ///
     /// `random` supplies that draw. It is a parameter rather than a call into a
     /// generator so the behaviour can be tested; the engine passes a real one.
+    ///
+    /// `recorded` is the answer something other than the player has already
+    /// decided on, and it replaces whatever the spent window produced. In the
+    /// original that is host slot `+0x98` — raised by `+0x94` (`FUN_0042bf10`)
+    /// and answered from the loaded slot by `FUN_00428a80` — which is how the
+    /// replay screen's play-data list plays a save back by the answers it
+    /// recorded. `FUN_00431740` applies it **before** anything is stored, so a
+    /// recorded index goes through `FUN_0044ddb0` and `+0x50(1)` like any other
+    /// answer: its label is marked picked and the chosen sound plays. It is
+    /// only consulted once the window is spent — while the window is live the
+    /// player's own answer wins, and the caller drops the flag when that
+    /// happens.
+    ///
+    /// # What a replay adds, and this does not have
+    ///
+    /// Host slot `+0x104` is "a replay scene is playing" — it is the same slot
+    /// `FUN_00424020` tests to decide between `_GetNextChapter@8` and the route
+    /// graph — and `FUN_00431740` reads it twice more when it is set. A live
+    /// pick is **refused**, as though nothing had been pressed, unless
+    /// `_GetSelectRead@4(answer + 1)` is non-zero; and a spent window's answer
+    /// goes through `FUN_0043f3b0`, which keeps it if that column is readable
+    /// and otherwise draws at random among the columns that are, or answers -2
+    /// — no answer at all — when none is. `_GetSelectRead@4` is the menu
+    /// module's `FUN_1001f250`, reading the three cells `_SelectReadCheck@0`
+    /// (`FUN_1001f1e0`) fills with host `+0x18`'s "has this script been read"
+    /// for the script each column branches to, and a column holding 0 is
+    /// filled in as not readable. **None of that is implemented here**: this
+    /// engine lets every column be answered in a replay. The two exports the
+    /// module needs for it do not exist on this side yet.
     pub fn tick(
         &mut self,
         frame: Frame,
@@ -731,14 +767,17 @@ impl Choice {
         input: Input,
         skipping: bool,
         random: &mut dyn FnMut(usize) -> usize,
+        recorded: Option<i32>,
     ) -> Event {
         if self.decided.is_some() || frame < self.start {
             return Event::Nothing;
         }
         if !self.raised {
             self.raised = true;
-            self.highlight = select.hit(input.pointer.0, input.pointer.1);
-            self.pointer = Some(input.pointer);
+            if let Some((x, y)) = input.pointer {
+                self.highlight = select.hit(x, y);
+                self.pointer = input.pointer;
+            }
             // `FUN_00431740` plays index 5 as the box goes up, and
             // `FUN_0044dcc0` arms the boxes and takes the first hit test.
             return Event::Raised(SystemSe::View);
@@ -759,21 +798,30 @@ impl Choice {
             } else {
                 None
             };
+            // And a recorded answer replaces it outright. The store only ever
+            // holds an index a box of this script settled on, so a value with
+            // no label to mark is a decline like any other negative one.
+            let picked = match recorded {
+                Some(answer) => usize::try_from(answer).ok().filter(|a| *a < self.count()),
+                None => picked,
+            };
             self.settle(picked, frame)
         }
     }
 
     /// `FUN_0044de50`: one frame of input against the current highlight.
     pub fn poll(&mut self, select: &Select, input: Input) -> Poll {
-        if self.pointer != Some(input.pointer) {
-            self.pointer = Some(input.pointer);
-            self.highlight = select.hit(input.pointer.0, input.pointer.1);
+        if let Some((x, y)) = input.pointer {
+            if self.pointer != input.pointer {
+                self.pointer = input.pointer;
+                self.highlight = select.hit(x, y);
+            }
         }
 
         if input.pick {
             // A press only counts on the box the pointer is genuinely over, so
             // dragging off a box and releasing chooses nothing.
-            if let Some(under) = select.hit(input.pointer.0, input.pointer.1) {
+            if let Some(under) = input.pointer.and_then(|(x, y)| select.hit(x, y)) {
                 if Some(under) == self.highlight {
                     return Poll::Chosen(under);
                 }
@@ -1134,16 +1182,16 @@ mod tests {
         let mut rng = |_: usize| 0;
         assert!(!c.visible(Frame(9)));
         assert_eq!(
-            c.tick(Frame(9), &s, Input::default(), false, &mut rng),
+            c.tick(Frame(9), &s, Input::default(), false, &mut rng, None),
             Event::Nothing
         );
         assert_eq!(
-            c.tick(Frame(10), &s, Input::default(), false, &mut rng),
+            c.tick(Frame(10), &s, Input::default(), false, &mut rng, None),
             Event::Raised(SystemSe::View)
         );
         assert!(c.visible(Frame(10)));
         assert_eq!(
-            c.tick(Frame(11), &s, Input::default(), false, &mut rng),
+            c.tick(Frame(11), &s, Input::default(), false, &mut rng, None),
             Event::Nothing
         );
     }
@@ -1153,16 +1201,16 @@ mod tests {
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(5));
         let s = split(Layout::Sideways, 2);
         let mut rng = |_: usize| 0;
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
         // `frame + 1 < end` holds up to frame 3.
         for frame in 1..4 {
             assert_eq!(
-                c.tick(Frame(frame), &s, Input::default(), false, &mut rng),
+                c.tick(Frame(frame), &s, Input::default(), false, &mut rng, None),
                 Event::Nothing
             );
         }
         assert_eq!(
-            c.tick(Frame(4), &s, Input::default(), false, &mut rng),
+            c.tick(Frame(4), &s, Input::default(), false, &mut rng, None),
             Event::Decided(-1, SystemSe::Cancel)
         );
         assert_eq!(c.decision(), Some(None));
@@ -1178,16 +1226,16 @@ mod tests {
         let s = split(Layout::Sideways, 2);
         let mut rng = |_: usize| 0;
         let on_the_left = Input {
-            pointer: (0.25, 0.5),
+            pointer: Some((0.25, 0.5)),
             ..Input::default()
         };
-        c.tick(Frame(0), &s, on_the_left, false, &mut rng);
+        c.tick(Frame(0), &s, on_the_left, false, &mut rng, None);
         let picking = Input {
             pick: true,
             ..on_the_left
         };
         assert_eq!(
-            c.tick(Frame(1), &s, picking, false, &mut rng),
+            c.tick(Frame(1), &s, picking, false, &mut rng, None),
             Event::Decided(0, SystemSe::Select)
         );
         // The picked label is held at full LIT for the whole ramp...
@@ -1218,10 +1266,10 @@ mod tests {
         let s = split(Layout::Sideways, 1);
         let mut rng = |_: usize| 0;
         let on_it = Input {
-            pointer: (0.5, 0.5),
+            pointer: Some((0.5, 0.5)),
             ..Input::default()
         };
-        c.tick(Frame(0), &s, on_it, false, &mut rng);
+        c.tick(Frame(0), &s, on_it, false, &mut rng, None);
         c.tick(
             Frame(1),
             &s,
@@ -1231,6 +1279,7 @@ mod tests {
             },
             false,
             &mut rng,
+            None,
         );
         assert_eq!(c.label_colour(0, Frame(1 + FADE_FRAMES)), Some(LABEL_LIT));
         assert_eq!(
@@ -1253,8 +1302,8 @@ mod tests {
                 assert_eq!(n, 3);
                 draw
             };
-            c.tick(Frame(0), &s, Input::default(), true, &mut rng);
-            let event = c.tick(Frame(1), &s, Input::default(), true, &mut rng);
+            c.tick(Frame(0), &s, Input::default(), true, &mut rng, None);
+            let event = c.tick(Frame(1), &s, Input::default(), true, &mut rng, None);
             let se = if expected < 0 {
                 SystemSe::Cancel
             } else {
@@ -1264,12 +1313,75 @@ mod tests {
         }
     }
 
+    /// Host `+0x98`: the answer something other than the player decided on
+    /// replaces a spent window's, and goes on to mark its label and ring as a
+    /// choice. `FUN_00431740` applies it before `FUN_0043f330` stores
+    /// anything, so it is not a patch on the answer afterwards.
+    #[test]
+    fn a_recorded_answer_replaces_a_spent_window_and_marks_its_label() {
+        let s = split(Layout::Sideways, 2);
+        let mut rng = |_: usize| 0;
+
+        // Without one, a window nobody answered declines: no label is picked
+        // and both ramp straight out.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2));
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, None),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+        assert_eq!(c.label_colour(1, Frame(1)), Some(LABEL_PLAIN));
+
+        // With one, that label is the picked one: lit, and held for a whole
+        // `FADE_FRAMES` while the other is already ramping.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2));
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, Some(1));
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, Some(1)),
+            Event::Decided(1, SystemSe::Select)
+        );
+        assert_eq!(c.decision(), Some(Some(1)));
+        // The unpicked label is what ends the box, at its own `FADE_FRAMES`,
+        // and the picked one is still held lit when it does.
+        assert_eq!(c.label_colour(1, Frame(1 + FADE_FRAMES)), Some(LABEL_LIT));
+        assert_eq!(c.label_colour(0, Frame(1 + FADE_FRAMES)), None);
+        assert!(!c.visible(Frame(2 + FADE_FRAMES)));
+
+        // A recorded decline is a decline, and so is one with no label to mark.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2));
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, Some(-1));
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, Some(-1)),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+        let mut c = Choice::new("a", None, Frame(0), Frame(2));
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, Some(1));
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, Some(1)),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+    }
+
+    /// Nothing points at an exported box, and the highlight stays nowhere.
+    #[test]
+    fn a_caller_with_no_pointer_lights_no_label() {
+        let s = split(Layout::Sideways, 2);
+        let mut rng = |_: usize| 0;
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(9));
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(c.highlight, None);
+        c.tick(Frame(1), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(c.highlight, None);
+        assert_eq!(c.label_colour(0, Frame(1)), Some(LABEL_PLAIN));
+        assert_eq!(c.label_colour(1, Frame(1)), Some(LABEL_PLAIN));
+    }
+
     #[test]
     fn clicking_a_box_chooses_it_and_the_arrows_wrap() {
         let s = split(Layout::Stacked, 2);
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
         let mut rng = |_: usize| 0;
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
 
         // Arrows wrap from nothing to the last box and round again.
         assert_eq!(
@@ -1287,19 +1399,19 @@ mod tests {
             &s,
             Input {
                 next: true,
-                pointer: (0.0, 0.0),
                 ..Input::default()
             },
         );
         assert_eq!(c.highlight, Some(0));
 
-        // Confirm takes the highlight.
+        // Confirm takes the highlight. No pointer anywhere above: a player on
+        // the arrows is not moving one, and `FUN_0044de50` only re-tests when
+        // the pair it stored changes.
         assert_eq!(
             c.poll(
                 &s,
                 Input {
                     confirm: true,
-                    pointer: (0.0, 0.0),
                     ..Input::default()
                 }
             ),
@@ -1308,12 +1420,12 @@ mod tests {
 
         // A click takes what is under the pointer.
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
         assert_eq!(
             c.poll(
                 &s,
                 Input {
-                    pointer: (0.5, 0.9),
+                    pointer: Some((0.5, 0.9)),
                     pick: true,
                     ..Input::default()
                 }
@@ -1327,27 +1439,27 @@ mod tests {
         let s = split(Layout::Sideways, 2);
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
         let mut rng = |_: usize| 0;
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
         assert_eq!(
             c.poll(
                 &s,
                 Input {
                     dismiss: true,
-                    pointer: (0.25, 0.5),
+                    pointer: Some((0.25, 0.5)),
                     ..Input::default()
                 }
             ),
             Poll::Cancelled
         );
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
         assert_eq!(
             c.poll(
                 &s,
                 Input {
                     pick: true,
                     dismiss: true,
-                    pointer: (0.25, 0.5),
+                    pointer: Some((0.25, 0.5)),
                     ..Input::default()
                 }
             ),
@@ -1360,7 +1472,7 @@ mod tests {
         let s = split(Layout::Sideways, 2);
         let mut c = Choice::new("a", Some("b"), Frame(0), Frame(100));
         let mut rng = |_: usize| 0;
-        c.tick(Frame(0), &s, Input::default(), false, &mut rng);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
         c.highlight = None;
         assert_eq!(
             c.poll(

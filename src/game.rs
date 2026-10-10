@@ -102,7 +102,7 @@ impl AudioCallback<f32> for MixerSource {
 /// The menu's click and move sounds fire many times a second while the pointer
 /// crosses widgets, and each one is a Vorbis stream.
 #[derive(Default)]
-struct Sounds {
+pub(crate) struct Sounds {
     cache: HashMap<String, Option<Arc<AudioBuffer>>>,
 }
 
@@ -111,7 +111,7 @@ impl Sounds {
     ///
     /// A sound that will not load is remembered as missing and logged once: a
     /// menu that falls silent is a much better failure than one that stops.
-    fn get(&mut self, vfs: &Vfs, path: &str) -> Option<Arc<AudioBuffer>> {
+    pub(crate) fn get(&mut self, vfs: &Vfs, path: &str) -> Option<Arc<AudioBuffer>> {
         if let Some(cached) = self.cache.get(path) {
             return cached.clone();
         }
@@ -134,12 +134,12 @@ impl Sounds {
 }
 
 /// The system sounds `FILMENGINE.INI` names, resolved once.
-struct SystemSounds {
+pub(crate) struct SystemSounds {
     paths: HashMap<&'static str, String>,
 }
 
 impl SystemSounds {
-    fn from_ini(film: &Ini) -> SystemSounds {
+    pub(crate) fn from_ini(film: &Ini) -> SystemSounds {
         let paths = SystemSe::ALL
             .into_iter()
             .filter_map(|se| se.path(film).map(|p| (se.key(), p.to_string())))
@@ -152,7 +152,7 @@ impl SystemSounds {
     /// Not one of the script's five `[PlaySe]` slots: a menu the control bar
     /// opened is up over a script that is only paused, and its sounds are a
     /// different object in the original — see [`Mixer::play_system_se`].
-    fn play(&self, se: SystemSe, vfs: &Vfs, sounds: &mut Sounds, mixer: &Mixer) {
+    pub(crate) fn play(&self, se: SystemSe, vfs: &Vfs, sounds: &mut Sounds, mixer: &Mixer) {
         let Some(path) = self.paths.get(se.key()) else {
             return;
         };
@@ -3889,52 +3889,52 @@ fn run_script(
             // previous, next, confirm and cancel. The pointer half was always
             // here; the other four are what a player without one presses.
             let input = Input {
-                pointer: (
+                pointer: Some((
                     f64::from((pointer.0 - dst.x) / dst.w),
                     f64::from((pointer.1 - dst.y) / dst.h),
-                ),
+                )),
                 pick: buttons.0,
                 dismiss: buttons.1,
                 ..answer
             };
-            let event = pending.tick(at, map, input, bar_state.auto, &mut |n| {
-                // The original seeds from `GetTickCount` and draws once; any
-                // source of the same range does the same job.
-                (Instant::now().elapsed().subsec_nanos() as usize ^ at.0 as usize) % n.max(1)
-            });
-            // `FUN_00431740` settles the answer before it picks the sound, and
-            // two of the things it does there are the play-data list's.
-            //
-            // While host `+0x98` is up — the list started this playthrough to
-            // follow a slot's own answers — a box **nobody answered** takes
-            // `FUN_00428a80`, the answer that slot recorded at this script, and
-            // then rings as whatever that answer is rather than as a cancel.
+            // While host `+0x98` is up — the play-data list started this
+            // playthrough to follow a slot's own answers — a box **nobody
+            // answered** takes `FUN_00428a80`, the answer that slot recorded at
+            // this script. `FUN_00431740` applies it before it stores anything,
+            // so the recorded index marks its label and rings as a choice
+            // rather than as a cancel; that is why it goes into the tick rather
+            // than onto the event it returns.
+            let recorded = player
+                .following_record
+                .then(|| progress.as_deref().and_then(Progress::recorded_choice))
+                .flatten();
+            let event = pending.tick(
+                at,
+                map,
+                input,
+                bar_state.auto,
+                &mut |n| {
+                    // The original seeds from `GetTickCount` and draws once;
+                    // any source of the same range does the same job.
+                    (Instant::now().elapsed().subsec_nanos() as usize ^ at.0 as usize) % n.max(1)
+                },
+                recorded,
+            );
             // And the moment the player answers a box themselves the flag comes
             // down (`+0x94(0)`), which is why following stops the first time
-            // they disagree with the recording. The flag is also what gates the
-            // write: `FUN_00428a50` runs only with it clear, so a followed
-            // playthrough does not overwrite the recording it is reading.
-            let mut event = event;
-            if let select::Event::Decided(index, _) = event {
-                if player.following_record {
-                    if index < 0 {
-                        if let Some(answer) =
-                            progress.as_deref().and_then(Progress::recorded_choice)
-                        {
-                            log::info!("the slot recorded {answer} here, so that is the answer");
-                            event = select::Event::Decided(
-                                answer,
-                                if answer < 0 {
-                                    SystemSe::Cancel
-                                } else {
-                                    SystemSe::Select
-                                },
-                            );
-                        }
-                    } else {
-                        log::info!("the player answered, so the recording is no longer followed");
-                        player.following_record = false;
-                    }
+            // they disagree with the recording. `FUN_00431740` lowers it in the
+            // branch where the window is still live and the poll returned
+            // something, so the test is the window rather than the answer: a
+            // decline the player gave inside it stops the following too. The
+            // flag is also what gates the write — `FUN_00428a50` runs only with
+            // it clear — so a followed playthrough does not overwrite the
+            // recording it is reading.
+            if let select::Event::Decided(..) = event {
+                if player.following_record && Frame(at.0 + 1) < pending.end {
+                    log::info!("the player answered, so the recording is no longer followed");
+                    player.following_record = false;
+                } else if let Some(answer) = recorded {
+                    log::info!("the slot recorded {answer} here, so that is the answer");
                 }
             }
             match event {

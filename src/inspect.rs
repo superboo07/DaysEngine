@@ -1258,9 +1258,14 @@ fn cmd_render(game: &Path, args: &RenderArgs) -> Result<()> {
             &font,
             W,
             H,
-            stacked,
-            english,
-            left_arrangement,
+            crate::playback::compose::Context {
+                stacked,
+                english,
+                left_arrangement,
+                // No `Choice` here: a frame asked for by timecode is drawn
+                // with the box live and nothing pointing at it.
+                labels: &[],
+            },
         );
 
         if let Some(strip) = &control {
@@ -1350,6 +1355,8 @@ struct Exporter<'a> {
     vfs: &'a crate::install::vfs::Vfs,
     font: &'a days_font::Font,
     settings: &'a crate::install::engine::Settings,
+    /// `FILMENGINE.INI`, for the choice box's hit map and the system sounds.
+    film: &'a crate::Ini,
     /// `[UseEnglish]`, which picks the script language and the text pitch.
     english: bool,
     /// The choice box's axis, from `FILMENGINE.INI`.
@@ -1371,24 +1378,33 @@ impl Exporter<'_> {
     /// muxes the two with the subtitle track. Muxing rather than re-encoding
     /// is why the stage is only ever walked once.
     ///
-    /// # What this does not reproduce
+    /// # The choice box
     ///
-    /// Nothing here drives [`crate::ui::select::Choice::tick`], so a
-    /// `[SetSELECT]` is drawn for its whole window and never answered.
-    /// [`crate::playback::stage::Visual::select`] carries the labels and the
-    /// window and not the `Choice` state, so both labels are
-    /// `LABEL_PLAIN` for the window's length and the box cuts out at `end`.
-    /// The original answers it — `FUN_00431740` decides once the window is
-    /// spent — stamps the settle frame into every label and runs
-    /// [`crate::ui::select::Choice::label_colour`]'s ramp over them, and plays
-    /// `SystemSe::Cancel` through host `+0x50` as it settles. So an exported
-    /// box has no highlight, no fade and no sound, and the walk this took
-    /// agrees with it: a spent window records -1, which is the column
-    /// [`crate::ui::replay::NO_CHOICE`] maps to.
+    /// A `[SetSELECT]` is driven here exactly as playback drives it:
+    /// [`crate::ui::select::Choice::tick`] raises it at `start`, plays
+    /// `SystemSe::View`, and settles it once the window is spent, which is
+    /// `FUN_00431740`'s own timeout. The answer is the one the walk took, and
+    /// it arrives the way the play-data list's does — as `tick`'s `recorded`,
+    /// host slot `+0x98` — so the picked label is marked, the chosen or
+    /// cancelled sound plays through the mixer, and
+    /// [`crate::ui::select::Choice::label_colour`]'s ramp runs over every
+    /// label until the box stops drawing.
     ///
-    /// Reproducing the ramp means handing `compose` a colour per label, which
-    /// is the live playback path's signature too, so it is not done here.
-    fn scene(&self, steps: &[String], out: &Path) -> Result<()> {
+    /// **Nothing is pointing at the box, because nothing here has a pointer.**
+    /// So no label is lit while the window is live — the highlight is
+    /// `FUN_0044de50`'s own -1 — and the first label to light is the one the
+    /// answer marks. That is this tool's stand-in for a player's hand, not a
+    /// recovered value: where the pointer rests during the window, and when in
+    /// it a real player clicks, is not something the shipped code decides.
+    /// Answering on the spent frame is the one moment the code does decide.
+    ///
+    /// The box belongs to the script, so the script ending cuts whatever is
+    /// left of the ramp — a film object per script is a `Choice` per script,
+    /// see [`crate::ui::replay`]. The shipped scripts are written to it:
+    /// `05-KA-A05` spends its window at frame 2787 and its `[Next]` is at
+    /// 2813, which is the picked label's 24-frame hold and two frames more.
+    fn scene(&self, plan: &[crate::ui::replay::Step], out: &Path) -> Result<()> {
+        use crate::ui::select;
         use days_script::{Command, Frame};
         use std::io::Write as _;
 
@@ -1399,8 +1415,9 @@ impl Exporter<'_> {
         let mut scripts = Vec::new();
         let mut cues: Vec<Cue> = Vec::new();
         let mut played = 0u32;
-        for step in steps {
-            let stem = step.rsplit('/').next().unwrap_or(step);
+        for step in plan {
+            let name = &step.script;
+            let stem = name.rsplit('/').next().unwrap_or(name);
             let (name, path) = crate::game::find_script(self.vfs, stem, self.english)?;
             let script = days_script::Script::parse(&name, &self.vfs.read_path(&path)?)?;
             for event in &script.events {
@@ -1414,7 +1431,7 @@ impl Exporter<'_> {
                 }
             }
             played += script.length.0;
-            scripts.push(script);
+            scripts.push((script, step.answer));
         }
 
         let stem = out
@@ -1458,9 +1475,22 @@ impl Exporter<'_> {
         let mixer = crate::Mixer::new();
         mixer.set_gains(self.gains);
         let mut samples: Vec<f32> = Vec::new();
+        // The box's own sounds go to the channel the menus own, exactly as
+        // `FUN_00431740` plays them through host `+0x50`. The cache is shared
+        // across the chain because the sounds are.
+        let system_se = crate::game::SystemSounds::from_ini(self.film);
+        let mut sounds = crate::game::Sounds::default();
 
-        for script in scripts {
+        for (script, step_answer) in scripts {
             let length = script.length.0;
+            // The choice box of this script, built the first frame its window
+            // covers and dropped with the script. A film object per script is
+            // a `Choice` per script: see `crate::ui::replay`.
+            let mut choice: Option<(select::Choice, select::Select)> = None;
+            let mut colours: Vec<Option<select::Rgba>> = Vec::new();
+            // The labels and window, owned, so they outlive the borrow of
+            // `choice` the tick above takes.
+            let mut box_art: Option<(Vec<String>, Frame, Frame)> = None;
             let mut stage = crate::Stage::new(script);
             stage.set_men_voice(self.men_voice);
             stage.set_video_size(width, height);
@@ -1480,14 +1510,78 @@ impl Exporter<'_> {
                 // and stays in it.
                 visual.text = None;
                 visual.text_id = None;
+
+                // The box, driven as the playback loop drives it: raised at
+                // `start`, answered on the frame the window is spent, and
+                // drawn on past that while its ramp runs. The answer is the
+                // walk's, handed over the way the play-data list hands a
+                // slot's — `tick`'s `recorded`, host slot `+0x98`.
+                if let (Some(window), None) = (visual.select, &choice) {
+                    let pending = select::Choice::new(window.a, window.b, window.start, window.end);
+                    match select::Select::load(
+                        self.vfs,
+                        self.film,
+                        pending.count(),
+                        crate::ui::screen::Resolution::Wide,
+                    ) {
+                        Ok(map) => {
+                            box_art = Some((pending.labels.clone(), window.start, window.end));
+                            choice = Some((pending, map));
+                        }
+                        // A missing hit map is not fatal, and here it costs
+                        // nothing at all: there is no pointer to hit-test.
+                        Err(err) => log::warn!("the choice box is unavailable: {err}"),
+                    }
+                }
+                colours.clear();
+                if let Some((pending, map)) = &mut choice {
+                    let event = pending.tick(
+                        Frame(frame),
+                        map,
+                        // No pointer: nothing is pointing at an exported box,
+                        // so no label is lit until the answer marks one.
+                        select::Input::default(),
+                        // Auto is off, so the draw below is never taken.
+                        false,
+                        &mut |_| 0,
+                        Some(step_answer),
+                    );
+                    if let select::Event::Raised(se) | select::Event::Decided(_, se) = event {
+                        system_se.play(se, self.vfs, &mut sounds, &mixer);
+                    }
+                    if pending.visible(Frame(frame)) {
+                        colours.extend(
+                            (0..pending.count()).map(|i| pending.label_colour(i, Frame(frame))),
+                        );
+                    } else {
+                        choice = None;
+                    }
+                }
+                // `visual.select` is the statement's own window and stops at
+                // `end`; the box does not, so while it is still drawing the
+                // labels come from the `Choice` instead.
+                if let Some((labels, start, end)) = &box_art {
+                    if !colours.is_empty() {
+                        visual.select = Some(crate::playback::stage::SelectWindow {
+                            a: &labels[0],
+                            b: labels.get(1).map(String::as_str),
+                            start: *start,
+                            end: *end,
+                        });
+                    }
+                }
+
                 let rgba = crate::playback::compose::frame_rgba_with(
                     &visual,
                     self.font,
                     width as usize,
                     height as usize,
-                    self.stacked,
-                    self.english,
-                    self.left_arrangement,
+                    crate::playback::compose::Context {
+                        stacked: self.stacked,
+                        english: self.english,
+                        left_arrangement: self.left_arrangement,
+                        labels: &colours,
+                    },
                 );
                 sink.write_all(&rgba)?;
 
@@ -1727,29 +1821,30 @@ fn one_column(
 fn cover(
     run: &crate::ui::replay::Run,
     answers: &dyn Fn(&str) -> Option<Vec<i32>>,
-) -> Vec<Vec<usize>> {
+) -> Vec<crate::ui::replay::Walk> {
     use crate::ui::replay::NO_CHOICE;
 
     let walks = run.walks(answers);
-    let mut need: std::collections::HashSet<usize> = walks.iter().flatten().copied().collect();
-    let mut chosen: Vec<Vec<usize>> = run
+    let mut need: std::collections::HashSet<usize> =
+        walks.iter().flat_map(|w| w.steps.iter()).copied().collect();
+    let mut chosen: Vec<crate::ui::replay::Walk> = run
         .walks(&|name| one_column(answers, NO_CHOICE, name))
         .into_iter()
         .take(1)
         .collect();
-    for step in chosen.iter().flatten() {
+    for step in chosen.iter().flat_map(|w| w.steps.iter()) {
         need.remove(step);
     }
     while !need.is_empty() {
         let best = walks
             .iter()
             .filter(|w| !chosen.contains(w))
-            .max_by_key(|w| w.iter().filter(|s| need.contains(s)).count());
+            .max_by_key(|w| w.steps.iter().filter(|s| need.contains(s)).count());
         let Some(best) = best else { break };
-        if !best.iter().any(|s| need.contains(s)) {
+        if !best.steps.iter().any(|s| need.contains(s)) {
             break;
         }
-        for step in best {
+        for step in &best.steps {
             need.remove(step);
         }
         chosen.push(best.clone());
@@ -1778,6 +1873,7 @@ fn cmd_export(game: &Path, args: &ExportArgs) -> Result<()> {
         vfs: &vfs,
         font: &font,
         settings: &settings,
+        film: &film,
         english: film.get_bool("UseEnglish").unwrap_or(false),
         stacked: crate::ui::select::Layout::from_ini(&film) == crate::ui::select::Layout::Stacked,
         left_arrangement: film.get_bool("LeftArrangement").unwrap_or(false),
@@ -1853,7 +1949,7 @@ fn cmd_export(game: &Path, args: &ExportArgs) -> Result<()> {
 
             // One file per walk. Without `--paths` that is one walk, down the
             // column `--choice` names.
-            let plans: Vec<(String, Vec<usize>)> = if args.paths {
+            let plans: Vec<(String, replay::Walk)> = if args.paths {
                 cover(&run, &lookup)
                     .into_iter()
                     .enumerate()
@@ -1883,15 +1979,23 @@ fn cmd_export(game: &Path, args: &ExportArgs) -> Result<()> {
                     );
                     continue;
                 }
-                let steps: Vec<String> = walk
-                    .iter()
-                    .filter_map(|step| run.script(*step).map(str::to_string))
-                    .collect();
+                let steps = run.plan(&walk);
                 if steps.is_empty() {
                     println!("{index:>3} {label}{plan} — no script recovered, skipped");
                     continue;
                 }
-                println!("{index:>3} {label}{plan} — {}", steps.join(" -> "));
+                println!(
+                    "{index:>3} {label}{plan} — {}",
+                    steps
+                        .iter()
+                        .map(|s| match s.answer {
+                            replay::NO_CHOICE => s.script.clone(),
+                            -1 => format!("{}(declined)", s.script),
+                            answer => format!("{}({answer})", s.script),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                );
                 exporter.scene(&steps, &out)?;
             }
         }
@@ -2394,16 +2498,16 @@ fn cmd_select(game: &Path, args: &SelectArgs) -> Result<()> {
         };
         let mut rng = |_: usize| 0;
         let hover = crate::ui::select::Input {
-            pointer,
+            pointer: Some(pointer),
             ..Default::default()
         };
-        choice.tick(Frame(0), &select, hover, false, &mut rng);
+        choice.tick(Frame(0), &select, hover, false, &mut rng, None);
         let answering = crate::ui::select::Input {
             pick: pick >= 0,
             dismiss: pick < 0,
             ..hover
         };
-        let event = choice.tick(Frame(1), &select, answering, false, &mut rng);
+        let event = choice.tick(Frame(1), &select, answering, false, &mut rng, None);
         println!("answered at frame 1: {event:?}");
         for frame in 1.. {
             if !choice.visible(Frame(frame)) {

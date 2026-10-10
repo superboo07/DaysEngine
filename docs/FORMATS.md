@@ -3833,18 +3833,53 @@ wheel, six keys — into the members host slot `+0x148` then reads. So holding t
 button down is not a press held down, every consumer in a frame sees the same
 one press, and nothing has to consume it to stop it repeating.
 
-Three things can answer instead of the player:
+Two things can answer instead of the player, and both act on a spent window:
 
-- with the auto flag (host `+0x134`) set, a spent window is **drawn at random**:
+- with the auto flag (host `+0x134`) set, the window is **drawn at random**:
   `srand(GetTickCount()); rand() % (count + 1) - 1`, over a range that includes
   `-1`, so skipping can still decline;
-- in a replay (host `+0x104`), `FUN_0043f3b0` overrides the pick with what was
-  recorded, and falls back to a random pick among the choices
-  `_GetSelectRead@4` says have been seen;
-- host `+0x98` replaces the answer outright with `FUN_00428a80`.
+- host `+0x98` — the play-data list following a slot's own answers — replaces
+  whatever the window produced with `FUN_00428a80`, the answer that slot
+  recorded at this script. It is applied before anything is stored, so a
+  recorded index goes on to mark its label and ring as a choice, exactly like
+  one the player gave. The flag also gates the write-back: `FUN_00428a50`
+  records the answer only with it clear, so a followed playthrough does not
+  overwrite what it is reading. `FUN_0042bf10` raises it through host `+0x94`,
+  and the tick lowers it — `+0x94(0)` — the moment the poll returns anything
+  other than `-2` while the window is still live, which is why following stops
+  the first time the player answers for themselves.
 
 A decided choice plays SE index 1, a declined one index 0, and the box going up
 plays index 5.
+
+#### A replay will not let you answer with a branch you have not seen
+
+Host slot `+0x104` is "a replay scene is playing" — the same slot
+`FUN_00424020` tests to choose between `_GetNextChapter@8` and the route graph
+— and with it set `FUN_00431740` puts the answer through one more gate, in both
+of its branches:
+
+- a **live** pick is thrown away as though nothing had been pressed —
+  `local_c = -2`, so the box stays up — unless `_GetSelectRead@4(answer + 1)`
+  is non-zero;
+- a **spent** window's answer goes through `FUN_0043f3b0`, which keeps it if
+  that column is readable, and otherwise collects the columns of `0..3` that
+  are and draws one of them at random, `column - 1`. With none readable it
+  answers `-2`, which the `-2 < local_c` guard below refuses: nothing is
+  stored, no sound plays, and the spent window is rolled again next frame.
+
+`_GetSelectRead@4` is the menu module's `FUN_1001f250`, reading the three cells
+at `SceneView + 0x2c8` that `_SelectReadCheck@0` (`FUN_1001f1e0`) fills. That
+one asks `FUN_1001ee20(this, 0, column)` for each column of the step now
+playing — the arm that takes the column as an argument instead of asking the
+host — and stores, for each, host `+0x18`'s answer for the script that column
+branches to: whether the player has read it. A cell holding 0 is "no option"
+and is filled in as not readable, which is the same 0 the branch tables use for
+a column no step can reach.
+
+**This engine does not implement that gate**: every column can be answered in a
+replay here. The two exports it needs, `_SelectReadCheck@0` and
+`_GetSelectRead@4`, have no engine-side caller yet.
 
 **An answered box fades out; it does not vanish.** Each label lives at
 `box + 0x128 + n * 0x50` and carries its own state in `entry + 0x44`, a colour

@@ -494,7 +494,25 @@ impl Run {
         (next < self.scripts.len()).then_some(next)
     }
 
-    /// Every distinct walk of this scene, as runs of step indices.
+    /// A walk's steps resolved to the scripts they play, with their answers.
+    ///
+    /// A step the scene's list has no script for is dropped, which is the same
+    /// thing `FUN_1001f0d0` does with an index that lands on the list's NULL
+    /// terminator.
+    pub fn plan(&self, walk: &Walk) -> Vec<Step> {
+        walk.steps
+            .iter()
+            .zip(walk.answers.iter().chain(std::iter::repeat(&NO_CHOICE)))
+            .filter_map(|(step, answer)| {
+                self.script(*step).map(|script| Step {
+                    script: script.to_string(),
+                    answer: *answer,
+                })
+            })
+            .collect()
+    }
+
+    /// Every distinct walk of this scene.
     ///
     /// The column [`Run::next`] reads is the answer settled by the step's
     /// **own** script, because the engine builds a fresh film object for every
@@ -509,14 +527,20 @@ impl Run {
     ///
     /// Bounded by a seen-set per walk, so a table that leads back into itself
     /// ends the walk rather than the session.
-    pub fn walks(&self, answers: &dyn Fn(&str) -> Option<Vec<i32>>) -> Vec<Vec<usize>> {
+    pub fn walks(&self, answers: &dyn Fn(&str) -> Option<Vec<i32>>) -> Vec<Walk> {
         let mut out = Vec::new();
         if self.scripts.is_empty() {
             return out;
         }
-        self.walk_on(0, &mut Vec::new(), answers, &mut out);
+        self.walk_on(0, &mut Walk::default(), answers, &mut out);
         out.sort();
         out.dedup();
+        // Two walks over the same steps differ only in an answer that led
+        // nowhere new — the last box of a scene whose every column ends it,
+        // say. That is the same scene played, so one of them is kept, and the
+        // sort above makes it the one with the lowest answers: a decline,
+        // which is the answer no player has to give.
+        out.dedup_by(|a, b| a.steps == b.steps);
         out
     }
 
@@ -525,30 +549,54 @@ impl Run {
     fn walk_on(
         &self,
         step: usize,
-        seen: &mut Vec<usize>,
+        seen: &mut Walk,
         answers: &dyn Fn(&str) -> Option<Vec<i32>>,
-        out: &mut Vec<Vec<usize>>,
+        out: &mut Vec<Walk>,
     ) {
-        seen.push(step);
         let options = self
             .script(step)
             .and_then(answers)
             .unwrap_or_else(|| vec![NO_CHOICE]);
-        let mut ended = true;
-        for answer in options {
+        seen.steps.push(step);
+        seen.answers.push(NO_CHOICE);
+        for &answer in &options {
+            let last = seen.answers.last_mut().expect("just pushed");
+            *last = answer;
             match self.next(step, answer) {
-                Some(next) if !seen.contains(&next) => {
-                    ended = false;
-                    self.walk_on(next, seen, answers, out);
-                }
-                _ => {}
+                Some(next) if !seen.steps.contains(&next) => self.walk_on(next, seen, answers, out),
+                // Nowhere new to go, so the scene ends on this answer.
+                _ => out.push(seen.clone()),
             }
         }
-        if ended {
-            out.push(seen.clone());
-        }
-        seen.pop();
+        seen.steps.pop();
+        seen.answers.pop();
     }
+}
+
+/// One step of a walk, resolved to the script it plays: [`Run::plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// The script, as the scene's list spells it — `04/04-SB-G05`.
+    pub script: String,
+    /// What this script's own `[SetSELECT]` settled on, and [`NO_CHOICE`] for
+    /// a script that raises none.
+    pub answer: i32,
+}
+
+/// One walk of a scene: the steps it plays, and what each step's box settled
+/// on.
+///
+/// The answers matter beyond the branch they take: the box stays on screen
+/// after it is answered and the label that was picked is marked, so anything
+/// drawing the scene needs to know which one it was. See
+/// [`crate::ui::select::Choice::label_colour`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Walk {
+    /// The steps played, in order.
+    pub steps: Vec<usize>,
+    /// Parallel to [`Walk::steps`]: the answer that step's own `[SetSELECT]`
+    /// settled on, and [`NO_CHOICE`] for a step whose script raises none.
+    pub answers: Vec<i32>,
 }
 
 /// What the last-choice value is before a choice box has settled.
@@ -1897,7 +1945,8 @@ mod tests {
                 .then(|| vec![0, 1, -1])
         };
         let walks = run.walks(&boxes);
-        let reached: std::collections::BTreeSet<usize> = walks.iter().flatten().copied().collect();
+        let reached: std::collections::BTreeSet<usize> =
+            walks.iter().flat_map(|w| w.steps.iter()).copied().collect();
         assert_eq!(reached, (0..9).collect(), "every step is reachable");
         // G06 and G07 raise no box, so both are read at column 0 and both go
         // to step 4 — which is the only way into the second half.
@@ -1908,7 +1957,9 @@ mod tests {
         assert_eq!(run.next(1, 0), Some(0));
         assert_eq!(run.next(2, 1), Some(0));
         assert!(
-            !walks.iter().any(|w| w.windows(2).any(|p| p == [1, 0])),
+            !walks
+                .iter()
+                .any(|w| w.steps.windows(2).any(|p| p == [1, 0])),
             "nothing walks G06 back to the scene's first script"
         );
     }
