@@ -166,7 +166,7 @@ impl UiScaler {
 /// of 0.028 the *strong* edges in the same frame, the ones a picture is made
 /// of, measure 150% of the unfiltered frame's, and at 0.035 they measure 179%.
 /// That is not detail being kept. It is contrast being manufactured.
-pub const DEFAULT_FILTERS: &str = "deblock=filter=weak:block=8,deband=r=16,gradfun=1.2:16";
+pub const DEFAULT_FILTERS: &str = "deblock=filter=strong:block=4:alpha=0.12:beta=0.07:gamma=0.06:delta=0.05,deband=r=16,gradfun=3.5:8";
 
 /// The chain movie frames go through after they are scaled, by default.
 ///
@@ -183,7 +183,7 @@ pub const DEFAULT_FILTERS_AFTER: &str = "";
 /// a step between two flat areas into noise, not enough to be seen as grain on
 /// a still frame. [`crate::media::grain`] is what it is for and
 /// `[Video] Grain = 0` turns it off.
-pub const DEFAULT_GRAIN: u8 = 2;
+pub const DEFAULT_GRAIN: u8 = 0;
 
 /// How hard a `MoveSom` level is felt, as a percentage of what it asks for.
 ///
