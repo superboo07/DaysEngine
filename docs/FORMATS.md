@@ -5687,6 +5687,33 @@ that runs over playback. So the route map reached from the title is a chart to
 look at with every cell inert, and the same screen reached from the control bar
 mid-playthrough is how the player jumps back.
 
+### Picking any unlocked cell — this engine's divergence
+
+`FUN_1000e750` gates a cell on the second question alone, so the shipped screen
+offers a jump **only inside the run that made it**: a chart full of story points
+collected over many runs offers almost none of them, and the chart the title's
+Load screen opens offers none at all. This engine offers every charted cell
+instead, from either chart — `DaysEngine.ini` `[Game] FreeRouteMap`, on by
+default, `off` for the rule above. `ui::routemap::offered` is the pair.
+
+The jump is the rest of it. `FUN_004331a0` finds the number among the marks the
+run recorded, and a mark carries the store as it stood as well as the script, so
+the shipped jump restores the player's state along with their position. A point
+this run never passed has no mark and so no state, and **nothing is invented in
+its place**: the save's store is left exactly as it stands and only `ROUTE` and
+`SCENE` in it move, to the scene the route module's own marker assigns that
+number. From the title the jump starts a film run first, so those flags are the
+zeroes `_ZeroReset@4` leaves. See `install::progress::Progress::jump_to_story`.
+
+Which scene that is comes from the branch graph read backwards
+(`days_route::Machine::scene_of_story`), and the two binaries agree about it
+exactly: the 161 cells this page table charts and the 161 story numbers the 55
+route handlers mark are the same 161 numbers, with no cell unmarked and no
+number uncharted. One number is marked twice — ROUTE `0x0f` marks `SP428` at
+scene 85, `03/03-KB-M07`, and again at scene 108, `03/03-KB-Z00` — and the menu
+module treats the pair as one place on the chart too, answering cell widget
+`0x27` from `_CheckScript@8` for both. The lower scene is the one jumped to.
+
 `FUN_1000e060` opens it on the player's own episode and page when there is a
 playthrough, from `_GetStory@4` and `_GetRouteMapPage@8`, both
 `RouteProcSDHQ.dll` tables over `ROUTE`. The second is a plain table for 46 of
@@ -5803,7 +5830,9 @@ of 100 or more in place of a slot — and `_GetRouteLoad@0` raised.
 recorded, restore it through `FUN_00432670` — the mark's store to
 `FUN_00428a20` and its script to `FUN_0042a760`, the same pair a slot's load
 uses — and then **erase every mark from it to the end**, because the story
-points after a rewind have not been reached any more.
+points after a rewind have not been reached any more. A number with no mark
+answers nothing, which is the half this engine extends; see *Picking any
+unlocked cell* above.
 
 The flag is what makes that possible: `FUN_00432850` skips emptying the marks
 while `_GetRouteLoad@0` is set, so the history the jump reads is still there

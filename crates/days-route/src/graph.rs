@@ -398,6 +398,31 @@ impl Machine {
             .flat_map(|(r, m)| m.iter().map(move |(&s, &n)| (r, s, n)))
     }
 
+    /// The scene a story number is marked at, for a jump to a story point no
+    /// mark in the run names — the engine's `Progress::from_story`.
+    ///
+    /// The marker is a route's own, so this is [`Machine::stories`] read
+    /// backwards and nothing more. It is **not** how the shipped engine jumps:
+    /// `FUN_004331a0` looks the number up among the marks the run recorded,
+    /// which carry the store as it stood as well as the script. This answers
+    /// only the script's position, which is what a jump to a point the run
+    /// never passed has to work from.
+    ///
+    /// **One story number is marked twice.** ROUTE `0x0f` marks `SP428` at
+    /// scene 85, `03/03-KB-M07`, and again at scene 108, `03/03-KB-Z00`; every
+    /// other one of the 161 numbers is marked once. The menu module agrees
+    /// that the pair is one place on the chart — `_CheckScript@8`'s arm for
+    /// that route answers cell widget `0x27` for both scenes, which is the
+    /// pair transcribed in the engine's `ui::routemap` — so there is no third
+    /// cell to tell them apart and either scene is "that cell". The lower is
+    /// answered, which is the first time the route reaches the point.
+    pub fn scene_of_story(&self, story: u32) -> Option<(usize, u16)> {
+        self.stories()
+            .filter(|&(_, _, n)| n == story)
+            .map(|(route, scene, _)| (route, scene))
+            .min()
+    }
+
     /// The decision tree a route runs for one scene.
     pub fn step(&self, route: usize, scene: u16) -> Option<Transition> {
         let raw = self.step_raw(route, scene)?;

@@ -696,7 +696,7 @@ impl Progress {
         Some(slot.script)
     }
 
-    /// Jumps to a story point the run has passed, as the route map does.
+    /// Jumps to a story point, as the route map does.
     ///
     /// `FUN_00428400` formats the number into `SP%03d` and hands it to
     /// `FUN_004331a0`, which finds that mark among the ones the run has
@@ -712,11 +712,20 @@ impl Progress {
     /// after this one have not been reached any more. The map is keyed by the
     /// `SP%03d` name, and those sort the same way their numbers do.
     ///
-    /// `None` is a story point this run never passed, which the route map does
-    /// not offer — it greys a cell whose flag the save's store does not carry.
+    /// **A point with no mark is the engine's own jump, not the original's.**
+    /// `FUN_004331a0` answers nothing for a number the run never recorded, and
+    /// the shipped screen never asks: it greys every cell whose flag the save's
+    /// store does not carry. This engine offers them — see
+    /// [`crate::install::engine::Settings::free_route_map`] — and reaches them
+    /// through [`Progress::jump_to_story`], which has no mark to restore and so no
+    /// store to restore either.
+    ///
+    /// `None` is a story point no mark and no route marks at all.
     pub fn from_story(&mut self, story: u32) -> Option<String> {
         let name = format!("SP{story:03}");
-        let mark = self.marks.get(&name)?;
+        let Some(mark) = self.marks.get(&name) else {
+            return self.jump_to_story(story, &name);
+        };
         let script = mark.script.clone();
         self.stores.save = mark.store.clone();
         self.script = script.clone();
@@ -727,6 +736,50 @@ impl Progress {
         self.gauge_raised = false;
         let (route, scene) = self.position();
         log::info!("{name} puts the player at ROUTE {route} SCENE {scene}: {script}");
+        Some(script)
+    }
+
+    /// Jumps to a story point this run never passed, which the original cannot
+    /// do.
+    ///
+    /// The route map's cells are the player's unlocked story points — the
+    /// global store — and only the handful of them this run happened to pass
+    /// carry a mark. A mark is the whole of what the shipped jump restores, so
+    /// for the rest there is no recovered state to put back and nothing is
+    /// invented in its place: **the save's store is left exactly as it
+    /// stands** and only the position in it moves, to the scene the route
+    /// module's own marker assigns that number
+    /// ([`days_route::Machine::scene_of_story`]).
+    ///
+    /// So what follows the jump is this run's own flags read from a new place:
+    /// the counters the player has earned, the gates they have opened, and
+    /// from the title the zeroes a film run starts with. That is a divergence,
+    /// and the honest one — the alternative is a store assembled out of
+    /// plausible values, which would decide branches the player never played
+    /// and look recovered doing it.
+    ///
+    /// The marks from this point onward go, by the same rule and for the same
+    /// reason the shipped jump erases them.
+    fn jump_to_story(&mut self, story: u32, name: &str) -> Option<String> {
+        let (route, scene) = self.machine.scene_of_story(story)?;
+        let table = self.routes.script(route, scene as usize)?.to_owned();
+        self.stores.save.set_int(ROUTE, route as i32);
+        self.stores.save.set_int(SCENE, scene as i32);
+        // The same swap every name out of the route tables goes through, and
+        // the same twin beside it. See [`Progress::take`].
+        let script = self.uniform_block(&table);
+        self.twin = match script == table {
+            true => String::new(),
+            false => table,
+        };
+        self.script = script.clone();
+        self.marks.split_off(name);
+        self.stores.choice = -1;
+        self.gauge_raised = false;
+        log::info!(
+            "{name} is ROUTE {route} SCENE {scene}, which this run never passed: \
+             jumping to {script} with the flags as they stand"
+        );
         Some(script)
     }
 

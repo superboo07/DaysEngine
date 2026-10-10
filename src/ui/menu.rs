@@ -519,6 +519,14 @@ pub struct Session {
     /// Whether ruby is on: `[AgateUsing]` overridden by `Config.DAT`'s
     /// `UseAgate`, which is host `+0x60`.
     pub ruby: bool,
+    /// Whether the route map offers every story point the player has unlocked
+    /// or only the ones the run they are in has passed.
+    ///
+    /// `DaysEngine.ini` `[Game] FreeRouteMap`, on by default. Off is the
+    /// original's rule, which is the one [`Menu::passed`] answers. See
+    /// [`crate::ui::routemap`] and
+    /// [`crate::install::engine::Settings::free_route_map`].
+    pub free_route_map: bool,
     /// Every line the player has been shown this session, oldest first.
     ///
     /// The engine's own list, not a menu's: `FUN_0043dbe0` pushes to it from
@@ -547,6 +555,7 @@ impl Session {
             flow: backlog::Flow::Horizontal,
             ruby: false,
             lines: Vec::new(),
+            free_route_map: true,
         }
     }
 }
@@ -2937,8 +2946,8 @@ impl Menu {
             // A cell of the route map paints its own state over the empty
             // chart in the base art. `FUN_1000ce40` builds the sprite from one
             // of two bands of the page's record table — `+0x21 + cells + i`
-            // for a story point this run has not passed and `+0x21 + 3 * cells
-            // + i` for one it has — and `FUN_1000c3d0` paints it only where the
+            // for a story point that cannot be picked and `+0x21 + 3 * cells
+            // + i` for one that can — and `FUN_1000c3d0` paints it only where the
             // global store says the point has ever been seen. The band the
             // regions themselves matched is the first, `+0x21 + i`, which is
             // the hover art, so a cell the pointer is on wants its own record
@@ -2956,6 +2965,12 @@ impl Menu {
                 if self.selection == Some(widget) {
                     return None;
                 }
+                // What the two bands mean is the same question the cell is
+                // enabled on, so the lit one is exactly what can be clicked.
+                // With `[Game] FreeRouteMap` on that is every charted cell,
+                // and the dim band — the original's "charted but not passed in
+                // this run" — is drawn nowhere; with it off the screen uses
+                // both, as the shipped one does.
                 let extra = if self.pickable().get(cell).copied().unwrap_or(false) {
                     2 * cells + cell
                 } else {
@@ -3736,13 +3751,21 @@ impl Menu {
             .unwrap_or(routemap::Page { cells: 0, base: 0 })
     }
 
-    /// Which cells of the page the player may jump to, from `FUN_1000c740`.
+    /// Which cells of the page the run showing has passed, from
+    /// `FUN_1000c740`.
     ///
     /// The save's own store answers it, and only while a playthrough is
     /// running: the module computes this half at all only when its `+0x4ec` is
     /// set, and that member is 1 from `setSystemInit` — the driver over
     /// playback — and 0 from `_SystemInit@8`, the title-rooted shell.
-    pub fn pickable(&self) -> Vec<bool> {
+    ///
+    /// **This is the original's answer to what can be picked, and this engine
+    /// asks it only when the player asks for that rule** — see
+    /// [`Menu::pickable`]. It is still the difference between the two jumps:
+    /// a story point this run passed carries a mark and is restored from it,
+    /// and one it did not is entered with the flags as they stand. See
+    /// [`crate::install::progress::Progress::from_story`].
+    pub fn passed(&self) -> Vec<bool> {
         let page = self.chart_page();
         let Some(run) = self
             .session
@@ -3760,6 +3783,20 @@ impl Menu {
                     cell,
                 )))
             })
+            .collect()
+    }
+
+    /// Which cells of the page the player may jump to, from
+    /// [`routemap::offered`] — which is where the shipped rule and this
+    /// engine's divergence from it are written down, along with the setting
+    /// that chooses between them.
+    pub fn pickable(&self) -> Vec<bool> {
+        let free = self.session.free_route_map;
+        let (charted, passed) = (self.charted(), self.passed());
+        charted
+            .iter()
+            .zip(&passed)
+            .map(|(&charted, &passed)| routemap::offered(free, charted, passed))
             .collect()
     }
 

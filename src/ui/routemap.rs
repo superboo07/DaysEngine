@@ -205,9 +205,11 @@ pub fn variant(episode: usize, page: usize) -> String {
 /// on: with it set only the first episode is reachable and the chart cannot be
 /// paged forward past it.
 ///
-/// A cell is enabled when the **save's** store carries its story point, which
-/// is `clickable` here — never when the screen was opened from the title, where
-/// `FUN_1000c740` leaves that array as `FUN_1000c850` zeroed it.
+/// A cell is enabled when `clickable` says so, and `FUN_1000c740` fills that
+/// array from the **save's** store — never when the screen was opened from the
+/// title, where it is left as `FUN_1000c850` zeroed it. Which question this
+/// engine asks for it is the caller's: see [`crate::ui::menu::Menu::pickable`],
+/// where the shipped rule is one of two.
 pub fn enabled(
     episode: usize,
     page: usize,
@@ -229,6 +231,33 @@ pub fn enabled(
         Act::Cell(cell) => clickable.get(cell).copied().unwrap_or(false),
         Act::None => false,
     }
+}
+
+/// Whether a cell can be picked: the shipped rule, or this engine's.
+///
+/// `charted` is the global store's answer — the player has seen this story
+/// point at some time, so the cell is drawn — and `passed` is the save's, the
+/// run showing having passed it. `FUN_1000c740` gathers both and
+/// `FUN_1000e750` gates the cell on the second alone, so **the original offers
+/// a jump only inside the run that made it**: a chart full of story points
+/// collected over many runs offers almost none of them, and the chart the
+/// title's Load screen opens offers none at all, because `+0x4ec` is clear
+/// there and the array is never filled.
+///
+/// With `free` the first answers instead, so any story point the player has
+/// unlocked can be picked, from either chart. That is a divergence and it is
+/// the player's to turn off: `DaysEngine.ini` `[Game] FreeRouteMap`, which is
+/// [`crate::install::engine::Settings::free_route_map`]. The jump that follows
+/// is [`crate::install::progress::Progress::from_story`], which restores a
+/// mark for a point the run passed and, for the rest, enters the script with
+/// the flags as they stand rather than inventing a state nobody played.
+///
+/// A cell that is not charted is never offered either way: `FUN_1000c3d0`
+/// does not paint one, and a point the save carries is always one the global
+/// store carries too, because the story marker sets the one name in both
+/// stores in the same call — host slot `+0x00`, `FUN_00428480`.
+pub fn offered(free: bool, charted: bool, passed: bool) -> bool {
+    charted && (free || passed)
 }
 
 /// Where the page lands when the episode changes, from `FUN_1000e8b0`.
@@ -894,16 +923,41 @@ mod tests {
         assert!(!enabled(2, 1, 4, false, &none, 10));
     }
 
-    /// A cell is pickable only when the save's store carries its story point,
-    /// so the chart opened from the title — where that array is all false —
-    /// has nothing to pick.
+    /// A cell is pickable only where the array `FUN_1000c740` fills says so,
+    /// and the chart opened from the title — where it is all false — has
+    /// nothing to pick.
     #[test]
-    fn a_cell_is_pickable_only_where_the_run_has_been() {
-        let passed = [true, false, true, false];
-        assert!(enabled(0, 0, 4, false, &passed, 0xb));
-        assert!(!enabled(0, 0, 4, false, &passed, 0xc));
-        assert!(enabled(0, 0, 4, false, &passed, 0xd));
+    fn a_cell_is_pickable_only_where_the_screen_offers_it() {
+        let offered = [true, false, true, false];
+        assert!(enabled(0, 0, 4, false, &offered, 0xb));
+        assert!(!enabled(0, 0, 4, false, &offered, 0xc));
+        assert!(enabled(0, 0, 4, false, &offered, 0xd));
         assert!(!enabled(0, 0, 4, false, &[false; 4], 0xb));
+    }
+
+    /// The shipped rule: a cell is offered only where the run showing passed
+    /// the story point, so a chart of points collected over earlier runs
+    /// offers none of them and neither does the title's.
+    #[test]
+    fn the_originals_rule_offers_only_what_this_run_passed() {
+        assert!(offered(false, true, true));
+        assert!(!offered(false, true, false));
+        // The title's chart: `+0x4ec` clear, so nothing is `passed`.
+        assert!(!offered(false, true, false));
+    }
+
+    /// This engine's: every charted point, which is every one the player has
+    /// ever unlocked. A point that is not charted is still not offered —
+    /// nothing draws that cell.
+    #[test]
+    fn a_free_route_map_offers_every_point_the_player_has_unlocked() {
+        assert!(offered(true, true, false));
+        assert!(offered(true, true, true));
+        assert!(!offered(true, false, false));
+        // And the shipped rule cannot offer an uncharted cell either, which is
+        // unreachable in the shipped data: the marker sets the one name in
+        // both stores at once.
+        assert!(!offered(false, false, true));
     }
 
     /// The number a cell carries is the one both the chart and the jump use.

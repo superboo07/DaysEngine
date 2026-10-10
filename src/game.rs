@@ -1198,11 +1198,19 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
                 // Loading from the title puts the player wherever the slot
                 // says, so the position comes from the slot and not from a
                 // fresh `searchRoot` on the name.
-                // The route map's cells are inert from the title — the module
-                // computes what can be picked only when a run is in play — so
-                // this arrives from the bar's copy of the screen. It is handled
-                // here too because the outcome is the menus', not playback's.
+                // The route map's cells are inert from the title in the
+                // original — the module computes what can be picked only when
+                // a run is in play — and live here under `[Game]
+                // FreeRouteMap`; see [`crate::ui::menu::Menu::pickable`].
+                // Picking one from the title starts a film run at that story
+                // point, so it starts from nothing first, exactly as New Game
+                // and a replay do above: there is no run whose flags could be
+                // carried in, and the last run's must not be.
                 Outcome::LoadStory(story) => {
+                    if let Some(p) = progress.as_mut() {
+                        p.film_start();
+                        settle_gauge(&mut player, p);
+                    }
                     if let Some(script) = enter_story(&mut player, progress.as_mut(), story) {
                         next = script;
                         chained = true;
@@ -1692,6 +1700,9 @@ fn build_session(player: &Player, start: &Ini, english: bool, run: Option<&Progr
         // The lines the player has been shown, which the engine keeps and the
         // backlog screen only reads.
         lines: player.backlog.clone(),
+        // The engine's own setting, not the game's: see
+        // [`crate::install::engine`].
+        free_route_map: player.settings.free_route_map,
     }
 }
 

@@ -585,11 +585,20 @@ pub struct MenuArgs {
     /// what the *run* has done have something to answer from.
     ///
     /// The route map is the screen this matters to: its cells are charted from
-    /// the global store but can only be picked where the run's own store
-    /// carries the story point. Pair it with `--from-bar 5`, since the module
-    /// asks that second question only when the control bar opened it.
+    /// the global store and the run's own store says which of them this run
+    /// passed. Pair it with `--from-bar 5`, since the module asks that second
+    /// question only when the control bar opened it.
     #[arg(long, value_name = "N")]
     run_from_slot: Option<u32>,
+    /// Give the route map the original's rule for what can be picked — only a
+    /// story point the run showing has passed — whatever `DaysEngine.ini`
+    /// `[Game] FreeRouteMap` says.
+    ///
+    /// Both rules are the screen's, so both are inspectable from here without
+    /// the settings file being edited between runs. See
+    /// [`crate::ui::menu::Menu::pickable`].
+    #[arg(long)]
+    original_route_map: bool,
     /// Stand in a peripheral on this `Port number`, one-based, so the SOMCON
     /// tab can be inspected as it looks with a device held.
     ///
@@ -3184,12 +3193,22 @@ fn cmd_save_story(game: &Path, slot: u32, story: u32) -> Result<()> {
     }
     let before: Vec<String> = progress.marks().map(str::to_owned).collect();
     println!("slot {slot} carries {} story points", before.len());
+    let marked = before.contains(&format!("SP{story:03}"));
     let Some(script) = progress.from_story(story) else {
-        println!("SP{story:03} is not one of them, so the route map would grey it");
+        println!("SP{story:03} is not one of them, and no route marks it either");
         return Ok(());
     };
     let (route, scene) = progress.position();
     println!("SP{story:03} plays {script} at ROUTE {route} SCENE {scene}");
+    // Which of the two jumps this was. The original only has the first: see
+    // `Progress::from_story`.
+    println!(
+        "  {}",
+        match marked {
+            true => "the slot's own mark, so its store is restored with it",
+            false => "no mark in this run, so the flags are carried in as they stand",
+        }
+    );
     let after: Vec<String> = progress.marks().map(str::to_owned).collect();
     println!(
         "  {} story points left, {} erased: {}",
@@ -3788,6 +3807,10 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             }
             slot.map(|slot| slot.store)
         }),
+        // The engine's own setting, which is the screen's rule for what a
+        // cell offers; `--original-route-map` is the other rule.
+        free_route_map: !args.original_route_map
+            && crate::install::engine::Settings::load().free_route_map,
         // The backlog's two answers. There is no run here to have logged any
         // lines, so the screen opens empty — which is what it does in the
         // original before the first `[PrintText]` too.
@@ -4218,16 +4241,21 @@ fn cmd_menu(game: &Path, args: &MenuArgs) -> Result<()> {
             page + 1,
             chart.cells
         );
+        let passed = menu.passed();
         for cell in 0..chart.cells {
             let story = crate::ui::routemap::story(episode, chart.base, cell);
             println!(
-                "    {:<6} {:<10} {:<14} {}",
+                "    {:<6} {:<10} {:<22} {}",
                 crate::ui::routemap::story_flag(story),
                 if charted[cell] { "charted" } else { "blank" },
-                if pickable[cell] {
-                    "can be picked"
-                } else {
-                    "not this run"
+                match (pickable[cell], passed[cell]) {
+                    // A jump that has a mark of its own to restore, which is
+                    // the only kind the original offers.
+                    (true, true) => "can be picked, passed",
+                    // The engine's own jump: no mark, so the flags as they
+                    // stand. See `Progress::from_story`.
+                    (true, false) => "can be picked, unlocked",
+                    (false, _) => "cannot be picked",
                 },
                 if marker == Some(cell) {
                     "you are here"

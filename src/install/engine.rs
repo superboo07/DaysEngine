@@ -71,6 +71,17 @@
 //! `[Input]` is the binding table — every key and every controller button,
 //! rebindable. See [`super::binding`].
 //!
+//! # The game's own behaviour
+//!
+//! `[Game]` is where this engine does something the original did not, so that
+//! a player who wants the shipped behaviour can have it. There is one so far:
+//! `FreeRouteMap`, the route map's cells. The original lets the player jump to
+//! a story point only while they are in the run that passed it; with this on
+//! — and it is on by default — any story point they have ever unlocked can be
+//! picked, from the chart the control bar opens and from the one the title's
+//! Load screen opens. `off` is the shipped rule exactly. See
+//! [`crate::ui::routemap`].
+//!
 //! `[Rumble] Strength` scales what the game's own `MoveSom` statements ask
 //! for. The toy those statements were written for is a serial device nobody
 //! can buy any more; a controller's rumble motor takes the same numbers. The
@@ -221,6 +232,10 @@ pub struct Settings {
     /// Percentage of the level a `MoveSom` asks for that reaches the motor.
     /// See [`DEFAULT_RUMBLE_STRENGTH`].
     pub rumble_strength: u16,
+    /// Whether any story point the player has unlocked can be picked on the
+    /// route map, rather than only one the run they are in has passed. On by
+    /// default; `off` is the original's rule. See [`crate::ui::routemap`].
+    pub free_route_map: bool,
 }
 
 impl Default for Settings {
@@ -234,6 +249,7 @@ impl Default for Settings {
             pixel_perfect: false,
             bindings: Bindings::default(),
             rumble_strength: DEFAULT_RUMBLE_STRENGTH,
+            free_route_map: true,
         }
     }
 }
@@ -459,6 +475,10 @@ impl Settings {
                 _ => log::warn!(
                     "{FILE} line {line}: {value:?} is not a rumble strength; 0 to {MAX_RUMBLE_STRENGTH}"
                 ),
+            },
+            ("game", "freeroutemap") => match parse_bool(value) {
+                Some(on) => self.free_route_map = on,
+                None => log::warn!("{FILE} line {line}: {value:?} is not on or off"),
             },
             // The binding table owns its own keys, because there are twenty of
             // them and they are the actions themselves.
@@ -699,7 +719,20 @@ pub fn template() -> String {
          ; `Port number` picks which connected controller feels them. This is\n\
          ; only how hard, as a percentage of what the script asked for. 0 to\n\
          ; {}; 0 turns rumble off without touching the game's own setting.\n\
-         Strength = {}\n",
+         Strength = {}\n\
+         \n\
+         [Game]\n\
+         ; The route map's cells. The original lets you jump to a story point\n\
+         ; only while you are in the run that passed it: every other cell is\n\
+         ; charted but dead, and the chart the title's Load screen opens has\n\
+         ; no live cell at all.\n\
+         ;\n\
+         ; On, any story point you have ever unlocked can be picked, from\n\
+         ; either chart. A point this run did not pass has no saved state to\n\
+         ; restore, so your flags and counters are carried into it as they\n\
+         ; stand — and from the title, as a new run starts them. `off` is the\n\
+         ; shipped rule exactly.\n\
+         FreeRouteMap = on\n",
         VideoScaler::NAMES,
         DEFAULT_FILTERS,
         DEFAULT_FILTERS_AFTER,
