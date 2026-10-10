@@ -1291,6 +1291,21 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
             // and the next press starts from a clear flag.
             player.skip_flag = false;
         }
+        // `_SelectReadCheck@0`, which `FUN_00438de0` calls as a replay's
+        // `[SetSELECT]` is parsed: for each of this step's three columns,
+        // whether the script that column branches to has been read. It is
+        // sampled here rather than at the statement because nothing inside a
+        // script can move it — a replay marks nothing read, its end-of-script
+        // block taking `_GetNextChapter@8` and never reaching host `+0x1c`.
+        //
+        // The store is the one host `+0x18` reads. `Progress` owns the live
+        // copy and every mark goes into it; where there is no branch graph
+        // there is no `Progress`, and the store loaded at startup is then the
+        // whole of it.
+        let select_read = replaying.as_ref().map(|(run, step)| {
+            let store = progress.as_ref().map_or(&player.flags, |p| p.global());
+            run.read_columns(*step, &|script| store.flag(script))
+        });
         canvas
             .window_mut()
             .set_title(&format!("DaysEngine — {name}"))?;
@@ -1302,6 +1317,7 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
             script,
             &start,
             progress.as_mut(),
+            select_read,
         )?;
         canvas.window_mut().set_title("DaysEngine")?;
         // Playback has been left, whichever way. Host `+0x100` (`FUN_0042a500`,
@@ -3130,6 +3146,7 @@ fn to_screen(
 }
 
 /// Plays one script to its end, or until the player quits.
+#[allow(clippy::too_many_arguments)]
 fn run_script(
     player: &mut Player,
     canvas: &mut Canvas<Window>,
@@ -3138,6 +3155,7 @@ fn run_script(
     script: Script,
     start_ini: &Ini,
     mut progress: Option<&mut Progress>,
+    select_read: Option<[bool; 3]>,
 ) -> Result<Outcome> {
     player.mixer.stop_all();
     // Nothing carries over from the last script: `FUN_004236f0` clears the
@@ -3868,7 +3886,29 @@ fn run_script(
         // the player: an ignored choice still resolves when its window runs out.
         match (&visual.select, &mut choice) {
             (Some(window), None) => {
-                let pending = Choice::new(window.a, window.b, window.start, window.end);
+                let mut pending = Choice::new(window.a, window.b, window.start, window.end);
+                // `FUN_00438de0`'s `[SetSELECT]` arm asks host `+0x104`
+                // whether a replay scene is playing and, when it is, calls
+                // `_SelectReadCheck@0` — so a replay's box knows from the
+                // moment it is parsed which of its columns the player may
+                // answer with.
+                if let Some(cells) = select_read {
+                    let names = ["declining", "the first label", "the second label"];
+                    log::info!(
+                        "this is a replay, so the box can be answered by {}",
+                        match cells
+                            .iter()
+                            .zip(names)
+                            .filter_map(|(open, name)| open.then_some(name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                        {
+                            open if open.is_empty() => "nothing the player has read".to_string(),
+                            open => open,
+                        }
+                    );
+                    pending = pending.in_replay(cells);
+                }
                 match Select::load(
                     player.vfs,
                     player.film,

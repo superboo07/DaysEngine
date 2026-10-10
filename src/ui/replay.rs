@@ -107,6 +107,8 @@
 //! takes the column as an argument instead of asking the host — so the three
 //! columns are the three outcomes of a single box; and it treats a cell of 0 as
 //! *no option*, skipping the per-script check it runs on every other value.
+//! That export is what gates a replay's choice box — see
+//! [`Run::read_columns`] and [`crate::ui::select::Choice::tick`].
 //! And the retail data: over all fourteen tables, 115 rows, columns 1 and 2
 //! hold 0 for exactly the rows whose script raises no box and hold a real step
 //! for exactly the rows whose script raises one.
@@ -486,12 +488,66 @@ impl Run {
     /// looks up is the list's NULL terminator — which is what an index equal to
     /// the list's length is.
     pub fn next(&self, step: usize, choice: i32) -> Option<usize> {
-        let next = match self.branch.as_ref().and_then(|table| table.get(step)) {
-            Some(row) => *row.get(column(choice))?,
-            None => i32::try_from(step).ok()?.checked_add(1)?,
-        };
-        let next = usize::try_from(next).ok()?;
+        let next = usize::try_from(self.target(step, column(choice))?).ok()?;
         (next < self.scripts.len()).then_some(next)
+    }
+
+    /// `FUN_1001ee20`: the table value one step's column holds.
+    ///
+    /// A scene with a table reads `table[step][column]` — `step * 0xc +
+    /// column * 4` — and every other scene takes the `default` arm, which is
+    /// `step + 1` and ignores the column entirely. So the three columns of a
+    /// tableless scene are one value, and whatever a box there settles on, the
+    /// scene plays down its list.
+    fn target(&self, step: usize, column: usize) -> Option<i32> {
+        match self.branch.as_ref().and_then(|table| table.get(step)) {
+            Some(row) => row.get(column).copied(),
+            None => i32::try_from(step).ok()?.checked_add(1),
+        }
+    }
+
+    /// Which of a step's three columns a replay will let the player answer
+    /// with: the three cells `_SelectReadCheck@0` fills and
+    /// `_GetSelectRead@4` answers out of.
+    ///
+    /// `FUN_1001f1e0` is that export. For each column of the step now playing
+    /// it asks `FUN_1001ee20(this, 0, column)` — the arm that takes the column
+    /// as an argument instead of asking the host for the step's own answer —
+    /// and stores one cell per column into `SceneView + 0x2c8 + column * 4`:
+    ///
+    /// ```text
+    /// step = FUN_1001ee20(this, 0, column)
+    /// if step == 0  cell = 0                      a cell of 0 is "no option"
+    /// else          cell = FUN_1001ed40(this, step)
+    /// ```
+    ///
+    /// `FUN_1001ed40` looks `step` up in the scene's own name table — the same
+    /// `+0x2a8` scene and `+0x2b4` version indices `FUN_1001f0d0` uses for
+    /// `_GetNextChapter@8`, so it is the name the scene would play — and hands
+    /// it to host slot `+0x18`, which is the global store's getter
+    /// (`FUN_00428770`: a lookup in the map at host `+0x10`, coerced to
+    /// `VT_BOOL` through `VariantChangeType`). That is the per-script read
+    /// record, so a cell is "the player has read the script this column
+    /// branches to". A NULL name — the list's terminator, which is what an
+    /// index at or past the end of the list reads — answers 0, so a column
+    /// that ends the scene is never readable.
+    ///
+    /// `read` is that record. The engine asks it with the name as the scene's
+    /// list spells it, which is the spelling the record is filed under — see
+    /// [`crate::install::progress::Progress::global`].
+    pub fn read_columns(&self, step: usize, read: &dyn Fn(&str) -> bool) -> [bool; 3] {
+        let mut cells = [false; 3];
+        for (column, cell) in cells.iter_mut().enumerate() {
+            let target = self.target(step, column).unwrap_or(0);
+            if target == 0 {
+                continue;
+            }
+            *cell = usize::try_from(target)
+                .ok()
+                .and_then(|step| self.script(step))
+                .is_some_and(read);
+        }
+        cells
     }
 
     /// A walk's steps resolved to the scripts they play, with their answers.
@@ -1912,6 +1968,62 @@ mod tests {
         assert_eq!(plain.next(0, 1), Some(1));
         assert_eq!(plain.next(2, 0), Some(3));
         assert_eq!(plain.next(3, 0), None);
+    }
+
+    /// `FUN_1001f1e0` + `FUN_1001ed40`: a column is readable when the script
+    /// it branches to has been read, a cell of 0 is no option at all, and a
+    /// column that ends the scene reads the list's NULL terminator and answers
+    /// 0 too.
+    #[test]
+    fn a_columns_readability_is_the_read_record_of_the_script_it_branches_to() {
+        // Scene 1's first two rows: a two-label box, then a one-label box
+        // whose second column is the 0 nothing can reach.
+        let scripts: Vec<String> = ["J03", "J04", "J05", "J06"]
+            .iter()
+            .map(|n| format!("02/02-2K-{n}"))
+            .collect();
+        let run = Run {
+            scripts,
+            branch: Some(vec![[3, 1, 2], [3, 2, 0], [4, 0, 0], [4, 0, 0]]),
+        };
+        let read = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| format!("02/02-2K-{n}")).collect();
+            move |script: &str| names.iter().any(|name| name == script)
+        };
+
+        // Everything read: the step's three real targets are all answerable.
+        assert_eq!(
+            run.read_columns(0, &read(&["J04", "J05", "J06"])),
+            [true, true, true]
+        );
+        // Only the first label's branch read, so that is the only answer the
+        // box takes — not even declining it is allowed.
+        assert_eq!(run.read_columns(0, &read(&["J04"])), [false, true, false]);
+        // The 0 in the one-label box's second column is no option and is
+        // never readable, whatever the first script's record says: the player
+        // has read `J03`, and the cell still answers false.
+        assert_eq!(
+            run.read_columns(1, &read(&["J02", "J03", "J05"])),
+            [false, true, false]
+        );
+        // A column that ends the scene — index 4 against a four-script list —
+        // lands on the terminator, which answers 0.
+        assert_eq!(
+            run.read_columns(2, &read(&["J03", "J04", "J05", "J06"])),
+            [false, false, false]
+        );
+
+        // A tableless scene takes the `default` arm, which ignores the column:
+        // all three cells are the next script down the list, so a box there is
+        // answerable every way or no way at all.
+        let plain = Run {
+            branch: None,
+            ..run
+        };
+        assert_eq!(plain.read_columns(0, &read(&["J04"])), [true; 3]);
+        assert_eq!(plain.read_columns(0, &read(&["J03"])), [false; 3]);
+        // And the last step's next script is the terminator.
+        assert_eq!(plain.read_columns(3, &read(&["J03", "J06"])), [false; 3]);
     }
 
     /// Scene 16's own shape, which is the case the per-script column settles:

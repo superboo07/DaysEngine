@@ -36,10 +36,12 @@
 //!
 //! # Whose answer it is
 //!
-//! Three things can answer instead of the player, and all three are in the tick:
-//! the auto flag turns a timeout into a *random* pick, a replay overrides the
-//! pick with what was recorded, and the host's `+0x98` member replaces it
-//! outright. See [`Choice::tick`].
+//! Two things answer instead of the player and one takes an answer away, and
+//! all three are in the tick: the auto flag turns a timeout into a *random*
+//! pick, the host's `+0x98` member — the play-data list following a save —
+//! replaces whatever the window produced with the answer that save recorded,
+//! and a **replay** refuses any answer whose branch the player has not read.
+//! See [`Choice::tick`].
 //!
 //! # An answered box fades; it does not vanish
 //!
@@ -598,6 +600,9 @@ pub struct Choice {
     pointer: Option<(f64, f64)>,
     /// Set the frame the box goes up, so it goes up once.
     raised: bool,
+    /// The three cells `_SelectReadCheck@0` filled when this box was armed, or
+    /// `None` when no replay scene is playing — see [`Choice::in_replay`].
+    select_read: Option<[bool; 3]>,
     decided: Option<Option<usize>>,
     /// The frame the answer settled on, which is what the fade counts from.
     /// `FUN_0044ddd0` stores it into every box as `entry+0x4c`.
@@ -624,6 +629,7 @@ impl Choice {
             highlight: None,
             pointer: None,
             raised: false,
+            select_read: None,
             decided: None,
             decided_at: None,
         }
@@ -631,6 +637,44 @@ impl Choice {
 
     pub fn count(&self) -> usize {
         self.labels.len()
+    }
+
+    /// Arms the box with what `_SelectReadCheck@0` found, which is what makes
+    /// it a replay's box rather than an ordinary one.
+    ///
+    /// `readable` is that export's three cells, by column: whether the script
+    /// the column branches to has been read — see
+    /// [`crate::ui::replay::Run::read_columns`]. The answer a column carries
+    /// is the cell's index less one, so cell 0 is the box declined and cells 1
+    /// and 2 are its two labels.
+    ///
+    /// The original samples them here and not in the tick: `FUN_00438de0`
+    /// parses `[SetSELECT]`, and the last thing its arm does is ask host slot
+    /// `+0x104` whether a replay scene is playing and, when it is, call
+    /// `_SelectReadCheck@0` — once, for the step now playing. Nothing moves
+    /// the cells after that, because a replay marks nothing read: the
+    /// end-of-script block takes `_GetNextChapter@8` and never reaches host
+    /// `+0x1c`.
+    #[must_use]
+    pub fn in_replay(mut self, readable: [bool; 3]) -> Choice {
+        self.select_read = Some(readable);
+        self
+    }
+
+    /// `_GetSelectRead@4(answer + 1)`: whether an answer's own column is one
+    /// the player may give.
+    ///
+    /// `FUN_1001f250` reads cell `answer + 1` — so a declined box, which is
+    /// `-1`, asks about cell 0, the column the scene takes when no box
+    /// settles. A box with no cells is not a replay's and refuses nothing.
+    fn readable(&self, answer: Option<usize>) -> bool {
+        let Some(cells) = self.select_read else {
+            return true;
+        };
+        cells
+            .get(answer.map_or(0, |index| index + 1))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Whether the box should be on screen at `frame`.
@@ -744,22 +788,33 @@ impl Choice {
     /// player's own answer wins, and the caller drops the flag when that
     /// happens.
     ///
-    /// # What a replay adds, and this does not have
+    /// # What a replay adds
     ///
     /// Host slot `+0x104` is "a replay scene is playing" — it is the same slot
     /// `FUN_00424020` tests to decide between `_GetNextChapter@8` and the route
-    /// graph — and `FUN_00431740` reads it twice more when it is set. A live
-    /// pick is **refused**, as though nothing had been pressed, unless
-    /// `_GetSelectRead@4(answer + 1)` is non-zero; and a spent window's answer
-    /// goes through `FUN_0043f3b0`, which keeps it if that column is readable
-    /// and otherwise draws at random among the columns that are, or answers -2
-    /// — no answer at all — when none is. `_GetSelectRead@4` is the menu
-    /// module's `FUN_1001f250`, reading the three cells `_SelectReadCheck@0`
-    /// (`FUN_1001f1e0`) fills with host `+0x18`'s "has this script been read"
-    /// for the script each column branches to, and a column holding 0 is
-    /// filled in as not readable. **None of that is implemented here**: this
-    /// engine lets every column be answered in a replay. The two exports the
-    /// module needs for it do not exist on this side yet.
+    /// graph — and `FUN_00431740` reads it in both of its branches when it is
+    /// set, to refuse an answer whose branch the player has not read. Which
+    /// columns those are is [`Choice::in_replay`]'s three cells, and the two
+    /// refusals are not the same:
+    ///
+    /// - a **live** pick is thrown away as though nothing had been pressed —
+    ///   `local_c = -2` — so the box stays up and the window stays live. The
+    ///   test is `local_c != -2 && _GetSelectRead@4(local_c + 1) == 0`, and a
+    ///   refusal to answer is `local_c = -1`, cell 0, so a box can no more be
+    ///   declined towards an unread branch than taken towards one;
+    /// - a **spent** window's answer goes through `FUN_0043f3b0`, which keeps
+    ///   it if its own column is readable and otherwise draws at random among
+    ///   the columns that are — `srand(GetTickCount()); rand() % open.len()`,
+    ///   and the answer is `column - 1`. With none readable it answers -2,
+    ///   which `FUN_00431740`'s `-2 < local_c` guard refuses outright: nothing
+    ///   is stored, no label is marked, no sound plays, and because the box is
+    ///   still unanswered the spent window is drawn again on the next frame
+    ///   and every frame after it. The scene then walks column 0, which is
+    ///   where a box that never settles leaves it.
+    ///
+    /// `recorded` is applied **after** both, so an answer from host `+0x98`
+    /// passes the gate whatever the cells say — that is the order the tick is
+    /// written in, not an exemption this engine added.
     pub fn tick(
         &mut self,
         frame: Frame,
@@ -784,11 +839,18 @@ impl Choice {
         }
 
         if Frame(frame.0 + 1) < self.end {
-            match self.poll(select, input) {
-                Poll::Undecided => Event::Nothing,
-                Poll::Chosen(index) => self.settle(Some(index), frame),
-                Poll::Cancelled => self.settle(None, frame),
+            let answer = match self.poll(select, input) {
+                Poll::Undecided => return Event::Nothing,
+                Poll::Chosen(index) => Some(index),
+                Poll::Cancelled => None,
+            };
+            // A replay refuses an answer whose branch the player has not read,
+            // and refuses it the way nothing-was-pressed is refused: the box
+            // stays up, the window stays live, and the next frame polls again.
+            if !self.readable(answer) {
+                return Event::Nothing;
             }
+            self.settle(answer, frame)
         } else {
             // The window is spent. Skipping draws one of `count + 1` answers,
             // the extra one being "no answer"; otherwise there is no answer.
@@ -798,14 +860,29 @@ impl Choice {
             } else {
                 None
             };
+            // In a replay the answer is then put through `FUN_0043f3b0`,
+            // which keeps it, redraws it among the readable columns, or
+            // answers "nothing at all".
+            let gated = match self.select_read {
+                Some(cells) => redraw(cells, picked, random),
+                None => Some(picked),
+            };
             // And a recorded answer replaces it outright. The store only ever
             // holds an index a box of this script settled on, so a value with
-            // no label to mark is a decline like any other negative one.
+            // no label to mark is a decline like any other negative one. It is
+            // applied after the gate above, which is why it is not subject to
+            // it.
             let picked = match recorded {
-                Some(answer) => usize::try_from(answer).ok().filter(|a| *a < self.count()),
-                None => picked,
+                Some(answer) => Some(usize::try_from(answer).ok().filter(|a| *a < self.count())),
+                None => gated,
             };
-            self.settle(picked, frame)
+            match picked {
+                Some(picked) => self.settle(picked, frame),
+                // `FUN_0043f3b0` answered -2 with no column to redraw to, and
+                // the `-2 < local_c` guard below it stores nothing. The box is
+                // still live, so this runs again next frame and draws again.
+                None => Event::Nothing,
+            }
         }
     }
 
@@ -865,6 +942,38 @@ impl Choice {
             None => Event::Decided(-1, SystemSe::Cancel),
         }
     }
+}
+
+/// `FUN_0043f3b0`: a spent window's answer, put through a replay's gate.
+///
+/// `cells` is `_SelectReadCheck@0`'s three columns and `answer` the answer the
+/// window produced, `None` for a decline. The shipped function keeps the
+/// answer when `_GetSelectRead@4(answer + 1)` is non-zero; otherwise it
+/// collects every cell of `0..3` that is readable and, if there is one, seeds
+/// `srand` from `GetTickCount` and takes `rand() % open.len()` of them, giving
+/// back that column less one. With none readable it answers -2, which is the
+/// `None` here: no answer at all, which the caller's guard refuses.
+///
+/// `random` is the draw, as a parameter so it can be tested — the same one
+/// [`Choice::tick`] hands the skipping draw.
+fn redraw(
+    cells: [bool; 3],
+    answer: Option<usize>,
+    random: &mut dyn FnMut(usize) -> usize,
+) -> Option<Option<usize>> {
+    if cells
+        .get(answer.map_or(0, |index| index + 1))
+        .copied()
+        .unwrap_or(false)
+    {
+        return Some(answer);
+    }
+    let open: Vec<usize> = (0..cells.len()).filter(|cell| cells[*cell]).collect();
+    if open.is_empty() {
+        return None;
+    }
+    let column = open[random(open.len()) % open.len()];
+    Some((column > 0).then(|| column - 1))
 }
 
 /// What a frame of [`Choice::tick`] produced, with the sound it owes.
@@ -1359,6 +1468,143 @@ mod tests {
         assert_eq!(
             c.tick(Frame(1), &s, Input::default(), false, &mut rng, Some(1)),
             Event::Decided(-1, SystemSe::Cancel)
+        );
+    }
+
+    /// A replay refuses a live answer whose branch the player has not read:
+    /// `FUN_00431740` sets `local_c` back to -2, which is the same -2 as
+    /// nothing having been pressed, so the box stays up and the window stays
+    /// live.
+    #[test]
+    fn a_replay_refuses_a_live_pick_towards_an_unread_branch() {
+        let s = split(Layout::Sideways, 2);
+        let mut rng = |_: usize| 0;
+        let on_the_right = Input {
+            pointer: Some((0.75, 0.5)),
+            pick: true,
+            ..Input::default()
+        };
+        // Cell 2 is the second label's column, and it is the only one read.
+        let mut c =
+            Choice::new("a", Some("b"), Frame(0), Frame(100)).in_replay([false, false, true]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, on_the_right, false, &mut rng, None),
+            Event::Decided(1, SystemSe::Select)
+        );
+
+        // The first label branches to a script this player has not read, so
+        // pressing it does nothing at all — no answer, no sound, and the box
+        // is still live on the frame after.
+        let on_the_left = Input {
+            pointer: Some((0.25, 0.5)),
+            ..on_the_right
+        };
+        let mut c =
+            Choice::new("a", Some("b"), Frame(0), Frame(100)).in_replay([false, false, true]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, on_the_left, false, &mut rng, None),
+            Event::Nothing
+        );
+        assert_eq!(c.decision(), None);
+        assert_eq!(
+            c.tick(Frame(2), &s, on_the_right, false, &mut rng, None),
+            Event::Decided(1, SystemSe::Select)
+        );
+
+        // Declining asks about cell 0, so a box can no more be refused
+        // towards an unread branch than taken towards one.
+        let cancelling = Input {
+            cancel: true,
+            ..Input::default()
+        };
+        let mut c =
+            Choice::new("a", Some("b"), Frame(0), Frame(100)).in_replay([false, false, true]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, cancelling, false, &mut rng, None),
+            Event::Nothing
+        );
+        let mut c =
+            Choice::new("a", Some("b"), Frame(0), Frame(100)).in_replay([true, false, false]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, cancelling, false, &mut rng, None),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+    }
+
+    /// `FUN_0043f3b0` on a spent window: the answer stands where its own
+    /// column is readable, and is otherwise redrawn among the columns that
+    /// are.
+    #[test]
+    fn a_spent_window_is_redrawn_among_the_columns_a_replay_allows() {
+        let s = split(Layout::Sideways, 2);
+
+        // The window runs out with no answer, which is -1 and cell 0. With
+        // cell 0 readable that stands.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2)).in_replay([true, false, false]);
+        let mut rng = |_: usize| panic!("the answer's own column was readable");
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, None),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+
+        // With it unreadable, the draw is over the two columns that are, and
+        // the answer is the column it lands on, less one.
+        for (draw, expected) in [(0usize, 0i32), (1, 1)] {
+            let mut c =
+                Choice::new("a", Some("b"), Frame(0), Frame(2)).in_replay([false, true, true]);
+            let mut rng = |n: usize| {
+                assert_eq!(n, 2);
+                draw
+            };
+            c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+            assert_eq!(
+                c.tick(Frame(1), &s, Input::default(), false, &mut rng, None),
+                Event::Decided(expected, SystemSe::Select)
+            );
+        }
+
+        // And a skipping draw that lands on an unreadable column is redrawn
+        // too, rather than being taken for an answer.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2)).in_replay([true, false, false]);
+        let mut rng = |n: usize| if n == 3 { 2 } else { 0 };
+        c.tick(Frame(0), &s, Input::default(), true, &mut rng, None);
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), true, &mut rng, None),
+            Event::Decided(-1, SystemSe::Cancel)
+        );
+    }
+
+    /// With no column readable `FUN_0043f3b0` answers -2, and the `-2 <
+    /// local_c` guard stores nothing: the box is left unanswered and the spent
+    /// window is drawn again every frame after.
+    #[test]
+    fn a_spent_window_with_nothing_readable_settles_nothing() {
+        let s = split(Layout::Sideways, 2);
+        let mut rng = |_: usize| panic!("there was no readable column to draw among");
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2)).in_replay([false; 3]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, None);
+        for frame in 1..5 {
+            assert_eq!(
+                c.tick(Frame(frame), &s, Input::default(), false, &mut rng, None),
+                Event::Nothing
+            );
+            assert_eq!(c.decision(), None);
+            // Unanswered, so the box has not started to fade.
+            assert_eq!(c.label_colour(0, Frame(frame)), Some(LABEL_PLAIN));
+        }
+
+        // A recorded answer is applied after the gate, so it settles the box
+        // the gate would not.
+        let mut c = Choice::new("a", Some("b"), Frame(0), Frame(2)).in_replay([false; 3]);
+        c.tick(Frame(0), &s, Input::default(), false, &mut rng, Some(1));
+        assert_eq!(
+            c.tick(Frame(1), &s, Input::default(), false, &mut rng, Some(1)),
+            Event::Decided(1, SystemSe::Select)
         );
     }
 

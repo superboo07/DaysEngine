@@ -3868,18 +3868,81 @@ of its branches:
   answers `-2`, which the `-2 < local_c` guard below refuses: nothing is
   stored, no sound plays, and the spent window is rolled again next frame.
 
-`_GetSelectRead@4` is the menu module's `FUN_1001f250`, reading the three cells
-at `SceneView + 0x2c8` that `_SelectReadCheck@0` (`FUN_1001f1e0`) fills. That
-one asks `FUN_1001ee20(this, 0, column)` for each column of the step now
-playing — the arm that takes the column as an argument instead of asking the
-host — and stores, for each, host `+0x18`'s answer for the script that column
-branches to: whether the player has read it. A cell holding 0 is "no option"
-and is filled in as not readable, which is the same 0 the branch tables use for
-a column no step can reach.
+A refusal to answer is `local_c = -1`, which asks about cell 0, so a box can no
+more be *declined* towards an unread branch than taken towards one. And the
+gate is not the last word on the answer: the recorded answer from host `+0x98`
+(`FUN_00428a80`) is applied **after** `FUN_0043f3b0` and overwrites whatever it
+produced, so an answer the play-data list supplies is never tested against
+`_GetSelectRead@4` at all.
 
-**This engine does not implement that gate**: every column can be answered in a
-replay here. The two exports it needs, `_SelectReadCheck@0` and
-`_GetSelectRead@4`, have no engine-side caller yet.
+`_GetSelectRead@4` is the menu module's `FUN_1001f250`, a one-argument read of
+`SceneView + 0x2c8 + n * 4` — the three cells `_SelectReadCheck@0`
+(`FUN_1001f1e0`) fills. That one asks `FUN_1001ee20(this, 0, column)` for each
+column of the step now playing — the arm that takes the column as an argument
+instead of asking the host — and stores, for each, the answer for the script
+that column branches to:
+
+```text
+for col in 0..3:
+    step = FUN_1001ee20(this, 0, col)
+    if step == 0:  cell[col] = 0                  a cell of 0 is "no option"
+    else:          cell[col] = FUN_1001ed40(this, step)
+```
+
+`FUN_1001ed40` reads the name at `step` out of the scene's own name table —
+the same `+0x2a8` scene and `+0x2b4` version indices `FUN_1001f0d0` uses for
+`_GetNextChapter@8`, so it is the name the scene would play — and hands it to
+host slot `+0x18`. That slot is `FUN_00428770`: a lookup in the map at host
+`+0x10` coerced to `VT_BOOL` through `VariantChangeType` (`OLEAUT32` ordinal
+12), which is the global store and the per-script read record described under
+*The per-script read record*. So a cell is "the player has read the script this
+column branches to". A NULL name answers 0, and the name table's terminator is
+what an index at or past the end of the list reads — so **a column that ends
+the scene is never readable**. A cell holding 0 is not readable either, which
+is the same 0 the branch tables use for a column no step can reach.
+
+Two further things follow from the tables themselves, and both were checked
+against the shipped data (a raw read of the fourteen tables out of the DLL's
+`.data`, beside the engine's own recovery of them):
+
+- **no cell is negative.** The end of a scene is written as an index at or past
+  the end of the list — 8 in an eight-script scene — never as -1. So
+  `FUN_1001ed40` is never handed a negative index and never reads behind the
+  name table.
+- **every column a box can actually settle on holds a real step.** The 0 cells
+  are exactly the columns no box reaches: `02-2K-J04`'s row is `(3, 2, 0)` and
+  its `[SetSELECT]` has one label, so answer 1 — cell 2 — cannot happen. A
+  reachable column therefore always names a script, and whether it is readable
+  is the player's record and nothing else.
+
+A tableless scene is the `default` arm of `FUN_1001ee20`, which is `step + 1`
+and ignores the column, so its three cells are one value: a box in such a scene
+is answerable every way or no way at all, and the last step of one is no way,
+because `step + 1` is the terminator.
+
+**The cells are sampled when the box is armed, not when it is polled.**
+`_SelectReadCheck@0` has one caller: `FUN_00438de0` at `0x0043b173`, the
+statement parser's `[SetSELECT]` arm — the same arm that reads the four fields
+into the box's start frame (`+0x11c`), its two labels (`+0x60`, `+0x98`, the
+second only when it is neither `NULL` nor `null`) and its end frame (`+0x120`).
+The last thing the arm does is ask host `+0x104` whether a replay scene is
+playing and, when it is, call the export, once, for the step now playing.
+Nothing moves the cells afterwards, because **a replay marks nothing read**:
+its end-of-script block takes `_GetNextChapter@8` and never reaches the host
+`+0x1c` that writes the record — see the replay gate in the table under *The
+per-script read record*.
+
+**This engine implements the gate.** `Run::read_columns` is
+`_SelectReadCheck@0`, `Choice::in_replay` arms a box with its three cells —
+where the original samples them, in `FUN_00438de0` — and `Choice::tick` holds
+both refusals, `FUN_0043f3b0` included. `daysengine replay` marks each branch
+column with `*` when this install's own record makes it answerable.
+
+The **exporter** is not gated, and that is the shipped order rather than a
+liberty: `daysengine export` hands a walk's answer to the box as host `+0x98`'s
+recorded answer, which the tick applies after `FUN_0043f3b0`. Every walk of a
+scene therefore encodes, including the ones a player could not answer their way
+to without reading the branch first.
 
 **An answered box fades out; it does not vanish.** Each label lives at
 `box + 0x128 + n * 0x50` and carries its own state in `entry + 0x44`, a colour

@@ -1398,6 +1398,15 @@ impl Exporter<'_> {
     /// it a real player clicks, is not something the shipped code decides.
     /// Answering on the spent frame is the one moment the code does decide.
     ///
+    /// **A replay's read gate does not apply here**, and that is the shipped
+    /// order rather than a liberty this tool takes: `FUN_00431740` puts a
+    /// spent window's answer through `FUN_0043f3b0` — the gate — and *then*
+    /// replaces it with host `+0x98`'s recorded answer, so an answer that
+    /// arrives the way this one does is never tested against
+    /// `_GetSelectRead@4`. Every walk of a scene therefore exports, including
+    /// the ones a player could not answer their way to without having read
+    /// the branch first. See [`crate::ui::select::Choice::tick`].
+    ///
     /// The box belongs to the script, so the script ending cuts whatever is
     /// left of the ramp — a film object per script is a `Choice` per script,
     /// see [`crate::ui::replay`]. The shipped scripts are written to it:
@@ -3603,7 +3612,7 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
                     .join(" -> ")
             );
         }
-        print_branch("        ", scene.branch.as_ref(), &scene.scripts);
+        print_branch("        ", scene.branch.as_ref(), &scene.scripts, &flags);
         for choice in &scene.choices {
             println!(
                 "        version {:<14} {}  {}",
@@ -3629,6 +3638,7 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
                 "                                       ",
                 choice.branch.as_ref(),
                 &choice.scripts,
+                &flags,
             );
         }
     }
@@ -3637,12 +3647,21 @@ fn cmd_replay(game: &Path, only_unlocked: bool) -> Result<()> {
     Ok(())
 }
 
-/// Prints the branch table a scene or one of its versions walks.
+/// Prints the branch table a scene or one of its versions walks, and which of
+/// each row's columns this install's read record lets a replay answer with.
 ///
 /// A row is the three next steps a step can lead to — the first for a player
 /// who has answered no choice box, the other two for the two answers — and a
-/// step past the end of the list is where the scene stops.
-fn print_branch(indent: &str, branch: Option<&crate::ui::replay::Branch>, scripts: &[String]) {
+/// step past the end of the list is where the scene stops. A column marked `*`
+/// is one `_SelectReadCheck@0` finds readable, which is the only kind a replay
+/// accepts an answer towards: see
+/// [`crate::ui::replay::Run::read_columns`].
+fn print_branch(
+    indent: &str,
+    branch: Option<&crate::ui::replay::Branch>,
+    scripts: &[String],
+    flags: &crate::install::save::FlagStore,
+) {
     let Some(table) = branch else {
         return;
     };
@@ -3653,13 +3672,23 @@ fn print_branch(indent: &str, branch: Option<&crate::ui::replay::Branch>, script
         Some(script) => script.rsplit('/').next().unwrap_or(script).to_string(),
         None => "end".to_string(),
     };
-    println!("{indent}branch  none / first / second");
+    let run = crate::ui::replay::Run {
+        scripts: scripts.to_vec(),
+        branch: Some(table.clone()),
+    };
+    println!("{indent}branch  none / first / second   (* = readable, so answerable in a replay)");
     for (step, row) in table.iter().enumerate() {
+        let readable = run.read_columns(step, &|script| flags.flag(script));
         println!(
             "{indent}  {:<14} {}",
             name(step as i32),
             row.iter()
-                .map(|next| name(*next))
+                .zip(readable)
+                .map(|(next, readable)| format!(
+                    "{}{}",
+                    name(*next),
+                    if readable { "*" } else { "" }
+                ))
                 .collect::<Vec<_>>()
                 .join(" / ")
         );
