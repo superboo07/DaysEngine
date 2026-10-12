@@ -75,16 +75,10 @@
     }
   },
 
-  // **Runs on the host, before the container exists.** Compose looks for .env
-  // beside the compose file; this project keeps it at the top of the tree, where
-  // .vscode/launch.json and a plain shell can read the same one. The link is
-  // made rather than the file copied, so there is still exactly one .env and it
-  // cannot drift -- and it is only made when there is something to link to, so a
-  // fresh clone with no .env yet gets no dangling symlink (compose then falls
-  // back to /var/empty, which is the designed answer for "no install").
-  //
-  // Both paths are gitignored by the `*.env` rule, so neither is ever committed.
-  "initializeCommand": "bash -c '[ -f .env ] && ln -sfn ../.env .devcontainer/.env || true'",
+  // Runs on the host before the container exists: links .env beside the
+  // compose file and builds the image. initialize.sh says why compose does
+  // not build it itself.
+  "initializeCommand": "bash .devcontainer/initialize.sh",
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   "waitFor": "postCreateCommand"

@@ -10,9 +10,11 @@
 # than the runtime creating an empty directory where the game was meant to be.
 services:
   dev:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Built by initialize.sh on the host, not by compose -- see the comment
+    # there for why a `build:` section here breaks the Dev Containers build.
+    # Outside VS Code, run .devcontainer/initialize.sh before `compose up`.
+    image: daysengine-devcontainer:latest
+    pull_policy: never
     command: sleep infinity
     init: true
 

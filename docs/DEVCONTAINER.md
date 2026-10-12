@@ -51,8 +51,13 @@ unset falls back to an empty directory, so the container still comes up and
 directory where the game was meant to be.
 
 Compose looks for `.env` beside the compose file, so `devcontainer.json`'s
-`initializeCommand` links the real one into `.devcontainer/` on the host before
-the container is built. There is still exactly one `.env`, and both paths are
+`initializeCommand` (`.devcontainer/initialize.sh`) links the real one into
+`.devcontainer/` on the host before the container is built. The same script
+builds the image with a plain `docker build`: compose 5 builds through buildx
+bake, which refuses the Dockerfile the Dev Containers CLI generates in `/tmp`
+whenever the service has a `build:` section, so the service names a prebuilt
+`daysengine-devcontainer:latest` instead. Outside VS Code, run that script before
+`docker compose up`. There is still exactly one `.env`, and both paths are
 gitignored.
 
 `DAYS_GAME_DIR` and `DAYS_SHINYDAYS_DIR` are also set *inside* the container, by
