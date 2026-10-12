@@ -22,3 +22,14 @@
 # The devcontainer's mount configuration: paths to the user's own installs.
 # .devcontainer/.env.example is the tracked half.
 *.env
+
+# What Gradle and an Android IDE write into android/ when they run without
+# tools/build-android.sh's --project-cache-dir (an IDE sync, a bare `gradle`):
+# per-project caches, the SDK path, project files. The script's own output
+# all lands under /target.
+/android/.gradle
+/android/.kotlin
+/android/.idea
+/android/local.properties
+/android/**/*.iml
+/android/**/.cxx
