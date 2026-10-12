@@ -32,6 +32,7 @@ use crate::install::feeling::{self, Deltas, Thresholds};
 use crate::install::ini::Ini;
 use crate::install::save::{self, Mark, Slot};
 use crate::install::vfs::Vfs;
+use crate::ui::replay;
 use days_route::{Act, Context, Machine, Next, Routes};
 use days_save::{FlagStore, Value, Version};
 use std::path::Path;
@@ -89,8 +90,17 @@ struct Stores {
     /// The global store, out of `GlobalFlag.DAT`.
     global: FlagStore,
     thresholds: Thresholds,
-    /// The choice the player last made, or -1 when the box timed out. The
-    /// engine stores it and the DLL reads it through host slot `+0x04`.
+    /// The film object's `+0x1f8`, which the DLL reads through host slot
+    /// `+0x04`: the index a choice box settled on, -1 when the box was
+    /// dismissed or ran out of time (`FUN_0043f330`), and
+    /// [`replay::NO_CHOICE`] when this script has raised none, which is what
+    /// `FUN_004388c0` writes as each script's film object is built.
+    ///
+    /// Nothing that reads it tells the two negatives apart. Every route
+    /// handler of both titles' modules tests it against 0 and 1 and nothing
+    /// else, and the menu module folds both into column 0 — see
+    /// `docs/FORMATS.md`, *What the arms branch on*. It is spelled -2 here
+    /// because it is spelled -2 on the replay side, and it is one member.
     choice: i32,
 }
 
@@ -218,7 +228,7 @@ impl Progress {
             stores: Stores {
                 global,
                 thresholds: Thresholds::parse(&read("Ini/StanderdScript.ini")),
-                choice: -1,
+                choice: replay::NO_CHOICE,
                 ..Default::default()
             },
             marks: Default::default(),
@@ -574,7 +584,7 @@ impl Progress {
         };
         let played = swapped;
         self.script = played.clone();
-        self.stores.choice = -1;
+        self.stores.choice = replay::NO_CHOICE;
         log::info!("{}", {
             let (r, s) = self.position();
             format!("moved to ROUTE {r} SCENE {s}: {played}")
@@ -630,7 +640,7 @@ impl Progress {
         self.stores.save = FlagStore::default();
         self.marks.clear();
         self.choices.clear();
-        self.stores.choice = -1;
+        self.stores.choice = replay::NO_CHOICE;
         self.gauge_raised = false;
         self.script.clear();
         self.twin.clear();
@@ -668,7 +678,7 @@ impl Progress {
         self.stores.save = slot.store;
         self.marks = slot.marks;
         self.choices = slot.choices;
-        self.stores.choice = -1;
+        self.stores.choice = replay::NO_CHOICE;
         self.gauge_raised = false;
         self.script = slot.script.clone();
         // A slot carries the name the swap already produced, which is in no
@@ -739,7 +749,7 @@ impl Progress {
         self.twin.clear();
         self.new_radish = self.stores.save.flag(NEW_RADISH);
         self.marks.split_off(&name);
-        self.stores.choice = -1;
+        self.stores.choice = replay::NO_CHOICE;
         self.gauge_raised = false;
         let (route, scene) = self.position();
         log::info!("{name} puts the player at ROUTE {route} SCENE {scene}: {script}");
@@ -781,7 +791,7 @@ impl Progress {
         };
         self.script = script.clone();
         self.marks.split_off(name);
-        self.stores.choice = -1;
+        self.stores.choice = replay::NO_CHOICE;
         self.gauge_raised = false;
         log::info!(
             "{name} is ROUTE {route} SCENE {scene}, which this run never passed: \

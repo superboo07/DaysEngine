@@ -659,7 +659,9 @@ pub struct Walk {
 ///
 /// `FUN_004388c0` writes it into the film object's `+0x1f8` when the object is
 /// constructed, and a film object is constructed per script, so every script
-/// starts here.
+/// starts here. It is the same member the route module reads through host
+/// `+0x04`, so [`crate::install::progress::Progress`] starts every script here
+/// as well.
 pub const NO_CHOICE: i32 = -2;
 
 /// The column of a branch row the step's own choice box selects.

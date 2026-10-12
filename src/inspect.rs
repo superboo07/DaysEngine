@@ -4623,7 +4623,7 @@ fn cmd_route(game: &Path, name: Option<&str>, list_scenes: bool, edges: bool) ->
             struct Flags(bool);
             impl days_route::Context for Flags {
                 fn choice(&self) -> i32 {
-                    -1
+                    crate::ui::replay::NO_CHOICE
                 }
                 fn int(&self, _: &str) -> i32 {
                     0

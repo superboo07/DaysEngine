@@ -1112,7 +1112,13 @@ fn formats_sp(img: &Image, entry: u32) -> bool {
 
 /// What the engine has to answer for the branch graph to run.
 pub trait Context {
-    /// The choice the player just made, or -1 when there was none.
+    /// The choice the player just made: the index the box settled on, -1 when
+    /// it was dismissed or ran out of time, and -2 when the script raised no
+    /// box at all.
+    ///
+    /// No handler tells the two negatives apart. Every one of them tests this
+    /// against 0 and against 1 and nothing else, so both fall through every
+    /// test the same way.
     fn choice(&self) -> i32;
     /// An int in the save's variable store. An unset name reads 0.
     fn int(&self, name: &str) -> i32;

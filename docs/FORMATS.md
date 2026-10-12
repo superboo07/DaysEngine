@@ -6061,6 +6061,43 @@ The 25 counter comparisons are at exactly the 25 routes the affection work
 found independently, and the 13 gate sites resolve to exactly the 13 entries
 `StanderdScript.ini` declares.
 
+**The choice is only ever tested against 0 and 1.** Host `+0x04` answers the
+film object's `+0x1f8`, which holds -2 when the script raised no box
+(`FUN_004388c0`), -1 when a box was dismissed or ran out of time
+(`FUN_0043f330`), and otherwise the index it settled on — see *The column is the
+step's own answer*. No handler in either title's route module tells -2 from -1:
+
+- Ghidra's data flow. Every `call` through a register last loaded from
+  `[x + 0x4]`, or straight through `[x + 0x4]`, followed from the call's output
+  through every copy, phi and arithmetic op to each comparison, switch or
+  argument it reaches. `RouteProcSDHQ.dll` has 941 such sites; 937 feed one
+  `INT_EQUAL` against 0 or against 1 and nothing else, and the other four are
+  COM plumbing (`Release`, `_com_error`) whose result is unused.
+  `RouteProcSD.dll` has 1,154: 1,147 feed `== 0` or `== 1`, two feed `!= 1`
+  (`0x10017155`, `0x1001728f`), and five are unused — four of the same COM
+  calls, and `FUN_1004d8c0`, a `_SetFeeling@8` arm that asks for the choice
+  and then, at `SCENE` 0xb, credits the same script whatever the answer. No result
+  reaches arithmetic, a call argument or a store.
+- `crates/days-route`'s own walker, instrumented to report every call it
+  resolves to slot `+0x04` and every `test`, `cmp`, arithmetic op, jump,
+  argument push and store whose operand is that result, over every `SCENE`
+  of all three dispatching exports and the three ending exports. It reaches
+  exactly the same call sites as Ghidra — 937 in School Days HQ, 1,150 in
+  Shiny Days, the set identical — and finds only `test eax, eax` and
+  `cmp eax, 1`, each followed by `jne`.
+
+Both share one blind spot: a vtable offset computed into a register rather than
+written as a displacement, and no handler does that. The menu module's only
+reader, `FUN_1001ee20` (`FUN_1002bd00` in `SysMenuSD.dll`), does test for -2,
+but only to fold it: `column = (c == -2) ? 0 : c + 1` sends -2 and -1 to the
+same column 0. The executable reads the member through `FUN_0042c0c0` alone,
+which is reached only from that host slot (`FUN_0042c080` → `FUN_0042c0a0`);
+the other instructions at displacement `0x1f8` are libvorbis, libpng and the
+CRT, on objects of their own.
+
+So which negative the engine spells there cannot change a route. This engine
+spells "no box this script" -2 on both sides anyway, because it is one member.
+
 Two of those are not save data at all:
 
 - One `.data` word gates the per-route flag reset at 44 sites. `DllMain`
