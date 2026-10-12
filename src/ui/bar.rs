@@ -775,10 +775,18 @@ pub struct State {
     /// Widget 2 calls `+0x10c(0)` before either of its presses, so a restart
     /// or a rewind takes the message off. The engine's own writes of the flag
     /// are the zero `FUN_00423130` gives it and the clear at the end of
-    /// `FUN_00424020`; a scan of the executable finds no third.
+    /// `FUN_00424020`, both at `engine + 0x5c8`; `FUN_004281a0` is the only
+    /// one that writes an argument, at the subobject's `+0x59c`.
     ///
-    /// **What raises it is not recovered.** So this engine never sets it, and
-    /// the two widgets it gates are never disabled by it.
+    /// **Nothing in the retail build raises it.** `FUN_004281a0`'s one
+    /// reference is its vtable entry, so only a module can call it, and
+    /// widget 2's `(0)` is the only host `+0x10c` call in any of the four
+    /// binaries the install ships — the other ten in `SysMenuSDHQ.dll` are the
+    /// graphics device's render-state calls on the bar's `this+0x10`, not the
+    /// host at `this+0x14`. See `docs/FORMATS.md` for the two methods and
+    /// their blind spot. So `+0x110` always answers false: this engine never
+    /// sets the flag, and the two widgets it gates are never disabled by it,
+    /// which is what the original does rather than a gap in it.
     pub message: bool,
     /// Host `+0x88`: `FUN_00427490`. Required by widgets 5..9, and by nothing
     /// else on the strip.

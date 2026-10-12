@@ -2804,8 +2804,26 @@ bracket the 25 into the same twelve groups:
 script name at `engine + 0x188` that is empty or does not resolve in the packs
 — it returns 0 the moment the lookup through `+0x18` answers. Its one writer is
 host `+0x10c` (`FUN_004281a0`), which tests the same name and drops the rate to
-1x when it fails; widget 2 calls that with 0 before either of its presses. What
-*raises* the flag is not recovered, so DaysEngine never sets it.
+1x when it fails; widget 2 calls that with 0 before either of its presses.
+
+**Nothing in the retail build raises it.** `FUN_004281a0` writes its argument
+and has exactly one reference in the executable — its own vtable entry at
+`0x004d29a0` — so only a module can reach it, and the install ships four
+binaries to look in. In `SysMenuSDHQ.dll` there are eleven `mov reg, [reg +
+0x10c]` sites and ten of them are the graphics device's three-argument
+render-state calls on the bar's `this+0x10` (`FUN_1000bcf0` and the draw pass
+`FUN_10024ca0`, which take the host at `this+0x14` instead); the eleventh is
+`FUN_10025b90`'s, widget 2's, and it pushes 0. `RouteProcSDHQ.dll` and
+`DSETUP.dll` have none, and the executable's own 38 are its own objects, not a
+call back through the host vtable. Two methods agree: Ghidra's listing of every
+instruction at that displacement, and a raw byte scan of all four files for
+`0c 01 00 00` behind both encodings (`8b /r` with `mod=10`, and `ff /2`, of
+which no binary holds one). Their shared blind spot is a vtable offset computed
+into a register, which none of these call sites does.
+
+So the flag is always clear, `+0x110` always answers false, and the two widgets
+it gates are never disabled by it. DaysEngine never sets it, which is the same
+behaviour rather than a gap.
 
 A press on a widget that is not live is swallowed *and silent*: the dispatch
 asks the enabled test before playing SE index 2. The enabled test is also what
@@ -2861,7 +2879,16 @@ runs `MenuBar->+0x38(host)`, the gauge settle. It is the last thing the rewind
 does, after the un-credit the route handler made on the way out, so **a rewind
 out of an answered choice puts the affection gauge at the counters the
 un-credit left and takes it down** rather than sliding it back and ringing
-`SeDown` — see *The gauge's ramp*. Two calls come before it in the same block,
+`SeDown` — see *The gauge's ramp*. The part the rewind lands on plays from its
+own beginning, `FUN_00431250(next, +0x53c + 1)`, so **a choice it raises is
+raised again and answered again**: the film object is rebuilt, so the answer
+holder is back at `-2` (`FUN_004388c0`), and `FUN_00432f50` writes the new index
+over the recorded one rather than keeping the first. The player always answers
+it themselves, because the latch that arms the second press is refused while
+host `+0x98` — the play-data list following a slot's answers — is up, and that
+is the only thing that answers a box on their behalf.
+
+Two calls come before the settle in the same block,
 and both are the rewind putting the part it is leaving down: `FUN_004316b0`
 marks the timeline (`+0x08 = 1`) and runs `FUN_0044ddd0` over the system-sound
 player at `engine + 0x334`, flagging all `+0x1c8` of its live entries finished,

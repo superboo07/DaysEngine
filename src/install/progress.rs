@@ -350,6 +350,13 @@ impl Progress {
     /// answers: `FUN_00431740` calls `FUN_00428a50` — the write — only when
     /// host `+0x98` is clear, so a followed playthrough credits its deltas
     /// without writing over the recording it is reading.
+    ///
+    /// **An answer given again replaces the one before it.** `FUN_00432f50`
+    /// looks the script's name up in the map at `engine+0xac +0x58` and, when
+    /// it is already there, stores the new index over the old at the entry's
+    /// `+0x1c`, inserting only when it is not — which is `insert`'s own
+    /// behaviour here. So a part replayed after a rewind, or after the bar's
+    /// restart, records the answer the player gives the second time.
     pub fn decide(&mut self, choice: i32, record: bool) {
         self.stores.choice = choice;
         let (route, scene) = self.position();

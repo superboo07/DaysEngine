@@ -1397,6 +1397,15 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
         // It cannot arrive out of a replay: the latch that arms the second
         // press is refused while host `+0x104` is up, so `replaying` is
         // untouched here.
+        //
+        // The part it lands on plays from its own beginning —
+        // `FUN_00431250(next, +0x53c + 1)` in the same block — so a choice it
+        // raises goes up again and is answered again: the film object is new,
+        // so the answer holder starts at `NO_CHOICE`, and the recorded answer
+        // is overwritten rather than kept (see [`Progress::decide`]). It
+        // cannot be answered *for* the player either, because the same latch
+        // is refused while host `+0x98` is up, which is the only thing that
+        // answers a box out of a recording.
         if outcome == Outcome::Rewound {
             let back = progress.as_mut().and_then(Progress::back);
             // And the gauge is settled, not ramped. `FUN_00424020`'s tail runs
