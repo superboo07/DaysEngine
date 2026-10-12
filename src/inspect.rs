@@ -4481,8 +4481,21 @@ fn rewind_from(progress: &mut crate::install::progress::Progress, steps: usize) 
             return;
         };
         let (route, scene) = progress.position();
-        let ((first, second), _) = progress.gauge();
-        println!("{step:>3}  ROUTE {route:>2} SCENE {scene:>3}  {back}   001={first} 002={second}");
+        // The un-credit raises the gauge, and the rewind takes it straight
+        // back down: `FUN_00424020`'s tail settles it under
+        // `if (engine+0x560)`, after the export has answered. The ramp itself
+        // lives on the player — `crate::game`'s `settle_gauge` is the whole of
+        // it — so the half that shows here is the flag.
+        let ((first, second), raised) = progress.gauge();
+        progress.lower_gauge();
+        println!(
+            "{step:>3}  ROUTE {route:>2} SCENE {scene:>3}  {back}   001={first} 002={second}{}",
+            if raised {
+                "  (un-credited, and the settle puts the gauge down)"
+            } else {
+                ""
+            }
+        );
     }
 }
 

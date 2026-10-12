@@ -2856,6 +2856,21 @@ cleared again at the end of the same block, once the next script is up, so a
 rewind is one step and not a mode. Widget 3 makes the same seek without the
 flag, and so goes forward.
 
+The flag has one more reader, in the tail of the same block: `if (engine+0x560)`
+runs `MenuBar->+0x38(host)`, the gauge settle. It is the last thing the rewind
+does, after the un-credit the route handler made on the way out, so **a rewind
+out of an answered choice puts the affection gauge at the counters the
+un-credit left and takes it down** rather than sliding it back and ringing
+`SeDown` — see *The gauge's ramp*. Two calls come before it in the same block,
+and both are the rewind putting the part it is leaving down: `FUN_004316b0`
+marks the timeline (`+0x08 = 1`) and runs `FUN_0044ddd0` over the system-sound
+player at `engine + 0x334`, flagging all `+0x1c8` of its live entries finished,
+and `FUN_0044d870` then zeroes that count — so the system SE a choice rang
+stops with the part. `FUN_004316b0` finishes by re-applying the live
+fast-forward rate through `FUN_004251d0` (`+0x530 = +0x534`, the rate itself out
+of `DAT_004f99f0`, and the clock restarted from `+0x544`), unless host `+0x134`
+(`FUN_0042bf30`, the member at `engine + 0x24c`) is non-zero.
+
 Neither is "leave the script" on its own. `FUN_00425bf0`'s case 3 under code 2
 asks the same question its case 6 asks for the skip:
 
@@ -6390,27 +6405,40 @@ from — nothing else writes them but step 4 and `FUN_10026050`.
 
 `FUN_10026050` — MenuBar vtable `+0x38` — is the other way the gauge comes
 down. It reads the two counters, puts the gauge at them with no ramp, resets the
-machine and lowers the flag. The engine has two call sites for it, and **only
-one of them can be reached**:
+machine and lowers the flag. The engine has two call sites for it, and **both
+are reached**:
 
 - `FUN_00423a70`, which is a film run starting: its first two acts are
   `_LoadInitScript@4` and `_ZeroReset@4`. Every way into playback goes through
   it, so a New Game, a slot and a story point all settle the gauge.
-- `FUN_00424020`, at the end of a script — but under `if (this+0x560)`, and
-  `this+0x560` is **never set**. Two methods agree: Ghidra's instruction
-  listing has fourteen references to that displacement, of which exactly two
-  are stores and both are `MOV byte ptr [reg+0x560],0x0` (`0x00423200` in the
-  initialiser and `0x004248af` in `FUN_00424020` itself); and a raw scan of the
-  file for the four bytes `60 05 00 00` preceded by a `MOV` store opcode with a
-  `disp32` ModRM finds fifteen occurrences of the displacement and the same two
-  stores, both with the immediate zero. Its blind spot would be a store built
-  from a register-held offset, which nothing in this function does.
+- `FUN_00424020`, at the end of a script, under `if (this+0x560)` — the rewind
+  flag, so a **rewind or a route-map jump** and nothing else. It is raised by
+  host `vt[0x124]` (`FUN_0042bfd0`) as `mov byte ptr [eax + 0x534], 1` through
+  the subobject at `engine + 0x2c`; see the gate table under *The read record*,
+  and `FUN_10025b90`, widget 2's second press, for the only caller that reaches
+  it with the rewind's argument. The settle sits *after*
+  `_GetBackScriptFile@12` in the same function, and every one of those handlers
+  un-credits the part it is leaving — which raises the gauge. So the rewind's
+  own raise is put at the counters and taken down in the same tick: going back
+  over a choice does not slide the gauge down to the counters the un-credit
+  left, and does not ring `SeDown` doing it.
 
-So **no script ending settles the gauge**, and that is what gives the ramp room
-to run. `_SetFeeling@8` is called from the choice handler, and a choice box sits
-in the last seconds of its script — `01-00-B00` raises one over
-`00:08:12..00:13:12` of a script that ends at `00:13:12` — so a raise that a
-script boundary cut short would nearly always be cut short. Instead it keeps
+A scan for stores at displacement `0x560` finds only the two that write zero
+(`0x00423200` in the initialiser, `0x004248af` in `FUN_00424020` itself),
+whether run over Ghidra's instruction listing or over the raw file; the write
+that matters is at `0x534`, because the host interface is a secondary base
+subobject. Both offsets exist and both are live — `engine + 0x534` is the lit
+rate index, written as a dword by `FUN_004250b0` and read by `FUN_004251d0`,
+while the flag is the byte `FUN_0042bfd0` writes — so the store is told apart
+by its operand size and by the fact that `FUN_0042bfd0`'s other two writes
+(`+0x1e4 = 0`, `+0x536`) land on `engine + 0x210`, the moving flag, and
+`engine + 0x562`, the route-map/rewind selector, only under the same reading.
+
+So an **ordinary** script ending does not settle the gauge, and that is what
+gives the ramp room to run. `_SetFeeling@8` is called from the choice handler,
+and a choice box sits in the last seconds of its script — `01-00-B00` raises one
+over `00:08:12..00:13:12` of a script that ends at `00:13:12` — so a raise that
+a script boundary cut short would nearly always be cut short. Instead it keeps
 sliding over the opening of the next scene, which is where most of a raise is
 actually seen.
 

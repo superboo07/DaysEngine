@@ -887,10 +887,12 @@ impl Progress {
     /// Hides the gauge, through the same slot `+0x30` that raised it.
     ///
     /// The last step of the gauge's own ramp is what does it in ordinary play.
-    /// The only other way is a film run starting, which settles the gauge
-    /// through `FUN_10026050`. **A script ending does not**: the engine's other
-    /// `+0x38` call is under a member that is never set. See
-    /// [`crate::ui::bar::gauge::Anim::settle`].
+    /// The two other ways are the settle, `FUN_10026050` through MenuBar
+    /// `+0x38`: a film run starting, and the rewind — `FUN_00424020`'s tail
+    /// under `if (engine+0x560)`, which takes down the raise the un-credit in
+    /// [`Progress::back`] just made. **An ordinary script ending does
+    /// neither**, because that flag is only up for a rewind or a route-map
+    /// jump. See [`crate::ui::bar::gauge::Anim::settle`].
     pub fn lower_gauge(&mut self) {
         self.gauge_raised = false;
     }

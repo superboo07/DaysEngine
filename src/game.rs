@@ -1398,7 +1398,19 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
         // press is refused while host `+0x104` is up, so `replaying` is
         // untouched here.
         if outcome == Outcome::Rewound {
-            match progress.as_mut().and_then(Progress::back) {
+            let back = progress.as_mut().and_then(Progress::back);
+            // And the gauge is settled, not ramped. `FUN_00424020`'s tail runs
+            // `MenuBar->+0x38(host)` — `FUN_10026050` — under
+            // `if (engine+0x560)`, the rewind flag, which is *after*
+            // `_GetBackScriptFile@12` has taken the part's deltas back off the
+            // counters. So the raise the un-credit just made is put at the
+            // counters as they now stand and taken down in the same tick: a
+            // rewind out of a choice does not play the ramp backwards, and
+            // does not ring `SeDown` on the way. See [`settle_gauge`].
+            if let Some(p) = progress.as_mut() {
+                settle_gauge(&mut player, p);
+            }
+            match back {
                 Some(script) => {
                     log::info!("the rewind goes back to {script}");
                     next = script.rsplit('/').next().unwrap_or(&script).to_string();
@@ -1589,6 +1601,12 @@ fn enter_slot(
 /// `FUN_00423a70`, which settles the gauge whether the run is a New Game, a
 /// slot or a story point, and the state each of those installs is what it
 /// settles to.
+///
+/// The engine's other call site is the rewind: `FUN_00424020`'s tail, under
+/// `if (engine+0x560)`, which is a rewind or a route-map jump and nothing
+/// else. Both reach the same slot, so going *back* over a choice settles the
+/// gauge at the counters the un-credit left rather than sliding it down to
+/// them.
 fn settle_gauge(player: &mut Player, progress: &mut Progress) {
     let ((first, second), _) = progress.gauge();
     player.gauge.settle(first, second);

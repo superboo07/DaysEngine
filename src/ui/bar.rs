@@ -3105,15 +3105,16 @@ pub mod gauge {
 
         /// Puts the gauge at a pair of counters with no ramp: `FUN_10026050`.
         ///
-        /// This happens **once a film run**, not once a script. The engine has
-        /// two call sites for MenuBar vtable `+0x38` and only one of them can
-        /// be reached: `FUN_00423a70`, which is the run starting — its first
-        /// acts are `_LoadInitScript@4` and `_ZeroReset@4`. The other, in
-        /// `FUN_00424020`, sits under `if (this+0x560)`, and `+0x560` is
-        /// written in exactly two places, both of them `= 0`. So no script
-        /// ending settles the gauge.
+        /// The engine has two call sites for MenuBar vtable `+0x38`, and both
+        /// are reached: `FUN_00423a70`, the run starting — its first acts are
+        /// `_LoadInitScript@4` and `_ZeroReset@4` — and `FUN_00424020`'s tail
+        /// under `if (this+0x560)`, which is the control bar's rewind or a
+        /// route-map jump. Host `+0x124` (`FUN_0042bfd0`) raises that flag,
+        /// and widget 2's second press is the only caller that reaches it with
+        /// the rewind's `0` (`FUN_10025b90`).
         ///
-        /// That is what gives the ramp room to run. A choice box sits in the
+        /// An **ordinary** script ending leaves the flag down, and that is
+        /// what gives the ramp room to run. A choice box sits in the
         /// last seconds of its script — `01-00-B00` raises one at 00:08:12 of a
         /// script that ends at 00:13:12 — so a raise that a script boundary
         /// could cut short would usually be cut short. Instead it keeps sliding
