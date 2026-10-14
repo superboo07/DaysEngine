@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use days_script::{Command, Fade, Frame, Script};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::Mixer;
 
@@ -105,6 +106,46 @@ pub fn apply_skip_flag(script: &mut Script, flag: bool) {
         script.skip_to
     );
     script.skip_to = script.length;
+}
+
+/// Time spent starting the statements one [`Stage::seek_to`] reached.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Started {
+    /// Every statement together.
+    pub total: Duration,
+    /// The slowest one, and what it was.
+    pub slowest: Option<(Duration, String)>,
+}
+
+impl Started {
+    fn add(&mut self, took: Duration, command: &Command) {
+        self.total += took;
+        if self.slowest.as_ref().is_none_or(|(worst, _)| took > *worst) {
+            self.slowest = Some((took, label(command)));
+        }
+    }
+}
+
+/// A statement as a log line names it: its kind, and what it loads if it
+/// loads anything.
+fn label(command: &Command) -> String {
+    match command {
+        Command::PlayVoice { path, .. } => format!("PlayVoice {path}"),
+        Command::CreateBg { path, .. } => format!("CreateBG {path}"),
+        Command::PlaySe { path, .. } => format!("PlaySe {path}"),
+        Command::PlayMovie { path, .. } => format!("PlayMovie {path}"),
+        Command::PlayBgm { path } => format!("PlayBgm {path}"),
+        Command::EndBgm { path } => format!("EndBgm {path}"),
+        Command::EndRoll { path } => format!("EndRoll {path}"),
+        other => {
+            let debug = format!("{other:?}");
+            debug
+                .split([' ', '(', '{'])
+                .next()
+                .unwrap_or(&debug)
+                .to_string()
+        }
+    }
 }
 
 /// A movie being played, with its position on the script timeline.
@@ -242,6 +283,8 @@ pub struct Stage {
     script: Script,
     /// Frame most recently played. Events are fired for `(played, target]`.
     played: Option<Frame>,
+    /// What the last [`Stage::seek_to`] spent starting statements.
+    started: Started,
     movie: Option<Movie>,
     still: Option<Still>,
     fade: Option<FadeState>,
@@ -400,6 +443,7 @@ impl Stage {
         Stage {
             script,
             played: None,
+            started: Started::default(),
             movie: None,
             still: None,
             fade: None,
@@ -621,12 +665,15 @@ impl Stage {
             .cloned()
             .collect();
 
+        self.started = Started::default();
         for event in due {
+            let began = Instant::now();
             if let Err(err) = self.dispatch(&event.command, event.start, event.end, vfs, mixer) {
                 // A missing asset must not end playback: 166 voice references in
                 // the retail scripts point at clips that were never recorded.
                 log::warn!("{}: {err:#}", self.script.name);
             }
+            self.started.add(began.elapsed(), &event.command);
         }
 
         // Then the male lines a closed `MenVoice` has been refusing, which the
@@ -635,6 +682,14 @@ impl Stage {
 
         self.played = Some(target);
         Ok(())
+    }
+
+    /// What the last [`Stage::seek_to`] spent starting statements, for
+    /// [`crate::playback::profile`]. Starting one can mean reading a movie out
+    /// of the packs and opening it, or decoding a whole sound, all on the
+    /// thread that draws.
+    pub fn started(&self) -> &Started {
+        &self.started
     }
 
     /// Offers every held male voice line again, and forgets the ones whose

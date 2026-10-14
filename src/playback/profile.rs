@@ -16,6 +16,7 @@
 //! noticed in. It goes through `log`, which on Android is logcat, so a device
 //! with no profiler attached can still say where its frames went.
 
+use super::stage::Started;
 use crate::media::Timings;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,10 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub struct Profile {
     account: Account,
+    /// When the last pass was accounted for, so the gap to the next one can
+    /// be. Kept across clips: a stall at a cut is paid by the clip it cuts
+    /// to, whose first frames it is that go unseen.
+    previous: Option<Instant>,
 }
 
 /// What one clip has cost so far.
@@ -53,6 +58,22 @@ struct Account {
     stall: Duration,
     /// The most frames a single pass decoded.
     most: u32,
+    /// The pass that took longest over starting statements and decoding
+    /// together, and how it divided.
+    slowest: Option<Slowest>,
+    /// The longest from one pass to the next. A movie frame is 41.7ms, so a
+    /// gap longer than that is a picture that was never on screen, whatever
+    /// the pass spent it on — the two above, or drawing, or anything else.
+    gap: Duration,
+}
+
+/// The costliest pass of a clip.
+#[derive(Debug, Clone, PartialEq)]
+struct Slowest {
+    /// Starting the statements the pass reached. See [`Started`].
+    started: Started,
+    /// Decoding the movie forward.
+    decoding: Duration,
 }
 
 impl Profile {
@@ -60,12 +81,20 @@ impl Profile {
         Profile::default()
     }
 
-    /// One pass of the loop: the clip on screen, what decoding it forward to
-    /// this frame cost, and how long the pass waited for that.
+    /// One pass of the loop, at `now`: the clip on screen, what decoding it
+    /// forward to this frame cost and how long the pass waited for that, and
+    /// what starting the statements it reached cost.
     ///
     /// A different clip from the last pass's ends the old one's account,
     /// which is logged.
-    pub fn pass(&mut self, clip: Option<&str>, decoded: &Timings, waited: Duration) {
+    pub fn pass(
+        &mut self,
+        clip: Option<&str>,
+        decoded: &Timings,
+        waited: Duration,
+        started: &Started,
+        now: Instant,
+    ) {
         if clip != self.account.clip.as_deref() {
             self.log();
             self.account = Account {
@@ -73,9 +102,25 @@ impl Profile {
                 ..Account::default()
             };
         }
+        let gap = self.previous.map(|previous| now - previous);
+        self.previous = Some(now);
         let account = &mut self.account;
         if account.clip.is_none() {
             return;
+        }
+        if let Some(gap) = gap {
+            account.gap = account.gap.max(gap);
+        }
+        let cost = started.total + waited;
+        if account
+            .slowest
+            .as_ref()
+            .is_none_or(|slowest| cost > slowest.started.total + slowest.decoding)
+        {
+            account.slowest = Some(Slowest {
+                started: started.clone(),
+                decoding: waited,
+            });
         }
         account.decoded.merge(decoded);
         let frames = decoded.frames + decoded.skipped;
@@ -121,17 +166,35 @@ impl Profile {
         } else {
             String::new()
         };
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let slowest = match &account.slowest {
+            Some(Slowest { started, decoding }) => format!(
+                "; slowest pass {:.1}ms: {:.1}ms starting statements{}, {:.1}ms decoding",
+                ms(started.total + *decoding),
+                ms(started.total),
+                match &started.slowest {
+                    Some((took, what)) if !took.is_zero() => {
+                        format!(" (most of all {what}, {:.1}ms)", ms(*took))
+                    }
+                    _ => String::new(),
+                },
+                ms(*decoding),
+            ),
+            None => String::new(),
+        };
         Some(format!(
             "movie {clip} at {}x{}: {} frames decoded, {} shown{rate}; {}{over}; \
              upload {upload:.2}ms a picture; longest wait on the decoder {:.1}ms, \
-             at most {} frames decoded in one pass",
+             at most {} frames decoded in one pass{slowest}; \
+             longest gap between passes {:.1}ms",
             account.size.0,
             account.size.1,
             account.decoded.frames + account.decoded.skipped,
             account.shown,
             account.decoded,
-            account.stall.as_secs_f64() * 1000.0,
+            ms(account.stall),
             account.most,
+            ms(account.gap),
         ))
     }
 
@@ -170,15 +233,13 @@ mod tests {
     fn a_clip_is_accounted_for_across_passes() {
         let mut profile = Profile::new();
         let at = Instant::now();
-        profile.pass(Some("A"), &frames(1, 10), Duration::from_millis(11));
-        profile.shown((1920, 1080), Duration::from_millis(2), at);
-        profile.pass(Some("A"), &Timings::default(), Duration::from_millis(50));
-        profile.pass(Some("A"), &frames(3, 10), Duration::from_millis(31));
-        profile.shown(
-            (1920, 1080),
-            Duration::from_millis(4),
-            at + Duration::from_millis(125),
-        );
+        let ms = Duration::from_millis;
+        let none = Started::default();
+        profile.pass(Some("A"), &frames(1, 10), ms(11), &none, at);
+        profile.shown((1920, 1080), ms(2), at);
+        profile.pass(Some("A"), &Timings::default(), ms(1), &none, at + ms(17));
+        profile.pass(Some("A"), &frames(3, 10), ms(31), &none, at + ms(70));
+        profile.shown((1920, 1080), ms(4), at + ms(125));
 
         let line = profile.summary().expect("a clip with frames has a summary");
         assert!(line.contains("movie A at 1920x1080"), "{line}");
@@ -195,21 +256,53 @@ mod tests {
             line.contains("at most 3 frames decoded in one pass"),
             "{line}"
         );
+        assert!(line.contains("longest gap between passes 53.0ms"), "{line}");
         assert!(!line.contains("over the"), "{line}");
+    }
+
+    /// The slowest pass says how it divided between starting statements and
+    /// decoding, and names the statement that cost most.
+    #[test]
+    fn the_slowest_pass_names_what_it_spent_its_time_on() {
+        let mut profile = Profile::new();
+        let at = Instant::now();
+        let ms = Duration::from_millis;
+        let opening = Started {
+            total: ms(40),
+            slowest: Some((ms(35), "PlayMovie Movie00/clip".to_string())),
+        };
+        profile.pass(Some("A"), &frames(3, 5), ms(15), &opening, at);
+        profile.pass(
+            Some("A"),
+            &frames(1, 5),
+            ms(20),
+            &Started::default(),
+            at + ms(42),
+        );
+        let line = profile.summary().unwrap();
+        assert!(
+            line.contains(
+                "slowest pass 55.0ms: 40.0ms starting statements \
+                 (most of all PlayMovie Movie00/clip, 35.0ms), 15.0ms decoding"
+            ),
+            "{line}"
+        );
     }
 
     /// Another clip starts a fresh account, and so does a pass with no movie.
     #[test]
     fn a_new_clip_starts_a_new_account() {
         let mut profile = Profile::new();
-        profile.pass(Some("A"), &frames(5, 10), Duration::ZERO);
-        profile.pass(Some("B"), &frames(1, 50), Duration::ZERO);
+        let at = Instant::now();
+        let none = Started::default();
+        profile.pass(Some("A"), &frames(5, 10), Duration::ZERO, &none, at);
+        profile.pass(Some("B"), &frames(1, 50), Duration::ZERO, &none, at);
         let line = profile.summary().unwrap();
         assert!(line.starts_with("movie B"), "{line}");
         assert!(line.contains("1 frames decoded"), "{line}");
         assert!(line.contains("over the 41.7ms"), "{line}");
 
-        profile.pass(None, &Timings::default(), Duration::ZERO);
+        profile.pass(None, &Timings::default(), Duration::ZERO, &none, at);
         assert_eq!(profile.summary(), None);
     }
 }

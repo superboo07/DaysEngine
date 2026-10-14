@@ -3528,12 +3528,16 @@ fn run_script(
         // part-way through starts then. See `Stage::set_men_voice`.
         stage.set_men_voice(config.flag(Flag::MenVoice));
         stage.seek_to(at, player.vfs, player.mixer)?;
+        let started = stage.started().clone();
         let asked_at = Instant::now();
         let visual = stage.visual_at(at);
+        let asked = asked_at.elapsed();
         profile.pass(
             visual.movie_id.map(|(clip, _)| clip),
             &visual.decoded,
-            asked_at.elapsed(),
+            asked,
+            &started,
+            asked_at + asked,
         );
 
         // The backlog. `FUN_0043dbe0` logs a statement where it dispatches it,
