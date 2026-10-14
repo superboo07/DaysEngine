@@ -60,13 +60,16 @@ pub fn frame_rgba_with(
         *px = [0, 0, 0, 255];
     }
 
-    if let Some(frame) = visual.movie {
+    // A frame here is always RGBA: a headless stage is given the CPU
+    // equivalent of the GPU scaler, `VideoScaler::on_cpu`, so the YUV a GPU
+    // would be handed never reaches the compositor.
+    if let Some((frame, rgba)) = visual.movie.and_then(|f| Some((f, f.rgba()?))) {
         blit(
             &mut out,
             width,
             height,
             &Surface {
-                pixels: &frame.rgba,
+                pixels: rgba,
                 width: frame.width as usize,
                 height: frame.height as usize,
             },

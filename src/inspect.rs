@@ -1060,11 +1060,12 @@ fn parse_size(text: &str) -> Result<(u32, u32)> {
 /// Writes an RGBA frame as a binary PPM, dropping alpha. Enough to eyeball a
 /// decode without pulling in an image encoder.
 fn write_ppm(path: &Path, frame: &crate::media::VideoFrame) -> Result<()> {
+    let rgba = frame
+        .rgba()
+        .context("the frame is YUV for the GPU; --dump-frame needs a CPU [Video] Scaler")?;
     let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
     out.extend(
-        frame
-            .rgba
-            .as_chunks::<4>()
+        rgba.as_chunks::<4>()
             .0
             .iter()
             .flat_map(|p| [p[0], p[1], p[2]]),
@@ -1516,7 +1517,9 @@ impl Exporter<'_> {
             let mut stage = crate::Stage::new(script);
             stage.set_men_voice(self.men_voice);
             stage.set_video_size(width, height);
-            stage.set_video_scaler(self.settings.video_scaler);
+            // No GPU here to hand a scale to, so `gpu` scales as what the
+            // GPU's linear filter is on the CPU. See `VideoScaler::on_cpu`.
+            stage.set_video_scaler(self.settings.video_scaler.on_cpu());
             stage.set_video_filters(
                 &self.settings.video_filters,
                 &self.settings.video_filters_after,

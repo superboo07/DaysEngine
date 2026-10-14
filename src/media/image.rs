@@ -206,6 +206,16 @@ mod tests {
     /// failed to build an operation list, or built the wrong one, shows up here
     /// rather than on the player's screen.
     #[test]
+    fn every_name_is_its_own_scaler() {
+        // `name` is what a fresh settings file is written with, so it has to
+        // read back as the scaler it was written from.
+        for name in VideoScaler::NAMES.split(", ") {
+            let filter = VideoScaler::from_name(name).expect(name);
+            assert_eq!(filter.name(), name);
+        }
+    }
+
+    #[test]
     fn every_filter_scales() {
         let src = flat((800, 452), [200, 120, 40, 255]);
         for name in VideoScaler::NAMES.split(", ") {

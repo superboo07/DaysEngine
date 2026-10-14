@@ -8,12 +8,13 @@ use rusty_ffmpeg::ffi;
 use std::ffi::c_int;
 use std::time::{Duration, Instant};
 
-/// One decoded frame, as tightly packed RGBA.
+/// One decoded frame.
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, row-major, no padding.
-    pub rgba: Vec<u8>,
+    /// The picture: RGBA at the size it was asked for, or the clip's own YUV
+    /// for a GPU to convert and scale. See [`VideoScaler::Gpu`].
+    pub pixels: Pixels,
     /// 0-based position in the clip. This, not [`Self::timestamp`], is what the
     /// engine schedules against: the script clock counts frames at 24 fps and
     /// every movie in the game is constant frame rate.
@@ -24,6 +25,36 @@ pub struct VideoFrame {
     /// ASF clip carries no timestamp, so that case falls back to
     /// `index / frame_rate`.
     pub timestamp: f64,
+}
+
+impl VideoFrame {
+    /// The picture as packed RGBA, or `None` when it is YUV for a GPU.
+    pub fn rgba(&self) -> Option<&[u8]> {
+        match &self.pixels {
+            Pixels::Rgba(rgba) => Some(rgba),
+            Pixels::I420(_) => None,
+        }
+    }
+
+    /// The picture as packed RGBA. An error when it is YUV for a GPU, which
+    /// only a decoder set to [`VideoScaler::Gpu`] makes.
+    pub fn into_rgba(self) -> Result<Vec<u8>, Error> {
+        match self.pixels {
+            Pixels::Rgba(rgba) => Ok(rgba),
+            Pixels::I420(_) => Err(Error::NotRgba),
+        }
+    }
+}
+
+/// A frame's pixels, every row tightly packed.
+pub enum Pixels {
+    /// `width * height * 4` bytes, row-major. What every CPU consumer reads.
+    Rgba(Vec<u8>),
+    /// Planar YUV 4:2:0 at the clip's own size, the planes one after another:
+    /// Y at `width` x `height`, then U and V at half that each way, rounded
+    /// up. The layout `SDL_PIXELFORMAT_IYUV` takes in one upload, which is
+    /// what it is for.
+    I420(Vec<u8>),
 }
 
 /// Where decoding time went, summed over the frames since the last
@@ -143,6 +174,23 @@ pub enum VideoScaler {
     Neighbour,
     /// Averages the source area, which is the right answer going *down*.
     Area,
+    /// No scaling here at all: the clip comes back at its own size as YUV, and
+    /// the GPU converts and scales it as it draws — with its linear filter,
+    /// which is what the original's Direct3D path did (`FUN_0044a3d0` sets
+    /// `D3DTEXF_LINEAR`). The default on Android.
+    ///
+    /// Measured on a Snapdragon 8 Gen 2 at 2237x1264, the scale to the window
+    /// was 24-27ms of a 31-35ms frame, and the copy and upload of the result
+    /// another 3. This puts a third of a megabyte in a texture instead, at any
+    /// window size.
+    ///
+    /// The cost is everything that works on the scaled frame: the
+    /// `[Video] FiltersAfterScale` chain and the grain need RGBA at the size
+    /// it is seen, and there is none, so they are skipped. A CPU consumer that
+    /// has to scale anyway — a headless render, a background through
+    /// [`crate::media::ImageScaler`] — scales bilinear, which is the GPU's own
+    /// filter done on the CPU; see [`VideoScaler::on_cpu`].
+    Gpu,
 }
 
 impl VideoScaler {
@@ -157,6 +205,7 @@ impl VideoScaler {
             VideoScaler::Gaussian => ffi::SWS_GAUSS,
             VideoScaler::Neighbour => ffi::SWS_POINT,
             VideoScaler::Area => ffi::SWS_AREA,
+            VideoScaler::Gpu => ffi::SWS_BILINEAR,
         };
         i64::from(flag)
     }
@@ -176,14 +225,40 @@ impl VideoScaler {
                     VideoScaler::Neighbour
                 }
                 n if n == "area" => VideoScaler::Area,
+                n if n == "gpu" => VideoScaler::Gpu,
                 _ => return None,
             },
         )
     }
 
+    /// The name a settings file spells this with.
+    pub fn name(self) -> &'static str {
+        match self {
+            VideoScaler::FastBilinear => "fast_bilinear",
+            VideoScaler::Bilinear => "bilinear",
+            VideoScaler::Bicubic => "bicubic",
+            VideoScaler::Lanczos => "lanczos",
+            VideoScaler::Spline => "spline",
+            VideoScaler::Gaussian => "gaussian",
+            VideoScaler::Neighbour => "neighbour",
+            VideoScaler::Area => "area",
+            VideoScaler::Gpu => "gpu",
+        }
+    }
+
+    /// The scaler for something with no GPU to hand the scale to — a headless
+    /// render. [`VideoScaler::Gpu`] becomes bilinear, the GPU's own filter;
+    /// everything else is already a CPU scaler.
+    pub fn on_cpu(self) -> VideoScaler {
+        match self {
+            VideoScaler::Gpu => VideoScaler::Bilinear,
+            other => other,
+        }
+    }
+
     /// Every name this accepts, for the message that lists them.
     pub const NAMES: &'static str =
-        "fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area";
+        "fast_bilinear, bilinear, bicubic, lanczos, spline, gaussian, neighbour, area, gpu";
 }
 
 /// A lazily-decoding video stream over an in-memory clip.
@@ -224,6 +299,9 @@ pub struct VideoDecoder {
     post_failed: bool,
     /// The dither laid over the finished RGBA frame. See [`grain`].
     grain: grain::Grain,
+    /// Whether the log has said that [`VideoScaler::Gpu`] leaves the
+    /// post-scale chain and the grain out, so it says so once.
+    gpu_noted: bool,
     /// Where the frames since the last [`VideoDecoder::take_timings`] went.
     timings: Timings,
     _io: Box<MemoryIo>,
@@ -339,7 +417,7 @@ impl VideoDecoder {
             guard.frame = frame;
 
             let scaler = new_scaler(VideoScaler::default(), ScaleBackend::Legacy)?;
-            let scaled = new_rgba_frame((width, height))?;
+            let scaled = new_frame(ffi::AV_PIX_FMT_RGBA, (width, height))?;
 
             guard.disarm();
             Ok(VideoDecoder {
@@ -366,6 +444,7 @@ impl VideoDecoder {
                 post_graph: None,
                 post_failed: false,
                 grain: grain::Grain::new(0),
+                gpu_noted: false,
                 timings: Timings::default(),
                 draining: false,
                 finished: false,
@@ -554,19 +633,27 @@ impl VideoDecoder {
     /// 24 fps clock has no room for.
     ///
     /// A zero in either dimension, or the size it is already at, is ignored.
+    /// Under [`VideoScaler::Gpu`] the size is kept for later and frames still
+    /// come back at the clip's own.
     pub fn set_output_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
         if (width, height) == self.output || width == 0 || height == 0 {
             return Ok(());
         }
-        // SAFETY: the new frame is built before the old one is freed, so a
-        // failure leaves the decoder producing the size it already was.
-        let scaled = unsafe { new_rgba_frame((width, height))? };
-        unsafe { ffi::av_frame_free(&mut self.scaled) };
-        self.scaled = scaled;
         self.output = (width, height);
-        // The post-scale graph was configured for the old size.
+        // The post-scale graph was configured for the old size. The scaler's
+        // own frame is resized by the next conversion, see `target`.
         self.post_graph = None;
         Ok(())
+    }
+
+    /// The format and size the scaler writes: RGBA at the window's size, or
+    /// under [`VideoScaler::Gpu`] the clip's own YUV at its own.
+    fn target(&self) -> (ffi::AVPixelFormat, (u32, u32)) {
+        if self.filter == VideoScaler::Gpu {
+            (ffi::AV_PIX_FMT_YUV420P, (self.width, self.height))
+        } else {
+            (ffi::AV_PIX_FMT_RGBA, self.output)
+        }
     }
 
     /// Chooses the filter frames are scaled with, from `DaysEngine.ini`.
@@ -768,7 +855,8 @@ impl VideoDecoder {
     /// `decode` is how long getting the frame out of the decoder took, for
     /// [`Timings`]; every stage after it is timed here.
     fn convert_frame(&mut self, decode: Duration) -> Result<VideoFrame, Error> {
-        let (w, h) = (self.output.0 as usize, self.output.1 as usize);
+        let (format, (width, height)) = self.target();
+        let (w, h) = (width as usize, height as usize);
         let mut times = Timings {
             frames: 1,
             decode,
@@ -781,12 +869,32 @@ impl VideoDecoder {
             lap = now;
         };
 
-        // SAFETY: the scaler writes `self.scaled`, an RGBA frame of exactly
-        // `w` x `h`, and `rgba` is exactly that many packed bytes.
         let index = self.index;
         self.index += 1;
 
-        let (mut rgba, timestamp) = unsafe {
+        // SAFETY: `self.scaled` is made to be exactly `format` at `w` x `h`
+        // before the scaler writes it, and every copy below reads that many
+        // rows of that many bytes out of it.
+        let (mut pixels, timestamp) = unsafe {
+            // The scaler's frame is the one thing whose shape follows the
+            // window and the scaler; it is rebuilt here, on the frame that
+            // first needs the new shape, rather than wherever either changed.
+            let current = (
+                (*self.scaled).format,
+                (*self.scaled).width as u32,
+                (*self.scaled).height as u32,
+            );
+            if current != (format, width, height) {
+                let scaled = match new_frame(format, (width, height)) {
+                    Ok(scaled) => scaled,
+                    Err(err) => {
+                        ffi::av_frame_unref(self.frame);
+                        return Err(err);
+                    }
+                };
+                ffi::av_frame_free(&mut self.scaled);
+                self.scaled = scaled;
+            }
             // Filtered at the clip's own size, then scaled to the window: a
             // debander cannot see a band the scaler has already stretched.
             let source = self.filtered();
@@ -800,21 +908,54 @@ impl VideoDecoder {
                     code: scaled,
                 });
             }
-            // Anything that is added to the picture rather than repaired in it
-            // happens here, at the size it will be seen — see
-            // [`VideoDecoder::set_post_filters`].
-            let shown = self.post_filtered();
-            stage(&mut times.post);
-            // Out of the scaler's own rows, which carry whatever padding its
-            // SIMD wanted, into the packed buffer the rest of the engine works
-            // in.
-            let mut rgba = vec![0u8; w * h * 4];
-            let from = (*shown).data[0];
-            let from_stride = (*shown).linesize[0] as usize;
-            for (row, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
-                std::ptr::copy_nonoverlapping(from.add(row * from_stride), out.as_mut_ptr(), w * 4);
-            }
-            stage(&mut times.copy);
+            let pixels = if format == ffi::AV_PIX_FMT_YUV420P {
+                // For the GPU: the three planes, out of the scaler's padded
+                // rows and one after another. Nothing has been added to the
+                // picture, because there is no picture at the size it is seen
+                // to add it to — see `VideoScaler::Gpu`.
+                if !self.gpu_noted && (!self.post_filters.is_empty() || self.grain.is_visible()) {
+                    self.gpu_noted = true;
+                    log::info!(
+                        "[Video] Scaler = gpu: FiltersAfterScale and Grain work on the \
+                         scaled frame, which the GPU makes, so they are not applied"
+                    );
+                }
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let mut i420 = Vec::with_capacity(w * h + 2 * cw * ch);
+                for (plane, (pw, ph)) in [(w, h), (cw, ch), (cw, ch)].into_iter().enumerate() {
+                    let from = (*self.scaled).data[plane];
+                    let stride = (*self.scaled).linesize[plane] as usize;
+                    for row in 0..ph {
+                        i420.extend_from_slice(std::slice::from_raw_parts(
+                            from.add(row * stride),
+                            pw,
+                        ));
+                    }
+                }
+                stage(&mut times.copy);
+                Pixels::I420(i420)
+            } else {
+                // Anything that is added to the picture rather than repaired
+                // in it happens here, at the size it will be seen — see
+                // [`VideoDecoder::set_post_filters`].
+                let shown = self.post_filtered();
+                stage(&mut times.post);
+                // Out of the scaler's own rows, which carry whatever padding
+                // its SIMD wanted, into the packed buffer the rest of the
+                // engine works in.
+                let mut rgba = vec![0u8; w * h * 4];
+                let from = (*shown).data[0];
+                let from_stride = (*shown).linesize[0] as usize;
+                for (row, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+                    std::ptr::copy_nonoverlapping(
+                        from.add(row * from_stride),
+                        out.as_mut_ptr(),
+                        w * 4,
+                    );
+                }
+                stage(&mut times.copy);
+                Pixels::Rgba(rgba)
+            };
 
             let best = (*self.frame).best_effort_timestamp;
             let pts = if best == ffi::AV_NOPTS_VALUE {
@@ -828,20 +969,22 @@ impl VideoDecoder {
             } else {
                 pts as f64 * self.time_base
             };
-            (rgba, timestamp)
+            (pixels, timestamp)
         };
 
         // Last of all, on the frame at the size it will be seen: a dither laid
         // down before the scale is not a dither by the time it is shown.
-        self.grain.apply(&mut rgba, w, index);
+        if let Pixels::Rgba(rgba) = &mut pixels {
+            self.grain.apply(rgba, w, index);
+        }
         stage(&mut times.grain);
         times.worst = times.total();
         self.timings.merge(&times);
 
         Ok(VideoFrame {
-            width: self.output.0,
-            height: self.output.1,
-            rgba,
+            width,
+            height,
+            pixels,
             index,
             timestamp,
         })
@@ -1016,13 +1159,27 @@ pub(super) unsafe fn new_scaler(
 /// The returned frame is owned by the caller and must be freed with
 /// `av_frame_free`.
 pub(super) unsafe fn new_rgba_frame(size: (u32, u32)) -> Result<*mut ffi::AVFrame, Error> {
+    // SAFETY: the caller's contract, passed on.
+    unsafe { new_frame(ffi::AV_PIX_FMT_RGBA, size) }
+}
+
+/// Allocates a frame of `format` and `size` for the scaler to write into.
+///
+/// # Safety
+///
+/// The returned frame is owned by the caller and must be freed with
+/// `av_frame_free`.
+unsafe fn new_frame(
+    format: ffi::AVPixelFormat,
+    size: (u32, u32),
+) -> Result<*mut ffi::AVFrame, Error> {
     // SAFETY: the frame is freed on every path that does not return it.
     unsafe {
         let mut frame = ffi::av_frame_alloc();
         if frame.is_null() {
             return Err(Error::Alloc("AVFrame"));
         }
-        (*frame).format = ffi::AV_PIX_FMT_RGBA;
+        (*frame).format = format;
         (*frame).width = size.0 as c_int;
         (*frame).height = size.1 as c_int;
         // 0 lets ffmpeg pick the row alignment its SIMD wants.

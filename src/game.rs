@@ -36,6 +36,8 @@ use crate::install::save::FlagStore;
 use crate::install::vfs::Vfs;
 use crate::media::AudioBuffer;
 use crate::media::ImageScaler;
+use crate::media::Pixels;
+use crate::media::VideoScaler;
 use crate::playback::lipsync::compose_mouths;
 use crate::playback::som::{self, Device};
 use crate::ui::backlog;
@@ -618,6 +620,8 @@ struct MovieFrame<'r> {
     window: (u32, u32),
     /// The texture's own size, which is what the decoder actually gave.
     size: (u32, u32),
+    /// And its pixel format: RGBA, or YUV under `[Video] Scaler = gpu`.
+    format: sdl3::sys::pixels::SDL_PixelFormat,
     texture: Texture<'r>,
 }
 
@@ -3016,8 +3020,9 @@ impl<'r> DressBackground<'r> {
                 let frame = clip
                     .next_frame()?
                     .context("the dress-select background decoded no frames")?;
+                let (width, height) = (frame.width, frame.height);
                 (
-                    days_ui::Image::from_rgba(frame.width, frame.height, frame.rgba),
+                    days_ui::Image::from_rgba(width, height, frame.into_rgba()?),
                     Some(clip),
                 )
             }
@@ -3078,11 +3083,10 @@ impl<'r> DressBackground<'r> {
                 }
             }
         }
-        if let Some(frame) = newest {
-            if let Err(err) = self
-                .texture
-                .update(None, &frame.rgba, frame.width as usize * 4)
-            {
+        // This clip's decoder is never given the GPU scaler, so its frames
+        // are RGBA.
+        if let Some((frame, rgba)) = newest.as_ref().and_then(|f| Some((f, f.rgba()?))) {
+            if let Err(err) = self.texture.update(None, rgba, frame.width as usize * 4) {
                 log::warn!("uploading the dress-select background: {err}");
                 self.clip = None;
             }
@@ -3103,11 +3107,26 @@ fn new_texture<'a>(
     height: u32,
     mode: ScaleMode,
 ) -> Result<Texture<'a>> {
-    let mut texture = creator.create_texture_streaming(
-        PixelFormat::try_from(sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32)?,
-        width,
-        height,
-    )?;
+    new_texture_as(
+        creator,
+        sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32,
+        (width, height),
+        mode,
+    )
+}
+
+/// A streaming texture of `format`. RGBA for nearly everything; a movie
+/// under `[Video] Scaler = gpu` is YUV, which SDL's renderer converts as it
+/// draws — as BT.601 limited range, SDL's default for YUV and the matrix
+/// libswscale applies to these untagged clips on the CPU path too.
+fn new_texture_as<'a>(
+    creator: &'a TextureCreator<WindowContext>,
+    format: sdl3::sys::pixels::SDL_PixelFormat,
+    (width, height): (u32, u32),
+    mode: ScaleMode,
+) -> Result<Texture<'a>> {
+    let mut texture =
+        creator.create_texture_streaming(PixelFormat::try_from(format)?, width, height)?;
     texture.set_scale_mode(mode);
     Ok(texture)
 }
@@ -3244,6 +3263,12 @@ fn run_script(
     );
     // Whole-number scaling, and what it means for how the art is sampled.
     let whole = player.whole_pixels();
+    // `[Video] Scaler = gpu` scales backgrounds the way it scales movies: they
+    // go up at their own size and the texture's linear filter takes them to
+    // the window. That is also what makes a lip-synced line's first three
+    // mouth pictures free, rather than a whole background scaled on the CPU
+    // apiece.
+    let gpu = player.settings.video_scaler == VideoScaler::Gpu;
     let art = art_sampling(whole);
     let mut config = player.config.clone();
     // `[UseEnglish]` decides the dialogue pitch and whether it wraps at all.
@@ -4075,7 +4100,10 @@ fn run_script(
         // A movie frame arrives at the size the window wants it, because the
         // decoder was asked for that size: libswscale folds the scale into the
         // colour conversion every frame goes through anyway, in hand-written
-        // SIMD. See `crate::media::VideoDecoder::set_output_size`. What is
+        // SIMD. See `crate::media::VideoDecoder::set_output_size`. Under
+        // `[Video] Scaler = gpu` it arrives at the clip's own size as YUV
+        // instead, and the texture is a YUV one: the GPU converts it and the
+        // copy below scales it, with the texture's linear filter. What is
         // left here is the upload, and that happens once per *picture* — the
         // loop spins much faster than 24 fps to stay responsive to the pointer,
         // so it sees each frame several times over. `movie_id` is what says two
@@ -4089,7 +4117,25 @@ fn run_script(
                 .is_none_or(|held| showing != Some((held.clip.as_str(), held.index, held.window)));
             if stale {
                 let size = (frame.width, frame.height);
-                if movie_texture.as_ref().is_none_or(|held| held.size != size) {
+                let (format, pixels, pitch) = match &frame.pixels {
+                    Pixels::Rgba(rgba) => (
+                        sdl3::sys::pixels::SDL_PIXELFORMAT_RGBA32,
+                        rgba,
+                        frame.width as usize * 4,
+                    ),
+                    // One upload of all three planes: SDL reads the U and V
+                    // planes after the Y one, at half its pitch rounded up,
+                    // which is how `Pixels::I420` lays them out.
+                    Pixels::I420(i420) => (
+                        sdl3::sys::pixels::SDL_PIXELFORMAT_IYUV,
+                        i420,
+                        frame.width as usize,
+                    ),
+                };
+                if movie_texture
+                    .as_ref()
+                    .is_none_or(|held| (held.size, held.format) != (size, format))
+                {
                     movie_texture = Some(MovieFrame {
                         // Nothing is in it yet; the upload below is what makes
                         // an identity true.
@@ -4097,13 +4143,14 @@ fn run_script(
                         index: 0,
                         window: (0, 0),
                         size,
-                        texture: new_texture(creator, size.0, size.1, ScaleMode::Linear)?,
+                        format,
+                        texture: new_texture_as(creator, format, size, ScaleMode::Linear)?,
                     });
                 }
                 if let Some(held) = &mut movie_texture {
                     let uploading = Instant::now();
                     held.texture
-                        .update(None, &frame.rgba, frame.width as usize * 4)
+                        .update(None, pixels, pitch)
                         .context("uploading movie frame")?;
                     let done = Instant::now();
                     profile.shown(size, done - uploading, done);
@@ -4122,10 +4169,11 @@ fn run_script(
             }
         } else if let Some(still) = visual.still {
             // Scaled to the window here, unless whole-number scaling is on —
-            // then it goes up at its own size for the blit to multiply. Rebuilt
-            // when the background changes, when a mouth moves, or when the size
-            // it was built for does.
-            let at = if whole {
+            // then it goes up at its own size for the blit to multiply — or
+            // the GPU is doing the scaling. Rebuilt when the background
+            // changes, when a mouth moves, or when the size it was built for
+            // does.
+            let at = if whole || gpu {
                 (still.width, still.height)
             } else {
                 window_px
@@ -4175,7 +4223,7 @@ fn run_script(
         // movie's 1000-and-up, and under the fade layer's 7500. See
         // `crate::playback::stage::Card`.
         if let Some(card) = visual.card {
-            let at = if whole {
+            let at = if whole || gpu {
                 (card.width, card.height)
             } else {
                 window_px

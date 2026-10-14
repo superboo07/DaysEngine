@@ -283,11 +283,8 @@ pub fn load_image(vfs: &Vfs, path: &str) -> Result<days_ui::Image, Error> {
     let frame = crate::media::VideoDecoder::open(bytes)?
         .next_frame()?
         .ok_or(Error::EmptyClip)?;
-    Ok(days_ui::Image::from_rgba(
-        frame.width,
-        frame.height,
-        frame.rgba,
-    ))
+    let (width, height) = (frame.width, frame.height);
+    Ok(days_ui::Image::from_rgba(width, height, frame.into_rgba()?))
 }
 
 fn non_empty(s: &&str) -> bool {

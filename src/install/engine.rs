@@ -150,7 +150,26 @@ impl UiScaler {
     const NAMES: &'static str = "pixel, bspline, mitchell, catmull_rom";
 }
 
+/// How movie frames and backgrounds are scaled to the window, by default.
+///
+/// Spline on the CPU, except on Android, where it is [`VideoScaler::Gpu`]:
+/// measured on a Snapdragon 8 Gen 2 in landscape, the CPU scale was 24-27ms of
+/// a 31-35ms frame, three quarters of everything a frame costs, and a phone has
+/// a GPU that does it for nothing as it draws.
+pub const DEFAULT_SCALER: VideoScaler = if cfg!(target_os = "android") {
+    VideoScaler::Gpu
+} else {
+    VideoScaler::Spline
+};
+
 /// The chain movie frames go through before they are scaled, by default.
+///
+/// **None on Android.** Everything below is about what the chain buys, and on
+/// a desktop it is a few milliseconds of a frame; on a phone it is the next
+/// largest cost once the scale is on the GPU — 5-8ms a frame on a Snapdragon
+/// 8 Gen 2, with `deblock` and `deband` plain C on every architecture and
+/// `gradfun`'s SIMD x86-only — for repair a phone-sized screen shows least.
+/// `[Video] Filters` turns it back on.
 ///
 /// Three filters for the two artifacts the retail encode has — 8x8 transform
 /// blocks, and gradients quantised into bands — both of which are measured in
@@ -177,7 +196,11 @@ impl UiScaler {
 /// of 0.028 the *strong* edges in the same frame, the ones a picture is made
 /// of, measure 150% of the unfiltered frame's, and at 0.035 they measure 179%.
 /// That is not detail being kept. It is contrast being manufactured.
-pub const DEFAULT_FILTERS: &str = "deblock=filter=strong:block=4:alpha=0.12:beta=0.07:gamma=0.06:delta=0.05,deband=r=16,gradfun=3.5:8";
+pub const DEFAULT_FILTERS: &str = if cfg!(target_os = "android") {
+    ""
+} else {
+    "deblock=filter=strong:block=4:alpha=0.12:beta=0.07:gamma=0.06:delta=0.05,deband=r=16,gradfun=3.5:8"
+};
 
 /// The chain movie frames go through after they are scaled, by default.
 ///
@@ -241,7 +264,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
-            video_scaler: VideoScaler::default(),
+            video_scaler: DEFAULT_SCALER,
             video_filters: DEFAULT_FILTERS.to_string(),
             video_filters_after: DEFAULT_FILTERS_AFTER.to_string(),
             video_grain: DEFAULT_GRAIN,
@@ -638,10 +661,14 @@ pub fn template() -> String {
          ; already filled in.\n\
          \n\
          [Video]\n\
-         ; How a movie frame is scaled to the window. libswscale's filters:\n\
+         ; How a movie frame or a background is scaled to the window:\n\
          ;   {}\n\
-         ; The original left this to Direct3D's bilinear; spline is sharper.\n\
-         Scaler = spline\n\
+         ; All but gpu are libswscale's filters, on the CPU. gpu hands the\n\
+         ; scale to the graphics card, which is far cheaper and filters\n\
+         ; bilinear, the way the original's Direct3D did; it also leaves out\n\
+         ; FiltersAfterScale and Grain, which need the scaled frame. spline\n\
+         ; is sharper.\n\
+         Scaler = {}\n\
          \n\
          ; libavfilter chains, `ffmpeg -vf` syntax, run over every movie frame.\n\
          ; Empty means no filtering at all, which is what the original did.\n\
@@ -734,6 +761,7 @@ pub fn template() -> String {
          ; shipped rule exactly.\n\
          FreeRouteMap = on\n",
         VideoScaler::NAMES,
+        DEFAULT_SCALER.name(),
         DEFAULT_FILTERS,
         DEFAULT_FILTERS_AFTER,
         crate::media::grain::MAX,

@@ -27,7 +27,7 @@ pub mod video;
 
 pub use audio::{decode_audio, AudioBuffer};
 pub use image::{ImageScaler, Scaled};
-pub use video::{Timings, VideoDecoder, VideoFrame, VideoScaler};
+pub use video::{Pixels, Timings, VideoDecoder, VideoFrame, VideoScaler};
 
 /// Mixer sample rate, from `Ini/DX8SOUND.INI` (`SamplePerSec`).
 pub const SAMPLE_RATE: u32 = 44_100;
@@ -46,6 +46,10 @@ pub enum Error {
     Alloc(&'static str),
     #[error("{0}")]
     Filter(String),
+    #[error(
+        "the frame is YUV for the GPU, not RGBA; this decoder was set to [Video] Scaler = gpu"
+    )]
+    NotRgba,
 }
 
 impl Error {
