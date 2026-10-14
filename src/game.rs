@@ -727,7 +727,7 @@ struct Player<'a> {
     /// script boundary would see its start time jump into the future and stop
     /// where it stood.
     clock: Instant,
-    vfs: &'a Vfs,
+    vfs: &'a Arc<Vfs>,
     font: &'a Font,
     mixer: &'a Mixer,
     sounds: Sounds,
@@ -965,7 +965,9 @@ pub fn run_with(arguments: Vec<String>) -> Result<()> {
         Some(dir) => dir,
         None => discover_game_dir()?,
     };
-    let vfs = Vfs::mount(&game)?;
+    // Shared, because the stage reads movies and sounds ahead of their
+    // statements on a thread of its own. See `Stage::look_ahead`.
+    let vfs = Arc::new(Vfs::mount(&game)?);
     // Which files the three shipped binaries are, found by what they export
     // rather than by name: the titles on this engine spell them differently.
     // Mounting the packs already had to classify them, so take that answer.
@@ -3528,6 +3530,7 @@ fn run_script(
         // part-way through starts then. See `Stage::set_men_voice`.
         stage.set_men_voice(config.flag(Flag::MenVoice));
         stage.seek_to(at, player.vfs, player.mixer)?;
+        stage.look_ahead(at, player.vfs);
         let started = stage.started().clone();
         let asked_at = Instant::now();
         let visual = stage.visual_at(at);

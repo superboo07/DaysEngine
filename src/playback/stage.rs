@@ -6,11 +6,15 @@
 //!
 //! Assets are loaded when their statement fires rather than up front: a script
 //! can reference a hundred movies and thirty minutes of voice, and the game only
-//! ever needs the next few seconds.
+//! ever needs the next few seconds. The playback loop has those few seconds
+//! got ready on a worker thread first — [`Stage::look_ahead`] — so that the
+//! statement collects its movie or sound instead of loading it on the pass
+//! that cuts.
 
 use crate::install::vfs::Vfs;
 use crate::media::{AudioBuffer, Timings, VideoDecoder, VideoFrame};
 use crate::playback::lipsync::{self, Envelope, Mouth};
+use crate::playback::prefetch::Prefetch;
 use crate::playback::som;
 use anyhow::{Context, Result};
 use days_script::{Command, Fade, Frame, Script};
@@ -159,6 +163,130 @@ struct Movie {
     /// showing its last image rather than flashing.
     current: Option<VideoFrame>,
     path: String,
+}
+
+/// How movie frames are scaled and filtered, all of it from `DaysEngine.ini`.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct VideoSettings {
+    /// The filter frames are scaled with.
+    scaler: crate::media::VideoScaler,
+    /// What frames are put through on either side of that scale, and the grain
+    /// laid over the result. See [`crate::media::filter`] and
+    /// [`crate::media::grain`].
+    filters: (String, String),
+    grain: u8,
+    /// The size frames are wanted at, or `None` for the clip's own.
+    ///
+    /// The window is almost never 800x452, and a frame has to be scaled to it
+    /// somewhere. Here is the cheapest place: libswscale is already converting
+    /// every frame out of the codec's colour space, so the scale is folded into
+    /// a pass the frame was making anyway. See
+    /// [`crate::media::VideoDecoder::set_output_size`].
+    size: Option<(u32, u32)>,
+}
+
+impl VideoSettings {
+    /// Puts the filtering in place on one clip.
+    fn filter(&self, decoder: &mut VideoDecoder) {
+        decoder.set_filters(&self.filters.0);
+        decoder.set_post_filters(&self.filters.1);
+        decoder.set_grain(self.grain);
+    }
+
+    /// Puts all of it on a freshly opened clip.
+    fn apply(&self, decoder: &mut VideoDecoder, path: &str) {
+        if let Err(err) = decoder.set_scaler(self.scaler) {
+            log::warn!("{path}: cannot scale with {:?}: {err}", self.scaler);
+        }
+        self.filter(decoder);
+        let Some((width, height)) = self.size else {
+            return;
+        };
+        if let Err(err) = decoder.set_output_size(width, height) {
+            log::warn!("{path}: cannot decode at {width}x{height}: {err}");
+        }
+    }
+}
+
+/// How far ahead of the clock [`Stage::look_ahead`] gets statements ready.
+///
+/// What it has to cover is the worker's queue at a cut: a movie and the few
+/// sounds that start with it, about 25ms each on a Snapdragon 8 Gen 2 — call
+/// it a tenth of a second. Two seconds is twenty times that, and short enough
+/// that what is held ready is never more than the next cut or two.
+const LOOKAHEAD: u32 = 2 * days_script::FPS;
+
+/// What [`Stage::look_ahead`] gets ready, by what collects it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Item {
+    /// A `[PlayMovie]` or `[EndRoll]`: its start frame and its path.
+    Movie(u32, String),
+    /// A sound, by its pack entry's name — the key of [`Stage::audio_cache`].
+    Sound(String),
+}
+
+enum Prepared {
+    /// Boxed: an open decoder is some six hundred bytes, a sound a pointer.
+    Movie(Box<Result<OpenMovie>>),
+    Sound(Result<Arc<AudioBuffer>>),
+}
+
+/// A movie read, opened, set up and decoded to its first frame.
+struct OpenMovie {
+    decoder: VideoDecoder,
+    first: Option<VideoFrame>,
+    /// What it was set up with. Settings that have changed since — a window
+    /// resized while the worker had it — make it no use, because its first
+    /// frame was made with the old ones.
+    settings: VideoSettings,
+}
+
+/// Reads and opens a movie and puts the stage's settings on it.
+fn open_movie(vfs: &Vfs, path: &str, settings: &VideoSettings) -> Result<VideoDecoder> {
+    let bytes = vfs
+        .read_path_as(path, "wmv")
+        .with_context(|| format!("loading movie {path}"))?;
+    let mut decoder = VideoDecoder::open(bytes).with_context(|| format!("opening movie {path}"))?;
+    settings.apply(&mut decoder, path);
+    Ok(decoder)
+}
+
+/// What the worker does for a movie: [`open_movie`], and its first frame.
+///
+/// The first frame is where the codec and the filter graphs are built, so it
+/// is most of what a cut costs that is not the open itself. Its decode time is
+/// the worker's and is dropped rather than reported as though the pass that
+/// shows it had spent it.
+fn prepare_movie(vfs: &Vfs, path: &str, settings: VideoSettings) -> Result<OpenMovie> {
+    let mut decoder = open_movie(vfs, path, &settings)?;
+    let first = match decoder.frame_at(0) {
+        Ok(first) => first,
+        Err(err) => {
+            // Left for the stage to meet again and report as it plays.
+            log::debug!("{path}: no first frame ahead of time: {err}");
+            decoder.rewind().ok();
+            None
+        }
+    };
+    decoder.take_timings();
+    Ok(OpenMovie {
+        decoder,
+        first,
+        settings,
+    })
+}
+
+/// Reads a sound out of the packs and decodes it: the head now and the rest on
+/// a thread, because some of the script's sounds are minutes long and decoding
+/// one whole stopped the movie for as long as it took. See
+/// `media::audio::decode_audio_progressive`.
+fn decode_sound(
+    vfs: &Vfs,
+    handle: crate::install::vfs::Handle,
+    key: &str,
+) -> Result<Arc<AudioBuffer>> {
+    let bytes = vfs.read(handle)?;
+    crate::media::decode_audio_progressive(bytes).with_context(|| format!("decoding {key}"))
 }
 
 /// A still background image, decoded from PNG.
@@ -318,21 +446,13 @@ pub struct Stage {
     /// per background too, and re-checking it every frame would mean three
     /// failed pack lookups per speaker per frame.
     mouths: BTreeMap<String, Option<Mouth>>,
-    /// The filter movie frames are scaled with, from `DaysEngine.ini`.
-    video_scaler: crate::media::VideoScaler,
-    /// What movie frames are put through on either side of that scale, and the
-    /// grain laid over the result — all three from `DaysEngine.ini`. See
-    /// [`crate::media::filter`] and [`crate::media::grain`].
-    video_filters: (String, String),
-    video_grain: u8,
-    /// The size movie frames are wanted at, or `None` for the clip's own.
-    ///
-    /// The window is almost never 800x452, and a frame has to be scaled to it
-    /// somewhere. Here is the cheapest place: libswscale is already converting
-    /// every frame out of the codec's colour space, so the scale is folded into
-    /// a pass the frame was making anyway. See
-    /// [`crate::media::VideoDecoder::set_output_size`].
-    video_size: Option<(u32, u32)>,
+    /// How movie frames are scaled and filtered, from `DaysEngine.ini`.
+    video: VideoSettings,
+    /// Movies and sounds being got ready ahead of their statements. See
+    /// [`Stage::look_ahead`].
+    prefetch: Prefetch<Item, Prepared>,
+    /// The frame [`Stage::look_ahead`] has asked for everything up to.
+    looked_to: Option<Frame>,
     /// The rate the control bar's speed widgets have selected, from
     /// [`crate::ui::bar::SPEEDS`].
     ///
@@ -452,10 +572,9 @@ impl Stage {
             held_voices: Vec::new(),
             voices: BTreeMap::new(),
             mouths: BTreeMap::new(),
-            video_scaler: crate::media::VideoScaler::default(),
-            video_filters: (String::new(), String::new()),
-            video_grain: 0,
-            video_size: None,
+            video: VideoSettings::default(),
+            prefetch: Prefetch::new(),
+            looked_to: None,
             rate: 1.0,
             ending_card: false,
             card: None,
@@ -502,10 +621,10 @@ impl Stage {
     /// movie at the wrong size is still a movie, and losing playback over it
     /// would be worse.
     pub fn set_video_size(&mut self, width: u32, height: u32) {
-        if self.video_size == Some((width, height)) {
+        if self.video.size == Some((width, height)) {
             return;
         }
-        self.video_size = Some((width, height));
+        self.video.size = Some((width, height));
         if let Some(movie) = &mut self.movie {
             if let Err(err) = movie.decoder.set_output_size(width, height) {
                 log::warn!("{}: cannot decode at {width}x{height}: {err}", movie.path);
@@ -516,10 +635,10 @@ impl Stage {
     /// Chooses the filter movie frames are scaled with, applying it to whatever
     /// is playing and to every clip this stage opens afterwards.
     pub fn set_video_scaler(&mut self, scaler: crate::media::VideoScaler) {
-        if self.video_scaler == scaler {
+        if self.video.scaler == scaler {
             return;
         }
-        self.video_scaler = scaler;
+        self.video.scaler = scaler;
         if let Some(movie) = &mut self.movie {
             if let Err(err) = movie.decoder.set_scaler(scaler) {
                 log::warn!("{}: cannot scale with {scaler:?}: {err}", movie.path);
@@ -536,40 +655,18 @@ impl Stage {
     pub fn set_video_filters(&mut self, before: &str, after: &str, grain: u8) {
         if (before, after, grain)
             == (
-                &*self.video_filters.0,
-                &*self.video_filters.1,
-                self.video_grain,
+                &*self.video.filters.0,
+                &*self.video.filters.1,
+                self.video.grain,
             )
         {
             return;
         }
-        before.clone_into(&mut self.video_filters.0);
-        after.clone_into(&mut self.video_filters.1);
-        self.video_grain = grain;
+        before.clone_into(&mut self.video.filters.0);
+        after.clone_into(&mut self.video.filters.1);
+        self.video.grain = grain;
         if let Some(movie) = &mut self.movie {
-            Stage::filter_video(&self.video_filters, grain, &mut movie.decoder);
-        }
-    }
-
-    /// Puts one clip's filtering in place. Shared by the setter above and by
-    /// every clip this stage opens.
-    fn filter_video(filters: &(String, String), grain: u8, decoder: &mut VideoDecoder) {
-        decoder.set_filters(&filters.0);
-        decoder.set_post_filters(&filters.1);
-        decoder.set_grain(grain);
-    }
-
-    /// Puts this stage's video settings on a freshly opened clip.
-    fn size_video(&self, decoder: &mut VideoDecoder, path: &str) {
-        if let Err(err) = decoder.set_scaler(self.video_scaler) {
-            log::warn!("{path}: cannot scale with {:?}: {err}", self.video_scaler);
-        }
-        Stage::filter_video(&self.video_filters, self.video_grain, decoder);
-        let Some((width, height)) = self.video_size else {
-            return;
-        };
-        if let Err(err) = decoder.set_output_size(width, height) {
-            log::warn!("{path}: cannot decode at {width}x{height}: {err}");
+            self.video.filter(&mut movie.decoder);
         }
     }
 
@@ -680,14 +777,18 @@ impl Stage {
         // original re-offers on every tick rather than on the statement.
         self.release_held_voices(target, vfs, mixer);
 
+        // Whatever was got ready for a statement this pass has passed and that
+        // it did not collect, nothing will.
+        self.prefetch.forget_until(target);
         self.played = Some(target);
         Ok(())
     }
 
     /// What the last [`Stage::seek_to`] spent starting statements, for
     /// [`crate::playback::profile`]. Starting one can mean reading a movie out
-    /// of the packs and opening it, or decoding a whole sound, all on the
-    /// thread that draws.
+    /// of the packs and opening it, or decoding a sound's head, on the thread
+    /// that draws — or, for one [`Stage::look_ahead`] got ready in time, only
+    /// collecting it.
     pub fn started(&self) -> &Started {
         &self.started
     }
@@ -731,6 +832,8 @@ impl Stage {
         self.voices.clear();
         self.held_voices.clear();
         self.mouths.clear();
+        self.prefetch.clear();
+        self.looked_to = None;
     }
 
     /// Starts a voice clip: the tail of `FUN_0044e800`, past the `MenVoice`
@@ -775,19 +878,7 @@ impl Stage {
                     // No retail statement sets this; flag it if one ever does.
                     log::warn!("[PlayMovie] {path} requests looping, which is unimplemented");
                 }
-                let bytes = vfs
-                    .read_path_as(path, "wmv")
-                    .with_context(|| format!("loading movie {path}"))?;
-                let mut decoder =
-                    VideoDecoder::open(bytes).with_context(|| format!("opening movie {path}"))?;
-                self.size_video(&mut decoder, path);
-                self.movie = Some(Movie {
-                    decoder,
-                    start,
-                    next_index: 0,
-                    current: None,
-                    path: path.clone(),
-                });
+                self.start_movie(vfs, start, path)?;
                 // A movie covers the whole frame, so the still under it is
                 // done.
                 self.drop_background();
@@ -876,16 +967,7 @@ impl Stage {
                 });
             }
             Command::EndRoll { path } => {
-                let bytes = vfs.read_path_as(path, "wmv")?;
-                let mut decoder = VideoDecoder::open(bytes)?;
-                self.size_video(&mut decoder, path);
-                self.movie = Some(Movie {
-                    decoder,
-                    start,
-                    next_index: 0,
-                    current: None,
-                    path: path.clone(),
-                });
+                self.start_movie(vfs, start, path)?;
                 // The card is built from the same string the movie was opened
                 // from -- `FUN_0041a300` inserts `L"Ex01/"` at position 0 of
                 // it, after `_CheckEndRollSelect@8`'s letter has already been
@@ -962,14 +1044,101 @@ impl Stage {
         if let Some(cached) = self.audio_cache.get(&key) {
             return Ok(cached.clone());
         }
-        let bytes = vfs.read(handle)?;
-        // The head now and the rest on a thread: some of the script's sounds
-        // are minutes long, and decoding one whole here stopped the movie for
-        // as long as it took. See `media::audio::decode_audio_progressive`.
-        let buffer = crate::media::decode_audio_progressive(bytes)
-            .with_context(|| format!("decoding {key}"))?;
+        let buffer = match self.prefetch.take(&Item::Sound(key.clone())) {
+            Some(Prepared::Sound(prepared)) => prepared?,
+            _ => decode_sound(vfs, handle, &key)?,
+        };
         self.audio_cache.insert(key, buffer.clone());
         Ok(buffer)
+    }
+
+    /// Starts the movie a `[PlayMovie]` or `[EndRoll]` at `start` plays: the
+    /// one [`Stage::look_ahead`] got ready if it did, and otherwise opened
+    /// here and now.
+    fn start_movie(&mut self, vfs: &Vfs, start: Frame, path: &str) -> Result<()> {
+        let prepared = match self.prefetch.take(&Item::Movie(start.0, path.to_string())) {
+            Some(Prepared::Movie(prepared)) => match *prepared {
+                Ok(open) if open.settings == self.video => Some(open),
+                Ok(_) => {
+                    log::debug!("{path}: the video settings changed while it was opened ahead");
+                    None
+                }
+                Err(err) => return Err(err),
+            },
+            _ => None,
+        };
+        let (decoder, current) = match prepared {
+            Some(open) => (open.decoder, open.first),
+            None => (open_movie(vfs, path, &self.video)?, None),
+        };
+        self.movie = Some(Movie {
+            decoder,
+            start,
+            next_index: current.as_ref().map_or(0, |frame| frame.index + 1),
+            current,
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Gets the movies and sounds that start in the next [`LOOKAHEAD`] frames
+    /// after `at` ready on a worker thread, so that the pass their statement
+    /// fires on only has to collect them.
+    ///
+    /// The playback loop calls this after [`Stage::seek_to`]; nothing else
+    /// needs to, because a statement nobody looked ahead for is started the way
+    /// it always was. What it moves off the thread that draws is the pack read
+    /// and everything after it — a movie's open and first frame, a sound's
+    /// head. The pack read is safe there on Android too: a pack is opened
+    /// through the Storage Access Framework once, at mount, and read with
+    /// plain file I/O after that (see `install::saf`), so the worker never
+    /// touches the JVM. See [`crate::playback::prefetch`].
+    pub fn look_ahead(&mut self, at: Frame, vfs: &Arc<Vfs>) {
+        let from = self.looked_to.map_or(at, |to| to.max(at));
+        let until = Frame(at.0.saturating_add(LOOKAHEAD));
+        if until <= from {
+            return;
+        }
+        self.looked_to = Some(until);
+        let coming = self
+            .script
+            .events
+            .iter()
+            .filter(|e| e.start > from && e.start <= until);
+        for event in coming {
+            let due = event.start;
+            let sound = |path: &str| vfs.resolve_as(path, "ogg");
+            let handles = match &event.command {
+                Command::PlayMovie { path, .. } | Command::EndRoll { path } => {
+                    let (vfs, path, settings) = (vfs.clone(), path.clone(), self.video.clone());
+                    self.prefetch
+                        .request(Item::Movie(due.0, path.clone()), due, move || {
+                            Prepared::Movie(Box::new(prepare_movie(&vfs, &path, settings)))
+                        });
+                    continue;
+                }
+                Command::PlaySe { path, .. }
+                | Command::EndBgm { path }
+                | Command::PlayVoice { path, .. } => vec![sound(path)],
+                Command::PlayBgm { path } => match vfs.resolve_bgm(path) {
+                    Some(bgm) => vec![bgm.intro, Some(bgm.looped)],
+                    None => continue,
+                },
+                _ => continue,
+            };
+            // A sound that is not there is the statement's to report, when it
+            // comes due.
+            for handle in handles.into_iter().flatten() {
+                let key = vfs.entry(handle).name.clone();
+                if self.audio_cache.contains_key(&key) {
+                    continue;
+                }
+                let (vfs, name) = (vfs.clone(), key.clone());
+                self.prefetch.request(Item::Sound(key), due, move || {
+                    Prepared::Sound(decode_sound(&vfs, handle, &name))
+                });
+            }
+        }
     }
 
     fn audio_by_path(&mut self, vfs: &Vfs, path: &str) -> Result<Arc<AudioBuffer>> {
