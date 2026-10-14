@@ -58,6 +58,19 @@ const TOUCH_MOUSE_EVENTS: &str = "SDL_TOUCH_MOUSE_EVENTS";
 /// SDL's hint for reporting a mouse as a touch as well. See the module note.
 const MOUSE_TOUCH_EVENTS: &str = "SDL_MOUSE_TOUCH_EVENTS";
 
+/// SDL's hint for which ways up the screen may be.
+///
+/// The manifest already asks for `sensorLandscape`, and on its own that is
+/// not enough: SDL re-requests an orientation when it creates the window, and
+/// for a **resizable** window with this hint unset, `SDLActivity`'s
+/// `setOrientationBis` asks for `SCREEN_ORIENTATION_FULL_USER` — every
+/// orientation the rotation lock allows, portrait included — overriding the
+/// manifest. Naming both landscapes here makes it ask for `USER_LANDSCAPE`
+/// instead: either way round, still honouring the rotation lock. The game is
+/// a 16:9 picture and has no portrait layout, so portrait was only ever the
+/// same picture letterboxed into a third of the screen.
+const ORIENTATIONS: &str = "SDL_ORIENTATIONS";
+
 // Android's own logging, out of liblog. There is no safe binding to call
 // instead, and this is the whole of the FFI here.
 #[link(name = "log")]
@@ -140,6 +153,7 @@ fn boot() -> anyhow::Result<()> {
     start_logging();
     sdl3::hint::set(TOUCH_MOUSE_EVENTS, "1");
     sdl3::hint::set(MOUSE_TOUCH_EVENTS, "0");
+    sdl3::hint::set(ORIENTATIONS, "LandscapeLeft LandscapeRight");
 
     if !saf::present() {
         anyhow::bail!(
