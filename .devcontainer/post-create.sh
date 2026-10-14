@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs once, after the container is created.
+# Runs once, after the container is created. Idempotent and never destructive:
+# nothing that already exists is replaced.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -8,10 +9,12 @@ cd "$(dirname "$0")/.."
 # user running it.
 git config --global --add safe.directory "$PWD" || true
 
+bash .devcontainer/enable-plugins.sh
+
 # third_party/ffmpeg and third_party/sdl are the pinned sources EVERY build
 # links, a developer's as much as a release archive's (tools/build-sdl.sh,
 # tools/build-ffmpeg.sh, and the note at the top of the justfile). Without them
-# there is nothing to build against at all, so say so loudly -- but do not fail
+# there is nothing to build against at all, so say so -- but do not fail
 # the container, which is still worth having for everything that is not a build.
 git submodule update --init --depth 1 || {
     echo "submodule fetch failed; nothing will build until it succeeds." >&2
@@ -45,64 +48,8 @@ rustup target add x86_64-pc-windows-gnu
 # Warm the registry cache so the first build is a build and not a download.
 cargo fetch --locked || true
 
-# The identity git commits with. Nothing is copied from the host: ~/.gitconfig
-# and ~/.ssh are volumes this container owns (see docker-compose.yml), so the
-# first container asks once and every rebuild after it stays quiet.
-if ! git config --global --get user.email >/dev/null 2>&1; then
-    cat <<'MSG'
-
-  ------------------------------------------------------------------
-  git has no identity in this container yet. It is not taken from your
-  host config on purpose -- set it once and the volume keeps it:
-
-      git config --global user.name  "you"
-      git config --global user.email "you@example.com"
-
-  For signed commits, put a key in /root/.ssh (also a volume, also
-  yours) and point git at it:
-
-      ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519
-      git config --global gpg.format ssh
-      git config --global user.signingkey /root/.ssh/id_ed25519.pub
-      git config --global commit.gpgsign true
-  ------------------------------------------------------------------
-
-MSG
-fi
-
-echo
-# Each install is mounted at its own path, so DAYS_GAME_DIR and
-# DAYS_SHINYDAYS_DIR mean the same thing in here as they do on the host --
-# docker-compose.yml sets both from the same .env it mounted them from.
-for title in "School Days HQ:${DAYS_GAME_DIR:-}" "Shiny Days:${DAYS_SHINYDAYS_DIR:-}"; do
-    name=${title%%:*}
-    dir=${title#*:}
-    [ -n "$dir" ] || continue
-    if [ -d "$dir/Packs" ]; then
-        echo "$name mounted at $dir."
-    else
-        echo "$name: nothing at $dir -- check the path in .env."
-    fi
-done
-
-if [ -z "${DAYS_GAME_DIR:-}" ] && [ -z "${DAYS_SHINYDAYS_DIR:-}" ]; then
-    cat <<'MSG'
-  ------------------------------------------------------------------
-  No install is mounted.
-
-  Copy .env.example to .env -- at the top of the repository, not in
-  .devcontainer/ -- point DAYS_GAME_DIR at your own School Days HQ
-  directory, and rebuild the container. Without it the engine builds
-  and nothing can be verified: the archive key and the UI widget
-  tables both come from your install.
-
-  The same file is what .vscode/launch.json reads, so filling it in
-  once is also what makes the "Play:" configurations work.
-  ------------------------------------------------------------------
-MSG
-fi
-
-echo
-echo "Ready. Builds run in a container either way -- see tools/container.sh."
-echo "  just check          fmt, clippy -D warnings, tests"
-echo "  just dist-linux     release archive, built in a clean image"
+# Everything to tell you -- a missing install, git identity, signing key, the
+# commands -- is in welcome.sh, which checks the state as it is *now* and runs
+# again in every terminal and before claude.sh starts Claude. Output from this
+# script only reaches the creation log, which nobody sees twice.
+bash .devcontainer/welcome.sh || true

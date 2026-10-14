@@ -12,7 +12,14 @@
 # `media::image` needs the dynamic swscale API that first ships in n8.0 -- see
 # the note at the top of the justfile. Linking it segfaulted; pinning a newer
 # one in from testing would have been a second ffmpeg to reason about.
-FROM debian:trixie-slim
+#
+# **Nothing user-supplied is in this image** -- no game files, no Ghidra project.
+# Those are the player's own and are mounted at run time (docker-compose.yml).
+#
+# Everything runs as root in here. The container is run by **rootless Podman**,
+# so container root is your own host user: files written into the bind-mounted
+# tree stay owned by you, and root in here has no privilege you do not have.
+FROM docker.io/library/debian:trixie-slim
 
 # Everything docs/DEPENDENCIES.md asks a developer to install, and what the
 # Windows cross-build needs (mingw-w64). docs/WINDOWS.md is the same list said
@@ -209,48 +216,40 @@ ENV GHIDRA_PROJ=/root/ghidra_projects
 
 # **Podman inside the devcontainer, and no --privileged.**
 #
-# A release archive is built in the `builder` image, not in this one, so that
+# A release archive is built in tools/dist/'s image, not in this one, so that
 # what ships is not quietly linked against something only the devcontainer has.
-# That needs a container runtime in here. Podman rather than dockerd: dockerd
-# wants CAP_SYS_ADMIN (which is what the docker-in-docker feature's
-# --privileged buys) and its rootless script cannot call newuidmap from an
-# unprivileged user in a container, while podman as root in here can.
+# That needs a container runtime in here, and tools/in-container.sh finds this
+# one. podman-docker is the `docker` command, for anything that calls it by that
+# name. There is **no container socket from the host**: handing one in would give
+# the container the host's engine.
 #
-# It needs no daemon, so nothing starts it at postStart. tools/container.sh adds
-# the two flags each nested invocation does need -- --network=host, because
-# podman's bridge wants CAP_NET_ADMIN this container has not got, and
-# --pid=host, because a fresh /proc cannot be mounted over this one's masked
-# paths.
+# The devcontainer itself is run by rootless Podman, so podman here runs as this
+# container's root, which is you on the host -- nested builds get nothing you do
+# not have. docker-compose.yml supplies SYS_ADMIN inside that user namespace,
+# seccomp unconfined for crun's pivot_root and a storage volume; the config
+# below covers what a container cannot do:
+#  - netns=host: netavark cannot create bridges in here (netlink EPERM), so
+#    nested builds and runs share this container's network. in-container.sh
+#    also passes --network=host, which says the same thing.
+#  - cgroups=disabled: /sys/fs/cgroup is read-only in here (in-container.sh
+#    passes --cgroups=disabled to the same end).
+#  - keyring=false: session keyrings are denied.
+#  - short names resolve on Docker Hub, as `FROM debian:trixie` does in Docker.
+#
+# **No storage driver is named.** /var/lib/containers is a volume, so a fresh
+# store is native overlay -- no fuse, which is what used to force vfs here. A
+# store that already holds vfs layers (the one moved over from the Docker-era
+# container) is detected and kept as vfs; `podman system reset` empties it and
+# the next build starts it as overlay.
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 	&& apt-get install -y --no-install-recommends \
-		podman crun slirp4netns uidmap \
-	&& apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Written after the install: these are the packages' own conffiles, and a file
-# already sitting there stops dpkg to ask which version to keep.
-#
-# **vfs, not overlay.** fuse-overlayfs works for the image store until a build
-# step takes a lock inside it, where it fails with "Unable to lock database".
-# vfs copies each layer instead of stacking them, which costs disk and nothing
-# else. /var/lib/containers is a named volume (see docker-compose.yml) so a
-# built image survives a devcontainer rebuild.
-RUN printf '%s\n' \
-		'[storage]' \
-		'driver = "vfs"' \
-		'runroot = "/run/containers/storage"' \
-		'graphroot = "/var/lib/containers/storage"' \
-		> /etc/containers/storage.conf \
-	&& mkdir -p /etc/containers/registries.conf.d \
-	&& printf 'unqualified-search-registries = ["docker.io"]\n' \
-		> /etc/containers/registries.conf.d/00-docker-io.conf
-
-# The subordinate range podman maps into its containers. 2000:60000 rather than
-# the usual 100000:65536, because under a rootless host daemon this container is
-# itself given uids 1..65536 -- 100000 does not exist in here and newuidmap
-# refuses it. Without a range podman falls back to a single uid and cannot
-# unpack an image that owns a file as anything but root.
-RUN printf 'root:2000:60000\n' > /etc/subuid \
-	&& printf 'root:2000:60000\n' > /etc/subgid
+		podman podman-docker crun uidmap \
+	&& apt-get clean && rm -rf /var/lib/apt/lists/* \
+	&& printf '%s\n' '[containers]' 'netns = "host"' 'cgroups = "disabled"' 'keyring = false' \
+		'[engine]' 'cgroup_manager = "cgroupfs"' > /etc/containers/containers.conf \
+	&& printf '%s\n' 'unqualified-search-registries = ["docker.io"]' 'short-name-mode = "permissive"' \
+		> /etc/containers/registries.conf.d/50-docker-hub.conf \
+	&& touch /etc/containers/nodocker
 
 # XDG_RUNTIME_DIR for the container's root user; docker-compose.yml binds the
 # host's Wayland, PipeWire and PulseAudio sockets into it. Created here rather
@@ -295,16 +294,40 @@ RUN set -eu; \
 ENV DISABLE_AUTOUPDATER=1
 ENV DISABLE_INSTALLATION_CHECKS=1
 
-# Mount points for the volumes docker-compose.yml puts here: the SSH directory
-# you put your own key in, git's global config, and Claude Code's state. Created
-# in the image so the volumes inherit these modes -- .ssh in particular is 0700
-# or ssh refuses to use what is in it. **Nothing is copied from the host**; each
-# of these starts empty and is yours to fill in once, from inside the container.
-RUN mkdir -p /root/.ssh /root/.config/git /root/.claude \
-	&& chmod 700 /root/.ssh
-
-# Backed by a named volume, so shell history survives a rebuild.
-RUN mkdir -p /commandhistory && touch /commandhistory/.bash_history
+# Mount points for the volumes docker-compose.yml puts here, created in the
+# image so the volumes inherit owner and mode -- .ssh in particular is 0700 or
+# ssh refuses to use what is in it: the SSH directory you put your own key in,
+# git's global config, Claude Code's state, the Android signing key, the Ghidra
+# project, shell history and podman's image store. **Nothing is copied from the
+# host**; each of these starts empty and is yours to fill in once, from inside
+# the container.
+RUN install -d -m 0700 /root/.ssh \
+	&& install -d /root/.config/git /root/.claude /root/.android \
+		/root/ghidra_projects /var/lib/containers /commandhistory \
+	&& install -m 0600 /dev/null /commandhistory/.bash_history
 ENV HISTFILE=/commandhistory/.bash_history
+
+# HTTP(S) remotes need a password or token on every push unless a credential
+# helper keeps it. git's default `store` file, ~/.git-credentials, is on no
+# volume and is gone after a rebuild; `cache` is memory only. This stores it in
+# the gitconfig volume instead, so you log in once. System config (the image),
+# so it needs no setup. Plain text, mode 0600, never leaves the volume; no
+# keyring (there is no session D-Bus in here).
+RUN git config --system credential.helper 'store --file /root/.config/git/credentials'
+
+# The to-do list and command reference (welcome.sh) in every interactive
+# terminal -- post-create's output only reaches a creation log nobody reads. The
+# whole thing the first time in a container, only the to-do items after that.
+# Non-interactive shells (`devcontainer exec claude`, lifecycle hooks) skip it.
+RUN cat >> /root/.bashrc <<'SH'
+
+if [[ $- == *i* ]] && [ -f /workspaces/DaysEngine/.devcontainer/welcome.sh ]; then
+	if [ -e /tmp/.welcome-shown ]; then
+		bash /workspaces/DaysEngine/.devcontainer/welcome.sh --brief
+	else
+		bash /workspaces/DaysEngine/.devcontainer/welcome.sh; touch /tmp/.welcome-shown
+	fi
+fi
+SH
 
 ENV DEVCONTAINER=true

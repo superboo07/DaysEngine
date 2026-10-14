@@ -377,6 +377,22 @@ Design decisions already made and not up for re-litigation:
 
 ---
 
+## The devcontainer
+
+Run by **rootless Podman**, as root inside (which is the host user):
+`.devcontainer/claude.sh`, or "Reopen in Container" with VS Code's
+`dev.containers.dockerPath` set to `podman`. Debian trixie, rustup acting on
+`rust-toolchain.toml`, cargo-deny, MinGW, Ghidra + PyGhidra, Claude Code. `.env`
+at the top of the tree sets `DAYS_GAME_DIR`, `DAYS_SHINYDAYS_DIR`,
+`DAYS_MOUNT_MODE` (installs are `rw` by default, so playing saves) and
+`DAYS_GHIDRA_PROJECT_DIR`; installs are mounted at their own paths, and your
+skills and plugins read-only. Builds share `target/` with the host by design
+(`.cargo/config.toml`); the release and vendored-library builds run in nested
+podman via `tools/in-container.sh`. **No host credentials are bound: ssh, git
+config and Claude state are volumes.** `docs/DEVCONTAINER.md` has the rest.
+
+---
+
 ## Dependencies
 
 Read `docs/DEPENDENCIES.md` before adding anything.

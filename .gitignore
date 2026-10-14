@@ -20,7 +20,7 @@
 # by git as submodules and must not be listed here.
 
 # The devcontainer's mount configuration: paths to the user's own installs.
-# .devcontainer/.env.example is the tracked half.
+# .env.example at the top of the tree is the tracked half.
 *.env
 
 # What Gradle and an Android IDE write into android/ when they run without

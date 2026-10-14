@@ -6,7 +6,8 @@
 #
 # `up` is idempotent: it starts the container if it is not running and reuses it
 # if it is. VS Code is not needed for any of this -- the devcontainer CLI reads
-# the same devcontainer.json and docker-compose.yml.
+# the same devcontainer.json, and runs it with rootless Podman like VS Code does
+# (with "dev.containers.dockerPath": "podman").
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,5 +43,32 @@ if [ -z "$DEVCONTAINER_CLI" ]; then
 	fi
 fi
 
-$DEVCONTAINER_CLI up --workspace-folder .
-exec $DEVCONTAINER_CLI exec --workspace-folder . claude "$@"
+# The container is run by rootless Podman (devcontainer.json says why). The
+# flag goes after the subcommand: before `exec` the CLI would take "exec" as
+# the program to run.
+ENGINE=(--docker-path podman)
+
+# The CLI runs `podman compose`, which prefers docker-compose when it is
+# installed -- and that needs Podman's API socket. podman-compose needs none,
+# so use it when it is here and nothing else was chosen (initialize.sh says
+# what to do otherwise).
+if [ -z "${PODMAN_COMPOSE_PROVIDER:-}" ] && command -v podman-compose >/dev/null 2>&1; then
+	export PODMAN_COMPOSE_PROVIDER=podman-compose
+fi
+export PODMAN_COMPOSE_WARNING_LOGS=false
+
+$DEVCONTAINER_CLI up "${ENGINE[@]}" --workspace-folder .
+$DEVCONTAINER_CLI exec "${ENGINE[@]}" --workspace-folder . bash .devcontainer/enable-plugins.sh >&2
+
+# What still needs doing and how to work in here (welcome.sh). post-create's
+# output never gets this far -- it is in the build log above, and a reused
+# container does not run it at all. To stderr so `claude -p` output stays clean.
+# When there is a to-do and a person at the terminal, wait: Claude's UI would
+# otherwise push it out of view straight away.
+status=0
+$DEVCONTAINER_CLI exec "${ENGINE[@]}" --workspace-folder . bash .devcontainer/welcome.sh >&2 || status=$?
+if [ "$status" = 10 ] && [ -t 0 ] && [ -t 2 ]; then
+	read -r -p "Press Enter to start Claude... " _ >&2 || true
+fi
+
+exec $DEVCONTAINER_CLI exec "${ENGINE[@]}" --workspace-folder . claude "$@"

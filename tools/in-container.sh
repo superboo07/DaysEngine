@@ -74,24 +74,23 @@ EOF
     exit 1
 fi
 
-# **The two flags podman needs when it is nested inside the devcontainer.** Both
-# were measured in this image against rootless docker as the outer runtime, and
-# the third thing that makes them work is on the other side, in
-# .devcontainer/docker-compose.yml.
+# **The two flags podman needs when it is nested inside the devcontainer.** The
+# devcontainer is itself run by rootless Podman, and these were measured there.
 #
-#   --network=host      podman's own bridge wants CAP_NET_ADMIN, which the
-#                       devcontainer has not got.
+#   --network=host      podman's own bridge cannot be created in there (netavark
+#                       gets EPERM from netlink).
 #   --cgroups=disabled  the outer container's /sys/fs/cgroup is read-only, so
 #                       creating the container's cgroup fails with "opening
 #                       file `cgroup.subtree_control` for writing". Podman then
 #                       requires a private PID namespace, which is why
 #                       --pid=host is NOT passed: the two are mutually
-#                       exclusive, and with it the run fails anyway on
-#                       "mount `proc` to `proc`: Operation not permitted".
+#                       exclusive.
 #
-# That last failure is what `systempaths=unconfined` on the devcontainer fixes:
-# a new PID namespace needs a fresh /proc, and the kernel refuses to mount one
-# while the outer /proc carries the runtime's masked overmounts.
+# The devcontainer image's /etc/containers/containers.conf sets both as
+# defaults too (netns, cgroups); passing them here keeps this script correct
+# against an image that does not. The rest of what nesting needs -- SYS_ADMIN
+# and an unconfined seccomp profile, inside the outer user namespace -- is on
+# the other side, in .devcontainer/docker-compose.yml.
 #
 # Nothing here applies to podman on a real host, or to docker.
 days_engine_flags=()

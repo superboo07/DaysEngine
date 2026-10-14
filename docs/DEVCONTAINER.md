@@ -1,14 +1,23 @@
 # The devcontainer
 
-A VS Code devcontainer holding the toolchain, the libraries a developer build
-links, and enough of the desktop session that the game runs in it. It is the
+A devcontainer holding the toolchain, the libraries a developer build links,
+and enough of the desktop session that the game runs in it. It is the
 recommended way to work on this project and is not required to build it: the
 release archives are built by `tools/in-container.sh`, which needs podman or
 docker and nothing else.
 
-Open it with **Reopen in Container**, or from a terminal with
-`.devcontainer/claude.sh` (which brings the container up and starts Claude Code
-inside it).
+It is run by **rootless Podman**, as root inside — which rootless Podman maps to
+your own host user, so everything it writes into the tree or an install is owned
+by you. The host needs podman and a compose provider (podman-compose, or
+docker-compose with `podman.socket` running), and crun as Podman's OCI
+runtime for gamepads to open; nothing else.
+
+Open it from a terminal with `.devcontainer/claude.sh` (which brings the
+container up, shows what still needs doing, and starts Claude Code inside it),
+or in VS Code with **Reopen in Container** after setting the user setting
+`"dev.containers.dockerPath": "podman"`. Every new terminal in it shows
+`.devcontainer/welcome.sh`: the to-do items (no install mounted, no git
+identity, vendored libraries not built) and the commands.
 
 ## Your install has to be mounted, and you say where
 
@@ -53,11 +62,11 @@ directory where the game was meant to be.
 Compose looks for `.env` beside the compose file, so `devcontainer.json`'s
 `initializeCommand` (`.devcontainer/initialize.sh`) links the real one into
 `.devcontainer/` on the host before the container is built. The same script
-builds the image with a plain `docker build`: compose 5 builds through buildx
-bake, which refuses the Dockerfile the Dev Containers CLI generates in `/tmp`
-whenever the service has a `build:` section, so the service names a prebuilt
-`daysengine-devcontainer:latest` instead. Outside VS Code, run that script before
-`docker compose up`. There is still exactly one `.env`, and both paths are
+builds the image with a plain `podman build`: the Dev Containers CLI builds
+through a Dockerfile it generates in `/tmp`, outside the build context, whenever
+the service has a `build:` section, so the service names a prebuilt
+`localhost/daysengine-devcontainer:latest` instead and the tooling never builds.
+Outside VS Code, run that script before `podman compose up`. There is still exactly one `.env`, and both paths are
 gitignored.
 
 `DAYS_GAME_DIR` and `DAYS_SHINYDAYS_DIR` are also set *inside* the container, by
@@ -96,15 +105,20 @@ and set `DAYS_MOUNT_MODE=ro`.
 
 ## Running the game in it
 
-`docker-compose.yml` binds in what a window needs: the Wayland socket (X11 as
-the fallback), PipeWire and PulseAudio, `/dev/dri` for the host's GPU, and
-`/dev/input` with `/run/udev` for gamepads. SDL3 picks its video driver from
-what it can reach.
+`docker-compose.yml` binds in what a window needs: the Wayland socket,
+PipeWire and PulseAudio, `/dev/dri` for the host's GPU, and `/dev/input` with
+`/run/udev` for gamepads. The host's X server is **not** bound: reaching it needs
+your xauth cookie, a host secret, and SDL3 drives Wayland itself.
 
 Gamepads need the last of those and not the first: a pad reaches SDL through
 evdev, not over the Wayland socket, which is why a keyboard works in a container
 and a controller does not without the bind. `/dev/input` is bound as a directory
-so a pad plugged in later appears.
+so a pad plugged in later appears. Rootless Podman applies no device cgroup, so
+what decides whether a node opens is its file permissions — group `input` — and
+`group_add: keep-groups` carries your host groups into the container for that.
+**That needs crun as the host's OCI runtime**; under runc it is silently a
+no-op and no pad opens. Every input node is readable in here, keyboards
+included, which the Docker-era cgroup rule also allowed.
 
 When the window comes up black, `vulkaninfo --summary` and `glxinfo -B` say
 whether the GPU arrived; both are in the image for that.
@@ -112,7 +126,8 @@ whether the GPU arrived; both are in the image for that.
 ## git, SSH and Claude Code are yours, and nothing is copied in
 
 `/root/.ssh`, git's global config and `/root/.claude` are **named volumes that
-start empty**. No key, config or credential is bound in from the host. Set them
+start empty**. No container socket, ssh agent or session bus reaches in either,
+and `devcontainer.json` blanks what VS Code would otherwise forward. No key, config or credential is bound in from the host. Set them
 up once inside the container and the volumes keep them across rebuilds:
 
 ```bash
@@ -127,7 +142,8 @@ and every commit then fails with "Couldn't load public key".
 
 `CLAUDE_CONFIG_DIR` does the same job for Claude Code: credentials, settings and
 per-project history live in the volume, so a rebuild does not ask you to log in
-again.
+again. An HTTP(S) push login is kept in the gitconfig volume too
+(`/root/.config/git/credentials`), so it is asked for once.
 
 ## Ghidra
 
@@ -200,19 +216,20 @@ builds the pinned SDL3 and ffmpeg into `target/`, once per checkout, and
 release links. `docs/DEPENDENCIES.md` has the reasoning, including why this is
 no longer the distribution's ffmpeg.
 
-Podman inside the devcontainer runs without `--privileged`. Three things make
-that work, and each was measured in this image rather than copied from
-elsewhere:
+Podman inside the devcontainer runs without `--privileged` and without any
+container socket from the host. The devcontainer is itself rootless Podman, so
+the capabilities it is given apply only inside your own user namespace:
 
-- `--network=host` on the nested run, because podman's own bridge wants
-  `CAP_NET_ADMIN` the devcontainer has not got.
-- `--cgroups=disabled` on the nested run, because the outer container's
-  `/sys/fs/cgroup` is read-only and creating the container's cgroup otherwise
-  fails on `cgroup.subtree_control`. Podman then insists on a private PID
-  namespace, so `--pid=host` is *not* passed — the two are mutually exclusive.
-- `systempaths=unconfined` on the devcontainer itself, because a private PID
-  namespace needs a fresh `/proc` and the kernel refuses to mount one while the
-  outer `/proc` carries the runtime's masked overmounts.
+- `SYS_ADMIN` and `seccomp=unconfined` on the devcontainer, for nested podman's
+  mounts and namespaces and crun's `pivot_root`.
+- `netns = "host"` and `cgroups = "disabled"` in the image's
+  `/etc/containers/containers.conf`, because podman's own bridge cannot be made
+  in here and the outer `/sys/fs/cgroup` is read-only. `tools/in-container.sh`
+  passes `--network=host --cgroups=disabled` to the same end.
+- `/var/lib/containers` on a volume, so the image store is native overlay
+  rather than overlay stacked on the container's own root, and survives a
+  rebuild. A store carried over from the Docker-era container is still vfs;
+  `podman system reset` in here empties it and the next build starts overlay.
 
 Who the build runs as is decided by asking the runtime, not by assuming. Under
 **rootless** podman or docker, container root already *is* the caller, so the
@@ -229,7 +246,10 @@ lets rustup act on the file; `RUSTUP_HOME` is a volume, so a rebuild does not
 download it again. The release builder image takes the same value as a build
 argument, read from the same file by `tools/in-container.sh`.
 
-Your own Claude skills are the one exception: `~/.claude/skills` is bound in
-**read-only**, over the volume, so what you wrote on the host is available in
-the container and nothing in the container can change it. Editing a skill on the
-host takes effect without a rebuild.
+Your own Claude skills and installed plugins are the one exception:
+`~/.claude/skills` and `~/.claude/plugins` are bound in **read-only**, over the
+volume, so what you have on the host is available in the container and nothing
+in the container can change it. Editing a skill or installing a plugin on the
+host takes effect without a rebuild (`.devcontainer/enable-plugins.sh` enables
+new plugins before every `claude.sh` session); a plugin's own state is a
+container volume.

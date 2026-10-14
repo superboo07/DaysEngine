@@ -1,6 +1,10 @@
 {
   "name": "DaysEngine",
 
+  // **Run by rootless Podman, not Docker** (VS Code: set the user setting
+  // "dev.containers.dockerPath" to "podman"; claude.sh passes --docker-path
+  // podman itself).
+
   // Compose rather than a bare image, because the game installs are mounted
   // from paths that differ on every machine and .env (beside this file) is how
   // those are said once. Copy .env.example to .env and fill it in.
@@ -9,21 +13,22 @@
   "workspaceFolder": "/workspaces/DaysEngine",
   "shutdownAction": "stopCompose",
 
-  // Root, deliberately. Podman inside this container (see the comment in
-  // tools/Dockerfile.build) can write a multi-range uid map as root and cannot
-  // as an unprivileged user, which is what lets a release archive be built in
-  // here without --privileged. The Wayland and PipeWire binds go to
-  // /run/user/0 to match.
+  // Root, which rootless Podman maps to your own host user: files written into
+  // the bind-mounted tree stay owned by you, and root in here has nothing you
+  // do not have. It is also what podman inside this container runs as for the
+  // release builds (tools/in-container.sh). The Wayland and PipeWire binds go
+  // to /run/user/0 to match.
   "remoteUser": "root",
   "containerUser": "root",
 
   "containerEnv": {
     // Where docker-compose.yml put the sockets, and which display to reach.
     // The name is fixed rather than copied from the host because the bind
-    // renames whatever the host calls its socket to wayland-0.
+    // renames whatever the host calls its socket to wayland-0. No DISPLAY: the
+    // host's X server is not bound in (docker-compose.yml says why).
     "XDG_RUNTIME_DIR": "/run/user/0",
     "WAYLAND_DISPLAY": "wayland-0",
-    "DISPLAY": "${localEnv:DISPLAY}",
+    "PULSE_SERVER": "unix:/run/user/0/pulse/native",
 
     // DAYS_GAME_DIR and DAYS_SHINYDAYS_DIR are NOT here. They come from .env,
     // and compose is what reads that file, so docker-compose.yml sets them --
@@ -57,6 +62,16 @@
     "DAYS_ANDROID_KEYSTORE": "/root/.android/debug.keystore"
   },
 
+  // **The channels VS Code itself opens to host credentials**: it forwards the
+  // host's ssh agent and injects its own askpass and GitHub token into
+  // terminals. Blanked here (remoteEnv, because they must override what VS Code
+  // injects); the vscode settings below turn the injection off too.
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "",
+    "GIT_ASKPASS": "",
+    "GITHUB_TOKEN": ""
+  },
+
   "customizations": {
     "vscode": {
       // The same list as .vscode/extensions.json recommends, installed rather
@@ -69,17 +84,22 @@
         "anthropic.claude-code"
       ],
       "settings": {
+        "git.terminalAuthentication": false,
+        "github.gitAuthentication": false,
         "rust-analyzer.check.command": "clippy",
         "rust-analyzer.check.extraArgs": ["--locked", "--all-targets", "--", "-D", "warnings"]
       }
     }
   },
 
-  // Runs on the host before the container exists: links .env beside the
-  // compose file and builds the image. initialize.sh says why compose does
+  // **Runs on the host, before the container exists.** Links .env beside the
+  // compose file, checks podman's compose provider can reach Podman, and builds
+  // the image with a plain `podman build`. initialize.sh says why compose does
   // not build it itself.
   "initializeCommand": "bash .devcontainer/initialize.sh",
 
+  // Setup actions only. What you need to read is in welcome.sh, which claude.sh
+  // and every new terminal show -- this hook's output only reaches a log.
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   "waitFor": "postCreateCommand"
 }
