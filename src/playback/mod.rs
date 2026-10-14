@@ -5,12 +5,13 @@
 //! frame; [`mixer`] sums the audio that state says is playing, [`lipsync`]
 //! flaps a speaker's mouth for as long as their clip is audible, [`text`] lays
 //! dialogue out in the game's own font, [`compose`] draws the lot on the CPU so
-//! a frame can be checked without a display, and [`som`] is the levels a script
-//! asks a peripheral for.
+//! a frame can be checked without a display, [`som`] is the levels a script
+//! asks a peripheral for, and [`profile`] logs where a movie's time went.
 
 pub mod compose;
 pub mod lipsync;
 pub mod mixer;
+pub mod profile;
 pub mod scale;
 pub mod som;
 pub mod stage;

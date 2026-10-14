@@ -1028,6 +1028,10 @@ fn cmd_media(
                 "decoded and scaled in {took:.2?}, {each:.2?} a frame ({:.0} fps)",
                 frames as f64 / took.as_secs_f64()
             );
+            // Where that went, stage by stage — the same breakdown playback
+            // logs per clip, so a number from a device and a number from here
+            // can be read side by side.
+            println!("  {}", decoder.take_timings());
         }
         if let (Some(path), Some(frame)) = (dump_frame, first) {
             write_ppm(path, &frame)?;

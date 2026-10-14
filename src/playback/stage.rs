@@ -9,7 +9,7 @@
 //! ever needs the next few seconds.
 
 use crate::install::vfs::Vfs;
-use crate::media::{AudioBuffer, VideoDecoder, VideoFrame};
+use crate::media::{AudioBuffer, Timings, VideoDecoder, VideoFrame};
 use crate::playback::lipsync::{self, Envelope, Mouth};
 use crate::playback::som;
 use anyhow::{Context, Result};
@@ -142,6 +142,11 @@ pub struct Visual<'a> {
     /// visuals carrying the same pair here are the same picture, and the second
     /// one needs no work at all.
     pub movie_id: Option<(&'a str, u64)>,
+    /// What decoding the movie forward to this frame cost, stage by stage. No
+    /// frames at all on a pass that found the picture already decoded; more
+    /// than one on a pass that had fallen behind. See
+    /// [`crate::playback::profile`].
+    pub decoded: Timings,
     /// The still background to show, if one is set and no movie covers it.
     pub still: Option<&'a Still>,
     /// The `Ex01` episode title card, over both of them, while its window is
@@ -919,21 +924,23 @@ impl Stage {
     /// Decodes forward so the movie shows the right frame for `at`, then reports
     /// everything that should be drawn.
     pub fn visual_at(&mut self, at: Frame) -> Visual<'_> {
+        let mut decoded = Timings::default();
         if let Some(movie) = &mut self.movie {
             let wanted = u64::from(at.0.saturating_sub(movie.start.0));
-            while movie.next_index <= wanted {
-                match movie.decoder.next_frame() {
+            // Straight to the frame this pass shows. A pass that has fallen
+            // behind decodes the frames in between but converts only the last
+            // — see `VideoDecoder::frame_at` for what converting them all cost.
+            if movie.next_index <= wanted {
+                match movie.decoder.frame_at(wanted) {
                     Ok(Some(frame)) => {
                         movie.next_index = frame.index + 1;
                         movie.current = Some(frame);
                     }
-                    Ok(None) => break, // Clip exhausted; hold the last frame.
-                    Err(err) => {
-                        log::warn!("decoding {}: {err}", movie.path);
-                        break;
-                    }
+                    Ok(None) => {} // Clip exhausted; hold the last frame.
+                    Err(err) => log::warn!("decoding {}: {err}", movie.path),
                 }
             }
+            decoded = movie.decoder.take_timings();
         }
 
         let movie = self
@@ -943,6 +950,7 @@ impl Stage {
         let mut visual = Visual {
             movie: movie.map(|(_, frame)| frame),
             movie_id: movie.map(|(clip, frame)| (clip.path.as_str(), frame.index)),
+            decoded,
             still: self.still.as_ref(),
             card: self
                 .card

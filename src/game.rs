@@ -3214,6 +3214,8 @@ fn run_script(
     // that changes none of them reuses the texture.
     let mut stills: Stills<Texture<'_>> = Stills::new();
     let mut movie_texture: Option<MovieFrame<'_>> = None;
+    // Where each clip's time goes, logged as the clip ends.
+    let mut profile = crate::playback::profile::Profile::new();
     // The ending card, which is one picture for its whole window.
     let mut card_texture: Stills<Texture<'_>> = Stills::new();
     // Stills go through libswscale, the same scaler and the same filter a movie
@@ -3501,7 +3503,13 @@ fn run_script(
         // part-way through starts then. See `Stage::set_men_voice`.
         stage.set_men_voice(config.flag(Flag::MenVoice));
         stage.seek_to(at, player.vfs, player.mixer)?;
+        let asked_at = Instant::now();
         let visual = stage.visual_at(at);
+        profile.pass(
+            visual.movie_id.map(|(clip, _)| clip),
+            &visual.decoded,
+            asked_at.elapsed(),
+        );
 
         // The backlog. `FUN_0043dbe0` logs a statement where it dispatches it,
         // once; this loop samples the timeline far faster than 24 fps, so the
@@ -4093,9 +4101,12 @@ fn run_script(
                     });
                 }
                 if let Some(held) = &mut movie_texture {
+                    let uploading = Instant::now();
                     held.texture
                         .update(None, &frame.rgba, frame.width as usize * 4)
                         .context("uploading movie frame")?;
+                    let done = Instant::now();
+                    profile.shown(size, done - uploading, done);
                     if let Some((clip, index, window)) = showing {
                         held.clip.clear();
                         held.clip.push_str(clip);

@@ -6,6 +6,7 @@ use super::io::MemoryIo;
 use super::Error;
 use rusty_ffmpeg::ffi;
 use std::ffi::c_int;
+use std::time::{Duration, Instant};
 
 /// One decoded frame, as tightly packed RGBA.
 pub struct VideoFrame {
@@ -23,6 +24,94 @@ pub struct VideoFrame {
     /// ASF clip carries no timestamp, so that case falls back to
     /// `index / frame_rate`.
     pub timestamp: f64,
+}
+
+/// Where decoding time went, summed over the frames since the last
+/// [`VideoDecoder::take_timings`].
+///
+/// One field per stage a frame goes through in [`VideoDecoder::next_frame`],
+/// in that order. Wall-clock time on the calling thread: a stage that fans out
+/// to slice threads (the scale, and the filters that support it) counts how
+/// long the caller waited for it, not the CPU time it spent across cores —
+/// which is the number that decides whether a frame fits in its 41ms.
+///
+/// This is what `daysengine media --at-size` prints and what
+/// [`crate::playback::profile`] logs per clip, so a device can say where its
+/// frames go without a profiler attached.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Timings {
+    /// How many frames were converted and handed back. Every stage but
+    /// [`Self::decode`] is summed over these.
+    pub frames: u32,
+    /// Frames decoded and dropped without being converted, because a caller
+    /// that had fallen behind asked for a later one. See
+    /// [`VideoDecoder::frame_at`].
+    pub skipped: u32,
+    /// Demuxing and decoding: `av_read_frame` through `avcodec_receive_frame`,
+    /// for the skipped frames as well as the converted ones.
+    pub decode: Duration,
+    /// The `[Video] Filters` graph, before the scale.
+    pub filter: Duration,
+    /// `sws_scale_frame`: the colour conversion and the scale to the window.
+    pub scale: Duration,
+    /// The `[Video] FiltersAfterScale` graph.
+    pub post: Duration,
+    /// Allocating the packed RGBA buffer and copying the scaler's rows into it.
+    pub copy: Duration,
+    /// The grain pass.
+    pub grain: Duration,
+    /// The slowest single frame, all stages together.
+    pub worst: Duration,
+}
+
+impl Timings {
+    /// Every stage together.
+    pub fn total(&self) -> Duration {
+        self.decode + self.filter + self.scale + self.post + self.copy + self.grain
+    }
+
+    /// Adds `other`'s frames to these.
+    pub fn merge(&mut self, other: &Timings) {
+        self.frames += other.frames;
+        self.skipped += other.skipped;
+        self.decode += other.decode;
+        self.filter += other.filter;
+        self.scale += other.scale;
+        self.post += other.post;
+        self.copy += other.copy;
+        self.grain += other.grain;
+        self.worst = self.worst.max(other.worst);
+    }
+}
+
+/// The average frame, one stage after another, in milliseconds.
+///
+/// The decode is averaged over every frame decoded, skipped ones included, and
+/// the other stages over the frames that went through them — so the total is
+/// what a frame that is shown costs, and a skipped one costs its decode.
+impl std::fmt::Display for Timings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.frames.max(1);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(n);
+        let decoded = (self.frames + self.skipped).max(1);
+        let decode = self.decode.as_secs_f64() * 1000.0 / f64::from(decoded);
+        let shown = ms(self.filter + self.scale + self.post + self.copy + self.grain) + decode;
+        write!(
+            f,
+            "decode {decode:.2}ms, filter {:.2}ms, scale {:.2}ms, post {:.2}ms, copy {:.2}ms, \
+             grain {:.2}ms = {shown:.2}ms a frame (worst {:.2}ms)",
+            ms(self.filter),
+            ms(self.scale),
+            ms(self.post),
+            ms(self.copy),
+            ms(self.grain),
+            self.worst.as_secs_f64() * 1000.0,
+        )?;
+        if self.skipped > 0 {
+            write!(f, ", {} more decoded and skipped", self.skipped)?;
+        }
+        Ok(())
+    }
 }
 
 /// How a movie frame is scaled to the window.
@@ -105,6 +194,10 @@ pub struct VideoDecoder {
     codec: *mut ffi::AVCodecContext,
     packet: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
+    /// The last frame [`VideoDecoder::frame_at`] decoded and passed over, held
+    /// in case the clip ends before the one it was asked for. Allocated the
+    /// first time a frame is skipped.
+    skipped: *mut ffi::AVFrame,
     scaler: *mut ffi::SwsContext,
     /// The scaler's output, RGBA at [`VideoDecoder::output_size`]. Kept and
     /// rewritten in place rather than allocated per frame.
@@ -131,6 +224,8 @@ pub struct VideoDecoder {
     post_failed: bool,
     /// The dither laid over the finished RGBA frame. See [`grain`].
     grain: grain::Grain,
+    /// Where the frames since the last [`VideoDecoder::take_timings`] went.
+    timings: Timings,
     _io: Box<MemoryIo>,
     stream_index: c_int,
     time_base: f64,
@@ -252,6 +347,7 @@ impl VideoDecoder {
                 codec,
                 packet,
                 frame,
+                skipped: std::ptr::null_mut(),
                 scaler,
                 scaled,
                 _io: io,
@@ -270,6 +366,7 @@ impl VideoDecoder {
                 post_graph: None,
                 post_failed: false,
                 grain: grain::Grain::new(0),
+                timings: Timings::default(),
                 draining: false,
                 finished: false,
             })
@@ -317,20 +414,87 @@ impl VideoDecoder {
         Ok(())
     }
 
+    /// Where the frames decoded since the last call went, and a fresh start.
+    pub fn take_timings(&mut self) -> Timings {
+        std::mem::take(&mut self.timings)
+    }
+
     /// Decodes the next frame, or `None` at the end of the clip.
     pub fn next_frame(&mut self) -> Result<Option<VideoFrame>, Error> {
+        self.frame_at(self.index)
+    }
+
+    /// Decodes forward to the frame at `index` and converts that one only, or
+    /// the clip's last frame if it ends first. `None` once nothing is left.
+    ///
+    /// This is what a caller that has fallen behind wants. Converting a frame
+    /// — the filter chain, the scale to the window, the copy — is nearly all
+    /// of what one costs, and decoding one is a small part of it, so the
+    /// frames passed over on the way are decoded, because the next one
+    /// depends on them, and dropped without the rest. Measured on a
+    /// Snapdragon 8 Gen 2 before this existed: a pass that had fallen ten
+    /// frames behind converted all ten to show one, held the render thread
+    /// for half a second, and fell further behind for it, so a clip whose
+    /// frames each cost a little over their 41ms played at 5 fps.
+    ///
+    /// An `index` already behind the decoder is the next frame.
+    pub fn frame_at(&mut self, index: u64) -> Result<Option<VideoFrame>, Error> {
+        let started = Instant::now();
+        let mut holding = false;
+        let mut skipped = 0;
+        loop {
+            if !self.receive()? {
+                // The clip ended on the way. The last frame passed over is its
+                // last picture, and is the one to show.
+                if !holding {
+                    return Ok(None);
+                }
+                // SAFETY: `skipped` holds a decoded frame and `frame` is empty
+                // after a receive that produced nothing.
+                unsafe { ffi::av_frame_move_ref(self.frame, self.skipped) };
+                self.index -= 1;
+                skipped -= 1;
+            } else if self.index < index {
+                // SAFETY: both frames are allocated, and `skipped` is emptied
+                // before it takes `frame`'s reference.
+                unsafe {
+                    if self.skipped.is_null() {
+                        self.skipped = ffi::av_frame_alloc();
+                        if self.skipped.is_null() {
+                            return Err(Error::Alloc("AVFrame"));
+                        }
+                    }
+                    ffi::av_frame_unref(self.skipped);
+                    ffi::av_frame_move_ref(self.skipped, self.frame);
+                }
+                holding = true;
+                skipped += 1;
+                self.index += 1;
+                continue;
+            } else if holding {
+                // SAFETY: `skipped` is allocated; this drops what it held.
+                unsafe { ffi::av_frame_unref(self.skipped) };
+            }
+            self.timings.skipped += skipped;
+            return Ok(Some(self.convert_frame(started.elapsed())?));
+        }
+    }
+
+    /// Receives the next decoded frame into `self.frame`, feeding the decoder
+    /// as it asks. `false` at the end of the clip.
+    fn receive(&mut self) -> Result<bool, Error> {
         if self.finished {
-            return Ok(None);
+            return Ok(false);
         }
         loop {
             // SAFETY: all pointers are live for the lifetime of self.
             let code = unsafe { ffi::avcodec_receive_frame(self.codec, self.frame) };
             if code == 0 {
-                return Ok(Some(self.convert_frame()?));
+                return Ok(true);
             }
             if code == ffi::AVERROR_EOF {
                 self.finished = true;
-                return Ok(None);
+                return Ok(false);
             }
             if code != ffi::AVERROR(ffi::EAGAIN) {
                 return Err(Error::Ffmpeg {
@@ -342,7 +506,7 @@ impl VideoDecoder {
             // Decoder wants more input.
             if self.draining {
                 self.finished = true;
-                return Ok(None);
+                return Ok(false);
             }
             self.feed()?;
         }
@@ -600,20 +764,35 @@ impl VideoDecoder {
     }
 
     /// Converts the decoder's current frame to packed RGBA.
-    fn convert_frame(&mut self) -> Result<VideoFrame, Error> {
+    ///
+    /// `decode` is how long getting the frame out of the decoder took, for
+    /// [`Timings`]; every stage after it is timed here.
+    fn convert_frame(&mut self, decode: Duration) -> Result<VideoFrame, Error> {
         let (w, h) = (self.output.0 as usize, self.output.1 as usize);
-        let mut rgba = vec![0u8; w * h * 4];
+        let mut times = Timings {
+            frames: 1,
+            decode,
+            ..Timings::default()
+        };
+        let mut lap = Instant::now();
+        let mut stage = |into: &mut Duration| {
+            let now = Instant::now();
+            *into = now - lap;
+            lap = now;
+        };
 
         // SAFETY: the scaler writes `self.scaled`, an RGBA frame of exactly
         // `w` x `h`, and `rgba` is exactly that many packed bytes.
         let index = self.index;
         self.index += 1;
 
-        let timestamp = unsafe {
+        let (mut rgba, timestamp) = unsafe {
             // Filtered at the clip's own size, then scaled to the window: a
             // debander cannot see a band the scaler has already stretched.
             let source = self.filtered();
+            stage(&mut times.filter);
             let scaled = ffi::sws_scale_frame(self.scaler, self.scaled, source);
+            stage(&mut times.scale);
             if scaled < 0 {
                 ffi::av_frame_unref(self.frame);
                 return Err(Error::Ffmpeg {
@@ -625,14 +804,17 @@ impl VideoDecoder {
             // happens here, at the size it will be seen — see
             // [`VideoDecoder::set_post_filters`].
             let shown = self.post_filtered();
+            stage(&mut times.post);
             // Out of the scaler's own rows, which carry whatever padding its
             // SIMD wanted, into the packed buffer the rest of the engine works
             // in.
+            let mut rgba = vec![0u8; w * h * 4];
             let from = (*shown).data[0];
             let from_stride = (*shown).linesize[0] as usize;
             for (row, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
                 std::ptr::copy_nonoverlapping(from.add(row * from_stride), out.as_mut_ptr(), w * 4);
             }
+            stage(&mut times.copy);
 
             let best = (*self.frame).best_effort_timestamp;
             let pts = if best == ffi::AV_NOPTS_VALUE {
@@ -641,16 +823,20 @@ impl VideoDecoder {
                 best
             };
             ffi::av_frame_unref(self.frame);
-            if pts == ffi::AV_NOPTS_VALUE {
+            let timestamp = if pts == ffi::AV_NOPTS_VALUE {
                 index as f64 / self.frame_rate
             } else {
                 pts as f64 * self.time_base
-            }
+            };
+            (rgba, timestamp)
         };
 
         // Last of all, on the frame at the size it will be seen: a dither laid
         // down before the scale is not a dither by the time it is shown.
         self.grain.apply(&mut rgba, w, index);
+        stage(&mut times.grain);
+        times.worst = times.total();
+        self.timings.merge(&times);
 
         Ok(VideoFrame {
             width: self.output.0,
@@ -856,6 +1042,8 @@ impl Drop for VideoDecoder {
             ffi::sws_freeContext(self.scaler);
             ffi::av_frame_free(&mut self.scaled);
             ffi::av_frame_free(&mut self.frame);
+            // Null when nothing was ever skipped, which av_frame_free accepts.
+            ffi::av_frame_free(&mut self.skipped);
             ffi::av_packet_free(&mut self.packet);
             ffi::avcodec_free_context(&mut self.codec);
             ffi::avformat_close_input(&mut self.format);
