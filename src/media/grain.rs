@@ -124,16 +124,19 @@ impl Grain {
     /// saturating adds inside a `[u8; 4]` — measured about 12ms a frame at
     /// 1080p, which is a quarter of the frame. Expanding the offsets to one per
     /// byte, alpha's being zero, leaves the loop a single saturating add down
-    /// two contiguous runs, which vectorises: the same work measures about
-    /// 2.5ms.
+    /// two contiguous runs, which vectorises: on one thread the same work
+    /// measures about 3ms (3.1ms at 1920x1085 on an eight-core desktop).
     ///
     /// [`u8::saturating_add_signed`] is the other half of it. It is one
     /// instruction, and it is exactly the clamp that is wanted at both ends.
     ///
     /// The rest is threads. A band of rows is written by one worker and read by
-    /// nobody, so they need nothing from each other: 2.5ms becomes 1.25 at
-    /// 1080p, and 8ms becomes 1.7 at 4K, which nothing here is aiming at but
-    /// which is where a pass over every byte stops being free.
+    /// nobody, so they need nothing from each other. On the same eight cores,
+    /// 3.1ms becomes 2.1 at 1920x1085, and 11.2ms becomes 6.2 at 3840x2170 —
+    /// well short of eight times, but 4K, which nothing here is aiming at, is
+    /// where a pass over every byte stops being free. Measured as the grain
+    /// stage of `daysengine media --at-size`, three runs each, with one worker
+    /// forced for the single-thread figures.
     pub fn apply(&mut self, rgba: &mut [u8], width: usize, frame: u64) {
         if !self.is_visible() || width == 0 {
             return;
