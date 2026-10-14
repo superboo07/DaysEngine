@@ -262,8 +262,10 @@ const SILENT_MIN: i32 = -59;
 const SILENT_MAX: i32 = 60;
 
 impl Envelope {
-    /// Samples `audio` once per 24 fps frame.
+    /// Samples `audio` once per 24 fps frame, end to end — so a clip still
+    /// being decoded is waited for first.
     pub fn from_audio(audio: &AudioBuffer) -> Envelope {
+        audio.wait();
         let rate = f64::from(crate::media::SAMPLE_RATE);
         let total = audio.frames();
         let ticks = (audio.duration_seconds() * f64::from(FPS)).ceil() as usize;
@@ -273,7 +275,7 @@ impl Envelope {
                 if at >= total {
                     return false;
                 }
-                let sample = audio.samples[at * AudioBuffer::CHANNELS];
+                let sample = audio.sample(at * AudioBuffer::CHANNELS);
                 let pcm = (sample.clamp(-1.0, 1.0) * 32768.0) as i32;
                 !(SILENT_MIN..=SILENT_MAX).contains(&pcm)
             })
@@ -481,19 +483,18 @@ mod tests {
 
     #[test]
     fn the_silence_window_is_the_engines() {
-        let mut audio = AudioBuffer::silent();
         // Three 24 fps frames: silent, just inside the window, just outside.
         let per_frame = crate::media::SAMPLE_RATE as usize / FPS as usize;
-        audio.samples = vec![0.0; per_frame * 3 * AudioBuffer::CHANNELS];
-        let set = |audio: &mut AudioBuffer, n: usize, pcm: i32| {
+        let mut samples = vec![0.0; per_frame * 3 * AudioBuffer::CHANNELS];
+        let mut set = |n: usize, pcm: i32| {
             let at =
                 (n as f64 * f64::from(crate::media::SAMPLE_RATE) / f64::from(FPS)).round() as usize;
-            audio.samples[at * AudioBuffer::CHANNELS] = pcm as f32 / 32768.0;
+            samples[at * AudioBuffer::CHANNELS] = pcm as f32 / 32768.0;
         };
-        set(&mut audio, 0, 0);
-        set(&mut audio, 1, SILENT_MAX);
-        set(&mut audio, 2, SILENT_MAX + 1);
-        let env = Envelope::from_audio(&audio);
+        set(0, 0);
+        set(1, SILENT_MAX);
+        set(2, SILENT_MAX + 1);
+        let env = Envelope::from_audio(&AudioBuffer::complete(samples));
         assert!(!env.voiced(0));
         assert!(!env.voiced(1));
         assert!(env.voiced(2));

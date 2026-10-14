@@ -1043,7 +1043,7 @@ fn cmd_media(
             "audio {} frames, {:.3}s, peak {:.3}",
             audio.frames(),
             audio.duration_seconds(),
-            audio.samples.iter().fold(0f32, |m, s| m.max(s.abs()))
+            audio.samples().fold(0f32, |m, s| m.max(s.abs()))
         );
     }
     Ok(())

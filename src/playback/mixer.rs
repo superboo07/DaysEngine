@@ -109,14 +109,23 @@ impl Voice {
         }
     }
 
-    /// Advances to the next source frame, answering false once the voice has
-    /// finished. The wrap keeps the fractional part, so a resampled loop does
-    /// not drift or click at the seam.
-    fn wrap(&mut self) -> bool {
+    /// Advances to the next source frame, saying whether there is one to
+    /// play, the voice is waiting for one, or it has finished. The wrap keeps
+    /// the fractional part, so a resampled loop does not drift or click at
+    /// the seam.
+    ///
+    /// The end of what is decoded is only the end of the clip once the clip
+    /// is complete. Before that it is the head of a clip whose rest is still
+    /// being decoded — see `media::audio::decode_audio_progressive` — and the
+    /// voice waits there, neither ending nor looping early.
+    fn wrap(&mut self) -> Step {
         loop {
             let frames = self.buffer.frames();
             if self.position < frames as f64 {
-                return true;
+                return Step::Play;
+            }
+            if !self.buffer.is_complete() {
+                return Step::Wait;
             }
             // End of this buffer: move to the follow-on, loop, or stop.
             if let Some(next) = self.then.take() {
@@ -130,7 +139,7 @@ impl Voice {
                 self.position -= frames as f64;
                 continue;
             }
-            return false;
+            return Step::Done;
         }
     }
 
@@ -155,14 +164,18 @@ impl Voice {
         if rate == 1.0 && self.position.fract() == 0.0 {
             let mut written = 0usize;
             while written < wanted {
-                if !self.wrap() {
-                    return false;
+                match self.wrap() {
+                    Step::Play => {}
+                    Step::Wait => return true,
+                    Step::Done => return false,
                 }
                 let at = self.position as usize;
-                let available = self.buffer.frames() - at;
-                let take = available.min(wanted - written);
+                // As far as the part of the clip `at` is in goes, which is
+                // the whole clip unless the rest is still being decoded.
+                let run = self.buffer.run(at);
+                let take = (run.len() / channels).min(wanted - written);
                 if !silent {
-                    let src = &self.buffer.samples[at * channels..(at + take) * channels];
+                    let src = &run[..take * channels];
                     let dst = &mut out[written * channels..(written + take) * channels];
                     for (d, s) in dst.iter_mut().zip(src) {
                         *d += s * self.volume;
@@ -175,8 +188,10 @@ impl Voice {
         }
 
         for frame in 0..wanted {
-            if !self.wrap() {
-                return false;
+            match self.wrap() {
+                Step::Play => {}
+                Step::Wait => return true,
+                Step::Done => return false,
             }
             if !silent {
                 // Linear interpolation between the two source frames the
@@ -186,8 +201,8 @@ impl Voice {
                 let next = (at + 1).min(self.buffer.frames() - 1);
                 let frac = (self.position - at as f64) as f32;
                 for channel in 0..channels {
-                    let a = self.buffer.samples[at * channels + channel];
-                    let b = self.buffer.samples[next * channels + channel];
+                    let a = self.buffer.sample(at * channels + channel);
+                    let b = self.buffer.sample(next * channels + channel);
                     out[frame * channels + channel] += (a + (b - a) * frac) * self.volume;
                 }
             }
@@ -195,6 +210,16 @@ impl Voice {
         }
         true
     }
+}
+
+/// What a voice's next source frame is. See [`Voice::wrap`].
+enum Step {
+    /// There, at the position.
+    Play,
+    /// Not decoded yet. Nothing is written and the position holds.
+    Wait,
+    /// Past the end of a clip that has one.
+    Done,
 }
 
 /// Mixer state, shared between the game thread and the audio callback.
@@ -478,9 +503,10 @@ mod tests {
     use super::*;
 
     fn buffer(frames: usize, value: f32) -> Arc<AudioBuffer> {
-        Arc::new(AudioBuffer {
-            samples: vec![value; frames * AudioBuffer::CHANNELS],
-        })
+        Arc::new(AudioBuffer::complete(vec![
+            value;
+            frames * AudioBuffer::CHANNELS
+        ]))
     }
 
     /// A ramp, so a resampled read is distinguishable from a plain one.
@@ -490,9 +516,9 @@ mod tests {
     /// same.
     fn ramp(frames: usize) -> Arc<AudioBuffer> {
         let channels = AudioBuffer::CHANNELS;
-        Arc::new(AudioBuffer {
-            samples: (0..frames * channels).map(|i| step(i / channels)).collect(),
-        })
+        Arc::new(AudioBuffer::complete(
+            (0..frames * channels).map(|i| step(i / channels)).collect(),
+        ))
     }
 
     /// The ramp's value at source frame `n`.
@@ -725,5 +751,36 @@ mod tests {
             out.iter().all(|&s| (s - 0.5).abs() < 1e-6),
             "se+voice {out:?}"
         );
+    }
+
+    /// A sound that catches up with its own decoding waits where it is: it
+    /// neither ends nor loops at the end of the head, and when the rest
+    /// arrives it carries on from the very next frame.
+    #[test]
+    fn a_sound_still_being_decoded_waits_for_the_rest() {
+        let channels = AudioBuffer::CHANNELS;
+        let frame = |n: usize| step(n);
+        let samples = |range: std::ops::Range<usize>| -> Vec<f32> {
+            range.flat_map(|n| [frame(n); 2]).collect()
+        };
+        let pending = Arc::new(AudioBuffer::pending(samples(0..3)));
+        let mixer = Mixer::new();
+        mixer.play_bgm(None, pending.clone());
+
+        // Three frames are there and five are asked for: the three, then
+        // nothing, and the sound is still playing.
+        let mut out = vec![0.0; 5 * channels];
+        mixer.render(&mut out);
+        assert_eq!(left(&out), [frame(0), frame(1), frame(2), 0.0, 0.0]);
+        let mut out = vec![0.0; 2 * channels];
+        mixer.render(&mut out);
+        assert_eq!(left(&out), [0.0, 0.0], "it moved on without the rest");
+
+        // The rest arrives, and the clip picks up at frame 3 — not 0, which
+        // a loop would be, and not 5, which a clock that kept running would.
+        pending.arrive(samples(3..6));
+        let mut out = vec![0.0; 4 * channels];
+        mixer.render(&mut out);
+        assert_eq!(left(&out), [frame(3), frame(4), frame(5), frame(0)]);
     }
 }

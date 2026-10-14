@@ -25,7 +25,7 @@ pub mod grain;
 pub mod image;
 pub mod video;
 
-pub use audio::{decode_audio, AudioBuffer};
+pub use audio::{decode_audio, decode_audio_progressive, AudioBuffer};
 pub use image::{ImageScaler, Scaled};
 pub use video::{Pixels, Timings, VideoDecoder, VideoFrame, VideoScaler};
 

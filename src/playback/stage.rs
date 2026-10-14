@@ -963,8 +963,11 @@ impl Stage {
             return Ok(cached.clone());
         }
         let bytes = vfs.read(handle)?;
-        let buffer =
-            Arc::new(crate::media::decode_audio(bytes).with_context(|| format!("decoding {key}"))?);
+        // The head now and the rest on a thread: some of the script's sounds
+        // are minutes long, and decoding one whole here stopped the movie for
+        // as long as it took. See `media::audio::decode_audio_progressive`.
+        let buffer = crate::media::decode_audio_progressive(bytes)
+            .with_context(|| format!("decoding {key}"))?;
         self.audio_cache.insert(key, buffer.clone());
         Ok(buffer)
     }
