@@ -135,7 +135,8 @@ android-deps:
     ./tools/build-ffmpeg.sh android-arm64
     ./tools/build-ffmpeg.sh android-x86_64
 
-# A debug-signed APK, ready for `adb install`.
+# A debug-signed APK for arm64, ready for `adb install`: optimised, without
+# release's LTO, so a change rebuilds in seconds. See tools/build-android.sh.
 android:
     ./tools/build-android.sh
 

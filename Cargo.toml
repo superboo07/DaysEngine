@@ -145,6 +145,15 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# What a debug `tools/build-android.sh` builds: release's opt-level, without
+# the two settings that turn every change into a rebuild of the whole crate.
+# For the edit-install-measure loop on a phone; `--release` is what ships.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 # A debug build has to be playable, because playing it is how this engine is
 # checked against the real game.
 #

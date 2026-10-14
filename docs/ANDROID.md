@@ -7,7 +7,7 @@ picker, and everything after that is the game's own art.
 
 ```bash
 just android-deps    # SDL3 + ffmpeg for both ABIs. Slow; once per checkout.
-just android         # a debug-signed APK, ready for `adb install`
+just android         # a debug-signed arm64 APK, ready for `adb install`
 just dist-android    # a release APK in target/dist/
 ```
 
@@ -49,6 +49,13 @@ nothing in this engine needs a 32-bit process, since `days-gpk` and `days-ui`
 
 The list is `abis` in `tools/build-android.sh`, four fields per line, and
 adding one is the whole change.
+
+Only `--release` builds the whole list. A debug build is the loop of changing
+something and measuring it on a phone, so it builds `arm64-v8a` alone, with
+Cargo.toml's `quick` profile: release's `opt-level`, without the thin LTO and
+single codegen unit that make every change a rebuild of the whole crate. A
+cold one is about three minutes; after that, a change costs its own crate and
+gradle. The emulator is `x86_64`, and wants `--release`.
 
 ## The engine is a library here
 

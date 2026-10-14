@@ -3,8 +3,8 @@
 # Builds the engine for Android and, unless told otherwise, packages it as an
 # APK.
 #
-#   tools/build-android.sh              debug APK, every configured ABI
-#   tools/build-android.sh --release    release APK
+#   tools/build-android.sh              debug APK, arm64 only, `quick` profile
+#   tools/build-android.sh --release    release APK, every configured ABI
 #   tools/build-android.sh --libs-only  just the .so files, no gradle
 #
 # What comes out is target/dist/daysengine-android-<commit>.apk, and what goes
@@ -74,7 +74,22 @@ abis=(
     "x86_64-linux-android:x86_64:x86_64-linux-android:android-x86_64"
 )
 
+# A debug build is the edit-install-measure loop on a phone, where a release
+# build of both ABIs is minutes per change. So it builds the one ABI phones
+# are, with Cargo.toml's `quick` profile -- release's opt-level without its LTO
+# and single codegen unit, which are what make every change a whole-crate
+# rebuild. The native code is optimised, so what is measured on it is what
+# ships give or take the last few percent of the Rust code, and the hot paths
+# of a movie frame are ffmpeg's in any case. An emulator, which is x86_64,
+# wants --release.
+if [ "$mode" = debug ]; then
+    abis=("${abis[0]}")
+fi
+
 jni_libs=$root/target/android/jniLibs
+# A debug build after a release one must not package the other ABI's stale
+# libraries alongside the fresh one, so the directory starts empty either way.
+rm -rf "$jni_libs"
 
 for entry in "${abis[@]}"; do
     IFS=: read -r rust abi triple flavour <<<"$entry"
@@ -99,16 +114,18 @@ for entry in "${abis[@]}"; do
     upper=$(echo "$rust" | tr 'a-z-' 'A-Z_')
     export "CARGO_TARGET_${upper}_LINKER=$toolchain/bin/$triple$api-clang"
 
-    profile=()
+    profile=(--profile quick)
+    built_in=quick
     if [ "$mode" = release ]; then
         profile=(--release)
+        built_in=release
     fi
     (cd "$root" && cargo rustc --locked --lib --no-default-features \
         --crate-type cdylib --target "$rust" "${profile[@]}")
 
     out=$jni_libs/$abi
     mkdir -p "$out"
-    cp "$root/target/$rust/$mode/libdaysengine.so" "$out/"
+    cp "$root/target/$rust/$built_in/libdaysengine.so" "$out/"
     cp "$sdl_prefix/lib/libSDL3.so" "$out/"
     # Only the libraries the engine actually names. libavdevice is built --
     # rusty_ffmpeg always puts it on the link line -- and nothing in src/media
